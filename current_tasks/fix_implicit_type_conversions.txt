@@ -1,0 +1,28 @@
+Task: Fix implicit type conversions and float calling convention
+
+Status: In Progress
+
+Problem:
+The compiler was missing implicit type conversions in several places:
+1. Function call arguments: passing float where int expected (and vice versa)
+   was not inserting type casts.
+2. Variable initialization: `float f = 'a'` or `int x = 3.14` did not convert.
+3. Assignments: `f = 97` (int to float) stored wrong type without cast.
+4. Return statements: returning float from int-returning function (and vice versa).
+5. The calling convention didn't properly pass float arguments through float
+   registers (d0-d7 on ARM, xmm0-7 on x86, fa0-7 on RISC-V).
+6. Variadic argument promotion: float wasn't promoted to double for variadic calls.
+
+Fix:
+- Added function_param_types map to IR lowerer (tracks param types for arg casts)
+- Added emit_implicit_cast() helper to insert Cast IR instructions
+- Updated function call lowering to cast arguments to match parameter types
+- Updated variable init and assignment to insert float<->int casts
+- Updated return statement to use emit_implicit_cast
+- Added arg_types to Call/CallIndirect IR instructions for calling convention
+- Updated all three backends to use arg_types for proper float register assignment
+- Updated emit_store_params in all backends to read float params from float regs
+- Fixed ARM emit_cast_instrs to properly handle F32 vs F64 int<->float casts
+- Added vararg float->double promotion
+
+Impact: ~100 more tests passing across all three architectures.
