@@ -301,6 +301,8 @@ impl Preprocessor {
         self.define_simple_macro("__asm__", "asm");
         self.define_simple_macro("__asm", "asm");
         self.define_simple_macro("__typeof__", "typeof");
+        self.define_simple_macro("__alignof", "_Alignof");
+        self.define_simple_macro("__alignof__", "_Alignof");
 
         // MSVC-compatible integer type specifiers
         self.define_simple_macro("__int8", "char");

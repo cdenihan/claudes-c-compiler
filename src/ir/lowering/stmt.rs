@@ -143,6 +143,21 @@ impl Lowerer {
                 matches!(d, DerivedDeclarator::FunctionPointer(_, _) | DerivedDeclarator::Function(_, _)));
             let var_ty = if is_pointer || is_array_of_pointers || is_array_of_func_ptrs { IrType::Ptr } else { base_ty };
 
+            // For typedef'd arrays (e.g., typedef int type1[2]; type1 a = {0, 0}),
+            // base_ty is IrType::Ptr (array decays to pointer), but the element store
+            // type should be derived from the actual array element type.
+            let elem_ir_ty = if is_array && base_ty == IrType::Ptr && !is_array_of_pointers {
+                // The type spec resolved to an Array type; get the element type
+                let resolved = self.resolve_type_spec(&decl.type_spec);
+                if let TypeSpecifier::Array(ref elem_ts, _) = resolved {
+                    self.type_spec_to_ir(elem_ts)
+                } else {
+                    base_ty
+                }
+            } else {
+                base_ty
+            };
+
             // For unsized arrays (int a[] = {...}), compute actual size from initializer
             let is_unsized_array = is_array && declarator.derived.iter().any(|d| {
                 matches!(d, DerivedDeclarator::Array(None))
@@ -389,7 +404,7 @@ impl Lowerer {
                             if array_dim_strides.len() > 1 {
                                 // Multi-dimensional array init: zero first, then fill
                                 self.zero_init_alloca(alloca, alloc_size);
-                                self.lower_array_init_list(items, alloca, base_ty, &array_dim_strides);
+                                self.lower_array_init_list(items, alloca, elem_ir_ty, &array_dim_strides);
                             } else if let Some(ref s_layout) = elem_struct_layout {
                                 // Array of structs: init each element using struct layout
                                 self.zero_init_alloca(alloca, alloc_size);
@@ -460,7 +475,7 @@ impl Lowerer {
 
                                 // For arrays of pointers, the element type is Ptr (8 bytes),
                                 // not the base type spec (which would be e.g. I32 for int *arr[N]).
-                                let elem_store_ty = if is_array_of_pointers { IrType::I64 } else { base_ty };
+                                let elem_store_ty = if is_array_of_pointers { IrType::I64 } else { elem_ir_ty };
 
                                 let mut current_idx = 0usize;
                                 for item in items.iter() {
@@ -473,7 +488,7 @@ impl Lowerer {
 
                                     // Handle each item, with special case for string literals in char arrays
                                     if let Initializer::Expr(e) = &item.init {
-                                        if !is_array_of_pointers && (base_ty == IrType::I8 || base_ty == IrType::U8) {
+                                        if !is_array_of_pointers && (elem_ir_ty == IrType::I8 || elem_ir_ty == IrType::U8) {
                                             if let Expr::StringLiteral(s, _) = e {
                                                 self.emit_string_to_alloca(alloca, s, current_idx * elem_size);
                                                 current_idx += 1;
