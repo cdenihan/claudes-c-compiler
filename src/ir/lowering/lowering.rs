@@ -2119,6 +2119,12 @@ impl Lowerer {
                 if let Some(info) = self.locals.get(name) {
                     return info.is_bool;
                 }
+                // Check global variables for _Bool type
+                if let Some(ginfo) = self.globals.get(name) {
+                    if let Some(ref ct) = ginfo.c_type {
+                        return matches!(ct, CType::Bool);
+                    }
+                }
                 false
             }
             Expr::Deref(_, _)
