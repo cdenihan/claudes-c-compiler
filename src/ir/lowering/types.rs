@@ -344,7 +344,7 @@ impl Lowerer {
             BinOp::BitOr => l | r,
             BinOp::BitXor => l ^ r,
             BinOp::Shl => l.wrapping_shl(r as u32),
-            BinOp::Shr => l.wrapping_shr(r as u32),
+            BinOp::Shr => (l as u64).wrapping_shr(r as u32) as i64,
             BinOp::Eq => if l == r { 1 } else { 0 },
             BinOp::Ne => if l != r { 1 } else { 0 },
             BinOp::Lt => if l < r { 1 } else { 0 },
@@ -869,6 +869,62 @@ impl Lowerer {
         for (name, ts) in posix_extras {
             self.typedefs.insert(name.to_string(), ts.clone());
         }
+    }
+
+    /// Seed known libc math function signatures for correct calling convention.
+    /// Without these, calls like atanf(1) would pass integer args in %rdi instead of %xmm0.
+    pub(super) fn seed_libc_math_functions(&mut self) {
+        use IrType::*;
+        // float func(float) - single-precision math
+        let f_f: &[&str] = &[
+            "sinf", "cosf", "tanf", "asinf", "acosf", "atanf",
+            "sinhf", "coshf", "tanhf", "asinhf", "acoshf", "atanhf",
+            "expf", "exp2f", "expm1f", "logf", "log2f", "log10f", "log1pf",
+            "sqrtf", "cbrtf", "fabsf", "ceilf", "floorf", "roundf", "truncf",
+            "rintf", "nearbyintf", "erff", "erfcf", "tgammaf", "lgammaf",
+        ];
+        for name in f_f {
+            self.function_return_types.insert(name.to_string(), F32);
+            self.function_param_types.insert(name.to_string(), vec![F32]);
+        }
+        // double func(double) - double-precision math
+        let d_d: &[&str] = &[
+            "sin", "cos", "tan", "asin", "acos", "atan",
+            "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
+            "exp", "exp2", "expm1", "log", "log2", "log10", "log1p",
+            "sqrt", "cbrt", "fabs", "ceil", "floor", "round", "trunc",
+            "rint", "nearbyint", "erf", "erfc", "tgamma", "lgamma",
+        ];
+        for name in d_d {
+            self.function_return_types.insert(name.to_string(), F64);
+            self.function_param_types.insert(name.to_string(), vec![F64]);
+        }
+        // float func(float, float) - two-arg single-precision
+        let f_ff: &[&str] = &["atan2f", "powf", "fmodf", "remainderf", "copysignf", "fminf", "fmaxf", "fdimf", "hypotf"];
+        for name in f_ff {
+            self.function_return_types.insert(name.to_string(), F32);
+            self.function_param_types.insert(name.to_string(), vec![F32, F32]);
+        }
+        // double func(double, double) - two-arg double-precision
+        let d_dd: &[&str] = &["atan2", "pow", "fmod", "remainder", "copysign", "fmin", "fmax", "fdim", "hypot"];
+        for name in d_dd {
+            self.function_return_types.insert(name.to_string(), F64);
+            self.function_param_types.insert(name.to_string(), vec![F64, F64]);
+        }
+        // int/long returning functions
+        self.function_return_types.insert("abs".to_string(), I32);
+        self.function_param_types.insert("abs".to_string(), vec![I32]);
+        self.function_return_types.insert("labs".to_string(), I64);
+        self.function_param_types.insert("labs".to_string(), vec![I64]);
+        // float func(float, int)
+        self.function_return_types.insert("ldexpf".to_string(), F32);
+        self.function_param_types.insert("ldexpf".to_string(), vec![F32, I32]);
+        self.function_return_types.insert("ldexp".to_string(), F64);
+        self.function_param_types.insert("ldexp".to_string(), vec![F64, I32]);
+        self.function_return_types.insert("scalbnf".to_string(), F32);
+        self.function_param_types.insert("scalbnf".to_string(), vec![F32, I32]);
+        self.function_return_types.insert("scalbn".to_string(), F64);
+        self.function_param_types.insert("scalbn".to_string(), vec![F64, I32]);
     }
 
     pub(super) fn type_spec_to_ir(&self, ts: &TypeSpecifier) -> IrType {

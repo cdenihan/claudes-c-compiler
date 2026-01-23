@@ -353,8 +353,14 @@ impl ArchCodegen for X86Codegen {
                         stack_param_offset += 8;
                     } else if is_float {
                         // Float params arrive in xmm0-xmm7 per SysV ABI
-                        self.state.emit(&format!("    movq %{}, {}(%rbp)",
-                            xmm_regs[float_reg_idx], slot.0));
+                        if ty == IrType::F32 {
+                            // Store F32: movd to eax (zero-extends to rax), then movq to slot
+                            self.state.emit(&format!("    movd %{}, %eax", xmm_regs[float_reg_idx]));
+                            self.state.emit(&format!("    movq %rax, {}(%rbp)", slot.0));
+                        } else {
+                            self.state.emit(&format!("    movq %{}, {}(%rbp)",
+                                xmm_regs[float_reg_idx], slot.0));
+                        }
                         float_reg_idx += 1;
                     } else {
                         let store_instr = Self::mov_store_for_type(ty);
@@ -417,11 +423,17 @@ impl ArchCodegen for X86Codegen {
     fn emit_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
         if ty.is_float() {
             // Float binary operation using SSE
+            let (mov_to_xmm, mov_from_xmm) = if ty == IrType::F32 {
+                ("movd %eax, %xmm0", "movd %xmm0, %eax")
+            } else {
+                ("movq %rax, %xmm0", "movq %xmm0, %rax")
+            };
+            let mov_to_xmm1 = if ty == IrType::F32 { "movd %eax, %xmm1" } else { "movq %rax, %xmm1" };
             self.operand_to_rax(lhs);
-            self.state.emit("    movq %rax, %xmm0");
+            self.state.emit(&format!("    {}", mov_to_xmm));
             self.state.emit("    pushq %rax");
             self.operand_to_rax(rhs);
-            self.state.emit("    movq %rax, %xmm1");
+            self.state.emit(&format!("    {}", mov_to_xmm1));
             self.state.emit("    popq %rax"); // balance stack
             let (add, sub, mul, div) = if ty == IrType::F64 {
                 ("addsd", "subsd", "mulsd", "divsd")
@@ -435,7 +447,7 @@ impl ArchCodegen for X86Codegen {
                 IrBinOp::SDiv | IrBinOp::UDiv => self.state.emit(&format!("    {} %xmm1, %xmm0", div)),
                 _ => self.state.emit(&format!("    {} %xmm1, %xmm0", add)),
             }
-            self.state.emit("    movq %xmm0, %rax");
+            self.state.emit(&format!("    {}", mov_from_xmm));
             self.store_rax_to(dest);
             return;
         }
@@ -562,11 +574,16 @@ impl ArchCodegen for X86Codegen {
     fn emit_cmp(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
         if ty.is_float() {
             // Float comparison using SSE
+            let (mov_to_xmm0, mov_to_xmm1) = if ty == IrType::F32 {
+                ("movd %eax, %xmm0", "movd %eax, %xmm1")
+            } else {
+                ("movq %rax, %xmm0", "movq %rax, %xmm1")
+            };
             self.operand_to_rax(lhs);
-            self.state.emit("    movq %rax, %xmm0");
+            self.state.emit(&format!("    {}", mov_to_xmm0));
             self.state.emit("    pushq %rax");
             self.operand_to_rax(rhs);
-            self.state.emit("    movq %rax, %xmm1");
+            self.state.emit(&format!("    {}", mov_to_xmm1));
             self.state.emit("    popq %rax");
             if ty == IrType::F64 {
                 self.state.emit("    ucomisd %xmm1, %xmm0");
@@ -677,8 +694,11 @@ impl ArchCodegen for X86Codegen {
         }
 
         if let Some(dest) = dest {
-            if return_type.is_float() {
-                // Float return value is in xmm0
+            if return_type == IrType::F32 {
+                // F32 return value is in xmm0 (low 32 bits)
+                self.state.emit("    movd %xmm0, %eax");
+            } else if return_type == IrType::F64 {
+                // F64 return value is in xmm0 (full 64 bits)
                 self.state.emit("    movq %xmm0, %rax");
             }
             self.store_rax_to(&dest);
@@ -736,8 +756,9 @@ impl ArchCodegen for X86Codegen {
     fn emit_return(&mut self, val: Option<&Operand>, _frame_size: i64) {
         if let Some(val) = val {
             self.operand_to_rax(val);
-            if self.current_return_type.is_float() {
-                // Move float bit pattern from rax to xmm0 for ABI compliance
+            if self.current_return_type == IrType::F32 {
+                self.state.emit("    movd %eax, %xmm0");
+            } else if self.current_return_type == IrType::F64 {
                 self.state.emit("    movq %rax, %xmm0");
             }
         }

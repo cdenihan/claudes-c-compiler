@@ -162,6 +162,8 @@ impl Lowerer {
     pub fn lower(mut self, tu: &TranslationUnit) -> IrModule {
         // Seed builtin typedefs (matching the parser's pre-seeded typedef names)
         self.seed_builtin_typedefs();
+        // Seed known libc math function signatures for correct calling convention
+        self.seed_libc_math_functions();
 
         // First pass: collect all function names, return types, and parameter types
         // so we can distinguish function references from global variable references,
