@@ -308,23 +308,35 @@ impl Parser {
                             if let Some(ref name) = pname {
                                 // Apply derived declarators (pointers, arrays) to the type
                                 let mut full_type = type_spec.clone();
+                                // First apply pointers
+                                for d in &pderived {
+                                    if let DerivedDeclarator::Pointer = d {
+                                        full_type = TypeSpecifier::Pointer(Box::new(full_type));
+                                    }
+                                }
+                                // Collect array dimensions
+                                let array_dims: Vec<_> = pderived.iter().filter_map(|d| {
+                                    if let DerivedDeclarator::Array(size) = d {
+                                        Some(size.clone())
+                                    } else {
+                                        None
+                                    }
+                                }).collect();
+                                // Array params: outermost dimension decays to pointer,
+                                // inner dimensions wrap as Array (same as non-K&R params).
+                                if !array_dims.is_empty() {
+                                    for dim in array_dims.iter().skip(1).rev() {
+                                        full_type = TypeSpecifier::Array(Box::new(full_type), dim.clone());
+                                    }
+                                    full_type = TypeSpecifier::Pointer(Box::new(full_type));
+                                }
+                                // Function/FunctionPointer params decay to pointers
                                 for d in &pderived {
                                     match d {
-                                        DerivedDeclarator::Pointer => {
+                                        DerivedDeclarator::Function(_, _) | DerivedDeclarator::FunctionPointer(_, _) => {
                                             full_type = TypeSpecifier::Pointer(Box::new(full_type));
                                         }
-                                        DerivedDeclarator::Array(_) => {
-                                            // Array params decay to pointers
-                                            full_type = TypeSpecifier::Pointer(Box::new(full_type));
-                                        }
-                                        DerivedDeclarator::Function(fp, fv) => {
-                                            // Function type decays to function pointer
-                                            full_type = TypeSpecifier::Pointer(Box::new(full_type));
-                                            let _ = (fp, fv); // params tracked elsewhere
-                                        }
-                                        DerivedDeclarator::FunctionPointer(_, _) => {
-                                            full_type = TypeSpecifier::Pointer(Box::new(full_type));
-                                        }
+                                        _ => {}
                                     }
                                 }
                                 // Find the matching param and update its type
