@@ -671,30 +671,208 @@ impl ArchCodegen for RiscvCodegen {
                  func_ptr: Option<&Operand>, dest: Option<Value>, return_type: IrType,
                  is_variadic: bool, _num_fixed_args: usize) {
         let float_arg_regs = ["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"];
+
+        // Phase 1: Classify all args into register assignments or stack overflow.
+        // 'I' = GP register, 'F' = FP register, 'Q' = F128 GP register pair, 'S' = stack, 'T' = F128 stack
+        let mut arg_classes: Vec<char> = Vec::new();
+        let mut arg_int_indices: Vec<usize> = Vec::new(); // GP reg index for 'I' or base index for 'Q'
+        let mut arg_fp_indices: Vec<usize> = Vec::new();  // FP reg index for 'F'
         let mut int_idx = 0usize;
         let mut float_idx = 0usize;
 
-        for (i, arg) in args.iter().enumerate() {
+        for (i, _arg) in args.iter().enumerate() {
+            let is_long_double = if i < arg_types.len() {
+                arg_types[i].is_long_double()
+            } else {
+                false
+            };
             let is_float_arg = if i < arg_types.len() {
                 arg_types[i].is_float()
             } else {
-                matches!(arg, Operand::Const(IrConst::F32(_) | IrConst::F64(_)))
+                matches!(args[i], Operand::Const(IrConst::F32(_) | IrConst::F64(_)))
             };
-            // For variadic functions, ALL arguments go through integer registers (a0-a7)
-            if is_float_arg && !is_variadic && float_idx < 8 {
+
+            if is_long_double {
+                // Align int_idx to even for register pair
+                if int_idx % 2 != 0 {
+                    int_idx += 1;
+                }
+                if int_idx + 1 < 8 {
+                    arg_classes.push('Q');
+                    arg_int_indices.push(int_idx);
+                    arg_fp_indices.push(0);
+                    int_idx += 2;
+                } else {
+                    arg_classes.push('T'); // F128 stack overflow
+                    arg_int_indices.push(0);
+                    arg_fp_indices.push(0);
+                    int_idx = 8;
+                }
+            } else if is_float_arg && !is_variadic && float_idx < 8 {
+                arg_classes.push('F');
+                arg_int_indices.push(0);
+                arg_fp_indices.push(float_idx);
+                float_idx += 1;
+            } else if int_idx < 8 {
+                arg_classes.push('I');
+                arg_int_indices.push(int_idx);
+                arg_fp_indices.push(0);
+                int_idx += 1;
+            } else {
+                arg_classes.push('S');
+                arg_int_indices.push(0);
+                arg_fp_indices.push(0);
+            }
+        }
+
+        // Phase 2: Handle F128 variable args that need __extenddftf2.
+        // Call __extenddftf2 for each, save results to stack temporaries.
+        // Count how many F128 variable reg args we have.
+        let mut f128_var_temps: Vec<(usize, i64)> = Vec::new(); // (arg_index, sp_offset of saved lo:hi)
+        let mut f128_temp_space: i64 = 0;
+        for (i, arg) in args.iter().enumerate() {
+            if arg_classes[i] == 'Q' {
+                if let Operand::Value(_) = arg {
+                    f128_temp_space += 16;
+                    f128_var_temps.push((i, 0)); // offset filled below
+                }
+            }
+        }
+
+        if f128_temp_space > 0 {
+            // Allocate temp space for F128 conversion results
+            self.state.emit(&format!("    addi sp, sp, -{}", f128_temp_space));
+            let mut temp_offset: i64 = 0;
+            for item in &mut f128_var_temps {
+                item.1 = temp_offset;
+                let arg = &args[item.0];
+                // Load f64 value, call __extenddftf2, save result
+                self.operand_to_t0(arg);
+                self.state.emit("    fmv.d.x fa0, t0");
+                self.state.emit("    call __extenddftf2");
+                // Save a0:a1 to temp space
+                self.state.emit(&format!("    sd a0, {}(sp)", temp_offset));
+                self.state.emit(&format!("    sd a1, {}(sp)", temp_offset + 8));
+                temp_offset += 16;
+            }
+        }
+
+        // Phase 3: Handle stack overflow args.
+        let stack_args: Vec<(usize, bool)> = args.iter().enumerate()
+            .filter(|(i, _)| arg_classes[*i] == 'S' || arg_classes[*i] == 'T')
+            .map(|(i, _)| (i, arg_classes[i] == 'T'))
+            .collect();
+
+        let mut stack_arg_space: usize = 0;
+        if !stack_args.is_empty() {
+            for &(_, is_f128) in &stack_args {
+                if is_f128 {
+                    stack_arg_space = (stack_arg_space + 15) & !15;
+                    stack_arg_space += 16;
+                } else {
+                    stack_arg_space += 8;
+                }
+            }
+            stack_arg_space = (stack_arg_space + 15) & !15;
+            self.state.emit(&format!("    addi sp, sp, -{}", stack_arg_space));
+            let mut offset: usize = 0;
+            for &(arg_i, is_f128) in &stack_args {
+                if is_f128 {
+                    offset = (offset + 15) & !15;
+                    match &args[arg_i] {
+                        Operand::Const(ref c) => {
+                            let f64_val = match c {
+                                IrConst::LongDouble(v) => *v,
+                                IrConst::F64(v) => *v,
+                                _ => c.to_f64().unwrap_or(0.0),
+                            };
+                            let bytes = crate::ir::ir::f64_to_f128_bytes(f64_val);
+                            let lo = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                            let hi = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
+                            self.state.emit(&format!("    li t0, {}", lo));
+                            self.state.emit(&format!("    sd t0, {}(sp)", offset));
+                            self.state.emit(&format!("    li t0, {}", hi));
+                            self.state.emit(&format!("    sd t0, {}(sp)", offset + 8));
+                        }
+                        Operand::Value(ref _v) => {
+                            self.operand_to_t0(&args[arg_i]);
+                            self.state.emit("    fmv.d.x fa0, t0");
+                            self.state.emit("    call __extenddftf2");
+                            self.state.emit(&format!("    sd a0, {}(sp)", offset));
+                            self.state.emit(&format!("    sd a1, {}(sp)", offset + 8));
+                        }
+                    }
+                    offset += 16;
+                } else {
+                    self.operand_to_t0(&args[arg_i]);
+                    self.state.emit(&format!("    sd t0, {}(sp)", offset));
+                    offset += 8;
+                }
+            }
+        }
+
+        // Phase 4: Load non-F128 register args.
+        // Load all non-F128 args into their target registers.
+        // Process GP args into t3-t6 first (temp), then FP args, then move GP from temp.
+        let mut gp_temps: Vec<(usize, &str)> = Vec::new(); // (target_reg_idx, temp_reg)
+        let temp_regs = ["t3", "t4", "t5", "t6", "s2", "s3", "s4", "s5"];
+        let mut temp_i = 0usize;
+        for (i, arg) in args.iter().enumerate() {
+            if arg_classes[i] == 'I' {
+                self.operand_to_t0(arg);
+                if temp_i < temp_regs.len() {
+                    self.state.emit(&format!("    mv {}, t0", temp_regs[temp_i]));
+                    gp_temps.push((arg_int_indices[i], temp_regs[temp_i]));
+                    temp_i += 1;
+                }
+            } else if arg_classes[i] == 'F' {
+                let fp_i = arg_fp_indices[i];
                 self.operand_to_t0(arg);
                 let arg_ty = if i < arg_types.len() { Some(arg_types[i]) } else { None };
                 if arg_ty == Some(IrType::F32) {
-                    self.state.emit(&format!("    fmv.w.x {}, t0", float_arg_regs[float_idx]));
+                    self.state.emit(&format!("    fmv.w.x {}, t0", float_arg_regs[fp_i]));
                 } else {
-                    self.state.emit(&format!("    fmv.d.x {}, t0", float_arg_regs[float_idx]));
+                    self.state.emit(&format!("    fmv.d.x {}, t0", float_arg_regs[fp_i]));
                 }
-                float_idx += 1;
-            } else if int_idx < 8 {
-                self.operand_to_t0(arg);
-                self.state.emit(&format!("    mv {}, t0", RISCV_ARG_REGS[int_idx]));
-                int_idx += 1;
             }
+        }
+
+        // Phase 5: Move GP args from temps to actual arg registers.
+        for (target_idx, temp_reg) in &gp_temps {
+            self.state.emit(&format!("    mv {}, {}", RISCV_ARG_REGS[*target_idx], temp_reg));
+        }
+
+        // Phase 6: Load F128 register args into their target register pairs.
+        for (i, _arg) in args.iter().enumerate() {
+            if arg_classes[i] != 'Q' { continue; }
+            let base_reg = arg_int_indices[i];
+            match &args[i] {
+                Operand::Const(ref c) => {
+                    let f64_val = match c {
+                        IrConst::LongDouble(v) => *v,
+                        IrConst::F64(v) => *v,
+                        _ => c.to_f64().unwrap_or(0.0),
+                    };
+                    let bytes = crate::ir::ir::f64_to_f128_bytes(f64_val);
+                    let lo = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                    let hi = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
+                    self.state.emit(&format!("    li {}, {}", RISCV_ARG_REGS[base_reg], lo));
+                    self.state.emit(&format!("    li {}, {}", RISCV_ARG_REGS[base_reg + 1], hi));
+                }
+                Operand::Value(_) => {
+                    // Load from temp space (saved in Phase 2)
+                    let temp_info = f128_var_temps.iter().find(|t| t.0 == i).unwrap();
+                    // Adjust offset for stack_arg_space
+                    let offset = temp_info.1 + stack_arg_space as i64;
+                    self.state.emit(&format!("    ld {}, {}(sp)", RISCV_ARG_REGS[base_reg], offset));
+                    self.state.emit(&format!("    ld {}, {}(sp)", RISCV_ARG_REGS[base_reg + 1], offset + 8));
+                }
+            }
+        }
+
+        // Clean up F128 temp space before the call (only if no stack overflow args below it)
+        if f128_temp_space > 0 && stack_arg_space == 0 {
+            self.state.emit(&format!("    addi sp, sp, {}", f128_temp_space));
         }
 
         if let Some(name) = direct_name {
@@ -703,6 +881,13 @@ impl ArchCodegen for RiscvCodegen {
             self.operand_to_t0(ptr);
             self.state.emit("    mv t2, t0");
             self.state.emit("    jalr ra, t2, 0");
+        }
+
+        // Clean up stack space after call
+        if stack_arg_space > 0 {
+            // Both stack overflow args and f128 temp space (if any) need cleanup
+            let cleanup = stack_arg_space + f128_temp_space as usize;
+            self.state.emit(&format!("    addi sp, sp, {}", cleanup));
         }
 
         if let Some(dest) = dest {
@@ -778,7 +963,7 @@ impl ArchCodegen for RiscvCodegen {
         self.state.emit(&format!("{}:", done_label));
     }
 
-    fn emit_va_arg(&mut self, dest: &Value, va_list_ptr: &Value, _result_ty: IrType) {
+    fn emit_va_arg(&mut self, dest: &Value, va_list_ptr: &Value, result_ty: IrType) {
         // RISC-V LP64D: va_list is just a void* (pointer to the next arg on stack).
         // Load va_list pointer address into t1
         if let Some(slot) = self.state.get_slot(va_list_ptr.0) {
@@ -790,11 +975,30 @@ impl ArchCodegen for RiscvCodegen {
         }
         // Load the current va_list pointer value (points to next arg)
         self.state.emit("    ld t2, 0(t1)");
-        // Load the argument value
-        self.state.emit("    ld t0, 0(t2)");
-        // Advance pointer by 8
-        self.state.emit("    addi t2, t2, 8");
-        self.state.emit("    sd t2, 0(t1)");
+
+        if result_ty.is_long_double() {
+            // F128 (long double): 16 bytes, 16-byte aligned.
+            // Align t2 to 16 bytes: t2 = (t2 + 15) & ~15
+            self.state.emit("    addi t2, t2, 15");
+            self.state.emit("    andi t2, t2, -16");
+            // Load 16 bytes (f128) into a0:a1 for __trunctfdf2
+            self.state.emit("    ld a0, 0(t2)");    // lo 8 bytes
+            self.state.emit("    ld a1, 8(t2)");    // hi 8 bytes
+            // Advance pointer by 16
+            self.state.emit("    addi t2, t2, 16");
+            self.state.emit("    sd t2, 0(t1)");
+            // Convert f128 (in a0:a1) to f64 using __trunctfdf2
+            // __trunctfdf2 on RISC-V: takes f128 in a0:a1, returns f64 in fa0
+            self.state.emit("    call __trunctfdf2");
+            // Move f64 result from fa0 to t0 (bit pattern)
+            self.state.emit("    fmv.x.d t0, fa0");
+        } else {
+            // Standard 8-byte arg
+            self.state.emit("    ld t0, 0(t2)");
+            // Advance pointer by 8
+            self.state.emit("    addi t2, t2, 8");
+            self.state.emit("    sd t2, 0(t1)");
+        }
         // Store result
         self.store_t0_to(dest);
     }

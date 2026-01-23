@@ -20,9 +20,9 @@ impl Lowerer {
             Expr::ULongLiteral(val, _) => Operand::Const(IrConst::I64(*val as i64)),
             Expr::FloatLiteral(val, _) => Operand::Const(IrConst::F64(*val)),
             Expr::FloatLiteralF32(val, _) => Operand::Const(IrConst::F32(*val as f32)),
-            // Long double literals: use F64 for computation (IR has no F80 type),
-            // but IrConst::LongDouble is used for global initializers
-            Expr::FloatLiteralLongDouble(val, _) => Operand::Const(IrConst::F64(*val)),
+            // Long double literals: use IrConst::LongDouble so the type is tracked as F128
+            // for correct ABI handling (16-byte passing in variadic calls, va_arg)
+            Expr::FloatLiteralLongDouble(val, _) => Operand::Const(IrConst::LongDouble(*val)),
             Expr::CharLiteral(ch, _) => Operand::Const(IrConst::I32(*ch as i32)),
 
             Expr::StringLiteral(s, _) => self.lower_string_literal(s),
@@ -2436,7 +2436,7 @@ impl Lowerer {
             Expr::CharLiteral(_, _) => IrType::I8,
             Expr::FloatLiteral(_, _) => IrType::F64,
             Expr::FloatLiteralF32(_, _) => IrType::F32,
-            Expr::FloatLiteralLongDouble(_, _) => IrType::F64, // long double uses F64 at IR level
+            Expr::FloatLiteralLongDouble(_, _) => IrType::F128, // long double: 16-byte ABI type
             Expr::Cast(ref target_type, _, _) => self.type_spec_to_ir(target_type),
             Expr::BinaryOp(op, lhs, rhs, _) => {
                 if op.is_comparison() || matches!(op, BinOp::LogicalAnd | BinOp::LogicalOr) {
@@ -2641,6 +2641,7 @@ impl Lowerer {
             TypeSpecifier::UnsignedShort => IrType::U16,
             TypeSpecifier::Float => IrType::F32,
             TypeSpecifier::Double => IrType::F64,
+            TypeSpecifier::LongDouble => IrType::F128,
             TypeSpecifier::Pointer(_) => IrType::Ptr,
             TypeSpecifier::Void => IrType::I64,
             TypeSpecifier::Bool => IrType::I8,

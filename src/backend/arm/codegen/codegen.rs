@@ -162,6 +162,25 @@ impl ArmCodegen {
         }
     }
 
+    /// Load a 64-bit immediate value into a register using mov/movk sequence.
+    fn emit_load_imm64(&mut self, reg: &str, val: i64) {
+        let bits = val as u64;
+        if bits == 0 {
+            self.state.emit(&format!("    mov {}, #0", reg));
+            return;
+        }
+        self.state.emit(&format!("    mov {}, #{}", reg, bits & 0xffff));
+        if (bits >> 16) & 0xffff != 0 {
+            self.state.emit(&format!("    movk {}, #{}, lsl #16", reg, (bits >> 16) & 0xffff));
+        }
+        if (bits >> 32) & 0xffff != 0 {
+            self.state.emit(&format!("    movk {}, #{}, lsl #32", reg, (bits >> 32) & 0xffff));
+        }
+        if (bits >> 48) & 0xffff != 0 {
+            self.state.emit(&format!("    movk {}, #{}, lsl #48", reg, (bits >> 48) & 0xffff));
+        }
+    }
+
     /// Emit function prologue: allocate stack and save fp/lr.
     fn emit_prologue_arm(&mut self, frame_size: i64) {
         if frame_size > 0 && frame_size <= 504 {
@@ -360,6 +379,17 @@ impl ArmCodegen {
     /// Emit a type cast instruction sequence for AArch64.
     fn emit_cast_instrs(&mut self, from_ty: IrType, to_ty: IrType) {
         if from_ty == to_ty { return; }
+
+        // F128 (long double) is stored as F64 bit pattern in x0.
+        // Treat F128 <-> F64 as no-op, and F128 <-> other as F64 <-> other.
+        if from_ty == IrType::F128 || to_ty == IrType::F128 {
+            let effective_from = if from_ty == IrType::F128 { IrType::F64 } else { from_ty };
+            let effective_to = if to_ty == IrType::F128 { IrType::F64 } else { to_ty };
+            if effective_from == effective_to {
+                return; // F128 <-> F64 is a no-op
+            }
+            return self.emit_cast_instrs(effective_from, effective_to);
+        }
 
         // Ptr is equivalent to I64/U64 on AArch64 (both 8 bytes, no conversion needed)
         // Treat Ptr <-> I64/U64 and Ptr <-> Ptr as no-ops
@@ -910,20 +940,30 @@ impl ArchCodegen for ArmCodegen {
         }
 
         // Classify args: determine which go in registers vs stack.
-        // On AArch64 (AAPCS64), both named and variadic float args go in FP registers (d0-d7),
+        // On AArch64 (AAPCS64), both named and variadic float args go in FP registers (d0-d7 / q0-q7),
         // and int args go in GP registers (x0-x7). The callee saves both register sets
         // and uses va_list with __gr_offs/__vr_offs to access variadic args.
-        let mut arg_classes: Vec<char> = Vec::new(); // 'f' = float reg, 'i' = int reg, 's' = stack
+        // F128 (long double) uses Q registers (128-bit) and consumes one FP register slot.
+        let mut arg_classes: Vec<char> = Vec::new(); // 'f' = float reg, 'i' = int reg, 's' = stack, 'q' = F128 in Q reg
         let mut fi = 0usize;
         let mut ii = 0usize;
         for (i, _arg) in args.iter().enumerate() {
             let arg_ty = if i < arg_types.len() { Some(arg_types[i]) } else { None };
+            let is_long_double = arg_ty == Some(IrType::F128);
             let is_float = if let Some(ty) = arg_ty {
                 ty.is_float()
             } else {
                 matches!(args[i], Operand::Const(IrConst::F32(_) | IrConst::F64(_)))
             };
-            if is_float && fi < 8 {
+            if is_long_double {
+                // F128 (long double) uses a Q register (128-bit SIMD), consuming one FP slot
+                if fi < 8 {
+                    arg_classes.push('q'); // quad = F128 in Q register
+                    fi += 1;
+                } else {
+                    arg_classes.push('S'); // stack quad (overflow)
+                }
+            } else if is_float && fi < 8 {
                 arg_classes.push('f');
                 fi += 1;
             } else if !is_float && ii < 8 {
@@ -934,13 +974,22 @@ impl ArchCodegen for ArmCodegen {
             }
         }
 
-        // Count stack arguments
+        // Count stack arguments - 'S' (stack overflow quad) args need 16 bytes, 's' args need 8 bytes
         let stack_arg_indices: Vec<usize> = args.iter().enumerate()
-            .filter(|(i, _)| arg_classes[*i] == 's')
+            .filter(|(i, _)| arg_classes[*i] == 's' || arg_classes[*i] == 'S')
             .map(|(i, _)| i)
             .collect();
-        let num_stack_args = stack_arg_indices.len();
-        let stack_arg_space = (((num_stack_args * 8) + 15) / 16) * 16;
+        let mut stack_arg_space: usize = 0;
+        for &idx in &stack_arg_indices {
+            if arg_classes[idx] == 'S' {
+                // Align to 16 bytes for quad
+                stack_arg_space = (stack_arg_space + 15) & !15;
+                stack_arg_space += 16;
+            } else {
+                stack_arg_space += 8;
+            }
+        }
+        stack_arg_space = (stack_arg_space + 15) & !15; // Final 16-byte alignment
 
         // Phase 1a: Load GP register args into temp registers (x9-x16).
         // FP args are handled separately since they use a different register bank.
@@ -953,20 +1002,73 @@ impl ArchCodegen for ArmCodegen {
             gp_tmp_idx += 1;
         }
 
-        // Phase 1b: Load FP register args directly into d0-d7 (or s0-s7).
+        // Phase 1b: Load FP register args directly into d0-d7 (or s0-s7, q0-q7 for F128).
         // FP regs don't conflict with GP temp regs, so this is safe.
+        // Process non-F128 float args first, then F128 args.
+        // F128 variables need __extenddftf2 which clobbers q0, so we process them last
+        // in reverse order to avoid clobbering previously set Q registers.
         let mut fp_reg_idx = 0usize;
-        for (i, arg) in args.iter().enumerate() {
-            if arg_classes[i] != 'f' { continue; }
+
+        // First pass: assign FP register indices to all 'f' and 'q' args
+        let mut fp_reg_assignments: Vec<(usize, usize)> = Vec::new(); // (arg_index, fp_reg_index)
+        for (i, _arg) in args.iter().enumerate() {
+            if arg_classes[i] != 'f' && arg_classes[i] != 'q' { continue; }
             if fp_reg_idx >= 8 { break; }
-            let arg_ty = if i < arg_types.len() { Some(arg_types[i]) } else { None };
-            self.operand_to_x0(arg);
-            if arg_ty == Some(IrType::F32) {
-                self.state.emit(&format!("    fmov s{}, w0", fp_reg_idx));
-            } else {
-                self.state.emit(&format!("    fmov d{}, x0", fp_reg_idx));
-            }
+            fp_reg_assignments.push((i, fp_reg_idx));
             fp_reg_idx += 1;
+        }
+
+        // Second pass: load non-F128 FP args first (they don't clobber Q registers)
+        for &(arg_i, reg_i) in &fp_reg_assignments {
+            if arg_classes[arg_i] == 'q' { continue; } // skip F128 for now
+            let arg_ty = if arg_i < arg_types.len() { Some(arg_types[arg_i]) } else { None };
+            self.operand_to_x0(&args[arg_i]);
+            if arg_ty == Some(IrType::F32) {
+                self.state.emit(&format!("    fmov s{}, w0", reg_i));
+            } else {
+                self.state.emit(&format!("    fmov d{}, x0", reg_i));
+            }
+        }
+
+        // Third pass: load F128 args into Q registers.
+        // Process in reverse order so __extenddftf2 result (q0) doesn't clobber
+        // previously loaded Q registers. For constants, we can load directly.
+        // For variables, __extenddftf2 returns in q0, then we move to target qN.
+        for &(arg_i, reg_i) in fp_reg_assignments.iter().rev() {
+            if arg_classes[arg_i] != 'q' { continue; } // only F128
+            match &args[arg_i] {
+                Operand::Const(c) => {
+                    let f64_val = match c {
+                        IrConst::LongDouble(v) => *v,
+                        IrConst::F64(v) => *v,
+                        _ => c.to_f64().unwrap_or(0.0),
+                    };
+                    let bytes = crate::ir::ir::f64_to_f128_bytes(f64_val);
+                    let lo = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                    let hi = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+                    // Load f128 constant into qN via x0/x1 and temp stack space
+                    self.emit_load_imm64("x0", lo as i64);
+                    self.emit_load_imm64("x1", hi as i64);
+                    self.state.emit("    stp x0, x1, [sp, #-16]!");
+                    self.state.emit(&format!("    ldr q{}, [sp]", reg_i));
+                    self.state.emit("    add sp, sp, #16");
+                }
+                Operand::Value(_v) => {
+                    // Variable: load f64 bit pattern, convert to f128 via __extenddftf2
+                    self.operand_to_x0(&args[arg_i]);
+                    self.state.emit("    fmov d0, x0");
+                    // Save GP temp regs (x9-x10) that may be clobbered
+                    self.state.emit("    stp x9, x10, [sp, #-16]!");
+                    self.state.emit("    bl __extenddftf2");
+                    self.state.emit("    ldp x9, x10, [sp], #16");
+                    // __extenddftf2 returns f128 in q0
+                    if reg_i != 0 {
+                        // Move q0 to target qN using NEON move
+                        self.state.emit(&format!("    mov v{}.16b, v0.16b", reg_i));
+                    }
+                    // If reg_i == 0, result is already in q0
+                }
+            }
         }
 
         // For stack args: load them all before adjusting SP, save to stack
@@ -976,10 +1078,32 @@ impl ArchCodegen for ArmCodegen {
             // Now we need to load operands with adjusted SP offsets
             let mut stack_offset = 0i64;
             for &arg_idx in &stack_arg_indices {
+                let is_stack_quad = arg_classes[arg_idx] == 'S';
+                if is_stack_quad {
+                    // Align stack_offset to 16 bytes for quad-precision long double
+                    stack_offset = (stack_offset + 15) & !15;
+                }
                 // For constants, no SP adjustment needed
                 match &args[arg_idx] {
-                    Operand::Const(_) => {
-                        self.operand_to_x0(&args[arg_idx]);
+                    Operand::Const(c) => {
+                        if is_stack_quad {
+                            // F128 overflow to stack: emit the quad-precision constant directly
+                            let f64_val = match c {
+                                IrConst::LongDouble(v) => *v,
+                                IrConst::F64(v) => *v,
+                                _ => c.to_f64().unwrap_or(0.0),
+                            };
+                            let bytes = crate::ir::ir::f64_to_f128_bytes(f64_val);
+                            let lo = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                            let hi = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+                            self.emit_load_imm64("x0", lo as i64);
+                            self.emit_store_to_sp("x0", stack_offset, "str");
+                            self.emit_load_imm64("x0", hi as i64);
+                            self.emit_store_to_sp("x0", stack_offset + 8, "str");
+                        } else {
+                            self.operand_to_x0(&args[arg_idx]);
+                            self.emit_store_to_sp("x0", stack_offset, "str");
+                        }
                     }
                     Operand::Value(v) => {
                         // SP moved by stack_arg_space, adjust slot offset
@@ -993,10 +1117,20 @@ impl ArchCodegen for ArmCodegen {
                         } else {
                             self.state.emit("    mov x0, #0");
                         }
+                        if is_stack_quad {
+                            // F128 overflow: convert f64 to f128 via __extenddftf2 (returns in q0)
+                            self.state.emit("    fmov d0, x0");
+                            self.state.emit("    stp x9, x10, [sp, #-16]!");
+                            self.state.emit("    bl __extenddftf2");
+                            self.state.emit("    ldp x9, x10, [sp], #16");
+                            // Store q0 (f128 result) to stack arg location
+                            self.state.emit(&format!("    str q0, [sp, #{}]", stack_offset));
+                        } else {
+                            self.emit_store_to_sp("x0", stack_offset, "str");
+                        }
                     }
                 }
-                self.emit_store_to_sp("x0", stack_offset as i64, "str");
-                stack_offset += 8;
+                stack_offset += if is_stack_quad { 16 } else { 8 };
             }
         }
 
@@ -1100,25 +1234,9 @@ impl ArchCodegen for ArmCodegen {
         //   [x1+16] __vr_top   (void*)  - end of FP/SIMD save area
         //   [x1+24] __gr_offs  (int32)  - offset from __gr_top (negative means regs available)
         //   [x1+28] __vr_offs  (int32)  - offset from __vr_top (negative means regs available)
-        //
-        // Algorithm for GP types (int, ptr, etc.):
-        //   if __gr_offs < 0:
-        //     addr = __gr_top + __gr_offs
-        //     __gr_offs += 8
-        //   else:
-        //     addr = __stack; __stack += 8
-        //
-        // Algorithm for FP types (float, double):
-        //   if __vr_offs < 0:
-        //     addr = __vr_top + __vr_offs
-        //     __vr_offs += 16
-        //   else:
-        //     addr = __stack; __stack += 8
 
         let is_fp = result_ty.is_float();
-        let label_id = self.state.next_label_id();
-        let label_stack = format!(".Lva_stack_{}", label_id);
-        let label_done = format!(".Lva_done_{}", label_id);
+        let is_f128 = result_ty.is_long_double();
 
         // x1 = pointer to va_list struct
         if let Some(slot) = self.state.get_slot(va_list_ptr.0) {
@@ -1129,7 +1247,51 @@ impl ArchCodegen for ArmCodegen {
             }
         }
 
-        if is_fp {
+        if is_f128 {
+            // F128 (long double) on AArch64: passed in Q registers, accessed via VR save area.
+            // Same path as F32/F64 but reads 16 bytes (one Q register slot).
+            let label_id = self.state.next_label_id();
+            let label_stack = format!(".Lva_stack_{}", label_id);
+            let label_done = format!(".Lva_done_{}", label_id);
+
+            // Check __vr_offs (offset 28 in va_list)
+            self.state.emit("    ldrsw x2, [x1, #28]");  // x2 = __vr_offs (sign-extended)
+            self.state.emit(&format!("    tbz x2, #63, {}", label_stack)); // if >= 0, go to stack
+            // Register save area path: addr = __vr_top + __vr_offs
+            self.state.emit("    ldr x3, [x1, #16]");     // x3 = __vr_top
+            self.state.emit("    add x3, x3, x2");         // x3 = __vr_top + __vr_offs
+            // Advance __vr_offs by 16 (one Q register slot)
+            self.state.emit("    add w2, w2, #16");
+            self.state.emit("    str w2, [x1, #28]");
+            // Load the f128 value from save area and convert to f64
+            // Save x1 (va_list ptr) since __trunctfdf2 may clobber it
+            self.state.emit("    mov x4, x1");
+            self.state.emit("    ldr q0, [x3]");           // load f128 into q0
+            self.state.emit("    bl __trunctfdf2");         // q0 -> d0
+            self.state.emit("    fmov x0, d0");
+            self.state.emit(&format!("    b {}", label_done));
+
+            // Stack overflow path (when all 8 VR slots exhausted)
+            self.state.emit(&format!("{}:", label_stack));
+            self.state.emit("    ldr x3, [x1]");           // x3 = __stack
+            // Align x3 to 16 bytes
+            self.state.emit("    add x3, x3, #15");
+            self.state.emit("    and x3, x3, #-16");
+            // Save va_list ptr
+            self.state.emit("    mov x4, x1");
+            self.state.emit("    ldr q0, [x3]");           // load f128 into q0
+            // Advance __stack by 16
+            self.state.emit("    add x3, x3, #16");
+            self.state.emit("    str x3, [x4]");           // store new __stack
+            self.state.emit("    bl __trunctfdf2");         // q0 -> d0
+            self.state.emit("    fmov x0, d0");
+
+            self.state.emit(&format!("{}:", label_done));
+        } else if is_fp {
+            let label_id = self.state.next_label_id();
+            let label_stack = format!(".Lva_stack_{}", label_id);
+            let label_done = format!(".Lva_done_{}", label_id);
+
             // FP type: check __vr_offs
             self.state.emit("    ldrsw x2, [x1, #28]");  // x2 = __vr_offs (sign-extended)
             self.state.emit(&format!("    tbz x2, #63, {}", label_stack)); // if >= 0, go to stack
@@ -1141,14 +1303,29 @@ impl ArchCodegen for ArmCodegen {
             self.state.emit("    str w2, [x1, #28]");
             // Load the value from the register save area
             if result_ty == IrType::F32 {
-                // F32: stored in lower 4 bytes of 16-byte Q register slot
                 self.state.emit("    ldr w0, [x3]");
             } else {
-                // F64: stored in lower 8 bytes of 16-byte Q register slot
                 self.state.emit("    ldr x0, [x3]");
             }
             self.state.emit(&format!("    b {}", label_done));
+
+            // Stack overflow path
+            self.state.emit(&format!("{}:", label_stack));
+            self.state.emit("    ldr x3, [x1]");
+            if result_ty == IrType::F32 {
+                self.state.emit("    ldr w0, [x3]");
+            } else {
+                self.state.emit("    ldr x0, [x3]");
+            }
+            self.state.emit("    add x3, x3, #8");
+            self.state.emit("    str x3, [x1]");
+
+            self.state.emit(&format!("{}:", label_done));
         } else {
+            let label_id = self.state.next_label_id();
+            let label_stack = format!(".Lva_stack_{}", label_id);
+            let label_done = format!(".Lva_done_{}", label_id);
+
             // GP type: check __gr_offs
             self.state.emit("    ldrsw x2, [x1, #24]");  // x2 = __gr_offs (sign-extended)
             self.state.emit(&format!("    tbz x2, #63, {}", label_stack)); // if >= 0, go to stack
@@ -1161,20 +1338,17 @@ impl ArchCodegen for ArmCodegen {
             // Load the value from the register save area
             self.state.emit("    ldr x0, [x3]");
             self.state.emit(&format!("    b {}", label_done));
-        }
 
-        // Stack overflow path
-        self.state.emit(&format!("{}:", label_stack));
-        self.state.emit("    ldr x3, [x1]");           // x3 = __stack
-        if result_ty == IrType::F32 {
-            self.state.emit("    ldr w0, [x3]");
-        } else {
+            // Stack overflow path
+            self.state.emit(&format!("{}:", label_stack));
+            self.state.emit("    ldr x3, [x1]");
             self.state.emit("    ldr x0, [x3]");
-        }
-        self.state.emit("    add x3, x3, #8");         // advance __stack by 8
-        self.state.emit("    str x3, [x1]");
+            self.state.emit("    add x3, x3, #8");
+            self.state.emit("    str x3, [x1]");
 
-        self.state.emit(&format!("{}:", label_done));
+            self.state.emit(&format!("{}:", label_done));
+        }
+
         // Store result to dest
         if let Some(slot) = self.state.get_slot(dest.0) {
             self.state.emit(&format!("    str x0, [x29, #{}]", slot.0));

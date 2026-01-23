@@ -243,11 +243,64 @@ pub enum IrConst {
     Zero,
 }
 
+/// Convert an f64 value to IEEE 754 binary128 (quad-precision) encoding (16 bytes, little-endian).
+/// Quad format: 1 sign bit, 15 exponent bits (bias 16383), 112 mantissa bits (implicit leading 1).
+/// This is used for long double on AArch64 and RISC-V.
+pub fn f64_to_f128_bytes(val: f64) -> [u8; 16] {
+    let bits = val.to_bits();
+    let sign = (bits >> 63) & 1;
+    let exp11 = ((bits >> 52) & 0x7FF) as i64;
+    let mantissa52 = bits & 0x000F_FFFF_FFFF_FFFF;
+
+    if exp11 == 0 && mantissa52 == 0 {
+        // Zero (positive or negative)
+        let mut bytes = [0u8; 16];
+        if sign == 1 {
+            bytes[15] = 0x80; // sign bit in MSB
+        }
+        return bytes;
+    }
+
+    if exp11 == 0x7FF {
+        // Infinity or NaN
+        let exp15: u16 = 0x7FFF;
+        if mantissa52 == 0 {
+            // Infinity
+            let mut bytes = [0u8; 16];
+            bytes[14] = (exp15 & 0xFF) as u8;
+            bytes[15] = ((exp15 >> 8) as u8) | ((sign as u8) << 7);
+            return bytes;
+        } else {
+            // NaN - set high mantissa bit
+            let mut bytes = [0u8; 16];
+            bytes[13] = 0x80; // quiet NaN bit
+            bytes[14] = (exp15 & 0xFF) as u8;
+            bytes[15] = ((exp15 >> 8) as u8) | ((sign as u8) << 7);
+            return bytes;
+        }
+    }
+
+    // Normal number
+    // f64 exponent bias is 1023, f128 exponent bias is 16383
+    let exp15 = (exp11 - 1023 + 16383) as u16;
+    // f64 has 52-bit mantissa (implicit 1.), f128 has 112-bit mantissa (implicit 1.)
+    // Shift the 52-bit mantissa to the top of the 112-bit mantissa field:
+    // mantissa112 = mantissa52 << (112 - 52) = mantissa52 << 60
+    // The 112-bit mantissa occupies bits [0..111] of the 128-bit value
+    // Layout (little-endian): bytes[0..13] = mantissa (112 bits = 14 bytes),
+    //   bytes[14..15] = exponent[0..14] (15 bits) + sign (1 bit)
+    // But actually: the quad format is:
+    //   bit 127 = sign, bits [112..126] = exponent (15 bits), bits [0..111] = mantissa
+    // In little-endian u128:
+    let mantissa112: u128 = (mantissa52 as u128) << 60;
+    let exp_sign: u128 = ((exp15 as u128) << 112) | ((sign as u128) << 127);
+    let val128 = mantissa112 | exp_sign;
+    val128.to_le_bytes()
+}
+
 /// Convert an f64 value to x87 80-bit extended precision encoding (10 bytes, little-endian).
 /// x87 format: 1 sign bit, 15 exponent bits (bias 16383), 64 mantissa bits (explicit integer bit).
-/// Currently unused (long double stored as IEEE 754 double + padding), but retained for
-/// future x87 FPU codegen support.
-#[allow(dead_code)]
+/// Used for long double on x86-64.
 pub fn f64_to_x87_bytes(val: f64) -> [u8; 10] {
     let bits = val.to_bits();
     let sign = (bits >> 63) & 1;
@@ -333,6 +386,7 @@ impl IrConst {
     pub fn cast_float_to_target(fv: f64, target: IrType) -> Option<IrConst> {
         Some(match target {
             IrType::F64 => IrConst::F64(fv),
+            IrType::F128 => IrConst::LongDouble(fv),
             IrType::F32 => IrConst::F32(fv as f32),
             IrType::I8 | IrType::U8 => IrConst::I8(fv as i8),
             IrType::I16 | IrType::U16 => IrConst::I16(fv as i16),
@@ -387,9 +441,13 @@ impl IrConst {
                 out.extend_from_slice(&v.to_bits().to_le_bytes());
             }
             IrConst::LongDouble(v) => {
-                // Store as IEEE 754 double (8 bytes) + 8 bytes zero padding = 16 bytes.
-                out.extend_from_slice(&v.to_bits().to_le_bytes());
-                out.extend_from_slice(&[0u8; 8]); // padding to 16 bytes
+                // Store as IEEE 754 binary128 (quad-precision) for AArch64/RISC-V,
+                // or x87 80-bit extended + padding for x86-64.
+                // We use quad-precision format which works correctly for ARM64/RISC-V.
+                // For x86-64, this also works because the x87 format is handled separately
+                // in the x86 backend's global data emission.
+                let bytes = f64_to_f128_bytes(*v);
+                out.extend_from_slice(&bytes);
             }
             _ => {
                 let le_bytes = self.to_i64().unwrap_or(0).to_le_bytes();
@@ -420,8 +478,8 @@ impl IrConst {
             (IrConst::I64(_), IrType::I64 | IrType::U64 | IrType::Ptr) => return self.clone(),
             (IrConst::F32(_), IrType::F32) => return self.clone(),
             (IrConst::F64(_), IrType::F64) => return self.clone(),
-            // LongDouble stays as LongDouble when target is F64 (since long double maps to F64 at IR level)
-            (IrConst::LongDouble(_), IrType::F64) => return self.clone(),
+            // LongDouble stays as LongDouble when target is F64 or F128
+            (IrConst::LongDouble(_), IrType::F64 | IrType::F128) => return self.clone(),
             _ => {}
         }
         // Convert integer types
@@ -447,6 +505,13 @@ impl IrConst {
             (IrConst::LongDouble(v), IrType::I16 | IrType::U16) => IrConst::I16(*v as i16),
             (IrConst::LongDouble(v), IrType::I32 | IrType::U32) => IrConst::I32(*v as i32),
             (IrConst::LongDouble(v), IrType::I64 | IrType::U64) => IrConst::I64(*v as i64),
+            // Conversions to F128 (long double)
+            (IrConst::F64(v), IrType::F128) => IrConst::LongDouble(*v),
+            (IrConst::F32(v), IrType::F128) => IrConst::LongDouble(*v as f64),
+            (IrConst::I64(v), IrType::F128) => IrConst::LongDouble(*v as f64),
+            (IrConst::I32(v), IrType::F128) => IrConst::LongDouble(*v as f64),
+            (IrConst::I16(v), IrType::F128) => IrConst::LongDouble(*v as f64),
+            (IrConst::I8(v), IrType::F128) => IrConst::LongDouble(*v as f64),
             _ => self.clone(),
         }
     }
@@ -459,6 +524,7 @@ impl IrConst {
             IrType::I32 | IrType::U32 => IrConst::I32(0),
             IrType::F32 => IrConst::F32(0.0),
             IrType::F64 => IrConst::F64(0.0),
+            IrType::F128 => IrConst::LongDouble(0.0),
             _ => IrConst::I64(0),
         }
     }

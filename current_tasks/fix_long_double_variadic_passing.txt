@@ -1,5 +1,5 @@
 Task: Fix long double passing in variadic function calls and va_arg retrieval
-Status: IN PROGRESS
+Status: DONE
 
 Problem:
 Long double values (16 bytes) are not correctly passed to variadic functions

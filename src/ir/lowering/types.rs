@@ -732,7 +732,7 @@ impl Lowerer {
             Expr::UIntLiteral(_, _) | Expr::ULongLiteral(_, _) => return IrType::U64,
             Expr::FloatLiteral(_, _) => return IrType::F64,
             Expr::FloatLiteralF32(_, _) => return IrType::F32,
-            Expr::FloatLiteralLongDouble(_, _) => return IrType::F64, // long double uses F64 at IR level
+            Expr::FloatLiteralLongDouble(_, _) => return IrType::F128, // long double: 16-byte ABI
             Expr::StringLiteral(_, _) => return IrType::Ptr,
             Expr::Cast(ref target_type, _, _) => return self.type_spec_to_ir(target_type),
             Expr::UnaryOp(UnaryOp::Neg, inner, _) | Expr::UnaryOp(UnaryOp::Plus, inner, _)
@@ -1195,7 +1195,8 @@ impl Lowerer {
             TypeSpecifier::Long | TypeSpecifier::LongLong => IrType::I64,
             TypeSpecifier::UnsignedLong | TypeSpecifier::UnsignedLongLong => IrType::U64,
             TypeSpecifier::Float => IrType::F32,
-            TypeSpecifier::Double | TypeSpecifier::LongDouble => IrType::F64,
+            TypeSpecifier::Double => IrType::F64,
+            TypeSpecifier::LongDouble => IrType::F128,
             TypeSpecifier::Pointer(_) => IrType::Ptr,
             TypeSpecifier::Array(_, _) => IrType::Ptr,
             TypeSpecifier::Struct(_, _) | TypeSpecifier::Union(_, _) => IrType::Ptr,

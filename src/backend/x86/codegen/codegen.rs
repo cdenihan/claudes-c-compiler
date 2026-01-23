@@ -778,13 +778,24 @@ impl ArchCodegen for X86Codegen {
         let mut float_idx = 0usize;
         let mut arg_assignments: Vec<(&Operand, bool, usize)> = Vec::new(); // (arg, is_float, reg_idx)
 
+        // Track which stack args are F128 (long double, 16-byte x87 extended)
+        let mut stack_arg_is_f128: Vec<bool> = Vec::new();
         for (i, arg) in args.iter().enumerate() {
+            let is_long_double = if i < arg_types.len() {
+                arg_types[i].is_long_double()
+            } else {
+                false
+            };
             let is_float_arg = if i < arg_types.len() {
                 arg_types[i].is_float()
             } else {
                 matches!(arg, Operand::Const(IrConst::F32(_) | IrConst::F64(_)))
             };
-            if is_float_arg && float_idx < 8 {
+            if is_long_double {
+                // F128 (long double): always goes on the stack as 16-byte x87 extended precision
+                stack_args.push(arg);
+                stack_arg_is_f128.push(true);
+            } else if is_float_arg && float_idx < 8 {
                 arg_assignments.push((arg, true, float_idx));
                 float_idx += 1;
             } else if !is_float_arg && int_idx < 6 {
@@ -792,21 +803,78 @@ impl ArchCodegen for X86Codegen {
                 int_idx += 1;
             } else {
                 stack_args.push(arg);
+                stack_arg_is_f128.push(false);
             }
         }
 
         // Ensure 16-byte stack alignment before call when pushing stack args.
-        // The stack is 16-byte aligned before this emit_call. Each pushq adds 8 bytes.
-        // If odd number of stack args, we need an extra 8-byte pad to maintain alignment.
-        let need_align_pad = stack_args.len() % 2 != 0;
+        // F128 args take 16 bytes (already aligned), non-F128 args take 8 bytes.
+        let mut total_stack_bytes: usize = 0;
+        for (si, _) in stack_args.iter().enumerate() {
+            if si < stack_arg_is_f128.len() && stack_arg_is_f128[si] {
+                total_stack_bytes += 16;
+            } else {
+                total_stack_bytes += 8;
+            }
+        }
+        let need_align_pad = total_stack_bytes % 16 != 0;
         if need_align_pad {
             self.state.emit("    subq $8, %rsp");
         }
 
-        // Push stack args in reverse order
-        for arg in stack_args.iter().rev() {
-            self.operand_to_rax(arg);
-            self.state.emit("    pushq %rax");
+        // Push stack args in reverse order.
+        // F128 (long double) args are pushed as 16 bytes in x87 80-bit extended format.
+        let n_stack = stack_args.len();
+        for ri in 0..n_stack {
+            let si = n_stack - 1 - ri; // reverse index
+            let is_f128 = si < stack_arg_is_f128.len() && stack_arg_is_f128[si];
+            if is_f128 {
+                // Push 16 bytes of x87 extended precision format
+                match stack_args[si] {
+                    Operand::Const(ref c) => {
+                        let f64_val = match c {
+                            IrConst::LongDouble(v) => *v,
+                            IrConst::F64(v) => *v,
+                            _ => c.to_f64().unwrap_or(0.0),
+                        };
+                        let x87_bytes = crate::ir::ir::f64_to_x87_bytes(f64_val);
+                        // x87 format: 10 bytes of data, padded to 16 with 6 zero bytes
+                        // Push hi 8 bytes first (padding + top 2 bytes of x87), then lo 8 bytes
+                        let lo = u64::from_le_bytes(x87_bytes[0..8].try_into().unwrap());
+                        let hi_2bytes = u16::from_le_bytes(x87_bytes[8..10].try_into().unwrap());
+                        // Push 8 bytes: 6 bytes padding (zeros) + 2 bytes (exp+sign)
+                        self.state.emit(&format!("    pushq ${}", hi_2bytes as i64));
+                        // Push 8 bytes: mantissa
+                        self.state.emit(&format!("    movabsq ${}, %rax", lo as i64));
+                        self.state.emit("    pushq %rax");
+                    }
+                    Operand::Value(ref v) => {
+                        // Variable: f64 value in slot, convert to x87 80-bit at runtime.
+                        // Load f64 into xmm0, store to temp, use fld/fstp to convert.
+                        if let Some(slot) = self.state.get_slot(v.0) {
+                            if self.state.is_alloca(v.0) {
+                                self.state.emit(&format!("    leaq {}(%rbp), %rax", slot.0));
+                            } else {
+                                self.state.emit(&format!("    movq {}(%rbp), %rax", slot.0));
+                            }
+                        } else {
+                            self.state.emit("    xorq %rax, %rax");
+                        }
+                        // rax has f64 bit pattern; use x87 to convert f64 -> 80-bit extended
+                        // Store f64 to temp memory, load with fldl, allocate 16 bytes, store with fstpt
+                        self.state.emit("    subq $16, %rsp");    // allocate 16 bytes for result
+                        self.state.emit("    pushq %rax");        // store f64 at [rsp] (temp)
+                        self.state.emit("    fldl (%rsp)");       // load f64 onto x87 stack
+                        self.state.emit("    addq $8, %rsp");     // pop temp f64
+                        self.state.emit("    fstpt (%rsp)");      // store 80-bit to [rsp] (16 bytes allocated)
+                        // 10 bytes written at [rsp], 6 bytes of padding at [rsp+10..rsp+15] are whatever
+                        // That's fine per ABI: only 10 bytes are significant
+                    }
+                }
+            } else {
+                self.operand_to_rax(stack_args[si]);
+                self.state.emit("    pushq %rax");
+            }
         }
 
         // Load register args
@@ -837,8 +905,8 @@ impl ArchCodegen for X86Codegen {
             self.state.emit("    call *%r10");
         }
 
-        if !stack_args.is_empty() {
-            let cleanup = stack_args.len() * 8 + if need_align_pad { 8 } else { 0 };
+        if total_stack_bytes > 0 || need_align_pad {
+            let cleanup = total_stack_bytes + if need_align_pad { 8 } else { 0 };
             self.state.emit(&format!("    addq ${}, %rsp", cleanup));
         }
 
@@ -923,6 +991,7 @@ impl ArchCodegen for X86Codegen {
         //     overflow_arg_area += 8
 
         let is_fp = result_ty.is_float();
+        let is_f128 = result_ty.is_long_double();
         let label_reg = self.state.fresh_label("va_arg_reg");
         let label_mem = self.state.fresh_label("va_arg_mem");
         let label_end = self.state.fresh_label("va_arg_end");
@@ -936,7 +1005,24 @@ impl ArchCodegen for X86Codegen {
             }
         }
 
-        if is_fp {
+        if is_f128 {
+            // F128 (long double) on x86-64: always from overflow_arg_area, 16 bytes.
+            // Read 10-byte x87 extended precision from overflow area, convert to f64.
+            self.state.emit("    movq 8(%rcx), %rdx");       // overflow_arg_area
+            // Use x87 to load 80-bit extended and convert to f64
+            self.state.emit("    fldt (%rdx)");              // load 80-bit extended from [rdx]
+            self.state.emit("    subq $8, %rsp");            // temp space for f64
+            self.state.emit("    fstpl (%rsp)");             // store as f64 to [rsp]
+            self.state.emit("    movq (%rsp), %rax");        // load f64 bit pattern into rax
+            self.state.emit("    addq $8, %rsp");            // free temp space
+            // Advance overflow_arg_area by 16 (x87 long double is 16-byte aligned on stack)
+            self.state.emit("    addq $16, 8(%rcx)");
+            // Store result and jump to end
+            if let Some(slot) = self.state.get_slot(dest.0) {
+                self.state.emit(&format!("    movq %rax, {}(%rbp)", slot.0));
+            }
+            return;
+        } else if is_fp {
             // Check fp_offset < 176
             self.state.emit("    movl 4(%rcx), %eax");  // fp_offset
             self.state.emit("    cmpl $176, %eax");

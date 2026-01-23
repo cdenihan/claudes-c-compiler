@@ -393,6 +393,10 @@ pub enum IrType {
     U64,
     F32,
     F64,
+    /// 128-bit floating point (long double on AArch64/RISC-V, 80-bit extended on x86-64).
+    /// Computation is done in F64 precision; this type exists to ensure correct
+    /// ABI handling (16-byte storage, proper variadic argument passing, va_arg).
+    F128,
     Ptr,
     Void,
 }
@@ -406,6 +410,7 @@ impl IrType {
             IrType::I64 | IrType::U64 | IrType::Ptr => 8,
             IrType::F32 => 4,
             IrType::F64 => 8,
+            IrType::F128 => 16,
             IrType::Void => 0,
         }
     }
@@ -433,9 +438,17 @@ impl IrType {
         self.is_signed() || self.is_unsigned()
     }
 
-    /// Whether this is a floating-point type.
+    /// Whether this is a floating-point type (F32 or F64, used in registers).
+    /// Note: F128 (long double) is NOT included here because it doesn't fit in
+    /// a single FP register on most architectures and needs special handling.
     pub fn is_float(&self) -> bool {
         matches!(self, IrType::F32 | IrType::F64)
+    }
+
+    /// Whether this is a long double type (F128).
+    /// Long double values are computed as F64 but stored as 16 bytes for ABI correctness.
+    pub fn is_long_double(&self) -> bool {
+        matches!(self, IrType::F128)
     }
 
     /// Get the unsigned counterpart of this type.
@@ -474,7 +487,8 @@ impl IrType {
             CType::Long | CType::LongLong => IrType::I64,
             CType::ULong | CType::ULongLong => IrType::U64,
             CType::Float => IrType::F32,
-            CType::Double | CType::LongDouble => IrType::F64,
+            CType::Double => IrType::F64,
+            CType::LongDouble => IrType::F128,
             CType::Pointer(_) | CType::Array(_, _) | CType::Function(_) => IrType::Ptr,
             CType::Struct(_) | CType::Union(_) => IrType::Ptr, // TODO: handle aggregates properly
         }
