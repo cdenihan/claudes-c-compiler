@@ -1,9 +1,0 @@
-Fix ARM64 caller-side long double parameter passing clobber bug.
-
-When calling functions with both long double (F128) and float/double parameters,
-__extenddftf2 (used to convert f64->f128) was clobbering previously-loaded
-float/double values in s0-s7/d0-d7.
-
-Fix: Process F128 variable args first (saving results to temp stack), then
-load F128 constants, then finally load non-F128 float/double args last.
-This ensures __extenddftf2 doesn't clobber any values that will be used.
