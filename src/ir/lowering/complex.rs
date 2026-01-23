@@ -7,7 +7,7 @@
 //! Layout:
 //!   - _Complex float:       [f32 real, f32 imag] = 8 bytes, align 4
 //!   - _Complex double:      [f64 real, f64 imag] = 16 bytes, align 8
-//!   - _Complex long double: [f64 real, f64 imag] = 16 bytes, align 8 (treated as double)
+//!   - _Complex long double: [f128 real, f128 imag] = 32 bytes, align 16
 
 use crate::frontend::parser::ast::*;
 use crate::ir::ir::*;
@@ -19,7 +19,8 @@ impl Lowerer {
     pub(super) fn complex_component_ir_type(ctype: &CType) -> IrType {
         match ctype {
             CType::ComplexFloat => IrType::F32,
-            CType::ComplexDouble | CType::ComplexLongDouble => IrType::F64,
+            CType::ComplexDouble => IrType::F64,
+            CType::ComplexLongDouble => IrType::F128,
             _ => IrType::F64, // fallback
         }
     }
@@ -28,7 +29,8 @@ impl Lowerer {
     pub(super) fn complex_component_size(ctype: &CType) -> usize {
         match ctype {
             CType::ComplexFloat => 4,
-            CType::ComplexDouble | CType::ComplexLongDouble => 8,
+            CType::ComplexDouble => 8,
+            CType::ComplexLongDouble => 16,
             _ => 8,
         }
     }
@@ -111,10 +113,12 @@ impl Lowerer {
         let comp_ty = Self::complex_component_ir_type(ctype);
         let zero = match comp_ty {
             IrType::F32 => Operand::Const(IrConst::F32(0.0)),
+            IrType::F128 => Operand::Const(IrConst::LongDouble(0.0)),
             _ => Operand::Const(IrConst::F64(0.0)),
         };
         let imag_val = match comp_ty {
             IrType::F32 => Operand::Const(IrConst::F32(val as f32)),
+            IrType::F128 => Operand::Const(IrConst::LongDouble(val)),
             _ => Operand::Const(IrConst::F64(val)),
         };
         self.store_complex_parts(alloca, zero, imag_val, ctype);
@@ -147,6 +151,7 @@ impl Lowerer {
             if ir_ty.is_float() {
                 match ir_ty {
                     IrType::F32 => Operand::Const(IrConst::F32(0.0)),
+                    IrType::F128 => Operand::Const(IrConst::LongDouble(0.0)),
                     _ => Operand::Const(IrConst::F64(0.0)),
                 }
             } else {
@@ -328,6 +333,7 @@ impl Lowerer {
         let comp_ty = Self::complex_component_ir_type(complex_type);
         let zero = match comp_ty {
             IrType::F32 => Operand::Const(IrConst::F32(0.0)),
+            IrType::F128 => Operand::Const(IrConst::LongDouble(0.0)),
             _ => Operand::Const(IrConst::F64(0.0)),
         };
 
@@ -748,10 +754,12 @@ impl Lowerer {
         let comp_ty = Self::complex_component_ir_type(ctype);
         let real_val = match comp_ty {
             IrType::F32 => Operand::Const(IrConst::F32(val as f32)),
+            IrType::F128 => Operand::Const(IrConst::LongDouble(val)),
             _ => Operand::Const(IrConst::F64(val)),
         };
         let zero = match comp_ty {
             IrType::F32 => Operand::Const(IrConst::F32(0.0)),
+            IrType::F128 => Operand::Const(IrConst::LongDouble(0.0)),
             _ => Operand::Const(IrConst::F64(0.0)),
         };
         self.store_complex_parts(alloca, real_val, zero, ctype);
@@ -762,17 +770,19 @@ impl Lowerer {
     /// Returns a GlobalInit::Array with [real, imag] constant values.
     pub(super) fn eval_complex_global_init(&self, expr: &Expr, target_type: &TypeSpecifier) -> Option<GlobalInit> {
         let (real, imag) = self.eval_complex_const(expr)?;
-        let is_float = matches!(target_type, TypeSpecifier::ComplexFloat);
-        if is_float {
-            Some(GlobalInit::Array(vec![
+        match target_type {
+            TypeSpecifier::ComplexFloat => Some(GlobalInit::Array(vec![
                 IrConst::F32(real as f32),
                 IrConst::F32(imag as f32),
-            ]))
-        } else {
-            Some(GlobalInit::Array(vec![
+            ])),
+            TypeSpecifier::ComplexLongDouble => Some(GlobalInit::Array(vec![
+                IrConst::LongDouble(real),
+                IrConst::LongDouble(imag),
+            ])),
+            _ => Some(GlobalInit::Array(vec![
                 IrConst::F64(real),
                 IrConst::F64(imag),
-            ]))
+            ])),
         }
     }
 
