@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use crate::frontend::parser::ast::*;
+use crate::frontend::sema::builtins::{self, BuiltinKind};
 use crate::ir::ir::*;
 use crate::common::types::{IrType, StructLayout, StructField, CType};
 
@@ -1206,6 +1207,53 @@ impl Lowerer {
                 self.lower_compound_assign(op, lhs, rhs)
             }
             Expr::FunctionCall(func, args, _) => {
+                // First, resolve __builtin_* functions before normal dispatch.
+                if let Expr::Identifier(name, _) = func.as_ref() {
+                    if let Some(builtin_info) = builtins::resolve_builtin(name) {
+                        match &builtin_info.kind {
+                            BuiltinKind::LibcAlias(libc_name) => {
+                                let arg_vals: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
+                                let dest = self.fresh_value();
+                                self.emit(Instruction::Call {
+                                    dest: Some(dest),
+                                    func: libc_name.clone(),
+                                    args: arg_vals,
+                                    return_type: IrType::I64,
+                                });
+                                return Operand::Value(dest);
+                            }
+                            BuiltinKind::Identity => {
+                                // __builtin_expect(x, y) -> just return x
+                                if let Some(first_arg) = args.first() {
+                                    return self.lower_expr(first_arg);
+                                }
+                                return Operand::Const(IrConst::I64(0));
+                            }
+                            BuiltinKind::ConstantI64(val) => {
+                                return Operand::Const(IrConst::I64(*val));
+                            }
+                            BuiltinKind::ConstantF64(_val) => {
+                                // TODO: handle float constants properly
+                                return Operand::Const(IrConst::I64(0));
+                            }
+                            BuiltinKind::Intrinsic(_intr) => {
+                                // Strip __builtin_ prefix and call the underlying function
+                                let cleaned_name = name.strip_prefix("__builtin_").unwrap_or(name).to_string();
+                                let arg_vals: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
+                                let dest = self.fresh_value();
+                                self.emit(Instruction::Call {
+                                    dest: Some(dest),
+                                    func: cleaned_name,
+                                    args: arg_vals,
+                                    return_type: IrType::I64,
+                                });
+                                return Operand::Value(dest);
+                            }
+                        }
+                    }
+                }
+
+                // Normal call dispatch (direct calls and indirect function pointer calls)
                 let arg_vals: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
                 let dest = self.fresh_value();
 
