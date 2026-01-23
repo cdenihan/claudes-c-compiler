@@ -262,6 +262,17 @@ impl X86Codegen {
 
         // At this point, only integer types remain (Ptr and float handled above)
         if from_ty.size() == to_ty.size() {
+            // Same size but different signedness: need to mask/extend correctly.
+            // When converting signed -> unsigned of same size, zero-extend to clear
+            // sign-extended upper bits in the 64-bit register.
+            if from_ty.is_signed() && to_ty.is_unsigned() {
+                match to_ty {
+                    IrType::U8 => self.state.emit("    movzbq %al, %rax"),
+                    IrType::U16 => self.state.emit("    movzwq %ax, %rax"),
+                    IrType::U32 => self.state.emit("    movl %eax, %eax"), // clears upper 32 bits
+                    _ => {} // U64: no masking needed
+                }
+            }
             return;
         }
 

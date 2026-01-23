@@ -701,7 +701,11 @@ impl Lowerer {
             Expr::Assign(lhs, _, _) | Expr::CompoundAssign(_, lhs, _, _) => {
                 return self.get_expr_type(lhs);
             }
-            Expr::Conditional(_, then_expr, _, _) => return self.get_expr_type(then_expr),
+            Expr::Conditional(_, then_expr, else_expr, _) => {
+                let then_ty = self.get_expr_type(then_expr);
+                let else_ty = self.get_expr_type(else_expr);
+                return Self::common_type(then_ty, else_ty);
+            }
             Expr::Comma(_, rhs, _) => return self.get_expr_type(rhs),
             Expr::PostfixOp(_, inner, _) => return self.get_expr_type(inner),
             Expr::AddressOf(_, _) => return IrType::Ptr,

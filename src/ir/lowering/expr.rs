@@ -881,6 +881,11 @@ impl Lowerer {
         let result_alloca = self.fresh_value();
         self.emit(Instruction::Alloca { dest: result_alloca, ty: IrType::I64, size: 8 });
 
+        // Compute the common type of both branches (C "usual arithmetic conversions")
+        let then_ty = self.get_expr_type(then_expr);
+        let else_ty = self.get_expr_type(else_expr);
+        let common_ty = Self::common_type(then_ty, else_ty);
+
         let then_label = self.fresh_label("ternary_then");
         let else_label = self.fresh_label("ternary_else");
         let end_label = self.fresh_label("ternary_end");
@@ -893,11 +898,13 @@ impl Lowerer {
 
         self.start_block(then_label);
         let then_val = self.lower_expr(then_expr);
+        let then_val = self.emit_implicit_cast(then_val, then_ty, common_ty);
         self.emit(Instruction::Store { val: then_val, ptr: result_alloca, ty: IrType::I64 });
         self.terminate(Terminator::Branch(end_label.clone()));
 
         self.start_block(else_label);
         let else_val = self.lower_expr(else_expr);
+        let else_val = self.emit_implicit_cast(else_val, else_ty, common_ty);
         self.emit(Instruction::Store { val: else_val, ptr: result_alloca, ty: IrType::I64 });
         self.terminate(Terminator::Branch(end_label.clone()));
 
@@ -1731,7 +1738,9 @@ impl Lowerer {
             Expr::Assign(lhs, _, _) | Expr::CompoundAssign(_, lhs, _, _) => {
                 self.infer_expr_type(lhs)
             }
-            Expr::Conditional(_, then_expr, _, _) => self.infer_expr_type(then_expr),
+            Expr::Conditional(_, then_expr, else_expr, _) => {
+                Self::common_type(self.infer_expr_type(then_expr), self.infer_expr_type(else_expr))
+            }
             Expr::Comma(_, rhs, _) => self.infer_expr_type(rhs),
             Expr::AddressOf(_, _) => IrType::Ptr,
             Expr::StringLiteral(_, _) => IrType::Ptr,
@@ -1740,7 +1749,7 @@ impl Lowerer {
     }
 
     /// Determine common type for usual arithmetic conversions.
-    fn common_type(a: IrType, b: IrType) -> IrType {
+    pub(super) fn common_type(a: IrType, b: IrType) -> IrType {
         if a == IrType::F64 || b == IrType::F64 { return IrType::F64; }
         if a == IrType::F32 || b == IrType::F32 { return IrType::F32; }
         if a == IrType::I64 || a == IrType::U64 || a == IrType::Ptr
@@ -1772,6 +1781,14 @@ impl Lowerer {
             || (!target_ty.is_float() && src_ty.is_float())
             || (target_ty.is_float() && src_ty.is_float() && target_ty != src_ty)
         {
+            let dest = self.fresh_value();
+            self.emit(Instruction::Cast { dest, src, from_ty: src_ty, to_ty: target_ty });
+            return Operand::Value(dest);
+        }
+
+        // Integer-to-integer conversions: emit Cast when the signedness or size differs,
+        // so the backend can apply proper sign/zero extension or truncation.
+        if src_ty.is_integer() && target_ty.is_integer() && src_ty != target_ty {
             let dest = self.fresh_value();
             self.emit(Instruction::Cast { dest, src, from_ty: src_ty, to_ty: target_ty });
             return Operand::Value(dest);
