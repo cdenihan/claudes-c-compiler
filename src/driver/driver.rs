@@ -107,8 +107,14 @@ impl Driver {
         }
     }
 
-    /// Configure the preprocessor with CLI-defined macros.
+    /// Configure the preprocessor with CLI-defined macros and target.
     fn configure_preprocessor(&self, preprocessor: &mut Preprocessor) {
+        // Set target architecture macros
+        match self.target {
+            Target::Aarch64 => preprocessor.set_target("aarch64"),
+            Target::Riscv64 => preprocessor.set_target("riscv64"),
+            Target::X86_64 => preprocessor.set_target("x86_64"),
+        }
         for def in &self.defines {
             preprocessor.define_macro(&def.name, &def.value);
         }

@@ -58,14 +58,13 @@ impl Preprocessor {
         pp
     }
 
-    /// Get default system include paths.
+    /// Get default system include paths (arch-neutral only).
     fn default_system_include_paths() -> Vec<PathBuf> {
         let mut paths = Vec::new();
-        // Standard system include paths
+        // Only include arch-neutral paths here; arch-specific paths are added by set_target
         let candidates = [
-            "/usr/include",
             "/usr/local/include",
-            // x86_64 multiarch
+            // x86_64 multiarch (default, removed by set_target for other arches)
             "/usr/include/x86_64-linux-gnu",
             // GCC headers (common versions)
             "/usr/lib/gcc/x86_64-linux-gnu/12/include",
@@ -73,6 +72,7 @@ impl Preprocessor {
             "/usr/lib/gcc/x86_64-linux-gnu/13/include",
             "/usr/lib/gcc/x86_64-linux-gnu/14/include",
             "/usr/lib/gcc/x86_64-linux-gnu/10/include",
+            "/usr/include",
         ];
         for candidate in &candidates {
             let path = PathBuf::from(candidate);
@@ -97,12 +97,14 @@ impl Preprocessor {
         self.define_simple_macro("__unix__", "1");
         self.define_simple_macro("__unix", "1");
         self.define_simple_macro("unix", "1");
+        self.define_simple_macro("__LP64__", "1");
+        self.define_simple_macro("_LP64", "1");
+
+        // Default to x86_64 arch macros (overridden by set_target)
         self.define_simple_macro("__x86_64__", "1");
         self.define_simple_macro("__x86_64", "1");
         self.define_simple_macro("__amd64__", "1");
         self.define_simple_macro("__amd64", "1");
-        self.define_simple_macro("__LP64__", "1");
-        self.define_simple_macro("_LP64", "1");
 
         // GCC compatibility macros
         self.define_simple_macro("__GNUC__", "4");
@@ -567,6 +569,72 @@ impl Preprocessor {
         let canonical = std::fs::canonicalize(&path)
             .unwrap_or_else(|_| path);
         self.include_stack.push(canonical);
+    }
+
+    /// Set the target architecture, updating predefined macros and include paths.
+    pub fn set_target(&mut self, target: &str) {
+        match target {
+            "aarch64" => {
+                // Remove x86 macros
+                self.macros.undefine("__x86_64__");
+                self.macros.undefine("__x86_64");
+                self.macros.undefine("__amd64__");
+                self.macros.undefine("__amd64");
+                // Define aarch64 macros
+                self.define_simple_macro("__aarch64__", "1");
+                self.define_simple_macro("__ARM_64BIT_STATE", "1");
+                self.define_simple_macro("__ARM_ARCH", "8");
+                self.define_simple_macro("__ARM_ARCH_ISA_A64", "1");
+                // Replace x86 include paths with aarch64 paths
+                self.system_include_paths.retain(|p| {
+                    let s = p.to_string_lossy();
+                    !s.contains("x86_64")
+                });
+                let aarch64_paths = [
+                    "/usr/lib/gcc-cross/aarch64-linux-gnu/11/include",
+                    "/usr/lib/gcc-cross/aarch64-linux-gnu/12/include",
+                    "/usr/lib/gcc-cross/aarch64-linux-gnu/13/include",
+                    "/usr/aarch64-linux-gnu/include",
+                    "/usr/include/aarch64-linux-gnu",
+                ];
+                for p in &aarch64_paths {
+                    let path = PathBuf::from(p);
+                    if path.is_dir() {
+                        self.system_include_paths.insert(0, path);
+                    }
+                }
+            }
+            "riscv64" => {
+                // Remove x86 macros
+                self.macros.undefine("__x86_64__");
+                self.macros.undefine("__x86_64");
+                self.macros.undefine("__amd64__");
+                self.macros.undefine("__amd64");
+                // Define riscv64 macros
+                self.define_simple_macro("__riscv", "1");
+                self.define_simple_macro("__riscv_xlen", "64");
+                // Replace x86 include paths with riscv64 paths
+                self.system_include_paths.retain(|p| {
+                    let s = p.to_string_lossy();
+                    !s.contains("x86_64")
+                });
+                let riscv_paths = [
+                    "/usr/lib/gcc-cross/riscv64-linux-gnu/11/include",
+                    "/usr/lib/gcc-cross/riscv64-linux-gnu/12/include",
+                    "/usr/riscv64-linux-gnu/include",
+                    "/usr/include/riscv64-linux-gnu",
+                ];
+                for p in &riscv_paths {
+                    let path = PathBuf::from(p);
+                    if path.is_dir() {
+                        self.system_include_paths.insert(0, path);
+                    }
+                }
+            }
+            _ => {
+                // x86_64 is already the default
+            }
+        }
     }
 
     /// Get the list of includes encountered during preprocessing.
