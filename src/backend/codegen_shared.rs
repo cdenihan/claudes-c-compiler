@@ -313,6 +313,11 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction) {
         Instruction::Fence { ordering } => {
             cg.emit_fence(*ordering);
         }
+        Instruction::Phi { .. } => {
+            // Phi nodes are resolved before codegen by lowering them to copies
+            // at the end of predecessor blocks. This case should not be reached
+            // in normal operation, but is a no-op for safety.
+        }
     }
 }
 

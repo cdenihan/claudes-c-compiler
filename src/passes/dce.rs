@@ -162,6 +162,11 @@ fn collect_instruction_uses(inst: &Instruction, used: &mut HashSet<u32>) {
             collect_operand_uses(val, used);
         }
         Instruction::Fence { .. } => {}
+        Instruction::Phi { incoming, .. } => {
+            for (op, _label) in incoming {
+                collect_operand_uses(op, used);
+            }
+        }
     }
 }
 
@@ -235,6 +240,7 @@ fn get_dest(inst: &Instruction) -> Option<Value> {
         Instruction::AtomicLoad { dest, .. } => Some(*dest),
         Instruction::AtomicStore { .. } => None,
         Instruction::Fence { .. } => None,
+        Instruction::Phi { dest, .. } => Some(*dest),
     }
 }
 

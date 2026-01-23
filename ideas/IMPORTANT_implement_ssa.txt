@@ -1,4 +1,0 @@
-The SSA pass is currently a NOP.
-
-Implement SSA to simplify future code and allow for better optimizations.
-Use standard techniques.

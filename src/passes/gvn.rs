@@ -227,6 +227,7 @@ fn get_inst_dest(inst: &Instruction) -> Option<Value> {
         Instruction::AtomicLoad { dest, .. } => Some(*dest),
         Instruction::AtomicStore { .. } => None,
         Instruction::Fence { .. } => None,
+        Instruction::Phi { dest, .. } => Some(*dest),
     }
 }
 

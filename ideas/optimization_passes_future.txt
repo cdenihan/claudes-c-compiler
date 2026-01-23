@@ -1,6 +1,6 @@
 Future optimization passes to implement:
 
-Note: Blocked on SSA
+Note: SSA is now implemented. These passes can proceed.
 
 The following passes are implemented and working:
 - Constant folding (constant_fold.rs)

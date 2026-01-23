@@ -182,6 +182,15 @@ pub enum Instruction {
     Fence {
         ordering: AtomicOrdering,
     },
+
+    /// SSA Phi node: merges values from different predecessor blocks.
+    /// Each entry in `incoming` is (value, block_label) indicating which value
+    /// flows in from which predecessor block.
+    Phi {
+        dest: Value,
+        ty: IrType,
+        incoming: Vec<(Operand, String)>,
+    },
 }
 
 /// Block terminator.

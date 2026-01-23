@@ -4,19 +4,21 @@ A C compiler written from scratch in Rust, targeting x86-64, AArch64, and RISC-V
 
 ## Status
 
-**Basic compilation pipeline functional.** ~72% of x86-64 tests passing.
+**Basic compilation pipeline functional with SSA.** ~73% of x86-64 tests passing.
 
 ### Working Features
 - Preprocessor with `#include` file resolution (system headers, -I paths, include guards, #pragma once)
 - Recursive descent parser with typedef tracking
 - Type-aware IR lowering and code generation
-- Optimization passes (constant folding, DCE, GVN, algebraic simplification)
+- **SSA construction via mem2reg** (dominator tree, dominance frontiers, phi insertion, variable renaming)
+- Phi elimination for backend codegen (parallel copy lowering)
+- Optimization passes (constant folding, DCE, GVN, algebraic simplification) operating on SSA form
 - Three backend targets with correct ABI handling
 
 ### Test Results (10% sample, ratio 10)
-- x86-64: ~72.3% passing (2162/2991)
-- AArch64: ~74.0% passing (2124/2869)
-- RISC-V 64: ~68.5% passing (1961/2861)
+- x86-64: ~73.0% passing (2183/2991)
+- AArch64: ~77.8% passing (2231/2869)
+- RISC-V 64: ~76.8% passing (2196/2861)
 
 ### What Works
 - `int main() { return N; }` for any integer N
@@ -54,6 +56,13 @@ A C compiler written from scratch in Rust, targeting x86-64, AArch64, and RISC-V
   - Constant expression evaluation for initializers
 
 ### Recent Additions
+- **SSA mem2reg pass**: Full SSA construction implemented via the standard iterated dominance
+  frontier algorithm. Promotes scalar stack allocas to SSA registers with phi nodes. Includes:
+  dominator tree computation (Cooper-Harvey-Kennedy algorithm), dominance frontier calculation,
+  phi insertion at join points, variable renaming via dominator tree DFS, and phi elimination
+  (lowering to parallel copies) before backend codegen. The IR now has a Phi instruction variant.
+  All optimization passes operate on proper SSA form. Unlocks future SSA-based optimizations
+  (SCCP, dominator-based GVN, copy propagation, LICM, etc.).
 - **Integer promotion for unary operators and switch**: Unary operators (`-`, `~`, `+`) now
   correctly apply C99 integer promotion rules, promoting `char`/`short` operands to `int` before
   the operation. Also fixed switch statement controlling expression promotion. Fixed binary op

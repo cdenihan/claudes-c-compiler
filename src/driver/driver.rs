@@ -4,7 +4,7 @@ use crate::frontend::lexer::Lexer;
 use crate::frontend::parser::Parser;
 use crate::frontend::sema::SemanticAnalyzer;
 use crate::ir::lowering::Lowerer;
-use crate::ir::mem2reg::promote_allocas;
+use crate::ir::mem2reg::{promote_allocas, eliminate_phis};
 use crate::passes::run_passes;
 use crate::common::source::SourceManager;
 
@@ -301,6 +301,9 @@ impl Driver {
         // Run optimization passes
         promote_allocas(&mut module);
         run_passes(&mut module, self.opt_level);
+
+        // Lower SSA phi nodes to copies before codegen
+        eliminate_phis(&mut module);
 
         // Generate assembly using target-specific codegen
         let asm = self.target.generate_assembly(&module);
