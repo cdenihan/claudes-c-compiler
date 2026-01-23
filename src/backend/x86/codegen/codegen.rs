@@ -284,6 +284,7 @@ impl X86Codegen {
             Instruction::UnaryOp { dest, .. } => Some(*dest),
             Instruction::Cmp { dest, .. } => Some(*dest),
             Instruction::Call { dest, .. } => *dest,
+            Instruction::CallIndirect { dest, .. } => *dest,
             Instruction::GetElementPtr { dest, .. } => Some(*dest),
             Instruction::Cast { dest, .. } => Some(*dest),
             Instruction::Copy { dest, .. } => Some(*dest),
@@ -520,6 +521,54 @@ impl X86Codegen {
                 self.emit_line("    xorl %eax, %eax"); // zero AL for variadic funcs
 
                 self.emit_line(&format!("    call {}", func));
+
+                // Clean up stack args
+                if stack_args.len() > 0 {
+                    self.emit_line(&format!("    addq ${}, %rsp", stack_args.len() * 8));
+                }
+
+                // Store result
+                if let Some(dest) = dest {
+                    if let Some(ValueLocation::Stack(offset)) = self.value_locations.get(&dest.0) {
+                        self.emit_line(&format!("    movq %rax, {}(%rbp)", offset));
+                    }
+                }
+            }
+            Instruction::CallIndirect { dest, func_ptr, args, .. } => {
+                let arg_regs = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
+
+                let mut stack_args: Vec<&Operand> = Vec::new();
+                let mut reg_args: Vec<(&Operand, usize)> = Vec::new();
+
+                for (i, arg) in args.iter().enumerate() {
+                    if i < 6 {
+                        reg_args.push((arg, i));
+                    } else {
+                        stack_args.push(arg);
+                    }
+                }
+
+                // Push stack args in reverse order
+                for arg in stack_args.iter().rev() {
+                    self.operand_to_rax(arg);
+                    self.emit_line("    pushq %rax");
+                }
+
+                // Load register args
+                for (arg, i) in &reg_args {
+                    self.operand_to_rax(arg);
+                    self.emit_line(&format!("    movq %rax, %{}", arg_regs[*i]));
+                }
+
+                // Load function pointer into r10 (caller-saved, not used for args)
+                self.operand_to_rax(func_ptr);
+                self.emit_line("    movq %rax, %r10");
+
+                // Zero AL for variadic functions (SysV ABI)
+                self.emit_line("    xorl %eax, %eax");
+
+                // Indirect call through r10
+                self.emit_line("    call *%r10");
 
                 // Clean up stack args
                 if stack_args.len() > 0 {

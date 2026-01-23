@@ -1206,21 +1206,84 @@ impl Lowerer {
                 self.lower_compound_assign(op, lhs, rhs)
             }
             Expr::FunctionCall(func, args, _) => {
-                let func_name = match func.as_ref() {
-                    Expr::Identifier(name, _) => name.clone(),
-                    _ => {
-                        // TODO: handle function pointers
-                        "unknown".to_string()
-                    }
-                };
                 let arg_vals: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
                 let dest = self.fresh_value();
-                self.emit(Instruction::Call {
-                    dest: Some(dest),
-                    func: func_name,
-                    args: arg_vals,
-                    return_type: IrType::I64,
-                });
+
+                match func.as_ref() {
+                    Expr::Identifier(name, _) => {
+                        // Check if this is a local variable (function pointer) rather
+                        // than a direct function name.
+                        let is_local_fptr = self.locals.contains_key(name)
+                            && !self.known_functions.contains(name);
+                        let is_global_fptr = !self.locals.contains_key(name)
+                            && self.globals.contains_key(name)
+                            && !self.known_functions.contains(name);
+
+                        if is_local_fptr {
+                            // Load the function pointer from the local variable
+                            let info = self.locals.get(name).unwrap().clone();
+                            let ptr_val = self.fresh_value();
+                            self.emit(Instruction::Load {
+                                dest: ptr_val,
+                                ptr: info.alloca,
+                                ty: IrType::Ptr,
+                            });
+                            self.emit(Instruction::CallIndirect {
+                                dest: Some(dest),
+                                func_ptr: Operand::Value(ptr_val),
+                                args: arg_vals,
+                                return_type: IrType::I64,
+                            });
+                        } else if is_global_fptr {
+                            // Load the function pointer from a global variable
+                            let addr = self.fresh_value();
+                            self.emit(Instruction::GlobalAddr { dest: addr, name: name.clone() });
+                            let ptr_val = self.fresh_value();
+                            self.emit(Instruction::Load {
+                                dest: ptr_val,
+                                ptr: addr,
+                                ty: IrType::Ptr,
+                            });
+                            self.emit(Instruction::CallIndirect {
+                                dest: Some(dest),
+                                func_ptr: Operand::Value(ptr_val),
+                                args: arg_vals,
+                                return_type: IrType::I64,
+                            });
+                        } else {
+                            // Direct function call
+                            self.emit(Instruction::Call {
+                                dest: Some(dest),
+                                func: name.clone(),
+                                args: arg_vals,
+                                return_type: IrType::I64,
+                            });
+                        }
+                    }
+                    Expr::Deref(inner, _) => {
+                        // (*func_ptr)(args...) - dereference is a no-op for function
+                        // pointers in C, just evaluate the inner expression to get the pointer
+                        let func_ptr = self.lower_expr(inner);
+                        self.emit(Instruction::CallIndirect {
+                            dest: Some(dest),
+                            func_ptr,
+                            args: arg_vals,
+                            return_type: IrType::I64,
+                        });
+                    }
+                    _ => {
+                        // General expression as callee (e.g., array[i](...), struct.fptr(...))
+                        // Evaluate the expression to get the function pointer value
+                        let func_ptr = self.lower_expr(func);
+                        self.emit(Instruction::CallIndirect {
+                            dest: Some(dest),
+                            func_ptr,
+                            args: arg_vals,
+                            return_type: IrType::I64,
+                        });
+                    }
+                }
+
                 Operand::Value(dest)
             }
             Expr::Conditional(cond, then_expr, else_expr, _) => {

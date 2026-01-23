@@ -258,6 +258,7 @@ impl RiscvCodegen {
             | Instruction::Cast { dest, .. } | Instruction::Copy { dest, .. }
             | Instruction::GlobalAddr { dest, .. } => Some(*dest),
             Instruction::Call { dest, .. } => *dest,
+            Instruction::CallIndirect { dest, .. } => *dest,
             Instruction::Store { .. } => None,
         }
     }
@@ -388,6 +389,25 @@ impl RiscvCodegen {
                     }
                 }
                 self.emit(&format!("    call {}", func));
+                if let Some(dest) = dest {
+                    if let Some(&offset) = self.value_locations.get(&dest.0) {
+                        self.emit(&format!("    sd a0, {}(s0)", offset));
+                    }
+                }
+            }
+            Instruction::CallIndirect { dest, func_ptr, args, .. } => {
+                let arg_regs = ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"];
+                for (i, arg) in args.iter().enumerate() {
+                    if i < 8 {
+                        self.operand_to_t0(arg);
+                        self.emit(&format!("    mv {}, t0", arg_regs[i]));
+                    }
+                }
+                // Load function pointer into t2 (caller-saved temp)
+                self.operand_to_t0(func_ptr);
+                self.emit("    mv t2, t0");
+                // Indirect call via jalr
+                self.emit("    jalr ra, t2, 0");
                 if let Some(dest) = dest {
                     if let Some(&offset) = self.value_locations.get(&dest.0) {
                         self.emit(&format!("    sd a0, {}(s0)", offset));

@@ -256,6 +256,7 @@ impl ArmCodegen {
             | Instruction::Cast { dest, .. } | Instruction::Copy { dest, .. }
             | Instruction::GlobalAddr { dest, .. } => Some(*dest),
             Instruction::Call { dest, .. } => *dest,
+            Instruction::CallIndirect { dest, .. } => *dest,
             Instruction::Store { .. } => None,
         }
     }
@@ -390,6 +391,30 @@ impl ArmCodegen {
                 }
                 // TODO: stack args for > 8 args
                 self.emit(&format!("    bl {}", func));
+                if let Some(dest) = dest {
+                    if let Some(&offset) = self.value_locations.get(&dest.0) {
+                        self.emit(&format!("    str x0, [sp, #{}]", offset));
+                    }
+                }
+            }
+            Instruction::CallIndirect { dest, func_ptr, args, .. } => {
+                let arg_regs = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"];
+                let tmp_regs = ["x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16"];
+                let num_args = args.len().min(8);
+                // Load all args into temp registers first
+                for (i, arg) in args.iter().enumerate().take(num_args) {
+                    self.operand_to_x0(arg);
+                    self.emit(&format!("    mov {}, x0", tmp_regs[i]));
+                }
+                // Move from temps to arg registers
+                for i in 0..num_args {
+                    self.emit(&format!("    mov {}, {}", arg_regs[i], tmp_regs[i]));
+                }
+                // Load function pointer into x17 (IP1, caller-saved scratch)
+                self.operand_to_x0(func_ptr);
+                self.emit("    mov x17, x0");
+                // Indirect call via blr
+                self.emit("    blr x17");
                 if let Some(dest) = dest {
                     if let Some(&offset) = self.value_locations.get(&dest.0) {
                         self.emit(&format!("    str x0, [sp, #{}]", offset));
