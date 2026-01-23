@@ -1,0 +1,17 @@
+Task: Fix large stack frame codegen on ARM and RISC-V
+
+Problem: ARM and RISC-V backends generate immediate operands that are out of range
+for large stack frames, causing assembly failures:
+- ARM: `stp x29, x30, [sp, #-N]!` requires -512 <= N <= 504 (7-bit signed * 8)
+- ARM: `ldp x29, x30, [sp], #N` same constraint
+- RISC-V: `addi sp, sp, -N` requires -2048 <= N <= 2047 (12-bit signed)
+- RISC-V: `sd ra, N(sp)` same 12-bit signed offset constraint
+
+Fix: For large frames, split prologue/epilogue into separate stack adjustment
+and register save/restore steps:
+- ARM: use `sub sp, sp, #N` (or mov+sub for N>4095) then `stp x29, x30, [sp]`
+- RISC-V: use `li tN, N; sub sp, sp, tN` then `sd ra, 0(sp)` etc.
+
+This affects ~2500 ARM test failures and ~900 RISC-V test failures.
+
+Status: In progress
