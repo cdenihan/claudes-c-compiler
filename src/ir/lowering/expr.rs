@@ -88,7 +88,8 @@ impl Lowerer {
         if let Some(ginfo) = self.globals.get(name).cloned() {
             let addr = self.fresh_value();
             self.emit(Instruction::GlobalAddr { dest: addr, name: name.to_string() });
-            if ginfo.is_array {
+            if ginfo.is_array || ginfo.is_struct {
+                // Arrays and structs decay to their address
                 return Operand::Value(addr);
             }
             let dest = self.fresh_value();
