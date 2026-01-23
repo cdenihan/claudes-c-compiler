@@ -1096,13 +1096,24 @@ impl Lowerer {
     /// Emits each field's value at its appropriate position, with padding bytes as zeros.
     /// Supports designated initializers like {.b = 2, .a = 1}.
     fn lower_struct_global_init(
-        &self,
+        &mut self,
         items: &[InitializerItem],
         layout: &StructLayout,
     ) -> GlobalInit {
-        // Check if any field has an address expression (needs relocation)
-        let has_addr_fields = items.iter().any(|item| {
+        // Check if any field has an address expression (needs relocation).
+        // This includes string literals used to initialize pointer fields.
+        let has_addr_fields = items.iter().enumerate().any(|(idx, item)| {
             if let Initializer::Expr(expr) = &item.init {
+                // String literals initializing pointer fields need relocations
+                if matches!(expr, Expr::StringLiteral(_, _)) {
+                    // Check if the corresponding field is a pointer type
+                    let field_idx = self.resolve_struct_init_field_idx(item, layout, idx);
+                    if field_idx < layout.fields.len() {
+                        if matches!(layout.fields[field_idx].ty, CType::Pointer(_)) {
+                            return true;
+                        }
+                    }
+                }
                 self.eval_const_expr(expr).is_none() && self.eval_global_addr_expr(expr).is_some()
             } else {
                 false
@@ -1391,7 +1402,7 @@ impl Lowerer {
     /// Lower a struct global init that contains address expressions.
     /// Emits field-by-field using Compound, with padding bytes between fields.
     fn lower_struct_global_init_compound(
-        &self,
+        &mut self,
         items: &[InitializerItem],
         layout: &StructLayout,
     ) -> GlobalInit {
@@ -1409,30 +1420,42 @@ impl Lowerer {
             current_field_idx = field_idx + 1;
         }
 
-        for (fi, field) in layout.fields.iter().enumerate() {
+        for fi in 0..layout.fields.len() {
+            let field_offset = layout.fields[fi].offset;
+            let field_size = layout.fields[fi].ty.size();
+            let field_is_pointer = matches!(layout.fields[fi].ty, CType::Pointer(_));
+
             // Emit padding before this field
-            if field.offset > current_offset {
-                let pad = field.offset - current_offset;
+            if field_offset > current_offset {
+                let pad = field_offset - current_offset;
                 for _ in 0..pad {
                     elements.push(GlobalInit::Scalar(IrConst::I8(0)));
                 }
-                current_offset = field.offset;
+                current_offset = field_offset;
             }
 
-            let field_size = field.ty.size();
             if let Some(item) = field_inits[fi] {
                 match &item.init {
                     Initializer::Expr(expr) => {
                         if let Expr::StringLiteral(s, _) = expr {
-                            // String literal initializing a char array field
-                            let s_bytes = s.as_bytes();
-                            for (i, &b) in s_bytes.iter().enumerate() {
-                                if i >= field_size { break; }
-                                elements.push(GlobalInit::Scalar(IrConst::I8(b as i8)));
-                            }
-                            // null terminator + remaining zero fill
-                            for _ in s_bytes.len()..field_size {
-                                elements.push(GlobalInit::Scalar(IrConst::I8(0)));
+                            if field_is_pointer {
+                                // String literal initializing a pointer field:
+                                // create a .rodata string entry and emit GlobalAddr
+                                let label = format!(".Lstr{}", self.next_string);
+                                self.next_string += 1;
+                                self.module.string_literals.push((label.clone(), s.clone()));
+                                elements.push(GlobalInit::GlobalAddr(label));
+                            } else {
+                                // String literal initializing a char array field
+                                let s_bytes = s.as_bytes();
+                                for (i, &b) in s_bytes.iter().enumerate() {
+                                    if i >= field_size { break; }
+                                    elements.push(GlobalInit::Scalar(IrConst::I8(b as i8)));
+                                }
+                                // null terminator + remaining zero fill
+                                for _ in s_bytes.len()..field_size {
+                                    elements.push(GlobalInit::Scalar(IrConst::I8(0)));
+                                }
                             }
                         } else if let Some(val) = self.eval_const_expr(expr) {
                             // Scalar constant - emit as bytes
@@ -1450,12 +1473,13 @@ impl Lowerer {
                     Initializer::List(nested_items) => {
                         // Nested struct/array init - serialize to bytes
                         let mut bytes = vec![0u8; field_size];
-                        if let Some(nested_layout) = self.get_struct_layout_for_ctype(&field.ty) {
+                        let field_ty = layout.fields[fi].ty.clone();
+                        if let Some(nested_layout) = self.get_struct_layout_for_ctype(&field_ty) {
                             self.fill_struct_global_bytes(nested_items, &nested_layout, &mut bytes, 0);
                         } else {
                             // Simple array or scalar list
                             let mut byte_offset = 0;
-                            let elem_ty = match &field.ty {
+                            let elem_ty = match &field_ty {
                                 CType::Array(inner, _) => IrType::from_ctype(inner),
                                 other => IrType::from_ctype(other),
                             };
@@ -1871,6 +1895,12 @@ impl Lowerer {
                 for field in fields {
                     self.collect_enum_constants(&field.type_spec);
                 }
+            }
+            // Unwrap Array and Pointer wrappers to find nested enum definitions.
+            // This handles cases like: enum { A, B } volatile arr[2][2]; inside structs,
+            // where the field type becomes Array(Array(Enum(...))).
+            TypeSpecifier::Array(inner, _) | TypeSpecifier::Pointer(inner) => {
+                self.collect_enum_constants(inner);
             }
             _ => {}
         }

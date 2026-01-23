@@ -1048,9 +1048,13 @@ impl Parser {
         self.skip_gcc_extensions();
 
         // Parse pointer(s)
+        // GCC allows __attribute__ after each pointer and its qualifiers:
+        //   int * __attribute__((noinline)) foo(...)
+        //   const char * __attribute__((noinline)) bar(...)
         while self.consume_if(&TokenKind::Star) {
             derived.push(DerivedDeclarator::Pointer);
             self.skip_cv_qualifiers();
+            self.skip_gcc_extensions();
         }
 
         // Parse name or parenthesized declarator
