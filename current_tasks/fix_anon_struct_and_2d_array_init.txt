@@ -1,0 +1,12 @@
+Task: Fix anonymous struct/union init and 2D struct array init
+Status: IN PROGRESS
+
+Fixes:
+1. Anonymous struct/union positional initialization: The resolve_init_field_idx
+   function was skipping unnamed fields during positional init, preventing anonymous
+   struct/union members from receiving initializer data.
+   
+2. Multi-dimensional array of structs initialization: Global init of struct type[N][M]
+   was using struct_size as the outer stride instead of elem_size (row size), causing
+   only the first row to be initialized. Also, sub-array init lists (rows) were being
+   treated as single struct inits rather than arrays of struct inits.
