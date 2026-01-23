@@ -1342,7 +1342,18 @@ impl Lowerer {
                     let constraint = inp.constraint.clone();
                     let name = inp.name.clone();
                     let inp_ty = self.get_expr_type(&inp.expr);
-                    let val = self.lower_expr(&inp.expr);
+                    // For immediate constraints ("I", "i", "n"), try to evaluate as
+                    // a compile-time constant to preserve the value for direct substitution
+                    let stripped = constraint.trim_start_matches(|c: char| c == '=' || c == '+' || c == '&');
+                    let val = if matches!(stripped, "I" | "i" | "n") {
+                        if let Some(const_val) = self.eval_const_expr(&inp.expr) {
+                            Operand::Const(const_val)
+                        } else {
+                            self.lower_expr(&inp.expr)
+                        }
+                    } else {
+                        self.lower_expr(&inp.expr)
+                    };
                     ir_inputs.push((constraint, val, name));
                     operand_types.push(inp_ty);
                 }

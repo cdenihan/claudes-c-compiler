@@ -687,17 +687,36 @@ impl ArchCodegen for X86Codegen {
                 IrUnaryOp::Neg => self.state.emit("    negq %rax"),
                 IrUnaryOp::Not => self.state.emit("    notq %rax"),
                 IrUnaryOp::Clz => {
-                    self.state.emit("    bsrq %rax, %rax");
-                    self.state.emit("    xorq $63, %rax");
+                    if ty == IrType::I32 || ty == IrType::U32 {
+                        self.state.emit("    bsrl %eax, %eax");
+                        self.state.emit("    xorl $31, %eax");
+                    } else {
+                        self.state.emit("    bsrq %rax, %rax");
+                        self.state.emit("    xorq $63, %rax");
+                    }
                 }
                 IrUnaryOp::Ctz => {
-                    self.state.emit("    tzcntq %rax, %rax");
+                    if ty == IrType::I32 || ty == IrType::U32 {
+                        self.state.emit("    tzcntl %eax, %eax");
+                    } else {
+                        self.state.emit("    tzcntq %rax, %rax");
+                    }
                 }
                 IrUnaryOp::Bswap => {
-                    self.state.emit("    bswapq %rax");
+                    if ty == IrType::I16 || ty == IrType::U16 {
+                        self.state.emit("    rolw $8, %ax");
+                    } else if ty == IrType::I32 || ty == IrType::U32 {
+                        self.state.emit("    bswapl %eax");
+                    } else {
+                        self.state.emit("    bswapq %rax");
+                    }
                 }
                 IrUnaryOp::Popcount => {
-                    self.state.emit("    popcntq %rax, %rax");
+                    if ty == IrType::I32 || ty == IrType::U32 {
+                        self.state.emit("    popcntl %eax, %eax");
+                    } else {
+                        self.state.emit("    popcntq %rax, %rax");
+                    }
                 }
             }
         }
