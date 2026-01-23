@@ -204,7 +204,7 @@ impl Lexer {
             let hex_str = std::str::from_utf8(&self.input[hex_start..self.pos]).unwrap_or("0");
             let value = u64::from_str_radix(hex_str, 16).unwrap_or(0);
             let (is_unsigned, is_long) = self.parse_int_suffix();
-            return self.make_int_token(value, is_unsigned, is_long, start);
+            return self.make_int_token(value, is_unsigned, is_long, true, start);
         }
 
         // Handle octal (but not if followed by '.' or 'e'/'E' which makes it a float)
@@ -230,7 +230,7 @@ impl Lexer {
                     let oct_str = std::str::from_utf8(&self.input[oct_start..self.pos]).unwrap_or("0");
                     let value = u64::from_str_radix(oct_str, 8).unwrap_or(0);
                     let (is_unsigned, is_long) = self.parse_int_suffix();
-                    return self.make_int_token(value, is_unsigned, is_long, start);
+                    return self.make_int_token(value, is_unsigned, is_long, true, start);
                 }
             }
         }
@@ -302,7 +302,7 @@ impl Lexer {
         } else {
             let uvalue: u64 = text.parse().unwrap_or(0);
             let (is_unsigned, is_long) = self.parse_int_suffix();
-            self.make_int_token(uvalue, is_unsigned, is_long, start)
+            self.make_int_token(uvalue, is_unsigned, is_long, false, start)
         }
     }
 
@@ -348,20 +348,43 @@ impl Lexer {
         (is_unsigned, is_long)
     }
 
-    /// Create the appropriate token kind based on integer value and suffix info.
-    fn make_int_token(&self, value: u64, is_unsigned: bool, is_long: bool, start: usize) -> Token {
+    /// Create the appropriate token kind based on integer value, suffix, and base info.
+    /// For hex/octal literals, C promotes: int -> unsigned int -> long -> unsigned long.
+    /// For decimal literals: int -> long -> long long (no implicit unsigned).
+    fn make_int_token(&self, value: u64, is_unsigned: bool, is_long: bool, is_hex_or_octal: bool, start: usize) -> Token {
         let span = Span::new(start as u32, self.pos as u32, self.file_id);
         if is_unsigned && is_long {
             Token::new(TokenKind::ULongLiteral(value), span)
         } else if is_unsigned {
-            Token::new(TokenKind::UIntLiteral(value), span)
+            if value > u32::MAX as u64 {
+                Token::new(TokenKind::ULongLiteral(value), span)
+            } else {
+                Token::new(TokenKind::UIntLiteral(value), span)
+            }
         } else if is_long {
-            Token::new(TokenKind::LongLiteral(value as i64), span)
-        } else if value > i64::MAX as u64 {
-            // Value too large for signed, promote to unsigned
-            Token::new(TokenKind::ULongLiteral(value), span)
+            if is_hex_or_octal && value > i64::MAX as u64 {
+                Token::new(TokenKind::ULongLiteral(value), span)
+            } else {
+                Token::new(TokenKind::LongLiteral(value as i64), span)
+            }
+        } else if is_hex_or_octal {
+            // Hex/octal: int -> unsigned int -> long -> unsigned long
+            if value <= i32::MAX as u64 {
+                Token::new(TokenKind::IntLiteral(value as i64), span)
+            } else if value <= u32::MAX as u64 {
+                Token::new(TokenKind::UIntLiteral(value), span)
+            } else if value <= i64::MAX as u64 {
+                Token::new(TokenKind::LongLiteral(value as i64), span)
+            } else {
+                Token::new(TokenKind::ULongLiteral(value), span)
+            }
         } else {
-            Token::new(TokenKind::IntLiteral(value as i64), span)
+            // Decimal: int -> long -> long long (unsigned only if > i64::MAX)
+            if value > i64::MAX as u64 {
+                Token::new(TokenKind::ULongLiteral(value), span)
+            } else {
+                Token::new(TokenKind::IntLiteral(value as i64), span)
+            }
         }
     }
 

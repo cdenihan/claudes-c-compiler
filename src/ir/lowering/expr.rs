@@ -221,8 +221,23 @@ impl Lowerer {
             let rhs_val = self.lower_expr_with_type(rhs, IrType::I64);
             (lhs_val, rhs_val)
         } else {
-            let lhs_val = self.lower_expr_with_type(lhs, op_ty);
-            let rhs_val = self.lower_expr_with_type(rhs, op_ty);
+            let mut lhs_val = self.lower_expr_with_type(lhs, op_ty);
+            let mut rhs_val = self.lower_expr_with_type(rhs, op_ty);
+            // When common_ty is U32, operands that are I32 may be sign-extended
+            // in their I64 representation. Mask both to 32 bits to ensure
+            // consistent zero-extended representation for unsigned operations.
+            if common_ty == IrType::U32 {
+                if lhs_ty == IrType::I32 || lhs_ty == IrType::I16 || lhs_ty == IrType::I8 {
+                    let masked = self.fresh_value();
+                    self.emit(Instruction::Cast { dest: masked, src: lhs_val, from_ty: IrType::I64, to_ty: IrType::U32 });
+                    lhs_val = Operand::Value(masked);
+                }
+                if rhs_ty == IrType::I32 || rhs_ty == IrType::I16 || rhs_ty == IrType::I8 {
+                    let masked = self.fresh_value();
+                    self.emit(Instruction::Cast { dest: masked, src: rhs_val, from_ty: IrType::I64, to_ty: IrType::U32 });
+                    rhs_val = Operand::Value(masked);
+                }
+            }
             (lhs_val, rhs_val)
         };
         let dest = self.fresh_value();
