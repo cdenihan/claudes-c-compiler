@@ -1,0 +1,23 @@
+Task: Fix type specifier parsing order and GNU __asm__ labels on declarations
+
+Status: In progress
+
+Problem:
+1. Type specifiers like "long unsigned int", "int long", etc. are not parsed because
+   the parser expects a fixed order (e.g., unsigned must come before long).
+   This causes "expected Semicolon, got Unsigned" errors when parsing system headers.
+
+2. GNU __asm__("name") on function/variable declarations is not handled.
+   This causes "expected Semicolon, got Asm" errors when parsing stdio.h which uses
+   __asm__("__isoc99_scanf") for symbol renaming.
+
+Both issues prevent parsing of system headers (stdio.h, stdlib.h, etc.), causing
+~1700+ segfaults from tests that compile but produce broken output.
+
+Fix:
+- Rewrite parse_type_specifier to collect all type specifier tokens (signed, unsigned,
+  long, int, short, char, etc.) and combine them into the correct type regardless
+  of order.
+- Add __asm__("...") handling after declarators (skip it since we don't need symbol
+  renaming for now).
+- Also handle __asm__ on function declarations specifically.
