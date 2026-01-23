@@ -1232,6 +1232,44 @@ impl Lowerer {
         }
     }
 
+    /// Copy a string literal's bytes into an alloca at a given byte offset,
+    /// followed by a null terminator. Used for `char s[] = "hello"` and
+    /// string elements in array initializer lists.
+    pub(super) fn emit_string_to_alloca(&mut self, alloca: Value, s: &str, base_offset: usize) {
+        let bytes = s.as_bytes();
+        for (j, &byte) in bytes.iter().enumerate() {
+            let val = Operand::Const(IrConst::I8(byte as i8));
+            let offset = Operand::Const(IrConst::I64((base_offset + j) as i64));
+            let addr = self.fresh_value();
+            self.emit(Instruction::GetElementPtr {
+                dest: addr, base: alloca, offset, ty: IrType::I8,
+            });
+            self.emit(Instruction::Store { val, ptr: addr, ty: IrType::I8 });
+        }
+        // Null terminator
+        let null_offset = Operand::Const(IrConst::I64((base_offset + bytes.len()) as i64));
+        let null_addr = self.fresh_value();
+        self.emit(Instruction::GetElementPtr {
+            dest: null_addr, base: alloca, offset: null_offset, ty: IrType::I8,
+        });
+        self.emit(Instruction::Store {
+            val: Operand::Const(IrConst::I8(0)), ptr: null_addr, ty: IrType::I8,
+        });
+    }
+
+    /// Emit a single element store at a given byte offset in an alloca.
+    /// Handles implicit type cast from the expression type to the target type.
+    pub(super) fn emit_array_element_store(
+        &mut self, alloca: Value, val: Operand, offset: usize, ty: IrType,
+    ) {
+        let offset_val = Operand::Const(IrConst::I64(offset as i64));
+        let elem_addr = self.fresh_value();
+        self.emit(Instruction::GetElementPtr {
+            dest: elem_addr, base: alloca, offset: offset_val, ty,
+        });
+        self.emit(Instruction::Store { val, ptr: elem_addr, ty });
+    }
+
     /// Zero-initialize an alloca by emitting stores of zero.
     pub(super) fn zero_init_alloca(&mut self, alloca: Value, total_size: usize) {
         let mut offset = 0usize;

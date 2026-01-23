@@ -236,33 +236,9 @@ impl Lowerer {
                 match init {
                     Initializer::Expr(expr) => {
                         if is_array && (base_ty == IrType::I8 || base_ty == IrType::U8) {
-                            // Char array initialized from string literal: char s[] = "hello"
-                            // Copy string bytes into the array element by element
+                            // Char array from string literal: char s[] = "hello"
                             if let Expr::StringLiteral(s, _) = expr {
-                                let bytes = s.as_bytes();
-                                for (i, &byte) in bytes.iter().enumerate() {
-                                    let val = Operand::Const(IrConst::I8(byte as i8));
-                                    let offset_val = Operand::Const(IrConst::I64(i as i64));
-                                    let elem_addr = self.fresh_value();
-                                    self.emit(Instruction::GetElementPtr {
-                                        dest: elem_addr,
-                                        base: alloca,
-                                        offset: offset_val,
-                                        ty: IrType::I8,
-                                    });
-                                    self.emit(Instruction::Store { val, ptr: elem_addr, ty: IrType::I8 });
-                                }
-                                // Null terminator
-                                let null_val = Operand::Const(IrConst::I8(0));
-                                let null_offset = Operand::Const(IrConst::I64(bytes.len() as i64));
-                                let null_addr = self.fresh_value();
-                                self.emit(Instruction::GetElementPtr {
-                                    dest: null_addr,
-                                    base: alloca,
-                                    offset: null_offset,
-                                    ty: IrType::I8,
-                                });
-                                self.emit(Instruction::Store { val: null_val, ptr: null_addr, ty: IrType::I8 });
+                                self.emit_string_to_alloca(alloca, s, 0);
                             } else {
                                 // Non-string expression initializer for char array (e.g., pointer assignment)
                                 let val = self.lower_expr(expr);
@@ -288,47 +264,9 @@ impl Lowerer {
                     }
                     Initializer::List(items) => {
                         if is_struct {
-                            // Initialize struct fields from initializer list
-                            // Supports designated initializers: {.b = 2, .a = 1}
+                            // Struct field initialization (with designator support)
                             if let Some(layout) = self.locals.get(&declarator.name).and_then(|l| l.struct_layout.clone()) {
-                                // Zero-initialize first if any designators are present
-                                let has_designators = items.iter().any(|item| !item.designators.is_empty());
-                                if has_designators {
-                                    self.zero_init_alloca(alloca, layout.size);
-                                }
-
-                                let mut current_field_idx = 0usize;
-                                for item in items.iter() {
-                                    // Determine target field from designator or position
-                                    let field_idx = if let Some(Designator::Field(ref name)) = item.designators.first() {
-                                        layout.fields.iter().position(|f| f.name == *name).unwrap_or(current_field_idx)
-                                    } else {
-                                        // Skip unnamed fields (anonymous bitfields) for positional init
-                                        let mut idx = current_field_idx;
-                                        while idx < layout.fields.len() && layout.fields[idx].name.is_empty() {
-                                            idx += 1;
-                                        }
-                                        idx
-                                    };
-
-                                    if field_idx >= layout.fields.len() { break; }
-                                    let field = &layout.fields[field_idx];
-                                    let field_offset = field.offset;
-                                    let field_ty = IrType::from_ctype(&field.ty);
-                                    let val = match &item.init {
-                                        Initializer::Expr(e) => self.lower_expr(e),
-                                        _ => Operand::Const(IrConst::I64(0)),
-                                    };
-                                    let field_addr = self.fresh_value();
-                                    self.emit(Instruction::GetElementPtr {
-                                        dest: field_addr,
-                                        base: alloca,
-                                        offset: Operand::Const(IrConst::I64(field_offset as i64)),
-                                        ty: field_ty,
-                                    });
-                                    self.emit(Instruction::Store { val, ptr: field_addr, ty: field_ty });
-                                    current_field_idx = field_idx + 1;
-                                }
+                                self.init_struct_fields(alloca, items, &layout);
                             }
                         } else if is_array && elem_size > 0 {
                             if array_dim_strides.len() > 1 {
@@ -354,61 +292,20 @@ impl Lowerer {
                                         }
                                     }
 
-                                    let val = match &item.init {
-                                        Initializer::Expr(e) => {
-                                            // Handle string literal in char array init list:
-                                            // char s[2][6] = {"Hello", "World"} inner items
-                                            if base_ty == IrType::I8 || base_ty == IrType::U8 {
-                                                if let Expr::StringLiteral(s, _) = e {
-                                                    // Copy string bytes into array at offset
-                                                    let bytes = s.as_bytes();
-                                                    let base_offset = current_idx * elem_size;
-                                                    for (j, &byte) in bytes.iter().enumerate() {
-                                                        let byte_val = Operand::Const(IrConst::I8(byte as i8));
-                                                        let byte_offset = Operand::Const(IrConst::I64((base_offset + j) as i64));
-                                                        let byte_addr = self.fresh_value();
-                                                        self.emit(Instruction::GetElementPtr {
-                                                            dest: byte_addr,
-                                                            base: alloca,
-                                                            offset: byte_offset,
-                                                            ty: IrType::I8,
-                                                        });
-                                                        self.emit(Instruction::Store { val: byte_val, ptr: byte_addr, ty: IrType::I8 });
-                                                    }
-                                                    // Null terminator
-                                                    let null_val = Operand::Const(IrConst::I8(0));
-                                                    let null_offset = Operand::Const(IrConst::I64((base_offset + bytes.len()) as i64));
-                                                    let null_addr = self.fresh_value();
-                                                    self.emit(Instruction::GetElementPtr {
-                                                        dest: null_addr,
-                                                        base: alloca,
-                                                        offset: null_offset,
-                                                        ty: IrType::I8,
-                                                    });
-                                                    self.emit(Instruction::Store { val: null_val, ptr: null_addr, ty: IrType::I8 });
-                                                    continue;
-                                                }
+                                    // Handle each item, with special case for string literals in char arrays
+                                    if let Initializer::Expr(e) = &item.init {
+                                        if base_ty == IrType::I8 || base_ty == IrType::U8 {
+                                            if let Expr::StringLiteral(s, _) = e {
+                                                self.emit_string_to_alloca(alloca, s, current_idx * elem_size);
+                                                current_idx += 1;
+                                                continue;
                                             }
-                                            self.lower_expr(e)
                                         }
-                                        _ => Operand::Const(IrConst::I64(0)),
-                                    };
-                                    // Implicit cast: handle type mismatches (e.g. double literal -> float array element)
-                                    let val = if let Initializer::Expr(e) = &item.init {
+                                        let val = self.lower_expr(e);
                                         let expr_ty = self.get_expr_type(e);
-                                        self.emit_implicit_cast(val, expr_ty, base_ty)
-                                    } else {
-                                        val
-                                    };
-                                    let offset_val = Operand::Const(IrConst::I64((current_idx * elem_size) as i64));
-                                    let elem_addr = self.fresh_value();
-                                    self.emit(Instruction::GetElementPtr {
-                                        dest: elem_addr,
-                                        base: alloca,
-                                        offset: offset_val,
-                                        ty: base_ty,
-                                    });
-                                    self.emit(Instruction::Store { val, ptr: elem_addr, ty: base_ty });
+                                        let val = self.emit_implicit_cast(val, expr_ty, base_ty);
+                                        self.emit_array_element_store(alloca, val, current_idx * elem_size, base_ty);
+                                    }
                                     current_idx += 1;
                                 }
                             }
@@ -428,115 +325,14 @@ impl Lowerer {
         base_ty: IrType,
         array_dim_strides: &[usize],
     ) {
-        let elem_size = *array_dim_strides.last().unwrap_or(&1);
-        let sub_elem_count = if array_dim_strides.len() > 1 && elem_size > 0 {
-            array_dim_strides[0] / elem_size
-        } else {
-            1
-        };
         let mut flat_index = 0usize;
-        for item in items {
-            let start_index = flat_index;
-            match &item.init {
-                Initializer::List(sub_items) => {
-                    if array_dim_strides.len() > 1 {
-                        // Recurse for sub-array
-                        self.lower_array_init_list_inner(sub_items, alloca, base_ty, &array_dim_strides[1..], &mut flat_index);
-                    } else {
-                        // Bottom level: treat as flat elements
-                        for sub_item in sub_items {
-                            if let Initializer::Expr(e) = &sub_item.init {
-                                let val = self.lower_expr(e);
-                                let offset_val = Operand::Const(IrConst::I64((flat_index * elem_size) as i64));
-                                let elem_addr = self.fresh_value();
-                                self.emit(Instruction::GetElementPtr {
-                                    dest: elem_addr,
-                                    base: alloca,
-                                    offset: offset_val,
-                                    ty: base_ty,
-                                });
-                                self.emit(Instruction::Store { val, ptr: elem_addr, ty: base_ty });
-                                flat_index += 1;
-                            }
-                        }
-                    }
-                }
-                Initializer::Expr(e) => {
-                    // Handle string literal in char array initializer list:
-                    // For char arr[2][6] = {"Hello", "World"}, each string fills a sub-array
-                    if base_ty == IrType::I8 || base_ty == IrType::U8 {
-                        if let Expr::StringLiteral(s, _) = e {
-                            let bytes = s.as_bytes();
-                            let byte_offset_base = flat_index * elem_size;
-                            for (j, &byte) in bytes.iter().enumerate() {
-                                let byte_val = Operand::Const(IrConst::I8(byte as i8));
-                                let byte_off = Operand::Const(IrConst::I64((byte_offset_base + j) as i64));
-                                let byte_addr = self.fresh_value();
-                                self.emit(Instruction::GetElementPtr {
-                                    dest: byte_addr,
-                                    base: alloca,
-                                    offset: byte_off,
-                                    ty: IrType::I8,
-                                });
-                                self.emit(Instruction::Store { val: byte_val, ptr: byte_addr, ty: IrType::I8 });
-                            }
-                            // Null terminator
-                            if byte_offset_base + bytes.len() < byte_offset_base + sub_elem_count * elem_size {
-                                let null_val = Operand::Const(IrConst::I8(0));
-                                let null_off = Operand::Const(IrConst::I64((byte_offset_base + bytes.len()) as i64));
-                                let null_addr = self.fresh_value();
-                                self.emit(Instruction::GetElementPtr {
-                                    dest: null_addr,
-                                    base: alloca,
-                                    offset: null_off,
-                                    ty: IrType::I8,
-                                });
-                                self.emit(Instruction::Store { val: null_val, ptr: null_addr, ty: IrType::I8 });
-                            }
-                            flat_index += sub_elem_count;
-                        } else {
-                            let val = self.lower_expr(e);
-                            let expr_ty = self.get_expr_type(e);
-                            let val = self.emit_implicit_cast(val, expr_ty, base_ty);
-                            let offset_val = Operand::Const(IrConst::I64((flat_index * elem_size) as i64));
-                            let elem_addr = self.fresh_value();
-                            self.emit(Instruction::GetElementPtr {
-                                dest: elem_addr,
-                                base: alloca,
-                                offset: offset_val,
-                                ty: base_ty,
-                            });
-                            self.emit(Instruction::Store { val, ptr: elem_addr, ty: base_ty });
-                            flat_index += 1;
-                        }
-                    } else {
-                        let val = self.lower_expr(e);
-                        let expr_ty = self.get_expr_type(e);
-                        let val = self.emit_implicit_cast(val, expr_ty, base_ty);
-                        let offset_val = Operand::Const(IrConst::I64((flat_index * elem_size) as i64));
-                        let elem_addr = self.fresh_value();
-                        self.emit(Instruction::GetElementPtr {
-                            dest: elem_addr,
-                            base: alloca,
-                            offset: offset_val,
-                            ty: base_ty,
-                        });
-                        self.emit(Instruction::Store { val, ptr: elem_addr, ty: base_ty });
-                        flat_index += 1;
-                    }
-                }
-            }
-            // Advance to next sub-array boundary if multi-dim
-            if array_dim_strides.len() > 1 {
-                let boundary = start_index + sub_elem_count;
-                if flat_index < boundary {
-                    flat_index = boundary;
-                }
-            }
-        }
+        self.lower_array_init_recursive(items, alloca, base_ty, array_dim_strides, &mut flat_index);
     }
 
-    fn lower_array_init_list_inner(
+    /// Recursive helper for multi-dimensional array initialization.
+    /// Processes each initializer item, recursing for nested braces and
+    /// advancing the flat_index to track the current element position.
+    fn lower_array_init_recursive(
         &mut self,
         items: &[InitializerItem],
         alloca: Value,
@@ -550,49 +346,40 @@ impl Lowerer {
         } else {
             1
         };
+
         for item in items {
             let start_index = *flat_index;
             match &item.init {
                 Initializer::List(sub_items) => {
                     if array_dim_strides.len() > 1 {
-                        self.lower_array_init_list_inner(sub_items, alloca, base_ty, &array_dim_strides[1..], flat_index);
+                        self.lower_array_init_recursive(sub_items, alloca, base_ty, &array_dim_strides[1..], flat_index);
                     } else {
+                        // Bottom level: treat as flat elements
                         for sub_item in sub_items {
                             if let Initializer::Expr(e) = &sub_item.init {
-                                let val = self.lower_expr(e);
-                                let expr_ty = self.get_expr_type(e);
-                                let val = self.emit_implicit_cast(val, expr_ty, base_ty);
-                                let offset_val = Operand::Const(IrConst::I64((*flat_index * elem_size) as i64));
-                                let elem_addr = self.fresh_value();
-                                self.emit(Instruction::GetElementPtr {
-                                    dest: elem_addr,
-                                    base: alloca,
-                                    offset: offset_val,
-                                    ty: base_ty,
-                                });
-                                self.emit(Instruction::Store { val, ptr: elem_addr, ty: base_ty });
+                                let val = self.lower_and_cast_init_expr(e, base_ty);
+                                self.emit_array_element_store(alloca, val, *flat_index * elem_size, base_ty);
                                 *flat_index += 1;
                             }
                         }
                     }
                 }
                 Initializer::Expr(e) => {
-                    let val = self.lower_expr(e);
-                    let expr_ty = self.get_expr_type(e);
-                    let val = self.emit_implicit_cast(val, expr_ty, base_ty);
-                    let offset_val = Operand::Const(IrConst::I64((*flat_index * elem_size) as i64));
-                    let elem_addr = self.fresh_value();
-                    self.emit(Instruction::GetElementPtr {
-                        dest: elem_addr,
-                        base: alloca,
-                        offset: offset_val,
-                        ty: base_ty,
-                    });
-                    self.emit(Instruction::Store { val, ptr: elem_addr, ty: base_ty });
+                    // String literal fills a sub-array in char arrays
+                    if base_ty == IrType::I8 || base_ty == IrType::U8 {
+                        if let Expr::StringLiteral(s, _) = e {
+                            self.emit_string_to_alloca(alloca, s, *flat_index * elem_size);
+                            *flat_index += sub_elem_count;
+                            // Skip boundary adjustment since we already advanced by sub_elem_count
+                            continue;
+                        }
+                    }
+                    let val = self.lower_and_cast_init_expr(e, base_ty);
+                    self.emit_array_element_store(alloca, val, *flat_index * elem_size, base_ty);
                     *flat_index += 1;
                 }
             }
-            // Advance to next sub-array boundary
+            // Advance to next sub-array boundary if multi-dim
             if array_dim_strides.len() > 1 {
                 let boundary = start_index + sub_elem_count;
                 if *flat_index < boundary {
@@ -600,6 +387,13 @@ impl Lowerer {
                 }
             }
         }
+    }
+
+    /// Lower an expression and cast it to the target array element type.
+    fn lower_and_cast_init_expr(&mut self, expr: &Expr, target_ty: IrType) -> Operand {
+        let val = self.lower_expr(expr);
+        let expr_ty = self.get_expr_type(expr);
+        self.emit_implicit_cast(val, expr_ty, target_ty)
     }
 
     pub(super) fn lower_stmt(&mut self, stmt: &Stmt) {

@@ -228,6 +228,14 @@ pub enum BinOp {
     LogicalOr,
 }
 
+impl BinOp {
+    /// Returns true for comparison operators (==, !=, <, <=, >, >=, &&, ||).
+    pub fn is_comparison(self) -> bool {
+        matches!(self, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le
+            | BinOp::Gt | BinOp::Ge | BinOp::LogicalAnd | BinOp::LogicalOr)
+    }
+}
+
 /// Unary operators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOp {
