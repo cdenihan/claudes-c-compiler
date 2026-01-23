@@ -1386,7 +1386,15 @@ impl Lowerer {
                                 }
                             } else {
                                 // Array of scalars: each sub_item is a scalar
-                                for (ai, sub_item) in sub_items.iter().enumerate() {
+                                // Supports [idx]=val designators within the sub-list
+                                let mut ai = 0usize;
+                                for sub_item in sub_items.iter() {
+                                    // Check for index designator: [idx]=val
+                                    if let Some(Designator::Index(ref idx_expr)) = sub_item.designators.first() {
+                                        if let Some(idx) = self.eval_const_expr(idx_expr).and_then(|c| c.to_usize()) {
+                                            ai = idx;
+                                        }
+                                    }
                                     if ai >= *arr_size { break; }
                                     let elem_offset = field_offset + ai * elem_size;
                                     if let Initializer::Expr(expr) = &sub_item.init {
@@ -1401,6 +1409,7 @@ impl Lowerer {
                                             }
                                         }
                                     }
+                                    ai += 1;
                                 }
                             }
                             item_idx += 1;

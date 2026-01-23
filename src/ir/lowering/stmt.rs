@@ -595,21 +595,29 @@ impl Lowerer {
                 self.lower_local_struct_init(items, base, &sub_layout);
             }
             CType::Array(ref elem_ty, _) => {
-                // Array field: init elements sequentially
+                // Array field: init elements with [idx]=val designator support
                 let elem_ir_ty = IrType::from_ctype(elem_ty);
                 let elem_size = elem_ty.size();
-                for (i, item) in items.iter().enumerate() {
+                let mut ai = 0usize;
+                for item in items.iter() {
+                    // Check for index designator: [idx]=val
+                    if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
+                        if let Some(idx) = self.eval_const_expr_for_designator(idx_expr) {
+                            ai = idx;
+                        }
+                    }
                     if let Initializer::Expr(e) = &item.init {
                         let val = self.lower_and_cast_init_expr(e, elem_ir_ty);
                         let elem_addr = self.fresh_value();
                         self.emit(Instruction::GetElementPtr {
                             dest: elem_addr,
                             base,
-                            offset: Operand::Const(IrConst::I64((i * elem_size) as i64)),
+                            offset: Operand::Const(IrConst::I64((ai * elem_size) as i64)),
                             ty: elem_ir_ty,
                         });
                         self.emit(Instruction::Store { val, ptr: elem_addr, ty: elem_ir_ty });
                     }
+                    ai += 1;
                 }
             }
             _ => {
@@ -1267,7 +1275,15 @@ impl Lowerer {
                                     }
                                 }
                             } else {
-                                for (ai, sub_item) in sub_items.iter().enumerate() {
+                                // Supports [idx]=val designators within the sub-list
+                                let mut ai = 0usize;
+                                for sub_item in sub_items.iter() {
+                                    // Check for index designator: [idx]=val
+                                    if let Some(Designator::Index(ref idx_expr)) = sub_item.designators.first() {
+                                        if let Some(idx) = self.eval_const_expr_for_designator(idx_expr) {
+                                            ai = idx;
+                                        }
+                                    }
                                     if ai >= *arr_size { break; }
                                     let elem_offset = field_offset + ai * elem_size;
                                     if let Initializer::Expr(e) = &sub_item.init {
@@ -1307,6 +1323,7 @@ impl Lowerer {
                                             }
                                         }
                                     }
+                                    ai += 1;
                                 }
                             }
                             item_idx += 1;
