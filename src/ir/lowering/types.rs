@@ -37,9 +37,28 @@ impl Lowerer {
                 let r = self.eval_const_expr(rhs)?;
                 self.eval_const_binop(op, &l, &r)
             }
+            Expr::UnaryOp(UnaryOp::BitNot, inner, _) => {
+                if let Some(val) = self.eval_const_expr(inner) {
+                    match val {
+                        IrConst::I64(v) => Some(IrConst::I64(!v)),
+                        IrConst::I32(v) => Some(IrConst::I32(!v)),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
             Expr::Cast(_, inner, _) => {
                 // For now, just pass through casts in constant expressions
                 self.eval_const_expr(inner)
+            }
+            Expr::Identifier(name, _) => {
+                // Look up enum constants
+                if let Some(&val) = self.enum_constants.get(name) {
+                    Some(IrConst::I64(val))
+                } else {
+                    None
+                }
             }
             _ => None,
         }
@@ -94,6 +113,9 @@ impl Lowerer {
     pub(super) fn get_expr_type(&self, expr: &Expr) -> IrType {
         match expr {
             Expr::Identifier(name, _) => {
+                if self.enum_constants.contains_key(name) {
+                    return IrType::I32;
+                }
                 if let Some(info) = self.locals.get(name) {
                     return info.ty;
                 }

@@ -83,6 +83,10 @@ pub struct Lowerer {
     pub(super) switch_val_allocas: Vec<Value>,
     /// Struct/union layouts indexed by tag name (or anonymous id).
     pub(super) struct_layouts: HashMap<String, StructLayout>,
+    /// Enum constant values collected from enum definitions.
+    pub(super) enum_constants: HashMap<String, i64>,
+    /// User-defined goto labels mapped to unique IR labels (scoped per function).
+    pub(super) user_labels: HashMap<String, String>,
 }
 
 impl Lowerer {
@@ -109,6 +113,8 @@ impl Lowerer {
             switch_default: Vec::new(),
             switch_val_allocas: Vec::new(),
             struct_layouts: HashMap::new(),
+            enum_constants: HashMap::new(),
+            user_labels: HashMap::new(),
         }
     }
 
@@ -129,7 +135,10 @@ impl Lowerer {
             }
         }
 
-        // Second pass: lower everything
+        // Second pass: collect all enum constants from the entire AST
+        self.collect_all_enum_constants(tu);
+
+        // Third pass: lower everything
         for decl in &tu.decls {
             match decl {
                 ExternalDecl::FunctionDef(func) => {
@@ -185,6 +194,7 @@ impl Lowerer {
         self.locals.clear();
         self.break_labels.clear();
         self.continue_labels.clear();
+        self.user_labels.clear();
         self.current_function_name = func.name.clone();
 
         let return_type = self.type_spec_to_ir(&func.return_type);
@@ -262,6 +272,9 @@ impl Lowerer {
         // Register any struct/union definitions
         self.register_struct_type(&decl.type_spec);
 
+        // Collect enum constants from top-level enum type declarations
+        self.collect_enum_constants(&decl.type_spec);
+
         for declarator in &decl.declarators {
             if declarator.name.is_empty() {
                 continue; // Skip anonymous declarations (e.g., struct definitions)
@@ -269,6 +282,26 @@ impl Lowerer {
 
             // Skip function declarations
             if declarator.derived.iter().any(|d| matches!(d, DerivedDeclarator::Function(_, _))) {
+                continue;
+            }
+
+            // extern without initializer: track the type but don't emit a .bss entry
+            // (the definition will come from another translation unit)
+            if decl.is_extern && declarator.init.is_none() {
+                if !self.globals.contains_key(&declarator.name) {
+                    let base_ty = self.type_spec_to_ir(&decl.type_spec);
+                    let (_, elem_size, is_array, is_pointer) = self.compute_decl_info(&decl.type_spec, &declarator.derived);
+                    let var_ty = if is_pointer { IrType::Ptr } else { base_ty };
+                    let struct_layout = self.get_struct_layout_for_type(&decl.type_spec);
+                    let is_struct = struct_layout.is_some() && !is_pointer && !is_array;
+                    self.globals.insert(declarator.name.clone(), GlobalInfo {
+                        ty: var_ty,
+                        elem_size,
+                        is_array,
+                        struct_layout,
+                        is_struct,
+                    });
+                }
                 continue;
             }
 
@@ -507,6 +540,94 @@ impl Lowerer {
             if offset + i < bytes.len() {
                 bytes[offset + i] = le_bytes[i];
             }
+        }
+    }
+
+    /// Collect all enum constants from the entire translation unit.
+    fn collect_all_enum_constants(&mut self, tu: &TranslationUnit) {
+        for decl in &tu.decls {
+            match decl {
+                ExternalDecl::Declaration(d) => {
+                    self.collect_enum_constants(&d.type_spec);
+                    // Also collect from local enum declarations inside initializers, etc.
+                }
+                ExternalDecl::FunctionDef(func) => {
+                    // Collect from return type
+                    self.collect_enum_constants(&func.return_type);
+                    // Collect from function body
+                    self.collect_enum_constants_from_compound(&func.body);
+                }
+            }
+        }
+    }
+
+    /// Collect enum constants from a type specifier.
+    pub(super) fn collect_enum_constants(&mut self, ts: &TypeSpecifier) {
+        if let TypeSpecifier::Enum(_, Some(variants)) = ts {
+            let mut next_val: i64 = 0;
+            for variant in variants {
+                if let Some(ref expr) = variant.value {
+                    if let Some(val) = self.eval_const_expr(expr) {
+                        if let Some(v) = self.const_to_i64(&val) {
+                            next_val = v;
+                        }
+                    }
+                }
+                self.enum_constants.insert(variant.name.clone(), next_val);
+                next_val += 1;
+            }
+        }
+    }
+
+    /// Recursively collect enum constants from a compound statement.
+    fn collect_enum_constants_from_compound(&mut self, compound: &CompoundStmt) {
+        for item in &compound.items {
+            match item {
+                BlockItem::Declaration(decl) => {
+                    self.collect_enum_constants(&decl.type_spec);
+                }
+                BlockItem::Statement(stmt) => {
+                    self.collect_enum_constants_from_stmt(stmt);
+                }
+            }
+        }
+    }
+
+    /// Recursively collect enum constants from a statement.
+    fn collect_enum_constants_from_stmt(&mut self, stmt: &Stmt) {
+        match stmt {
+            Stmt::Compound(compound) => self.collect_enum_constants_from_compound(compound),
+            Stmt::If(_, then_stmt, else_stmt, _) => {
+                self.collect_enum_constants_from_stmt(then_stmt);
+                if let Some(else_s) = else_stmt {
+                    self.collect_enum_constants_from_stmt(else_s);
+                }
+            }
+            Stmt::While(_, body, _) | Stmt::DoWhile(body, _, _) => {
+                self.collect_enum_constants_from_stmt(body);
+            }
+            Stmt::For(_, _, _, body, _) => {
+                self.collect_enum_constants_from_stmt(body);
+            }
+            Stmt::Switch(_, body, _) => {
+                self.collect_enum_constants_from_stmt(body);
+            }
+            Stmt::Case(_, stmt, _) | Stmt::Default(stmt, _) | Stmt::Label(_, stmt, _) => {
+                self.collect_enum_constants_from_stmt(stmt);
+            }
+            _ => {}
+        }
+    }
+
+    /// Get or create a unique IR label for a user-defined goto label.
+    pub(super) fn get_or_create_user_label(&mut self, name: &str) -> String {
+        let key = format!("{}::{}", self.current_function_name, name);
+        if let Some(label) = self.user_labels.get(&key) {
+            label.clone()
+        } else {
+            let label = self.fresh_label(&format!("user_{}", name));
+            self.user_labels.insert(key, label.clone());
+            label
         }
     }
 }

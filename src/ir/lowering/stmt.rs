@@ -5,12 +5,22 @@ use super::lowering::{Lowerer, LocalInfo, GlobalInfo};
 
 impl Lowerer {
     pub(super) fn lower_compound_stmt(&mut self, compound: &CompoundStmt) {
+        // Save current locals for block scope restoration
+        let saved_locals = self.locals.clone();
+
         for item in &compound.items {
             match item {
-                BlockItem::Declaration(decl) => self.lower_local_decl(decl),
+                BlockItem::Declaration(decl) => {
+                    // Collect enum constants from declarations within this block
+                    self.collect_enum_constants(&decl.type_spec);
+                    self.lower_local_decl(decl);
+                }
                 BlockItem::Statement(stmt) => self.lower_stmt(stmt),
             }
         }
+
+        // Restore outer scope locals (removes block-scoped declarations)
+        self.locals = saved_locals;
     }
 
     pub(super) fn lower_local_decl(&mut self, decl: &Declaration) {
@@ -20,6 +30,25 @@ impl Lowerer {
         for declarator in &decl.declarators {
             if declarator.name.is_empty() {
                 continue; // Skip anonymous declarations (e.g., bare struct definitions)
+            }
+
+            // Handle extern declarations inside function bodies:
+            // they reference a global symbol, not a local variable
+            if decl.is_extern {
+                self.locals.remove(&declarator.name);
+                if !self.globals.contains_key(&declarator.name) {
+                    let ty = self.type_spec_to_ir(&decl.type_spec);
+                    let is_pointer = declarator.derived.iter().any(|d| matches!(d, DerivedDeclarator::Pointer));
+                    let var_ty = if is_pointer { IrType::Ptr } else { ty };
+                    self.globals.insert(declarator.name.clone(), GlobalInfo {
+                        ty: var_ty,
+                        elem_size: 0,
+                        is_array: false,
+                        struct_layout: None,
+                        is_struct: false,
+                    });
+                }
+                continue;
             }
 
             let base_ty = self.type_spec_to_ir(&decl.type_spec);
@@ -40,7 +69,8 @@ impl Lowerer {
 
             // Handle static local variables: emit as globals with mangled names
             if decl.is_static {
-                let static_name = format!("{}.{}", self.current_function_name, declarator.name);
+                let static_id = self.next_static_local;
+                let static_name = format!("{}.{}.{}", self.current_function_name, declarator.name, static_id);
 
                 // Determine initializer (evaluated at compile time for static locals)
                 let init = if let Some(ref initializer) = declarator.init {
@@ -471,15 +501,13 @@ impl Lowerer {
                 self.lower_stmt(stmt);
             }
             Stmt::Goto(label, _span) => {
-                // Include function name in label to avoid collisions across functions
-                let scoped_label = format!(".Luser_{}_{}", self.current_function_name, label);
+                let scoped_label = self.get_or_create_user_label(label);
                 self.terminate(Terminator::Branch(scoped_label));
                 let dead = self.fresh_label("post_goto");
                 self.start_block(dead);
             }
             Stmt::Label(name, stmt, _span) => {
-                // Include function name in label to avoid collisions across functions
-                let label = format!(".Luser_{}_{}", self.current_function_name, name);
+                let label = self.get_or_create_user_label(name);
                 self.terminate(Terminator::Branch(label.clone()));
                 self.start_block(label);
                 self.lower_stmt(stmt);

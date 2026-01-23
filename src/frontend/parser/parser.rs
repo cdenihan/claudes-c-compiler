@@ -615,7 +615,9 @@ impl Parser {
             if let TokenKind::Identifier(name) = self.peek().clone() {
                 self.advance();
                 let value = if self.consume_if(&TokenKind::Assign) {
-                    Some(Box::new(self.parse_expr()))
+                    // Use assignment_expr (not full expr) to avoid consuming commas
+                    // between enum values as the comma operator
+                    Some(Box::new(self.parse_assignment_expr()))
                 } else {
                     None
                 };

@@ -25,6 +25,10 @@ impl Lowerer {
                 Operand::Value(dest)
             }
             Expr::Identifier(name, _) => {
+                // Check for enum constants first
+                if let Some(&val) = self.enum_constants.get(name) {
+                    return Operand::Const(IrConst::I64(val));
+                }
                 if let Some(info) = self.locals.get(name).cloned() {
                     if info.is_array {
                         // Arrays decay to pointer: return the alloca address itself
