@@ -1,0 +1,14 @@
+Implement GCC-style driver flags: -D, -S, -c, -E
+
+These are fundamental compiler driver modes:
+- -D<name>=<value>: Define preprocessor macro (passed to preprocessor)
+- -S: Compile to assembly only (output .s file)
+- -c: Compile to object file only (don't link)
+- -E: Preprocess only (output preprocessed source)
+
+Plan:
+1. Parse -D flags in main.rs, store defines in Driver
+2. Pass defines to Preprocessor which pre-seeds them as macros
+3. Implement -S mode: run through codegen, write .s file, skip assemble+link
+4. Implement -c mode: run through assemble, skip linking
+5. Implement -E mode: preprocess only, print to stdout
