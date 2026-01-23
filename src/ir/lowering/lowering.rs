@@ -833,10 +833,12 @@ impl Lowerer {
                         return GlobalInit::Array(values);
                     }
 
-                    // Check if any element is an address expression (for pointer arrays)
-                    let has_addr_exprs = base_ty == IrType::Ptr && items.iter().any(|item| {
+                    // Check if any element is an address expression or string literal
+                    // (for pointer arrays like char *arr[] or func_ptr arr[])
+                    let has_addr_exprs = items.iter().any(|item| {
                         if let Initializer::Expr(expr) = &item.init {
-                            self.eval_const_expr(expr).is_none() && self.eval_global_addr_expr(expr).is_some()
+                            matches!(expr, Expr::StringLiteral(_, _))
+                                || (self.eval_const_expr(expr).is_none() && self.eval_global_addr_expr(expr).is_some())
                         } else {
                             false
                         }
@@ -847,7 +849,13 @@ impl Lowerer {
                         let mut elements = Vec::with_capacity(num_elems);
                         for item in items {
                             if let Initializer::Expr(expr) = &item.init {
-                                if let Some(val) = self.eval_const_expr(expr) {
+                                if let Expr::StringLiteral(s, _) = expr {
+                                    // String literal: create .rodata entry and use its label
+                                    let label = format!(".Lstr{}", self.next_string);
+                                    self.next_string += 1;
+                                    self.module.string_literals.push((label.clone(), s.clone()));
+                                    elements.push(GlobalInit::GlobalAddr(label));
+                                } else if let Some(val) = self.eval_const_expr(expr) {
                                     elements.push(GlobalInit::Scalar(val));
                                 } else if let Some(addr) = self.eval_global_addr_expr(expr) {
                                     elements.push(addr);

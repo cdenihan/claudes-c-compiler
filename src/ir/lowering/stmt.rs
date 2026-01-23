@@ -444,7 +444,7 @@ impl Lowerer {
 
                                     // Handle each item, with special case for string literals in char arrays
                                     if let Initializer::Expr(e) = &item.init {
-                                        if base_ty == IrType::I8 || base_ty == IrType::U8 {
+                                        if !is_array_of_pointers && (base_ty == IrType::I8 || base_ty == IrType::U8) {
                                             if let Expr::StringLiteral(s, _) = e {
                                                 self.emit_string_to_alloca(alloca, s, current_idx * elem_size);
                                                 current_idx += 1;
