@@ -539,7 +539,7 @@ impl Lowerer {
                                 self.zero_init_alloca(alloca, alloc_size);
                                 // For pointer arrays (elem_size=8 but elem_ir_ty=I8),
                                 // use I64 as the element type for stores.
-                                let md_elem_ty = if is_array_of_pointers { IrType::I64 } else { elem_ir_ty };
+                                let md_elem_ty = if is_array_of_pointers || is_array_of_func_ptrs { IrType::I64 } else { elem_ir_ty };
                                 self.lower_array_init_list(items, alloca, md_elem_ty, &array_dim_strides);
                             } else if let Some(ref s_layout) = elem_struct_layout {
                                 // Array of structs: init each element using struct layout
@@ -611,7 +611,7 @@ impl Lowerer {
 
                                 // For arrays of pointers, the element type is Ptr (8 bytes),
                                 // not the base type spec (which would be e.g. I32 for int *arr[N]).
-                                let elem_store_ty = if is_array_of_pointers { IrType::I64 } else { elem_ir_ty };
+                                let elem_store_ty = if is_array_of_pointers || is_array_of_func_ptrs { IrType::I64 } else { elem_ir_ty };
 
                                 let mut current_idx = 0usize;
                                 for item in items.iter() {
