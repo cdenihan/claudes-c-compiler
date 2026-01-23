@@ -2552,7 +2552,7 @@ impl Lowerer {
         match ctype {
             CType::Pointer(inner) => {
                 match inner.as_ref() {
-                    CType::Function(ft) => IrType::from_ctype(&ft.return_type),
+                    CType::Function(ft) => Self::ir_type_from_func_return(&ft.return_type),
                     // Function pointer declared as (*fp)(params) produces
                     // Pointer(Pointer(ReturnType)) from build_full_ctype.
                     // Peel one more layer to get to the return type.
@@ -2569,9 +2569,15 @@ impl Lowerer {
                     _ => IrType::I64,
                 }
             }
-            CType::Function(ft) => IrType::from_ctype(&ft.return_type),
+            CType::Function(ft) => Self::ir_type_from_func_return(&ft.return_type),
             _ => IrType::I64,
         }
+    }
+
+    /// Convert a function's return CType to IrType, unwrapping the spurious Pointer
+    /// layer that build_full_ctype adds for function pointer declarators like (*fp)().
+    fn ir_type_from_func_return(return_type: &CType) -> IrType {
+        Self::peel_ptr_from_return_type(return_type)
     }
 
     /// Lower __builtin_va_arg(ap, type) expression.

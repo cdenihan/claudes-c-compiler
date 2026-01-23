@@ -739,6 +739,51 @@ impl Lowerer {
         }
     }
 
+    /// Extract the return IrType from a function pointer's CType.
+    /// Handles the spurious Pointer wrapper that build_full_ctype adds for (*fp)() syntax.
+    /// For `double (*fp)(void)`, the CType is Function { return_type: Pointer(Double) }
+    /// and we need to unwrap the Pointer to get F64.
+    fn extract_func_ptr_return_type(ctype: &CType) -> IrType {
+        match ctype {
+            CType::Pointer(inner) => match inner.as_ref() {
+                CType::Function(ft) => Self::peel_ptr_from_return_type(&ft.return_type),
+                // For parameter function pointers, CType is just Pointer(ReturnType)
+                // without the Function wrapper (type_spec_to_ctype doesn't generate Function nodes)
+                CType::Float => IrType::F32,
+                CType::Double | CType::LongDouble => IrType::F64,
+                // Pointer(Pointer(X)) means returning a pointer type
+                CType::Pointer(_) => IrType::Ptr,
+                _ => IrType::I64,
+            },
+            CType::Function(ft) => Self::peel_ptr_from_return_type(&ft.return_type),
+            _ => IrType::I64,
+        }
+    }
+
+    /// Peel one Pointer layer from a function's return_type CType.
+    /// This compensates for build_full_ctype wrapping the return type in Pointer
+    /// due to the (*fp) declarator syntax.
+    pub(super) fn peel_ptr_from_return_type(return_type: &CType) -> IrType {
+        match return_type {
+            CType::Pointer(inner) => match inner.as_ref() {
+                CType::Float => IrType::F32,
+                CType::Double | CType::LongDouble => IrType::F64,
+                CType::Void => IrType::I64,
+                CType::Char | CType::UChar | CType::Short | CType::UShort
+                | CType::Int | CType::UInt | CType::Bool => IrType::I32,
+                CType::Long | CType::ULong | CType::LongLong | CType::ULongLong => IrType::I64,
+                // Pointer(Pointer(...)) means actual pointer return type
+                CType::Pointer(_) => IrType::Ptr,
+                CType::Struct(_) | CType::Union(_) => IrType::Ptr,
+                CType::Function(_) => IrType::Ptr,
+                CType::Array(_, _) => IrType::Ptr,
+                _ => IrType::I64,
+            },
+            // No Pointer wrapper - direct conversion
+            _ => IrType::from_ctype(return_type),
+        }
+    }
+
     /// Get the IR type for an expression (best-effort, based on locals/globals info).
     pub(super) fn get_expr_type(&self, expr: &Expr) -> IrType {
         match expr {
@@ -843,23 +888,24 @@ impl Lowerer {
                         return ret_ty;
                     }
                 }
+                // For (*fptr)(...) calls, check the inner identifier
+                if let Expr::Deref(inner, _) = func.as_ref() {
+                    if let Expr::Identifier(name, _) = inner.as_ref() {
+                        if let Some(&ret_ty) = self.function_return_types.get(name) {
+                            return ret_ty;
+                        }
+                        if let Some(&ret_ty) = self.function_ptr_return_types.get(name) {
+                            return ret_ty;
+                        }
+                    }
+                    // Try CType of the inner (pre-deref) expression for function pointers
+                    if let Some(inner_ctype) = self.get_expr_ctype(inner) {
+                        return Self::extract_func_ptr_return_type(&inner_ctype);
+                    }
+                }
                 // For indirect calls (function pointers), determine return type from CType
                 if let Some(ctype) = self.get_expr_ctype(func) {
-                    match &ctype {
-                        CType::Pointer(inner) => match inner.as_ref() {
-                            CType::Function(ft) => return IrType::from_ctype(&ft.return_type),
-                            CType::Pointer(ret) => match ret.as_ref() {
-                                CType::Float => return IrType::F32,
-                                CType::Double => return IrType::F64,
-                                _ => {}
-                            },
-                            CType::Float => return IrType::F32,
-                            CType::Double => return IrType::F64,
-                            _ => {}
-                        },
-                        CType::Function(ft) => return IrType::from_ctype(&ft.return_type),
-                        _ => {}
-                    }
+                    return Self::extract_func_ptr_return_type(&ctype);
                 }
                 return IrType::I64;
             }
