@@ -521,6 +521,26 @@ impl Lowerer {
                         c_type,
                         is_bool,
                     });
+
+                    // For function pointer parameters, register their return type and
+                    // parameter types so indirect calls can perform correct argument casts
+                    if let Some(p) = func.params.get(orig_idx) {
+                        if let Some(ref fptr_params) = p.fptr_params {
+                            let ret_ty = self.type_spec_to_ir(&p.type_spec);
+                            // Strip the Pointer wrapper: type_spec is Pointer(ReturnType)
+                            let ret_ty = match &p.type_spec {
+                                TypeSpecifier::Pointer(inner) => self.type_spec_to_ir(inner),
+                                _ => ret_ty,
+                            };
+                            if let Some(ref name) = p.name {
+                                self.function_ptr_return_types.insert(name.clone(), ret_ty);
+                                let param_tys: Vec<IrType> = fptr_params.iter().map(|fp| {
+                                    self.type_spec_to_ir(&fp.type_spec)
+                                }).collect();
+                                self.function_ptr_param_types.insert(name.clone(), param_tys);
+                            }
+                        }
+                    }
                 }
             }
         }

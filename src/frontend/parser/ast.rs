@@ -33,6 +33,9 @@ pub struct ParamDecl {
     pub type_spec: TypeSpecifier,
     pub name: Option<String>,
     pub span: Span,
+    /// For function pointer parameters, the parameter types of the pointed-to function.
+    /// E.g., for `float (*func)(float, float)`, this holds the two float param decls.
+    pub fptr_params: Option<Vec<ParamDecl>>,
 }
 
 /// A variable/type declaration.

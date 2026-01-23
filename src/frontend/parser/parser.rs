@@ -1233,6 +1233,7 @@ impl Parser {
                             type_spec: TypeSpecifier::Int, // K&R default type
                             name: Some(n),
                             span,
+                            fptr_params: None,
                         });
                     } else {
                         break;
@@ -1257,7 +1258,7 @@ impl Parser {
             self.skip_gcc_extensions();
             if let Some(mut type_spec) = self.parse_type_specifier() {
                 // Parse parameter declarator (handles pointers, function pointers, arrays)
-                let (name, pointer_depth, array_dims, is_func_ptr, ptr_to_array_dims) = self.parse_param_declarator_full();
+                let (name, pointer_depth, array_dims, is_func_ptr, ptr_to_array_dims, fptr_param_decls) = self.parse_param_declarator_full();
                 self.skip_gcc_extensions();
 
                 // Wrap type with pointer levels from declarator
@@ -1296,7 +1297,7 @@ impl Parser {
                     type_spec = TypeSpecifier::Pointer(Box::new(type_spec));
                 }
 
-                params.push(ParamDecl { type_spec, name, span });
+                params.push(ParamDecl { type_spec, name, span, fptr_params: fptr_param_decls });
             } else {
                 break;
             }
@@ -1321,7 +1322,7 @@ impl Parser {
     /// Parse a parameter declarator. Returns (name, pointer_depth, array_dims, is_func_ptr, ptr_to_array_dims).
     /// array_dims: list of array dimension sizes (outermost first). Empty = not an array.
     /// The outermost dimension decays to pointer; inner dimensions wrap the type as Array.
-    fn parse_param_declarator_full(&mut self) -> (Option<String>, u32, Vec<Option<Box<Expr>>>, bool, Vec<Option<Box<Expr>>>) {
+    fn parse_param_declarator_full(&mut self) -> (Option<String>, u32, Vec<Option<Box<Expr>>>, bool, Vec<Option<Box<Expr>>>, Option<Vec<ParamDecl>>) {
         // Parse leading pointer(s)
         let mut pointer_depth: u32 = 0;
         while self.consume_if(&TokenKind::Star) {
@@ -1331,6 +1332,7 @@ impl Parser {
         let mut array_dims: Vec<Option<Box<Expr>>> = Vec::new();
         let mut is_func_ptr = false;
         let mut ptr_to_array_dims: Vec<Option<Box<Expr>>> = Vec::new();
+        let mut fptr_params: Option<Vec<ParamDecl>> = None;
 
         // Check for parenthesized declarator: (*name) or (*)
         let name = if matches!(self.peek(), TokenKind::LParen) {
@@ -1355,9 +1357,10 @@ impl Parser {
                 self.skip_array_dimensions();
                 self.expect(&TokenKind::RParen);
                 if matches!(self.peek(), TokenKind::LParen) {
-                    // Function pointer: (*name)(params) - skip param list
+                    // Function pointer: (*name)(params) - parse param list
                     is_func_ptr = true;
-                    self.skip_balanced_parens();
+                    let (fp_params, _variadic) = self.parse_param_list();
+                    fptr_params = Some(fp_params);
                 } else if matches!(self.peek(), TokenKind::LBracket) {
                     // Pointer-to-array: (*p)[N][M]...
                     // Collect dims into ptr_to_array_dims (NOT regular array_dims)
@@ -1438,7 +1441,7 @@ impl Parser {
             self.skip_balanced_parens();
         }
 
-        (name, pointer_depth, array_dims, is_func_ptr, ptr_to_array_dims)
+        (name, pointer_depth, array_dims, is_func_ptr, ptr_to_array_dims, fptr_params)
     }
 
     fn parse_compound_stmt(&mut self) -> CompoundStmt {
