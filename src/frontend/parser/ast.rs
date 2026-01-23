@@ -21,6 +21,8 @@ pub struct FunctionDef {
     pub params: Vec<ParamDecl>,
     pub variadic: bool,
     pub body: CompoundStmt,
+    pub is_static: bool,
+    pub is_inline: bool,
     pub span: Span,
 }
 
@@ -58,6 +60,8 @@ pub enum DerivedDeclarator {
     Pointer,
     Array(Option<Box<Expr>>),
     Function(Vec<ParamDecl>, bool), // params, variadic
+    /// Function pointer: (*name)(params) - distinguishes from pointer-to-return-type
+    FunctionPointer(Vec<ParamDecl>, bool), // params, variadic
 }
 
 /// An initializer.

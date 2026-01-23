@@ -321,12 +321,14 @@ impl Lowerer {
                                 let builtin_arg_types: Vec<IrType> = args.iter().map(|a| self.get_expr_type(a)).collect();
                                 let arg_vals: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
                                 let dest = self.fresh_value();
+                                let variadic = self.function_variadic.contains(libc_name.as_str());
                                 self.emit(Instruction::Call {
                                     dest: Some(dest),
                                     func: libc_name.clone(),
                                     args: arg_vals,
                                     arg_types: builtin_arg_types,
                                     return_type: IrType::I64,
+                                    is_variadic: variadic,
                                 });
                                 return Operand::Value(dest);
                             }
@@ -352,10 +354,11 @@ impl Lowerer {
                                 let dest = self.fresh_value();
                                 self.emit(Instruction::Call {
                                     dest: Some(dest),
-                                    func: cleaned_name,
+                                    func: cleaned_name.clone(),
                                     args: arg_vals,
                                     arg_types: intrinsic_arg_types,
                                     return_type: IrType::I64,
+                                    is_variadic: self.function_variadic.contains(cleaned_name.as_str()),
                                 });
                                 return Operand::Value(dest);
                             }
@@ -402,6 +405,13 @@ impl Lowerer {
                 // Default to I64 if unknown (e.g., implicitly declared functions).
                 let mut call_ret_ty = IrType::I64;
 
+                // Determine variadic status for the call
+                let call_variadic = if let Expr::Identifier(name, _) = func.as_ref() {
+                    self.is_function_variadic(name)
+                } else {
+                    false
+                };
+
                 match func.as_ref() {
                     Expr::Identifier(name, _) => {
                         // Check if this is a local variable (function pointer) rather
@@ -427,6 +437,7 @@ impl Lowerer {
                                 args: arg_vals,
                                 arg_types: computed_arg_types.clone(),
                                 return_type: IrType::I64,
+                                is_variadic: call_variadic,
                             });
                         } else if is_global_fptr {
                             // Load the function pointer from a global variable
@@ -444,6 +455,7 @@ impl Lowerer {
                                 args: arg_vals,
                                 arg_types: computed_arg_types.clone(),
                                 return_type: IrType::I64,
+                                is_variadic: call_variadic,
                             });
                         } else {
                             // Direct function call - look up return type
@@ -456,6 +468,7 @@ impl Lowerer {
                                 args: arg_vals,
                                 arg_types: computed_arg_types.clone(),
                                 return_type: call_ret_ty,
+                                is_variadic: call_variadic,
                             });
                         }
                     }
@@ -469,6 +482,7 @@ impl Lowerer {
                             args: arg_vals,
                             arg_types: computed_arg_types.clone(),
                             return_type: IrType::I64,
+                            is_variadic: false,
                         });
                     }
                     _ => {
@@ -481,6 +495,7 @@ impl Lowerer {
                             args: arg_vals,
                             arg_types: computed_arg_types.clone(),
                             return_type: IrType::I64,
+                            is_variadic: false,
                         });
                     }
                 }
@@ -1160,6 +1175,25 @@ impl Lowerer {
     /// Insert an implicit type cast from src_ty to target_ty if needed.
     /// Handles float<->int conversions, float<->float conversions, and integer
     /// widening/narrowing.
+    /// Check if a function is variadic. Uses the tracked declarations first,
+    /// then falls back to a hardcoded set of common libc variadic functions
+    /// for the case where the function is implicitly declared.
+    fn is_function_variadic(&self, name: &str) -> bool {
+        if self.function_variadic.contains(name) {
+            return true;
+        }
+        // If we have parameter types for this function and it's NOT in function_variadic,
+        // it was explicitly declared as non-variadic.
+        if self.function_param_types.contains_key(name) {
+            return false;
+        }
+        // For undeclared functions, check common variadic libc functions
+        matches!(name, "printf" | "fprintf" | "sprintf" | "snprintf" | "scanf" | "sscanf"
+            | "fscanf" | "dprintf" | "vprintf" | "vfprintf" | "vsprintf" | "vsnprintf"
+            | "syslog" | "err" | "errx" | "warn" | "warnx" | "asprintf" | "vasprintf"
+            | "open" | "fcntl" | "ioctl" | "execl" | "execlp" | "execle")
+    }
+
     pub(super) fn emit_implicit_cast(&mut self, src: Operand, src_ty: IrType, target_ty: IrType) -> Operand {
         if src_ty == target_ty {
             return src;

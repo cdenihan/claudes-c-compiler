@@ -54,6 +54,7 @@ pub struct IrFunction {
     pub blocks: Vec<BasicBlock>,
     pub is_variadic: bool,
     pub is_declaration: bool, // true if no body (extern)
+    pub is_static: bool,      // true if declared with `static` linkage
     pub stack_size: usize,
 }
 
@@ -98,10 +99,10 @@ pub enum Instruction {
     Cmp { dest: Value, op: IrCmpOp, lhs: Operand, rhs: Operand, ty: IrType },
 
     /// Function call: %dest = call func(args...)
-    Call { dest: Option<Value>, func: String, args: Vec<Operand>, arg_types: Vec<IrType>, return_type: IrType },
+    Call { dest: Option<Value>, func: String, args: Vec<Operand>, arg_types: Vec<IrType>, return_type: IrType, is_variadic: bool },
 
     /// Indirect function call through a pointer: %dest = call_indirect ptr(args...)
-    CallIndirect { dest: Option<Value>, func_ptr: Operand, args: Vec<Operand>, arg_types: Vec<IrType>, return_type: IrType },
+    CallIndirect { dest: Option<Value>, func_ptr: Operand, args: Vec<Operand>, arg_types: Vec<IrType>, return_type: IrType, is_variadic: bool },
 
     /// Get element pointer (for arrays/structs)
     GetElementPtr { dest: Value, base: Value, offset: Operand, ty: IrType },
@@ -213,6 +214,7 @@ impl IrFunction {
             blocks: Vec::new(),
             is_variadic,
             is_declaration: false,
+            is_static: false,
             stack_size: 0,
         }
     }

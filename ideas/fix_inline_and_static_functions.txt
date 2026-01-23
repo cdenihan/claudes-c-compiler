@@ -1,24 +1,9 @@
-Fix static inline functions emitted as global symbols.
+Remaining issue from static/inline function fix:
 
-Problem: System headers (glibc) define helper functions like __bswap_16,
-__bswap_32, __uint64_identity as 'static inline'. Our compiler emits these
-as global (T) symbols instead of local (t) symbols, causing "multiple
-definition" linker errors when linking multiple object files that include
-the same headers.
+Our compiler sometimes generates BSS globals for local variables declared
+inside blocks within switch cases and macro expansions. For example,
+'int cond;' inside a { } block might be emitted as a global BSS symbol.
+This is likely a parser/codegen scope issue with variable declarations
+inside nested blocks.
 
-This blocks: zlib (and likely all other target projects).
-
-Examples of affected functions from <byteswap.h> and <endian.h>:
-- __bswap_16, __bswap_32, __bswap_64
-- __uint16_identity, __uint32_identity, __uint64_identity
-
-Fix needed:
-1. Parse 'static' storage class on function definitions
-2. Emit static functions with local binding (STB_LOCAL) in ELF
-3. For 'inline' functions, either inline them or emit as local symbols
-4. For 'static inline', always emit as local (if used) or omit (if not used)
-
-Additionally, our compiler generates a BSS global for local variables
-declared inside blocks within switch cases and macro expansions
-(e.g., 'int cond;' inside a { } block was emitted as a global BSS
-symbol in lvm.o). This is likely a parser/codegen scope issue.
+(static function linkage and inline function emission have been fixed.)

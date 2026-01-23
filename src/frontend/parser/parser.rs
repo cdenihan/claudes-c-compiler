@@ -15,6 +15,8 @@ pub struct Parser {
     parsing_static: bool,
     /// Set to true when parse_type_specifier encounters an `extern` keyword.
     parsing_extern: bool,
+    /// Set to true when parse_type_specifier encounters an `inline` keyword.
+    parsing_inline: bool,
 }
 
 impl Parser {
@@ -26,6 +28,7 @@ impl Parser {
             parsing_typedef: false,
             parsing_static: false,
             parsing_extern: false,
+            parsing_inline: false,
         }
     }
 
@@ -226,6 +229,7 @@ impl Parser {
         self.parsing_typedef = false;
         self.parsing_static = false;
         self.parsing_extern = false;
+        self.parsing_inline = false;
 
         // Try to parse a type + name, then determine if it's a function def or declaration
         let start = self.peek_span();
@@ -299,13 +303,30 @@ impl Parser {
                 params
             };
 
+            let is_static = self.parsing_static;
+            let is_inline = self.parsing_inline;
+            // Wrap return type with any pointer derivations before the Function
+            // e.g., for `char *func()`, derived = [Pointer, Function(...)]
+            // so return_type should be Pointer(Char) not just Char
+            let mut return_type = type_spec;
+            for d in &derived {
+                match d {
+                    DerivedDeclarator::Pointer => {
+                        return_type = TypeSpecifier::Pointer(Box::new(return_type));
+                    }
+                    DerivedDeclarator::Function(_, _) => break,
+                    _ => {}
+                }
+            }
             let body = self.parse_compound_stmt();
             Some(ExternalDecl::FunctionDef(FunctionDef {
-                return_type: type_spec,
+                return_type,
                 name: name.unwrap_or_default(),
                 params: final_params,
                 variadic,
                 body,
+                is_static,
+                is_inline,
                 span: start,
             }))
         } else {
@@ -467,9 +488,13 @@ impl Parser {
             match self.peek().clone() {
                 // Qualifiers (skip)
                 TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict
-                | TokenKind::Register | TokenKind::Inline | TokenKind::Noreturn
+                | TokenKind::Register | TokenKind::Noreturn
                 | TokenKind::Auto => {
                     self.advance();
+                }
+                TokenKind::Inline => {
+                    self.advance();
+                    self.parsing_inline = true;
                 }
                 // Storage classes
                 TokenKind::Static => {
@@ -654,8 +679,12 @@ impl Parser {
                         self.advance();
                         self.parsing_extern = true;
                     }
-                    TokenKind::Register | TokenKind::Inline | TokenKind::Noreturn => {
+                    TokenKind::Register | TokenKind::Noreturn => {
                         self.advance();
+                    }
+                    TokenKind::Inline => {
+                        self.advance();
+                        self.parsing_inline = true;
                     }
                     TokenKind::Attribute => {
                         self.advance();
@@ -799,8 +828,12 @@ impl Parser {
                     self.advance();
                     self.parsing_extern = true;
                 }
-                TokenKind::Register | TokenKind::Inline | TokenKind::Noreturn => {
+                TokenKind::Register | TokenKind::Noreturn => {
                     self.advance();
+                }
+                TokenKind::Inline => {
+                    self.advance();
+                    self.parsing_inline = true;
                 }
                 TokenKind::Attribute => {
                     self.advance();
@@ -937,7 +970,7 @@ impl Parser {
                 // Parse the function parameter list or array that follows
                 if matches!(self.peek(), TokenKind::LParen) {
                     let (params, variadic) = self.parse_param_list();
-                    derived.push(DerivedDeclarator::Function(params, variadic));
+                    derived.push(DerivedDeclarator::FunctionPointer(params, variadic));
                 }
                 while matches!(self.peek(), TokenKind::LBracket) {
                     self.advance();
@@ -1228,6 +1261,7 @@ impl Parser {
         self.parsing_static = false;
         self.parsing_extern = false;
         self.parsing_typedef = false;
+        self.parsing_inline = false;
         let type_spec = self.parse_type_specifier()?;
         let is_static = self.parsing_static;
         let is_extern = self.parsing_extern;

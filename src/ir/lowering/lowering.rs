@@ -110,6 +110,8 @@ pub struct Lowerer {
     pub(super) function_return_types: HashMap<String, IrType>,
     /// Function name -> parameter types mapping for inserting implicit argument casts.
     pub(super) function_param_types: HashMap<String, Vec<IrType>>,
+    /// Function name -> is_variadic flag for calling convention handling.
+    pub(super) function_variadic: HashSet<String>,
 }
 
 impl Lowerer {
@@ -142,6 +144,7 @@ impl Lowerer {
             typedefs: HashMap::new(),
             function_return_types: HashMap::new(),
             function_param_types: HashMap::new(),
+            function_variadic: HashSet::new(),
         }
     }
 
@@ -164,22 +167,42 @@ impl Lowerer {
                 if !func.variadic || !param_tys.is_empty() {
                     self.function_param_types.insert(func.name.clone(), param_tys);
                 }
+                if func.variadic {
+                    self.function_variadic.insert(func.name.clone());
+                }
             }
             // Also detect function declarations (extern prototypes)
             if let ExternalDecl::Declaration(decl) = decl {
                 for declarator in &decl.declarators {
+                    // Find the Function derived declarator and count preceding Pointer derivations
+                    let mut ptr_count = 0;
+                    let mut func_info = None;
                     for d in &declarator.derived {
-                        if let DerivedDeclarator::Function(params, variadic) = d {
-                            self.known_functions.insert(declarator.name.clone());
-                            let ret_ty = self.type_spec_to_ir(&decl.type_spec);
-                            self.function_return_types.insert(declarator.name.clone(), ret_ty);
-                            let param_tys: Vec<IrType> = params.iter().map(|p| {
-                                self.type_spec_to_ir(&p.type_spec)
-                            }).collect();
-                            if !variadic || !param_tys.is_empty() {
-                                self.function_param_types.insert(declarator.name.clone(), param_tys);
+                        match d {
+                            DerivedDeclarator::Pointer => ptr_count += 1,
+                            DerivedDeclarator::Function(p, v) => {
+                                func_info = Some((p, v));
+                                break;
                             }
-                            break;
+                            _ => {}
+                        }
+                    }
+                    if let Some((params, variadic)) = func_info {
+                        self.known_functions.insert(declarator.name.clone());
+                        // Wrap return type with pointer levels from derived declarators
+                        let mut ret_ty = self.type_spec_to_ir(&decl.type_spec);
+                        if ptr_count > 0 {
+                            ret_ty = IrType::Ptr;
+                        }
+                        self.function_return_types.insert(declarator.name.clone(), ret_ty);
+                        let param_tys: Vec<IrType> = params.iter().map(|p| {
+                            self.type_spec_to_ir(&p.type_spec)
+                        }).collect();
+                        if !variadic || !param_tys.is_empty() {
+                            self.function_param_types.insert(declarator.name.clone(), param_tys);
+                        }
+                        if *variadic {
+                            self.function_variadic.insert(declarator.name.clone());
                         }
                     }
                 }
@@ -396,6 +419,7 @@ impl Lowerer {
             blocks: std::mem::take(&mut self.current_blocks),
             is_variadic: func.variadic,
             is_declaration: false,
+            is_static: func.is_static,
             stack_size: 0,
         };
         self.module.functions.push(ir_func);
@@ -436,16 +460,15 @@ impl Lowerer {
                 continue; // Skip anonymous declarations (e.g., struct definitions)
             }
 
-            // Skip function declarations (but NOT function pointer variables).
-            // A function pointer variable has both Pointer and Function derived declarators,
-            // e.g., int (*fp)(int, int) = add; has [Pointer, Function(...)].
-            // A pure function declaration only has Function, e.g., int func(int, int);
-            // Also: if it has an initializer, it must be a variable.
-            if declarator.derived.iter().any(|d| matches!(d, DerivedDeclarator::Function(_, _))) {
-                let has_pointer = declarator.derived.iter().any(|d| matches!(d, DerivedDeclarator::Pointer));
-                if !has_pointer && declarator.init.is_none() {
-                    continue;
-                }
+            // Skip function declarations (prototypes), but NOT function pointer variables.
+            // Function declarations use DerivedDeclarator::Function (e.g., int func(int);
+            // or char *func(int);). Function pointer variables use FunctionPointer
+            // (e.g., int (*fp)(int) = add;).
+            if declarator.derived.iter().any(|d| matches!(d, DerivedDeclarator::Function(_, _)))
+                && !declarator.derived.iter().any(|d| matches!(d, DerivedDeclarator::FunctionPointer(_, _)))
+                && declarator.init.is_none()
+            {
+                continue;
             }
 
             // extern without initializer: track the type but don't emit a .bss entry

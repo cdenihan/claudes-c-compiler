@@ -233,7 +233,8 @@ impl ArmCodegen {
         match ty {
             IrType::I8 | IrType::U8 => "strb",
             IrType::I16 | IrType::U16 => "strh",
-            _ => "str",
+            IrType::I32 | IrType::U32 | IrType::F32 => "str",  // 32-bit store with w register
+            _ => "str",  // 64-bit store with x register
         }
     }
 
@@ -244,14 +245,14 @@ impl ArmCodegen {
             IrType::I16 => "ldrsh",
             IrType::U16 => "ldrh",
             IrType::I32 => "ldrsw",
-            IrType::U32 => "ldr",
+            IrType::U32 | IrType::F32 => "ldr",  // 32-bit load
             _ => "ldr",
         }
     }
 
     fn load_dest_reg(ty: IrType) -> &'static str {
         match ty {
-            IrType::U8 | IrType::U16 | IrType::U32 => "w0",
+            IrType::U8 | IrType::U16 | IrType::U32 | IrType::F32 => "w0",
             _ => "x0",
         }
     }
@@ -260,7 +261,7 @@ impl ArmCodegen {
     fn reg_for_type(base: &str, ty: IrType) -> &'static str {
         let use_w = matches!(ty,
             IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 |
-            IrType::I32 | IrType::U32
+            IrType::I32 | IrType::U32 | IrType::F32
         );
         match base {
             "x0" => if use_w { "w0" } else { "x0" },
@@ -502,16 +503,33 @@ impl ArchCodegen for ArmCodegen {
             self.state.emit("    mov x1, x0");
             self.operand_to_x0(rhs);
             self.state.emit("    mov x2, x0");
-            self.state.emit("    fmov d0, x1");
-            self.state.emit("    fmov d1, x2");
-            match op {
-                IrBinOp::Add => self.state.emit("    fadd d0, d0, d1"),
-                IrBinOp::Sub => self.state.emit("    fsub d0, d0, d1"),
-                IrBinOp::Mul => self.state.emit("    fmul d0, d0, d1"),
-                IrBinOp::SDiv | IrBinOp::UDiv => self.state.emit("    fdiv d0, d0, d1"),
-                _ => self.state.emit("    fadd d0, d0, d1"),
+            if ty == IrType::F32 {
+                // Single-precision: use s registers
+                self.state.emit("    fmov s0, w1");
+                self.state.emit("    fmov s1, w2");
+                match op {
+                    IrBinOp::Add => self.state.emit("    fadd s0, s0, s1"),
+                    IrBinOp::Sub => self.state.emit("    fsub s0, s0, s1"),
+                    IrBinOp::Mul => self.state.emit("    fmul s0, s0, s1"),
+                    IrBinOp::SDiv | IrBinOp::UDiv => self.state.emit("    fdiv s0, s0, s1"),
+                    _ => self.state.emit("    fadd s0, s0, s1"),
+                }
+                self.state.emit("    fmov w0, s0");
+                // Zero-extend to 64-bit so upper bits are clean
+                self.state.emit("    mov w0, w0");
+            } else {
+                // Double-precision: use d registers
+                self.state.emit("    fmov d0, x1");
+                self.state.emit("    fmov d1, x2");
+                match op {
+                    IrBinOp::Add => self.state.emit("    fadd d0, d0, d1"),
+                    IrBinOp::Sub => self.state.emit("    fsub d0, d0, d1"),
+                    IrBinOp::Mul => self.state.emit("    fmul d0, d0, d1"),
+                    IrBinOp::SDiv | IrBinOp::UDiv => self.state.emit("    fdiv d0, d0, d1"),
+                    _ => self.state.emit("    fadd d0, d0, d1"),
+                }
+                self.state.emit("    fmov x0, d0");
             }
-            self.state.emit("    fmov x0, d0");
             self.store_x0_to(dest);
             return;
         }
@@ -591,9 +609,16 @@ impl ArchCodegen for ArmCodegen {
         if ty.is_float() {
             match op {
                 IrUnaryOp::Neg => {
-                    self.state.emit("    fmov d0, x0");
-                    self.state.emit("    fneg d0, d0");
-                    self.state.emit("    fmov x0, d0");
+                    if ty == IrType::F32 {
+                        self.state.emit("    fmov s0, w0");
+                        self.state.emit("    fneg s0, s0");
+                        self.state.emit("    fmov w0, s0");
+                        self.state.emit("    mov w0, w0"); // zero-extend
+                    } else {
+                        self.state.emit("    fmov d0, x0");
+                        self.state.emit("    fneg d0, d0");
+                        self.state.emit("    fmov x0, d0");
+                    }
                 }
                 IrUnaryOp::Not => self.state.emit("    mvn x0, x0"),
             }
@@ -611,9 +636,15 @@ impl ArchCodegen for ArmCodegen {
             self.operand_to_x0(lhs);
             self.state.emit("    mov x1, x0");
             self.operand_to_x0(rhs);
-            self.state.emit("    fmov d0, x1");
-            self.state.emit("    fmov d1, x0");
-            self.state.emit("    fcmp d0, d1");
+            if ty == IrType::F32 {
+                self.state.emit("    fmov s0, w1");
+                self.state.emit("    fmov s1, w0");
+                self.state.emit("    fcmp s0, s1");
+            } else {
+                self.state.emit("    fmov d0, x1");
+                self.state.emit("    fmov d1, x0");
+                self.state.emit("    fcmp d0, d1");
+            }
             let cond = match op {
                 IrCmpOp::Eq => "eq",
                 IrCmpOp::Ne => "ne",
@@ -656,7 +687,8 @@ impl ArchCodegen for ArmCodegen {
     }
 
     fn emit_call(&mut self, args: &[Operand], arg_types: &[IrType], direct_name: Option<&str>,
-                 func_ptr: Option<&Operand>, dest: Option<Value>, return_type: IrType) {
+                 func_ptr: Option<&Operand>, dest: Option<Value>, return_type: IrType,
+                 _is_variadic: bool) {
         let num_args = args.len().min(8);
         let mut float_reg_idx = 0usize;
         let mut int_reg_idx = 0usize;
@@ -676,7 +708,8 @@ impl ArchCodegen for ArmCodegen {
         }
         // Move from temps to arg registers using type info for float detection.
         // Float args go to dN; integer args go to xN.
-        // For AAPCS64: float/double args use d0-d7, int args use x0-x7.
+        // For AAPCS64 (Linux): float/double args use d0-d7, int args use x0-x7,
+        // even for variadic functions.
         for (i, _arg) in args.iter().enumerate().take(num_args) {
             let arg_ty = if i < arg_types.len() {
                 Some(arg_types[i])

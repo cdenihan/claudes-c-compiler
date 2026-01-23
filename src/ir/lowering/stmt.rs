@@ -393,6 +393,13 @@ impl Lowerer {
                                         }
                                         _ => Operand::Const(IrConst::I64(0)),
                                     };
+                                    // Implicit cast: handle type mismatches (e.g. double literal -> float array element)
+                                    let val = if let Initializer::Expr(e) = &item.init {
+                                        let expr_ty = self.get_expr_type(e);
+                                        self.emit_implicit_cast(val, expr_ty, base_ty)
+                                    } else {
+                                        val
+                                    };
                                     let offset_val = Operand::Const(IrConst::I64((current_idx * elem_size) as i64));
                                     let elem_addr = self.fresh_value();
                                     self.emit(Instruction::GetElementPtr {
@@ -489,6 +496,8 @@ impl Lowerer {
                             flat_index += sub_elem_count;
                         } else {
                             let val = self.lower_expr(e);
+                            let expr_ty = self.get_expr_type(e);
+                            let val = self.emit_implicit_cast(val, expr_ty, base_ty);
                             let offset_val = Operand::Const(IrConst::I64((flat_index * elem_size) as i64));
                             let elem_addr = self.fresh_value();
                             self.emit(Instruction::GetElementPtr {
@@ -502,6 +511,8 @@ impl Lowerer {
                         }
                     } else {
                         let val = self.lower_expr(e);
+                        let expr_ty = self.get_expr_type(e);
+                        let val = self.emit_implicit_cast(val, expr_ty, base_ty);
                         let offset_val = Operand::Const(IrConst::I64((flat_index * elem_size) as i64));
                         let elem_addr = self.fresh_value();
                         self.emit(Instruction::GetElementPtr {
@@ -549,6 +560,8 @@ impl Lowerer {
                         for sub_item in sub_items {
                             if let Initializer::Expr(e) = &sub_item.init {
                                 let val = self.lower_expr(e);
+                                let expr_ty = self.get_expr_type(e);
+                                let val = self.emit_implicit_cast(val, expr_ty, base_ty);
                                 let offset_val = Operand::Const(IrConst::I64((*flat_index * elem_size) as i64));
                                 let elem_addr = self.fresh_value();
                                 self.emit(Instruction::GetElementPtr {
@@ -565,6 +578,8 @@ impl Lowerer {
                 }
                 Initializer::Expr(e) => {
                     let val = self.lower_expr(e);
+                    let expr_ty = self.get_expr_type(e);
+                    let val = self.emit_implicit_cast(val, expr_ty, base_ty);
                     let offset_val = Operand::Const(IrConst::I64((*flat_index * elem_size) as i64));
                     let elem_addr = self.fresh_value();
                     self.emit(Instruction::GetElementPtr {

@@ -1133,7 +1133,7 @@ impl Lowerer {
                     });
                     result = CType::Array(Box::new(result), size);
                 }
-                DerivedDeclarator::Function(_, _) => {
+                DerivedDeclarator::Function(_, _) | DerivedDeclarator::FunctionPointer(_, _) => {
                     // Function declarator - treat as pointer to function
                     result = CType::Pointer(Box::new(result));
                 }

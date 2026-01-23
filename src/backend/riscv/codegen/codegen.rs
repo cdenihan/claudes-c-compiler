@@ -555,7 +555,8 @@ impl ArchCodegen for RiscvCodegen {
     }
 
     fn emit_call(&mut self, args: &[Operand], arg_types: &[IrType], direct_name: Option<&str>,
-                 func_ptr: Option<&Operand>, dest: Option<Value>, return_type: IrType) {
+                 func_ptr: Option<&Operand>, dest: Option<Value>, return_type: IrType,
+                 is_variadic: bool) {
         let float_arg_regs = ["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"];
         let mut int_idx = 0usize;
         let mut float_idx = 0usize;
@@ -566,7 +567,8 @@ impl ArchCodegen for RiscvCodegen {
             } else {
                 matches!(arg, Operand::Const(IrConst::F32(_) | IrConst::F64(_)))
             };
-            if is_float_arg && float_idx < 8 {
+            // For variadic functions, ALL arguments go through integer registers (a0-a7)
+            if is_float_arg && !is_variadic && float_idx < 8 {
                 self.operand_to_t0(arg);
                 let arg_ty = if i < arg_types.len() { Some(arg_types[i]) } else { None };
                 if arg_ty == Some(IrType::F32) {

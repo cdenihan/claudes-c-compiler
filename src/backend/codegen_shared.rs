@@ -120,8 +120,10 @@ pub trait ArchCodegen {
 
     /// Emit a function call (direct or indirect).
     /// `arg_types` provides the IR type of each argument for proper calling convention handling.
+    /// `is_variadic` indicates the called function uses variadic arguments (affects calling convention).
     fn emit_call(&mut self, args: &[Operand], arg_types: &[IrType], direct_name: Option<&str>,
-                 func_ptr: Option<&Operand>, dest: Option<Value>, return_type: IrType);
+                 func_ptr: Option<&Operand>, dest: Option<Value>, return_type: IrType,
+                 is_variadic: bool);
 
     /// Emit a global address load.
     fn emit_global_addr(&mut self, dest: &Value, name: &str);
@@ -177,7 +179,9 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction) {
     cg.state().reset_for_function();
 
     let type_dir = cg.function_type_directive();
-    cg.state().emit(&format!(".globl {}", func.name));
+    if !func.is_static {
+        cg.state().emit(&format!(".globl {}", func.name));
+    }
     cg.state().emit(&format!(".type {}, {}", func.name, type_dir));
     cg.state().emit(&format!("{}:", func.name));
 
@@ -225,11 +229,11 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction) {
         Instruction::Cmp { dest, op, lhs, rhs, ty } => {
             cg.emit_cmp(dest, *op, lhs, rhs, *ty);
         }
-        Instruction::Call { dest, func, args, arg_types, return_type } => {
-            cg.emit_call(args, arg_types, Some(func), None, *dest, *return_type);
+        Instruction::Call { dest, func, args, arg_types, return_type, is_variadic } => {
+            cg.emit_call(args, arg_types, Some(func), None, *dest, *return_type, *is_variadic);
         }
-        Instruction::CallIndirect { dest, func_ptr, args, arg_types, return_type } => {
-            cg.emit_call(args, arg_types, None, Some(func_ptr), *dest, *return_type);
+        Instruction::CallIndirect { dest, func_ptr, args, arg_types, return_type, is_variadic } => {
+            cg.emit_call(args, arg_types, None, Some(func_ptr), *dest, *return_type, *is_variadic);
         }
         Instruction::GlobalAddr { dest, name } => {
             cg.emit_global_addr(dest, name);

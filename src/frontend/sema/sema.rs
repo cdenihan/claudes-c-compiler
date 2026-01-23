@@ -117,10 +117,15 @@ impl SemanticAnalyzer {
             params: params.clone(),
             variadic: func.variadic,
         }));
+        let storage_class = if func.is_static {
+            StorageClass::Static
+        } else {
+            StorageClass::Extern
+        };
         self.symbol_table.declare(Symbol {
             name: func.name.clone(),
             ty: func_ctype,
-            storage_class: StorageClass::Extern,
+            storage_class,
             span: func.span,
             is_defined: true,
         });
@@ -514,7 +519,8 @@ impl SemanticAnalyzer {
                         .and_then(|e| self.eval_const_expr(e).map(|v| v as usize));
                     ty = CType::Array(Box::new(ty), size);
                 }
-                DerivedDeclarator::Function(params, variadic) => {
+                DerivedDeclarator::Function(params, variadic)
+                | DerivedDeclarator::FunctionPointer(params, variadic) => {
                     let param_types: Vec<(CType, Option<String>)> = params.iter().map(|p| {
                         let pt = self.type_spec_to_ctype(&p.type_spec);
                         (pt, p.name.clone())

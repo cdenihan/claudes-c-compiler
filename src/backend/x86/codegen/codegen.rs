@@ -437,12 +437,21 @@ impl ArchCodegen for X86Codegen {
         if ty.is_float() {
             match op {
                 IrUnaryOp::Neg => {
-                    // XOR sign bit to negate float
-                    self.state.emit("    movq %rax, %xmm0");
-                    self.state.emit("    movabsq $-9223372036854775808, %rcx"); // 0x8000000000000000
-                    self.state.emit("    movq %rcx, %xmm1");
-                    self.state.emit("    xorpd %xmm1, %xmm0");
-                    self.state.emit("    movq %xmm0, %rax");
+                    if ty == IrType::F32 {
+                        // XOR sign bit (bit 31) to negate float
+                        self.state.emit("    movq %rax, %xmm0");
+                        self.state.emit("    movl $0x80000000, %ecx");
+                        self.state.emit("    movd %ecx, %xmm1");
+                        self.state.emit("    xorps %xmm1, %xmm0");
+                        self.state.emit("    movq %xmm0, %rax");
+                    } else {
+                        // XOR sign bit (bit 63) to negate double
+                        self.state.emit("    movq %rax, %xmm0");
+                        self.state.emit("    movabsq $-9223372036854775808, %rcx"); // 0x8000000000000000
+                        self.state.emit("    movq %rcx, %xmm1");
+                        self.state.emit("    xorpd %xmm1, %xmm0");
+                        self.state.emit("    movq %xmm0, %rax");
+                    }
                 }
                 IrUnaryOp::Not => self.state.emit("    notq %rax"),
             }
@@ -509,7 +518,8 @@ impl ArchCodegen for X86Codegen {
     }
 
     fn emit_call(&mut self, args: &[Operand], arg_types: &[IrType], direct_name: Option<&str>,
-                 func_ptr: Option<&Operand>, dest: Option<Value>, return_type: IrType) {
+                 func_ptr: Option<&Operand>, dest: Option<Value>, return_type: IrType,
+                 _is_variadic: bool) {
         // Classify args: float args go in xmm regs, others in int regs
         let mut stack_args: Vec<&Operand> = Vec::new();
         let mut int_idx = 0usize;
