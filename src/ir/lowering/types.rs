@@ -731,6 +731,7 @@ impl Lowerer {
                             CType::Double => return IrType::F64,
                             _ => {}
                         },
+                        CType::Function(ft) => return IrType::from_ctype(&ft.return_type),
                         _ => {}
                     }
                 }
@@ -1761,12 +1762,30 @@ impl Lowerer {
         // - Pointers are applied immediately (forward order)
         // - Consecutive Array dimensions are collected and applied in reverse
         //   (so `int m[3][4]` with derived [Array(3), Array(4)] becomes Array(Array(Int,4),3))
+        // - For function pointers: [Pointer, FunctionPointer] means the Pointer wraps the
+        //   function type, not the base/return type. So we defer Pointer when followed by
+        //   FunctionPointer.
         let mut i = 0;
         while i < derived.len() {
             match &derived[i] {
                 DerivedDeclarator::Pointer => {
-                    result = CType::Pointer(Box::new(result));
-                    i += 1;
+                    // Check if this Pointer is followed by FunctionPointer - if so,
+                    // the Pointer wraps the function type (pointer-to-function), not
+                    // the return type.
+                    if i + 1 < derived.len() && matches!(&derived[i + 1], DerivedDeclarator::FunctionPointer(_, _)) {
+                        // Skip Pointer for now; FunctionPointer will use 'result' as
+                        // return type, then we wrap in Pointer after.
+                        let func_type = CType::Function(Box::new(crate::common::types::FunctionType {
+                            return_type: result,
+                            params: Vec::new(),
+                            variadic: false,
+                        }));
+                        result = CType::Pointer(Box::new(func_type));
+                        i += 2; // skip both Pointer and FunctionPointer
+                    } else {
+                        result = CType::Pointer(Box::new(result));
+                        i += 1;
+                    }
                 }
                 DerivedDeclarator::Array(_) => {
                     // Collect all consecutive Array declarators
@@ -1794,6 +1813,7 @@ impl Lowerer {
                     i += 1;
                 }
                 DerivedDeclarator::FunctionPointer(_, _) => {
+                    // Standalone FunctionPointer without preceding Pointer
                     let func_type = CType::Function(Box::new(crate::common::types::FunctionType {
                         return_type: result,
                         params: Vec::new(),
