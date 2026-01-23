@@ -1,5 +1,7 @@
 Future optimization passes to implement:
 
+Note: Blocked on SSA
+
 The following passes are implemented and working:
 - Constant folding (constant_fold.rs)
 - Dead code elimination (dce.rs)

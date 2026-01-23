@@ -1,5 +1,7 @@
 Implement a register allocator:
 
+Note: Blocked on SSA
+
 Current codegen uses a stack-based approach where every value is stored
 on the stack. This is correct but very slow.
 
