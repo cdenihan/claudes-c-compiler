@@ -1073,6 +1073,24 @@ impl Lowerer {
                 Some(Designator::Field(ref name)) => Some(name.as_str()),
                 _ => None,
             };
+            // Check for array index designator after field designator: .field[idx]
+            let array_start_idx: Option<usize> = if designator_name.is_some() {
+                item.designators.iter().find_map(|d| {
+                    if let Designator::Index(ref idx_expr) = d {
+                        self.eval_const_expr(idx_expr).and_then(|c| c.to_usize())
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                // Check for bare index designator on current field (when field is an array)
+                match item.designators.first() {
+                    Some(Designator::Index(ref idx_expr)) => {
+                        self.eval_const_expr(idx_expr).and_then(|c| c.to_usize())
+                    }
+                    _ => None,
+                }
+            };
             let field_idx = match layout.resolve_init_field_idx(designator_name, current_field_idx) {
                 Some(idx) => idx,
                 None => {
@@ -1221,11 +1239,13 @@ impl Lowerer {
                             // Flat initializer: fill array elements from consecutive items
                             // in the init list. E.g., struct { int a[3]; } x = {1, 2, 3};
                             // The items 1, 2, 3 fill a[0], a[1], a[2] respectively.
+                            // If an index designator is present (e.g., .a[1]=val), start from that index.
+                            let start_ai = array_start_idx.unwrap_or(0);
                             if matches!(elem_ty.as_ref(), CType::Struct(_) | CType::Union(_)) {
                                 // Array of structs: consume items for each struct element
                                 if let CType::Struct(st) = elem_ty.as_ref() {
                                     let sub_layout = StructLayout::for_struct(&st.fields);
-                                    for ai in 0..*arr_size {
+                                    for ai in start_ai..*arr_size {
                                         if item_idx >= items.len() { break; }
                                         let elem_offset = field_offset + ai * elem_size;
                                         let consumed = self.fill_struct_global_bytes(&items[item_idx..], &sub_layout, bytes, elem_offset);
@@ -1233,7 +1253,7 @@ impl Lowerer {
                                     }
                                 } else {
                                     // Union: take one item per element
-                                    for ai in 0..*arr_size {
+                                    for ai in start_ai..*arr_size {
                                         if item_idx >= items.len() { break; }
                                         let elem_offset = field_offset + ai * elem_size;
                                         if let Initializer::Expr(e) = &items[item_idx].init {
@@ -1244,17 +1264,19 @@ impl Lowerer {
                                     }
                                 }
                             } else {
-                                // Array of scalars: consume up to arr_size items
+                                // Array of scalars: consume up to arr_size items starting from start_ai
                                 let mut consumed = 0usize;
-                                while consumed < *arr_size && (item_idx + consumed) < items.len() {
+                                let mut ai = start_ai;
+                                while ai < *arr_size && (item_idx + consumed) < items.len() {
                                     let cur_item = &items[item_idx + consumed];
                                     // Stop if we hit a designator (targeting a different field)
-                                    if !cur_item.designators.is_empty() { break; }
+                                    if !cur_item.designators.is_empty() && consumed > 0 { break; }
                                     if let Initializer::Expr(e) = &cur_item.init {
                                         let val = self.eval_const_expr(e).unwrap_or(IrConst::I64(0));
-                                        let elem_offset = field_offset + consumed * elem_size;
+                                        let elem_offset = field_offset + ai * elem_size;
                                         self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
                                         consumed += 1;
+                                        ai += 1;
                                     } else {
                                         break;
                                     }

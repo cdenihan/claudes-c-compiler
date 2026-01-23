@@ -1067,6 +1067,7 @@ impl Lowerer {
                 let key = format!("union.{}", tag);
                 self.struct_layouts.get(&key).map(|l| l.size).unwrap_or(8)
             }
+            TypeSpecifier::Enum(_, _) => 4, // enums are always int-sized
             _ => 8,
         }
     }

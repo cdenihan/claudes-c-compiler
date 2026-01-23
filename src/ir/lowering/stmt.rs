@@ -657,7 +657,7 @@ impl Lowerer {
                             continue;
                         }
                     }
-                    // Bare expression: store at current flat index, no boundary snap
+                    // Bare scalar: fills one base element without sub-array padding
                     let val = self.lower_and_cast_init_expr(e, base_ty);
                     self.emit_array_element_store(alloca, val, *flat_index * elem_size, base_ty);
                     *flat_index += 1;
