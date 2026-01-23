@@ -395,15 +395,28 @@ impl Lowerer {
                                         offset: Operand::Const(IrConst::I64(base_byte_offset as i64)),
                                         ty: IrType::I8,
                                     });
+                                    // Check for field designator after index designator: [idx].field = val
+                                    let field_designator_name = item.designators.iter().find_map(|d| {
+                                        if let Designator::Field(ref name) = d {
+                                            Some(name.clone())
+                                        } else {
+                                            None
+                                        }
+                                    });
                                     match &item.init {
                                         Initializer::List(sub_items) => {
                                             // Initialize struct fields from sub-list
                                             self.lower_local_struct_init(sub_items, elem_base, s_layout);
                                         }
                                         Initializer::Expr(e) => {
-                                            // Single expr: assign to first field
                                             if !s_layout.fields.is_empty() {
-                                                let field = &s_layout.fields[0];
+                                                // Use designated field if specified, otherwise first field
+                                                let field = if let Some(ref fname) = field_designator_name {
+                                                    s_layout.fields.iter().find(|f| &f.name == fname)
+                                                        .unwrap_or(&s_layout.fields[0])
+                                                } else {
+                                                    &s_layout.fields[0]
+                                                };
                                                 let field_ty = IrType::from_ctype(&field.ty);
                                                 let val = self.lower_expr(e);
                                                 let field_addr = self.fresh_value();
@@ -417,7 +430,10 @@ impl Lowerer {
                                             }
                                         }
                                     }
-                                    current_idx += 1;
+                                    // Only advance current_idx if no field designator
+                                    if field_designator_name.is_none() {
+                                        current_idx += 1;
+                                    }
                                 }
                             } else {
                                 // 1D array: supports designated initializers [idx] = val

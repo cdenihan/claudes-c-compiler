@@ -816,23 +816,39 @@ impl Lowerer {
                                 break;
                             }
                             let base_offset = current_idx * struct_size;
+                            // Check for field designator after index designator: [idx].field = val
+                            let field_designator_name = item.designators.iter().find_map(|d| {
+                                if let Designator::Field(ref name) = d {
+                                    Some(name.clone())
+                                } else {
+                                    None
+                                }
+                            });
                             match &item.init {
                                 Initializer::List(sub_items) => {
                                     // Sub-list initializer for struct element
                                     self.write_struct_init_to_bytes(&mut bytes, base_offset, sub_items, layout);
                                 }
                                 Initializer::Expr(expr) => {
-                                    // Single expression for first field
                                     if let Some(val) = self.eval_const_expr(expr) {
                                         if !layout.fields.is_empty() {
-                                            let field = &layout.fields[0];
+                                            // Use designated field if specified, otherwise first field
+                                            let field = if let Some(ref fname) = field_designator_name {
+                                                layout.fields.iter().find(|f| &f.name == fname)
+                                                    .unwrap_or(&layout.fields[0])
+                                            } else {
+                                                &layout.fields[0]
+                                            };
                                             let field_ir_ty = IrType::from_ctype(&field.ty);
                                             self.write_const_to_bytes(&mut bytes, base_offset + field.offset, &val, field_ir_ty);
                                         }
                                     }
                                 }
                             }
-                            current_idx += 1;
+                            // Only advance current_idx if no field designator (sequential init)
+                            if field_designator_name.is_none() {
+                                current_idx += 1;
+                            }
                         }
                         let values: Vec<IrConst> = bytes.iter().map(|&b| IrConst::I8(b as i8)).collect();
                         return GlobalInit::Array(values);
