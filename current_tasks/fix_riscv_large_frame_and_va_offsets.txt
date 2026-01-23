@@ -1,0 +1,19 @@
+Task: Fix RISC-V large stack frame prologue/epilogue and va_arg/va_start/va_copy offset handling
+Status: IN PROGRESS
+
+Problem:
+1. RISC-V large frame prologue saves ra/s0 at 0(sp) and 8(sp) (bottom of frame),
+   but locals grow downward from s0 covering the ENTIRE frame including those locations.
+   This causes locals to clobber saved ra/s0, leading to SIGSEGV on return.
+   The small-frame case correctly saves at (frame_size-8)(sp) and (frame_size-16)(sp).
+
+2. va_arg, va_start, and va_copy use raw `addi`/`ld`/`sd` with s0 offsets that can
+   overflow the 12-bit immediate range on large frames, instead of going through the
+   emit_addi_s0/emit_load_from_s0/emit_store_to_s0 helpers.
+
+Fix:
+1. Fix large-frame prologue to save ra/s0 at s0-8 and s0-16 (top of frame),
+   and epilogue to restore from those positions.
+2. Update va_arg/va_start/va_copy to use the large-offset helper methods.
+
+Impact: Fixes ~10+ SIGSEGV failures on RISC-V for tests with large stack frames.
