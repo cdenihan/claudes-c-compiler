@@ -1,0 +1,16 @@
+Task: Fix Multi-Level Pointer Type Tracking
+
+Problem:
+- Variables like `double **pp` only store pointee_type=Ptr (one level)
+- Dereferencing through multiple levels loses type information
+- get_pointee_type_of_expr has no case for Expr::Deref
+- This causes wrong load types (I64 instead of F64) for **pp, ***ppp, etc.
+- Also affects pointer-to-array types
+
+Fix:
+- Store full TypeSpecifier (C type) in LocalInfo/GlobalInfo
+- Add Expr::Deref case to get_pointee_type_of_expr using full type peeling
+- Fix get_expr_type to properly resolve types through multiple dereference levels
+- Fix function parameter type tracking for pointer params
+
+Status: In progress
