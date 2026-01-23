@@ -1,7 +1,0 @@
-Implementing global variable support:
-- Global variable declarations (int, char, long, pointers, arrays)
-- Global variable initializers (constants)
-- Static global variables
-- Emit .data/.bss sections in assembly
-- Update all three backends (x86, arm, riscv)
-- Update IR lowering to handle global declarations

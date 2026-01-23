@@ -9,11 +9,33 @@ pub struct IrModule {
 }
 
 /// A global variable.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct IrGlobal {
     pub name: String,
     pub ty: IrType,
-    pub init: Option<IrConst>,
+    /// Size of the global in bytes (for arrays, this is elem_size * count).
+    pub size: usize,
+    /// Alignment in bytes.
+    pub align: usize,
+    /// Initializer for the global variable.
+    pub init: GlobalInit,
+    /// Whether this is a static (file-scope) variable.
+    pub is_static: bool,
+}
+
+/// Initializer for a global variable.
+#[derive(Debug, Clone)]
+pub enum GlobalInit {
+    /// No initializer (zero-initialized in .bss).
+    Zero,
+    /// Single scalar constant.
+    Scalar(IrConst),
+    /// Array of scalar constants.
+    Array(Vec<IrConst>),
+    /// String literal (stored as bytes with null terminator).
+    String(String),
+    /// Address of another global (for pointer globals like `const char *s = "hello"`).
+    GlobalAddr(String),
 }
 
 /// An IR function.

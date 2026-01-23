@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use crate::frontend::parser::ast::*;
 use crate::ir::ir::*;
 use crate::common::types::IrType;
@@ -15,6 +16,17 @@ struct LocalInfo {
     is_array: bool,
     /// The IR type of the variable (I8 for char, I32 for int, I64 for long, Ptr for pointers).
     ty: IrType,
+}
+
+/// Information about a global variable tracked by the lowerer.
+#[derive(Debug, Clone)]
+struct GlobalInfo {
+    /// The IR type of the global variable.
+    ty: IrType,
+    /// Element size for array globals.
+    elem_size: usize,
+    /// Whether this is an array.
+    is_array: bool,
 }
 
 /// Represents an lvalue - something that can be assigned to.
@@ -39,6 +51,10 @@ pub struct Lowerer {
     current_label: String,
     // Variable -> alloca mapping with metadata
     locals: HashMap<String, LocalInfo>,
+    // Global variable tracking (name -> info)
+    globals: HashMap<String, GlobalInfo>,
+    // Set of known function names (to distinguish globals from functions in Identifier)
+    known_functions: HashSet<String>,
     // Loop context for break/continue
     break_labels: Vec<String>,
     continue_labels: Vec<String>,
@@ -59,6 +75,8 @@ impl Lowerer {
             current_instrs: Vec::new(),
             current_label: String::new(),
             locals: HashMap::new(),
+            globals: HashMap::new(),
+            known_functions: HashSet::new(),
             break_labels: Vec::new(),
             continue_labels: Vec::new(),
             switch_end_labels: Vec::new(),
@@ -68,6 +86,23 @@ impl Lowerer {
     }
 
     pub fn lower(mut self, tu: &TranslationUnit) -> IrModule {
+        // First pass: collect all function names so we can distinguish
+        // function references from global variable references
+        for decl in &tu.decls {
+            if let ExternalDecl::FunctionDef(func) = decl {
+                self.known_functions.insert(func.name.clone());
+            }
+            // Also detect function declarations (extern prototypes)
+            if let ExternalDecl::Declaration(decl) = decl {
+                for declarator in &decl.declarators {
+                    if declarator.derived.iter().any(|d| matches!(d, DerivedDeclarator::Function(_, _))) {
+                        self.known_functions.insert(declarator.name.clone());
+                    }
+                }
+            }
+        }
+
+        // Second pass: lower everything
         for decl in &tu.decls {
             match decl {
                 ExternalDecl::FunctionDef(func) => {
@@ -173,8 +208,196 @@ impl Lowerer {
         self.module.functions.push(ir_func);
     }
 
-    fn lower_global_decl(&mut self, _decl: &Declaration) {
-        // TODO: handle global variables
+    fn lower_global_decl(&mut self, decl: &Declaration) {
+        for declarator in &decl.declarators {
+            if declarator.name.is_empty() {
+                continue; // Skip anonymous declarations (e.g., struct definitions)
+            }
+
+            // Skip function declarations
+            if declarator.derived.iter().any(|d| matches!(d, DerivedDeclarator::Function(_, _))) {
+                continue;
+            }
+
+            let base_ty = self.type_spec_to_ir(&decl.type_spec);
+            let (alloc_size, elem_size, is_array, is_pointer) = self.compute_decl_info(&decl.type_spec, &declarator.derived);
+            let var_ty = if is_pointer { IrType::Ptr } else { base_ty };
+
+            // Determine initializer
+            let init = if let Some(ref initializer) = declarator.init {
+                self.lower_global_init(initializer, &decl.type_spec, base_ty, is_array, elem_size, alloc_size)
+            } else {
+                GlobalInit::Zero
+            };
+
+            // Track this global variable
+            self.globals.insert(declarator.name.clone(), GlobalInfo {
+                ty: var_ty,
+                elem_size,
+                is_array,
+            });
+
+            // Determine alignment based on type
+            let align = match var_ty {
+                IrType::I8 => 1,
+                IrType::I16 => 2,
+                IrType::I32 => 4,
+                IrType::I64 | IrType::Ptr => 8,
+                IrType::F32 => 4,
+                IrType::F64 => 8,
+                IrType::Void => 1,
+            };
+
+            // TODO: detect static storage class from the parser
+            let is_static = false;
+
+            self.module.globals.push(IrGlobal {
+                name: declarator.name.clone(),
+                ty: var_ty,
+                size: alloc_size,
+                align,
+                init,
+                is_static,
+            });
+        }
+    }
+
+    /// Lower a global initializer to a GlobalInit value.
+    fn lower_global_init(
+        &mut self,
+        init: &Initializer,
+        _type_spec: &TypeSpecifier,
+        base_ty: IrType,
+        is_array: bool,
+        elem_size: usize,
+        total_size: usize,
+    ) -> GlobalInit {
+        match init {
+            Initializer::Expr(expr) => {
+                // Try to evaluate as a constant
+                if let Some(val) = self.eval_const_expr(expr) {
+                    return GlobalInit::Scalar(val);
+                }
+                // String literal initializer for pointer globals
+                if let Expr::StringLiteral(s, _) = expr {
+                    // This is like: const char *p = "hello"
+                    // We need to create a string literal and store its address
+                    let label = format!(".Lstr{}", self.next_string);
+                    self.next_string += 1;
+                    self.module.string_literals.push((label.clone(), s.clone()));
+                    return GlobalInit::GlobalAddr(label);
+                }
+                // Can't evaluate - zero init as fallback
+                GlobalInit::Zero
+            }
+            Initializer::List(items) => {
+                if is_array && elem_size > 0 {
+                    let num_elems = total_size / elem_size;
+                    let mut values = Vec::with_capacity(num_elems);
+                    for item in items {
+                        if let Initializer::Expr(expr) = &item.init {
+                            if let Some(val) = self.eval_const_expr(expr) {
+                                values.push(val);
+                            } else {
+                                values.push(self.zero_const(base_ty));
+                            }
+                        } else {
+                            values.push(self.zero_const(base_ty));
+                        }
+                    }
+                    // Zero-fill remaining elements
+                    while values.len() < num_elems {
+                        values.push(self.zero_const(base_ty));
+                    }
+                    return GlobalInit::Array(values);
+                }
+                // Non-array initializer list (struct init, etc.) - zero for now
+                // TODO: handle struct initializers
+                GlobalInit::Zero
+            }
+        }
+    }
+
+    /// Try to evaluate a constant expression at compile time.
+    fn eval_const_expr(&self, expr: &Expr) -> Option<IrConst> {
+        match expr {
+            Expr::IntLiteral(val, _) => {
+                Some(IrConst::I64(*val))
+            }
+            Expr::CharLiteral(ch, _) => {
+                Some(IrConst::I32(*ch as i32))
+            }
+            Expr::FloatLiteral(val, _) => {
+                Some(IrConst::F64(*val))
+            }
+            Expr::UnaryOp(UnaryOp::Neg, inner, _) => {
+                if let Some(val) = self.eval_const_expr(inner) {
+                    match val {
+                        IrConst::I64(v) => Some(IrConst::I64(-v)),
+                        IrConst::I32(v) => Some(IrConst::I32(-v)),
+                        IrConst::F64(v) => Some(IrConst::F64(-v)),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
+            Expr::BinaryOp(op, lhs, rhs, _) => {
+                let l = self.eval_const_expr(lhs)?;
+                let r = self.eval_const_expr(rhs)?;
+                self.eval_const_binop(op, &l, &r)
+            }
+            Expr::Cast(_, inner, _) => {
+                // For now, just pass through casts in constant expressions
+                self.eval_const_expr(inner)
+            }
+            _ => None,
+        }
+    }
+
+    /// Evaluate a constant binary operation.
+    fn eval_const_binop(&self, op: &BinOp, lhs: &IrConst, rhs: &IrConst) -> Option<IrConst> {
+        let l = self.const_to_i64(lhs)?;
+        let r = self.const_to_i64(rhs)?;
+        let result = match op {
+            BinOp::Add => l.wrapping_add(r),
+            BinOp::Sub => l.wrapping_sub(r),
+            BinOp::Mul => l.wrapping_mul(r),
+            BinOp::Div => if r != 0 { l.wrapping_div(r) } else { return None; },
+            BinOp::Mod => if r != 0 { l.wrapping_rem(r) } else { return None; },
+            BinOp::BitAnd => l & r,
+            BinOp::BitOr => l | r,
+            BinOp::BitXor => l ^ r,
+            BinOp::Shl => l.wrapping_shl(r as u32),
+            BinOp::Shr => l.wrapping_shr(r as u32),
+            _ => return None,
+        };
+        Some(IrConst::I64(result))
+    }
+
+    /// Convert an IrConst to i64.
+    fn const_to_i64(&self, c: &IrConst) -> Option<i64> {
+        match c {
+            IrConst::I8(v) => Some(*v as i64),
+            IrConst::I16(v) => Some(*v as i64),
+            IrConst::I32(v) => Some(*v as i64),
+            IrConst::I64(v) => Some(*v),
+            IrConst::Zero => Some(0),
+            _ => None,
+        }
+    }
+
+    /// Get the zero constant for a given IR type.
+    fn zero_const(&self, ty: IrType) -> IrConst {
+        match ty {
+            IrType::I8 => IrConst::I8(0),
+            IrType::I16 => IrConst::I16(0),
+            IrType::I32 => IrConst::I32(0),
+            IrType::I64 | IrType::Ptr => IrConst::I64(0),
+            IrType::F32 => IrConst::F32(0.0),
+            IrType::F64 => IrConst::F64(0.0),
+            IrType::Void => IrConst::Zero,
+        }
     }
 
     fn lower_compound_stmt(&mut self, compound: &CompoundStmt) {
@@ -458,6 +681,11 @@ impl Lowerer {
             Expr::Identifier(name, _) => {
                 if let Some(info) = self.locals.get(name).cloned() {
                     Some(LValue::Variable(info.alloca))
+                } else if self.globals.contains_key(name) {
+                    // Global variable: emit GlobalAddr to get its address
+                    let addr = self.fresh_value();
+                    self.emit(Instruction::GlobalAddr { dest: addr, name: name.clone() });
+                    Some(LValue::Address(addr))
                 } else {
                     None
                 }
@@ -581,6 +809,20 @@ impl Lowerer {
                         return Operand::Value(loaded);
                     }
                 }
+                if let Some(ginfo) = self.globals.get(name).cloned() {
+                    // Global variable
+                    let addr = self.fresh_value();
+                    self.emit(Instruction::GlobalAddr { dest: addr, name: name.clone() });
+                    if ginfo.is_array {
+                        // Global array: address IS the base pointer
+                        return Operand::Value(addr);
+                    } else {
+                        // Global pointer: load the pointer value
+                        let loaded = self.fresh_value();
+                        self.emit(Instruction::Load { dest: loaded, ptr: addr, ty: IrType::Ptr });
+                        return Operand::Value(loaded);
+                    }
+                }
                 // Fall through to generic lowering
                 self.lower_expr(base)
             }
@@ -597,6 +839,11 @@ impl Lowerer {
             if let Some(info) = self.locals.get(name) {
                 if info.elem_size > 0 {
                     return info.elem_size;
+                }
+            }
+            if let Some(ginfo) = self.globals.get(name) {
+                if ginfo.elem_size > 0 {
+                    return ginfo.elem_size;
                 }
             }
         }
@@ -634,8 +881,20 @@ impl Lowerer {
                     let dest = self.fresh_value();
                     self.emit(Instruction::Load { dest, ptr: info.alloca, ty: info.ty });
                     Operand::Value(dest)
+                } else if let Some(ginfo) = self.globals.get(name).cloned() {
+                    // Global variable: get address, then load the value
+                    let addr = self.fresh_value();
+                    self.emit(Instruction::GlobalAddr { dest: addr, name: name.clone() });
+                    if ginfo.is_array {
+                        // Arrays decay to pointer: address IS the pointer
+                        Operand::Value(addr)
+                    } else {
+                        let dest = self.fresh_value();
+                        self.emit(Instruction::Load { dest, ptr: addr, ty: ginfo.ty });
+                        Operand::Value(dest)
+                    }
                 } else {
-                    // Assume it's a function or global
+                    // Assume it's a function reference (or unknown global)
                     let dest = self.fresh_value();
                     self.emit(Instruction::GlobalAddr { dest, name: name.clone() });
                     Operand::Value(dest)
@@ -1028,12 +1287,15 @@ impl Lowerer {
         rhs_val
     }
 
-    /// Get the IR type for an expression (best-effort, based on locals info).
+    /// Get the IR type for an expression (best-effort, based on locals/globals info).
     fn get_expr_type(&self, expr: &Expr) -> IrType {
         match expr {
             Expr::Identifier(name, _) => {
                 if let Some(info) = self.locals.get(name) {
                     return info.ty;
+                }
+                if let Some(ginfo) = self.globals.get(name) {
+                    return ginfo.ty;
                 }
                 IrType::I64
             }

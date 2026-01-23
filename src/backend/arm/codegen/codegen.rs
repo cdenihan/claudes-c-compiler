@@ -32,6 +32,9 @@ impl ArmCodegen {
             self.emit("");
         }
 
+        // Global variables
+        self.emit_globals(&module.globals);
+
         self.emit(".section .text");
 
         for func in &module.functions {
@@ -42,6 +45,131 @@ impl ArmCodegen {
         }
 
         self.output
+    }
+
+    fn emit_globals(&mut self, globals: &[crate::ir::ir::IrGlobal]) {
+        use crate::ir::ir::{GlobalInit, IrGlobal};
+
+        let mut has_data = false;
+        let mut has_bss = false;
+
+        // Emit initialized globals in .data section
+        for g in globals {
+            if matches!(g.init, GlobalInit::Zero) {
+                continue;
+            }
+            if !has_data {
+                self.emit(".section .data");
+                has_data = true;
+            }
+            self.emit_global_def(g);
+        }
+
+        if has_data {
+            self.emit("");
+        }
+
+        // Emit zero-initialized globals in .bss section
+        for g in globals {
+            if !matches!(g.init, GlobalInit::Zero) {
+                continue;
+            }
+            if !has_bss {
+                self.emit(".section .bss");
+                has_bss = true;
+            }
+            if !g.is_static {
+                self.emit(&format!(".globl {}", g.name));
+            }
+            self.emit(&format!(".align {}", g.align));
+            self.emit(&format!(".type {}, @object", g.name));
+            self.emit(&format!(".size {}, {}", g.name, g.size));
+            self.emit(&format!("{}:", g.name));
+            self.emit(&format!("    .zero {}", g.size));
+        }
+
+        if has_bss {
+            self.emit("");
+        }
+    }
+
+    fn emit_global_def(&mut self, g: &crate::ir::ir::IrGlobal) {
+        use crate::ir::ir::GlobalInit;
+
+        if !g.is_static {
+            self.emit(&format!(".globl {}", g.name));
+        }
+        self.emit(&format!(".align {}", g.align));
+        self.emit(&format!(".type {}, @object", g.name));
+        self.emit(&format!(".size {}, {}", g.name, g.size));
+        self.emit(&format!("{}:", g.name));
+
+        match &g.init {
+            GlobalInit::Zero => {
+                self.emit(&format!("    .zero {}", g.size));
+            }
+            GlobalInit::Scalar(c) => {
+                self.emit_const_data(c, g.ty);
+            }
+            GlobalInit::Array(values) => {
+                for val in values {
+                    self.emit_const_data(val, g.ty);
+                }
+            }
+            GlobalInit::String(s) => {
+                self.emit(&format!("    .asciz \"{}\"", Self::escape_string(s)));
+            }
+            GlobalInit::GlobalAddr(label) => {
+                self.emit(&format!("    .xword {}", label));
+            }
+        }
+    }
+
+    fn emit_const_data(&mut self, c: &IrConst, ty: IrType) {
+        match c {
+            IrConst::I8(v) => self.emit(&format!("    .byte {}", v)),
+            IrConst::I16(v) => self.emit(&format!("    .short {}", v)),
+            IrConst::I32(v) => self.emit(&format!("    .long {}", v)),
+            IrConst::I64(v) => {
+                match ty {
+                    IrType::I8 => self.emit(&format!("    .byte {}", *v as i8)),
+                    IrType::I16 => self.emit(&format!("    .short {}", *v as i16)),
+                    IrType::I32 => self.emit(&format!("    .long {}", *v as i32)),
+                    _ => self.emit(&format!("    .xword {}", v)),
+                }
+            }
+            IrConst::F32(v) => {
+                self.emit(&format!("    .long {}", v.to_bits()));
+            }
+            IrConst::F64(v) => {
+                self.emit(&format!("    .xword {}", v.to_bits()));
+            }
+            IrConst::Zero => {
+                let size = ty.size();
+                self.emit(&format!("    .zero {}", if size == 0 { 4 } else { size }));
+            }
+        }
+    }
+
+    fn escape_string(s: &str) -> String {
+        let mut result = String::new();
+        for c in s.chars() {
+            match c {
+                '\\' => result.push_str("\\\\"),
+                '"' => result.push_str("\\\""),
+                '\n' => result.push_str("\\n"),
+                '\t' => result.push_str("\\t"),
+                '\r' => result.push_str("\\r"),
+                '\0' => result.push_str("\\0"),
+                c if c.is_ascii_graphic() || c == ' ' => result.push(c),
+                c => {
+                    for b in c.to_string().bytes() {
+                        result.push_str(&format!("\\{:03o}", b));
+                    }
+                }
+            }
+        }
+        result
     }
 
     fn emit(&mut self, s: &str) {
