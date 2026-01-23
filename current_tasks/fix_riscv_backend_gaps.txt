@@ -1,0 +1,26 @@
+Task: Fix RISC-V backend gaps - bit manipulation ops and inline asm constraints
+Status: IN PROGRESS
+
+Problems:
+1. RISC-V unary ops Clz/Ctz/Bswap/Popcount silently return 0 instead of computing
+   the correct result. x86 and ARM backends implement these correctly.
+
+2. RISC-V inline assembly is missing several constraint types:
+   - "A" constraint: memory address, should produce (register) format for AMO/LR/SC instructions
+   - "f" constraint: floating-point register, needs FP scratch register allocation (ft0-ft7)
+   - "I"/"i" constraint: immediate values, should emit the constant directly
+   - "J" constraint (in "rJ"): integer constant 0, maps to "zero" register
+   - "%z" modifier: zero-register-if-zero modifier (emit "zero" if value is 0)
+
+Fix plan:
+1. Implement software fallbacks for Clz/Ctz/Bswap/Popcount using shift loops
+2. Add "A" constraint support to produce (reg) format for memory operands
+3. Add "f" constraint support with FP scratch register allocation
+4. Add "I"/"i" constraint support to emit immediates directly
+5. Add "J" constraint handling
+6. Add %z modifier to template substitution
+
+Expected impact: ~39 inline asm test fixes + bit manipulation test fixes
+
+Affected files:
+- src/backend/riscv/codegen/codegen.rs
