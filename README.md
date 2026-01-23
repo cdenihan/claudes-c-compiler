@@ -7,7 +7,7 @@ A C compiler written from scratch in Rust, targeting x86-64, AArch64, and RISC-V
 **Basic compilation pipeline functional.** ~35% of x86-64 tests passing.
 
 ### Working Features
-- Preprocessor (macros, conditionals, built-in headers)
+- Preprocessor with `#include` file resolution (system headers, -I paths, include guards, #pragma once)
 - Recursive descent parser with typedef tracking
 - Type-aware IR lowering and code generation
 - Optimization passes (constant folding, DCE, GVN, algebraic simplification)
@@ -54,6 +54,10 @@ A C compiler written from scratch in Rust, targeting x86-64, AArch64, and RISC-V
   - Constant expression evaluation for initializers
 
 ### Recent Additions
+- **#include file resolution**: Full `#include` support reading actual system headers from
+  `/usr/include`, with search path support (-I), include guard recognition, #pragma once,
+  block comment stripping (C-style `/* */` comments no longer confuse the preprocessor),
+  recursive include processing, and GCC-compatible predefined macros.
 - **Static local variables**: `static` locals are emitted as globals with mangled names
   (e.g., `func.varname`), preserving values across function calls. Works with
   scalars, arrays, and initializers. Storage class tracking in parser and AST.
@@ -68,7 +72,7 @@ A C compiler written from scratch in Rust, targeting x86-64, AArch64, and RISC-V
   `__signed__`, `__noreturn__` recognized as their standard equivalents
 
 ### What's Not Yet Implemented
-- Full `#include` resolution (only built-in headers for now)
+- Parser support for GNU C extensions in system headers (`__attribute__`, `__asm__` renames)
 - Floating point
 - Full cast semantics (truncation/sign-extension in some cases)
 - Inline assembly (parsed but skipped)

@@ -1,0 +1,17 @@
+Task: Refactor backend codegen - extract shared instruction dispatch logic
+
+The three backend codegen files (x86/codegen.rs, arm/codegen.rs, riscv/codegen.rs)
+have massive structural duplication. generate_instruction(), generate_function(),
+calculate_stack_space(), and generate_terminator() are structurally identical
+across all three backends, differing only in register names, mnemonics, and ABI details.
+
+This refactoring will:
+1. Extract a shared codegen framework that handles the instruction dispatch loop
+2. Define a trait/interface for arch-specific operations (emit_binop, emit_store, etc.)
+3. Implement the trait for each architecture
+4. Reduce ~1800 lines of codegen to ~600 lines shared + ~200 lines per backend
+
+This eliminates the cross-backend inconsistency bugs and makes adding new IR
+instructions a one-place change instead of three.
+
+Status: In progress
