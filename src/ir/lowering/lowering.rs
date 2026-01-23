@@ -363,6 +363,10 @@ impl Lowerer {
             Expr::FloatLiteral(val, _) => {
                 Some(IrConst::F64(*val))
             }
+            Expr::UnaryOp(UnaryOp::Plus, inner, _) => {
+                // Unary plus: identity, just evaluate the inner expression
+                self.eval_const_expr(inner)
+            }
             Expr::UnaryOp(UnaryOp::Neg, inner, _) => {
                 if let Some(val) = self.eval_const_expr(inner) {
                     match val {
@@ -1158,6 +1162,10 @@ impl Lowerer {
             }
             Expr::UnaryOp(op, inner, _) => {
                 match op {
+                    UnaryOp::Plus => {
+                        // Unary plus is a no-op (identity), just lower the inner expression
+                        self.lower_expr(inner)
+                    }
                     UnaryOp::Neg => {
                         let val = self.lower_expr(inner);
                         let dest = self.fresh_value();
@@ -1263,6 +1271,53 @@ impl Lowerer {
                     Operand::Value(dest)
                 }
             }
+            Expr::CompoundLiteral(ref type_spec, ref init, _) => {
+                // Compound literal: (type){initializer}
+                // Allocate a local, initialize it, and return its address or value.
+                // For now, treat it as an alloca with the initializer, similar to a local var.
+                let ty = self.type_spec_to_ir(type_spec);
+                let size = self.sizeof_type(type_spec);
+                let alloca = self.fresh_value();
+                self.emit(Instruction::Alloca { dest: alloca, size, ty });
+                // Initialize the compound literal - for simple scalar initializers
+                match init.as_ref() {
+                    Initializer::Expr(expr) => {
+                        let val = self.lower_expr(expr);
+                        self.emit(Instruction::Store { val, ptr: alloca, ty });
+                    }
+                    Initializer::List(items) => {
+                        // Initialize elements
+                        let elem_size = self.compound_literal_elem_size(type_spec);
+                        for (i, item) in items.iter().enumerate() {
+                            let val = match &item.init {
+                                Initializer::Expr(expr) => self.lower_expr(expr),
+                                _ => Operand::Const(IrConst::I64(0)), // TODO: nested lists
+                            };
+                            if i == 0 && items.len() == 1 && elem_size == size {
+                                // Simple scalar in braces
+                                self.emit(Instruction::Store { val, ptr: alloca, ty });
+                            } else {
+                                // Array/struct element: compute offset
+                                let offset_val = Operand::Const(IrConst::I64((i * elem_size) as i64));
+                                let elem_ptr = self.fresh_value();
+                                self.emit(Instruction::GetElementPtr {
+                                    dest: elem_ptr,
+                                    base: alloca,
+                                    offset: offset_val,
+                                    ty,
+                                });
+                                let store_ty = if elem_size <= 1 { IrType::I8 }
+                                    else if elem_size <= 2 { IrType::I16 }
+                                    else if elem_size <= 4 { IrType::I32 }
+                                    else { IrType::I64 };
+                                self.emit(Instruction::Store { val, ptr: elem_ptr, ty: store_ty });
+                            }
+                        }
+                    }
+                }
+                // Return the alloca value (address of the compound literal)
+                Operand::Value(alloca)
+            }
             Expr::Sizeof(arg, _) => {
                 let size = match arg.as_ref() {
                     SizeofArg::Type(ts) => self.sizeof_type(ts),
@@ -1362,6 +1417,27 @@ impl Lowerer {
             Expr::Comma(lhs, rhs, _) => {
                 self.lower_expr(lhs);
                 self.lower_expr(rhs)
+            }
+            Expr::StmtExpr(compound, _) => {
+                // GCC statement expression: ({ stmt; ...; expr; })
+                // Lower all block items; the value is the last expression
+                let mut last_val = Operand::Const(IrConst::I64(0));
+                for item in &compound.items {
+                    match item {
+                        BlockItem::Statement(stmt) => {
+                            // Check if this is an expression statement (value to return)
+                            if let Stmt::Expr(Some(expr)) = stmt {
+                                last_val = self.lower_expr(expr);
+                            } else {
+                                self.lower_stmt(stmt);
+                            }
+                        }
+                        BlockItem::Declaration(decl) => {
+                            self.lower_local_decl(decl);
+                        }
+                    }
+                }
+                last_val
             }
         }
     }
@@ -1652,6 +1728,15 @@ impl Lowerer {
                 self.struct_layouts.get(&key).map(|l| l.size).unwrap_or(8)
             }
             _ => 8,
+        }
+    }
+
+    /// Get the element size for a compound literal type.
+    /// For arrays, returns the element size; for scalars/structs, returns the full size.
+    fn compound_literal_elem_size(&self, ts: &TypeSpecifier) -> usize {
+        match ts {
+            TypeSpecifier::Array(elem, _) => self.sizeof_type(elem),
+            _ => self.sizeof_type(ts),
         }
     }
 

@@ -33,7 +33,7 @@ pub struct ParamDecl {
 }
 
 /// A variable/type declaration.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Declaration {
     pub type_spec: TypeSpecifier,
     pub declarators: Vec<InitDeclarator>,
@@ -41,7 +41,7 @@ pub struct Declaration {
 }
 
 /// A declarator with optional initializer.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct InitDeclarator {
     pub name: String,
     pub derived: Vec<DerivedDeclarator>,
@@ -58,21 +58,21 @@ pub enum DerivedDeclarator {
 }
 
 /// An initializer.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Initializer {
     Expr(Expr),
     List(Vec<InitializerItem>),
 }
 
 /// An item in an initializer list.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct InitializerItem {
     pub designators: Vec<Designator>,
     pub init: Initializer,
 }
 
 /// A designator in an initializer.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Designator {
     Index(Expr),
     Field(String),
@@ -121,21 +121,21 @@ pub struct EnumVariant {
 }
 
 /// A compound statement (block).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CompoundStmt {
     pub items: Vec<BlockItem>,
     pub span: Span,
 }
 
 /// Items within a block.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum BlockItem {
     Declaration(Declaration),
     Statement(Stmt),
 }
 
 /// Statements.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Stmt {
     Expr(Option<Expr>),
     Return(Option<Expr>, Span),
@@ -154,7 +154,7 @@ pub enum Stmt {
 }
 
 /// For loop initializer.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ForInit {
     Declaration(Declaration),
     Expr(Expr),
@@ -179,6 +179,8 @@ pub enum Expr {
     MemberAccess(Box<Expr>, String, Span),
     PointerMemberAccess(Box<Expr>, String, Span),
     Cast(TypeSpecifier, Box<Expr>, Span),
+    CompoundLiteral(TypeSpecifier, Box<Initializer>, Span),
+    StmtExpr(CompoundStmt, Span),
     Sizeof(Box<SizeofArg>, Span),
     Comma(Box<Expr>, Box<Expr>, Span),
     AddressOf(Box<Expr>, Span),
@@ -218,6 +220,7 @@ pub enum BinOp {
 /// Unary operators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOp {
+    Plus,
     Neg,
     BitNot,
     LogicalNot,
@@ -241,7 +244,8 @@ impl Expr {
             | Expr::Assign(_, _, s) | Expr::CompoundAssign(_, _, _, s) | Expr::Conditional(_, _, _, s)
             | Expr::FunctionCall(_, _, s) | Expr::ArraySubscript(_, _, s)
             | Expr::MemberAccess(_, _, s) | Expr::PointerMemberAccess(_, _, s)
-            | Expr::Cast(_, _, s) | Expr::Sizeof(_, s) | Expr::Comma(_, _, s)
+            | Expr::Cast(_, _, s) | Expr::CompoundLiteral(_, _, s) | Expr::StmtExpr(_, s)
+            | Expr::Sizeof(_, s) | Expr::Comma(_, _, s)
             | Expr::AddressOf(_, s) | Expr::Deref(_, s) => *s,
         }
     }

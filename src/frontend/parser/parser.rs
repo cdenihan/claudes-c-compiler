@@ -193,10 +193,10 @@ impl Parser {
         // Parse declarator(s)
         let (name, derived) = self.parse_declarator();
 
-        // Check if this is a function definition (has a body)
+        // Check if this is a function definition (has a body or K&R param decls)
         let is_funcdef = !derived.is_empty()
             && matches!(derived.last(), Some(DerivedDeclarator::Function(_, _)))
-            && matches!(self.peek(), TokenKind::LBrace);
+            && (matches!(self.peek(), TokenKind::LBrace) || self.is_type_specifier());
 
         if is_funcdef {
             self.parsing_typedef = false; // function defs are never typedefs
@@ -206,11 +206,45 @@ impl Parser {
                 (vec![], false)
             };
 
+            // Handle K&R-style parameter declarations:
+            // int foo(a, b) int a; int b; { ... }
+            let final_params = if !matches!(self.peek(), TokenKind::LBrace) {
+                // K&R style: params only have names, types come in subsequent declarations
+                let mut kr_params = params.clone();
+                while self.is_type_specifier() && !matches!(self.peek(), TokenKind::LBrace) {
+                    // Parse the K&R parameter type declaration
+                    if let Some(type_spec) = self.parse_type_specifier() {
+                        // Parse the declarator(s) for this type
+                        loop {
+                            let (pname, _pderived) = self.parse_declarator();
+                            if let Some(ref name) = pname {
+                                // Find the matching param and update its type
+                                for param in kr_params.iter_mut() {
+                                    if param.name.as_deref() == Some(name.as_str()) {
+                                        param.type_spec = type_spec.clone();
+                                        break;
+                                    }
+                                }
+                            }
+                            if !self.consume_if(&TokenKind::Comma) {
+                                break;
+                            }
+                        }
+                        self.expect(&TokenKind::Semicolon);
+                    } else {
+                        break;
+                    }
+                }
+                kr_params
+            } else {
+                params
+            };
+
             let body = self.parse_compound_stmt();
             Some(ExternalDecl::FunctionDef(FunctionDef {
                 return_type: type_spec,
                 name: name.unwrap_or_default(),
-                params,
+                params: final_params,
                 variadic,
                 body,
                 span: start,
@@ -460,7 +494,8 @@ impl Parser {
             _ => return None,
         };
 
-        // Skip any trailing type qualifiers and attributes
+        // Skip any trailing type qualifiers, storage class specifiers, and attributes.
+        // C allows "int static x;" (storage class after type).
         loop {
             match self.peek() {
                 TokenKind::Complex => {
@@ -471,10 +506,21 @@ impl Parser {
                 TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict => {
                     self.advance();
                 }
+                TokenKind::Static | TokenKind::Extern | TokenKind::Register
+                | TokenKind::Inline | TokenKind::Noreturn => {
+                    // Storage class and function specifiers can appear after the type in C
+                    self.advance();
+                }
+                TokenKind::Attribute => {
+                    self.advance();
+                    self.skip_balanced_parens();
+                }
+                TokenKind::Extension => {
+                    self.advance();
+                }
                 _ => break,
             }
         }
-        self.skip_gcc_extensions();
 
         Some(base)
     }
@@ -578,9 +624,83 @@ impl Parser {
             self.advance();
             Some(n)
         } else if matches!(self.peek(), TokenKind::LParen) {
-            // Could be a parenthesized declarator or function params
-            // For now just grab the name if there's one
-            None
+            // Could be:
+            // 1. Function pointer: (*name)(params)
+            // 2. Parenthesized declarator: (name)
+            // 3. Function params: (int x, int y) - for abstract declarators
+            // Use lookahead to disambiguate
+            let save = self.pos;
+            self.advance(); // consume '('
+
+            if matches!(self.peek(), TokenKind::Star) || matches!(self.peek(), TokenKind::Caret) {
+                // Function pointer declarator: (*name) or (^name)
+                self.advance(); // consume '*' or '^'
+                // Skip qualifiers
+                loop {
+                    match self.peek() {
+                        TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict => {
+                            self.advance();
+                        }
+                        _ => break,
+                    }
+                }
+                let inner_name = if let TokenKind::Identifier(n) = self.peek().clone() {
+                    self.advance();
+                    Some(n)
+                } else {
+                    None
+                };
+                // Skip array brackets inside: (*name[n])
+                while matches!(self.peek(), TokenKind::LBracket) {
+                    self.advance();
+                    while !matches!(self.peek(), TokenKind::RBracket | TokenKind::Eof) {
+                        self.advance();
+                    }
+                    self.consume_if(&TokenKind::RBracket);
+                }
+                self.expect(&TokenKind::RParen);
+                derived.push(DerivedDeclarator::Pointer);
+                // Parse the function parameter list or array that follows
+                if matches!(self.peek(), TokenKind::LParen) {
+                    let (params, variadic) = self.parse_param_list();
+                    derived.push(DerivedDeclarator::Function(params, variadic));
+                }
+                while matches!(self.peek(), TokenKind::LBracket) {
+                    self.advance();
+                    let size = if matches!(self.peek(), TokenKind::RBracket) {
+                        None
+                    } else {
+                        Some(Box::new(self.parse_expr()))
+                    };
+                    self.expect(&TokenKind::RBracket);
+                    derived.push(DerivedDeclarator::Array(size));
+                }
+                self.skip_gcc_extensions();
+                return (inner_name, derived);
+            } else if let TokenKind::Identifier(_) = self.peek() {
+                // Parenthesized name: (name)
+                // But only if the next token after the identifier is ')'
+                let save2 = self.pos;
+                if let TokenKind::Identifier(n) = self.peek().clone() {
+                    self.advance();
+                    if matches!(self.peek(), TokenKind::RParen) {
+                        self.advance(); // consume ')'
+                        // Continue to parse array/function suffixes below
+                        Some(n)
+                    } else {
+                        // Not a parenthesized name; restore and treat as no name
+                        self.pos = save;
+                        None
+                    }
+                } else {
+                    self.pos = save2;
+                    None
+                }
+            } else {
+                // Not a declarator pattern we recognize; restore
+                self.pos = save;
+                None
+            }
         } else {
             None
         };
@@ -590,6 +710,8 @@ impl Parser {
             match self.peek() {
                 TokenKind::LBracket => {
                     self.advance();
+                    // Handle 'static' in array params: int a[static 10]
+                    self.consume_if(&TokenKind::Static);
                     let size = if matches!(self.peek(), TokenKind::RBracket) {
                         None
                     } else {
@@ -633,6 +755,32 @@ impl Parser {
             self.pos = save;
         }
 
+        // Check if this is a K&R-style identifier list: foo(a, b, c)
+        // Identifiers that are NOT type names appear directly
+        if let TokenKind::Identifier(ref name) = self.peek() {
+            if !self.typedefs.contains(name) && !self.is_type_specifier() {
+                // K&R-style identifier list
+                loop {
+                    if let TokenKind::Identifier(n) = self.peek().clone() {
+                        let span = self.peek_span();
+                        self.advance();
+                        params.push(ParamDecl {
+                            type_spec: TypeSpecifier::Int, // K&R default type
+                            name: Some(n),
+                            span,
+                        });
+                    } else {
+                        break;
+                    }
+                    if !self.consume_if(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&TokenKind::RParen);
+                return (params, variadic);
+            }
+        }
+
         loop {
             if matches!(self.peek(), TokenKind::Ellipsis) {
                 self.advance();
@@ -643,37 +791,8 @@ impl Parser {
             let span = self.peek_span();
             self.skip_gcc_extensions();
             if let Some(type_spec) = self.parse_type_specifier() {
-                let mut _derived = Vec::new();
-                // Parse pointer
-                while self.consume_if(&TokenKind::Star) {
-                    _derived.push(DerivedDeclarator::Pointer);
-                    loop {
-                        match self.peek() {
-                            TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict => {
-                                self.advance();
-                            }
-                            _ => break,
-                        }
-                    }
-                }
-                let name = if let TokenKind::Identifier(n) = self.peek().clone() {
-                    self.advance();
-                    Some(n)
-                } else {
-                    None
-                };
-                // Skip array brackets in params
-                while matches!(self.peek(), TokenKind::LBracket) {
-                    self.advance();
-                    while !matches!(self.peek(), TokenKind::RBracket | TokenKind::Eof) {
-                        self.advance();
-                    }
-                    self.consume_if(&TokenKind::RBracket);
-                }
-                // Skip function params in params (function pointer)
-                if matches!(self.peek(), TokenKind::LParen) {
-                    self.skip_balanced_parens();
-                }
+                // Parse parameter declarator (handles pointers, function pointers, arrays)
+                let name = self.parse_param_declarator();
                 self.skip_gcc_extensions();
                 params.push(ParamDecl { type_spec, name, span });
             } else {
@@ -687,6 +806,131 @@ impl Parser {
 
         self.expect(&TokenKind::RParen);
         (params, variadic)
+    }
+
+    /// Parse a parameter declarator, handling:
+    /// - Simple: `int x`
+    /// - Pointer: `int *x`
+    /// - Function pointer: `void (*fn)(int, int)`
+    /// - Array: `int arr[10]`
+    /// - Abstract (unnamed): `int *`, `void (*)(int)`
+    /// - Parenthesized: `int (x)`
+    /// Returns the name if one was found.
+    fn parse_param_declarator(&mut self) -> Option<String> {
+        // Parse leading pointer(s)
+        while self.consume_if(&TokenKind::Star) {
+            loop {
+                match self.peek() {
+                    TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict => {
+                        self.advance();
+                    }
+                    _ => break,
+                }
+            }
+        }
+
+        // Check for parenthesized declarator: (*name) or (*)
+        let name = if matches!(self.peek(), TokenKind::LParen) {
+            // Could be:
+            // 1. Function pointer: (*name)(params) or (*)(params)
+            // 2. Parenthesized name: (name)
+            // 3. An abstract function type
+            let save = self.pos;
+            self.advance(); // consume '('
+
+            if self.consume_if(&TokenKind::Star) {
+                // Function pointer: (*name) or (*)
+                // Skip qualifiers
+                loop {
+                    match self.peek() {
+                        TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict => {
+                            self.advance();
+                        }
+                        _ => break,
+                    }
+                }
+                let name = if let TokenKind::Identifier(n) = self.peek().clone() {
+                    self.advance();
+                    Some(n)
+                } else {
+                    None
+                };
+                // Skip array dimensions in function pointer declarators
+                while matches!(self.peek(), TokenKind::LBracket) {
+                    self.advance();
+                    while !matches!(self.peek(), TokenKind::RBracket | TokenKind::Eof) {
+                        self.advance();
+                    }
+                    self.consume_if(&TokenKind::RBracket);
+                }
+                self.expect(&TokenKind::RParen);
+                // Skip the function parameter list: (params)
+                if matches!(self.peek(), TokenKind::LParen) {
+                    self.skip_balanced_parens();
+                }
+                name
+            } else if self.consume_if(&TokenKind::Caret) {
+                // Block pointer (Apple extension): (^name) or (^)
+                let name = if let TokenKind::Identifier(n) = self.peek().clone() {
+                    self.advance();
+                    Some(n)
+                } else {
+                    None
+                };
+                self.expect(&TokenKind::RParen);
+                if matches!(self.peek(), TokenKind::LParen) {
+                    self.skip_balanced_parens();
+                }
+                name
+            } else if let TokenKind::Identifier(_) = self.peek() {
+                // Parenthesized name: (name)
+                let name = if let TokenKind::Identifier(n) = self.peek().clone() {
+                    self.advance();
+                    Some(n)
+                } else {
+                    None
+                };
+                self.expect(&TokenKind::RParen);
+                // Might be followed by array dimensions or param list
+                while matches!(self.peek(), TokenKind::LBracket) {
+                    self.advance();
+                    while !matches!(self.peek(), TokenKind::RBracket | TokenKind::Eof) {
+                        self.advance();
+                    }
+                    self.consume_if(&TokenKind::RBracket);
+                }
+                if matches!(self.peek(), TokenKind::LParen) {
+                    self.skip_balanced_parens();
+                }
+                name
+            } else {
+                // Not a recognized pattern, restore position
+                self.pos = save;
+                None
+            }
+        } else if let TokenKind::Identifier(n) = self.peek().clone() {
+            // Simple name
+            self.advance();
+            Some(n)
+        } else {
+            None
+        };
+
+        // Skip array dimensions
+        while matches!(self.peek(), TokenKind::LBracket) {
+            self.advance();
+            while !matches!(self.peek(), TokenKind::RBracket | TokenKind::Eof) {
+                self.advance();
+            }
+            self.consume_if(&TokenKind::RBracket);
+        }
+
+        // Skip trailing function param list (for function pointer types without name)
+        if matches!(self.peek(), TokenKind::LParen) {
+            self.skip_balanced_parens();
+        }
+
+        name
     }
 
     fn parse_compound_stmt(&mut self) -> CompoundStmt {
@@ -1151,18 +1395,41 @@ impl Parser {
     }
 
     fn parse_cast_expr(&mut self) -> Expr {
-        // Try to parse (type-name)expr as a cast expression
+        // Try to parse (type-name)expr as a cast expression or compound literal
         if matches!(self.peek(), TokenKind::LParen) {
             let save = self.pos;
             let save_typedef = self.parsing_typedef;
             self.advance();
             if self.is_type_specifier() {
                 if let Some(type_spec) = self.parse_type_specifier() {
-                    // Skip pointer declarators
-                    while self.consume_if(&TokenKind::Star) {}
+                    // Skip pointer declarators and array dimensions in abstract declarator
+                    while self.consume_if(&TokenKind::Star) {
+                        // skip const/volatile/restrict after pointer
+                        loop {
+                            match self.peek() {
+                                TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict => {
+                                    self.advance();
+                                }
+                                _ => break,
+                            }
+                        }
+                    }
+                    // Skip array dimensions in abstract declarators e.g. (int [3])
+                    while matches!(self.peek(), TokenKind::LBracket) {
+                        self.advance();
+                        while !matches!(self.peek(), TokenKind::RBracket | TokenKind::Eof) {
+                            self.advance();
+                        }
+                        self.consume_if(&TokenKind::RBracket);
+                    }
                     if matches!(self.peek(), TokenKind::RParen) {
                         let span = self.peek_span();
                         self.advance();
+                        // Check for compound literal: (type){...}
+                        if matches!(self.peek(), TokenKind::LBrace) {
+                            let init = self.parse_initializer();
+                            return Expr::CompoundLiteral(type_spec, Box::new(init), span);
+                        }
                         let expr = self.parse_cast_expr();
                         return Expr::Cast(type_spec, Box::new(expr), span);
                     }
@@ -1187,6 +1454,13 @@ impl Parser {
                 self.advance();
                 let expr = self.parse_unary_expr();
                 Expr::UnaryOp(UnaryOp::PreDec, Box::new(expr), span)
+            }
+            TokenKind::Plus => {
+                // Unary plus: +expr (C standard, no-op but valid)
+                let span = self.peek_span();
+                self.advance();
+                let expr = self.parse_cast_expr();
+                Expr::UnaryOp(UnaryOp::Plus, Box::new(expr), span)
             }
             TokenKind::Minus => {
                 let span = self.peek_span();
@@ -1223,15 +1497,41 @@ impl Parser {
                 self.advance();
                 if matches!(self.peek(), TokenKind::LParen) {
                     let save = self.pos;
+                    let save_typedef = self.parsing_typedef;
                     self.advance();
                     if self.is_type_specifier() {
                         if let Some(ts) = self.parse_type_specifier() {
-                            while self.consume_if(&TokenKind::Star) {}
-                            self.expect(&TokenKind::RParen);
-                            return Expr::Sizeof(Box::new(SizeofArg::Type(ts)), span);
+                            // Skip abstract declarator (pointers, arrays, function pointers)
+                            while self.consume_if(&TokenKind::Star) {
+                                loop {
+                                    match self.peek() {
+                                        TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict => {
+                                            self.advance();
+                                        }
+                                        _ => break,
+                                    }
+                                }
+                            }
+                            // Skip array dimensions: sizeof(int[10])
+                            while matches!(self.peek(), TokenKind::LBracket) {
+                                self.advance();
+                                while !matches!(self.peek(), TokenKind::RBracket | TokenKind::Eof) {
+                                    self.advance();
+                                }
+                                self.consume_if(&TokenKind::RBracket);
+                            }
+                            // Handle function pointer in sizeof: sizeof(void (*)(int))
+                            if matches!(self.peek(), TokenKind::LParen) {
+                                self.skip_balanced_parens();
+                            }
+                            if matches!(self.peek(), TokenKind::RParen) {
+                                self.expect(&TokenKind::RParen);
+                                return Expr::Sizeof(Box::new(SizeofArg::Type(ts)), span);
+                            }
                         }
                     }
                     self.pos = save;
+                    self.parsing_typedef = save_typedef;
                 }
                 let expr = self.parse_unary_expr();
                 Expr::Sizeof(Box::new(SizeofArg::Expr(expr)), span)
@@ -1346,9 +1646,20 @@ impl Parser {
             }
             TokenKind::LParen => {
                 self.advance();
-                let expr = self.parse_expr();
-                self.expect(&TokenKind::RParen);
-                expr
+                // Check for GCC statement expression: ({ stmt; stmt; expr; })
+                if matches!(self.peek(), TokenKind::LBrace) {
+                    let span = self.peek_span();
+                    // Parse as compound statement, use last expression as value
+                    let compound = self.parse_compound_stmt();
+                    self.expect(&TokenKind::RParen);
+                    // Extract last expression from compound statement
+                    // For now, treat as 0 - TODO: properly extract last expr value
+                    Expr::StmtExpr(compound, span)
+                } else {
+                    let expr = self.parse_expr();
+                    self.expect(&TokenKind::RParen);
+                    expr
+                }
             }
             TokenKind::Asm => {
                 // GCC asm expression: asm [volatile] (string : outputs : inputs : clobbers)
