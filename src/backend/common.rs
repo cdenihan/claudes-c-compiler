@@ -138,6 +138,9 @@ fn emit_globals(out: &mut AsmOutput, globals: &[IrGlobal], ptr_dir: PtrDirective
 
     // Initialized globals -> .data
     for g in globals {
+        if g.is_extern {
+            continue; // extern declarations have no storage
+        }
         if matches!(g.init, GlobalInit::Zero) {
             continue;
         }
@@ -153,6 +156,9 @@ fn emit_globals(out: &mut AsmOutput, globals: &[IrGlobal], ptr_dir: PtrDirective
 
     // Zero-initialized globals -> .bss
     for g in globals {
+        if g.is_extern {
+            continue; // extern declarations have no storage
+        }
         if !matches!(g.init, GlobalInit::Zero) {
             continue;
         }

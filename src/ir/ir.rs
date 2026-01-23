@@ -21,6 +21,8 @@ pub struct IrGlobal {
     pub init: GlobalInit,
     /// Whether this is a static (file-scope) variable.
     pub is_static: bool,
+    /// Whether this is an extern declaration (no storage emitted).
+    pub is_extern: bool,
 }
 
 /// Initializer for a global variable.

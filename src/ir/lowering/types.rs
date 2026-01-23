@@ -139,24 +139,35 @@ impl Lowerer {
                         }
                     }
                 }
-                // Fallback: check direct base
+                // Fallback: check direct base with pointee_type
                 if let Expr::Identifier(name, _) = base.as_ref() {
                     if let Some(info) = self.locals.get(name) {
+                        if let Some(pt) = info.pointee_type {
+                            return pt;
+                        }
                         if info.is_array {
                             return info.ty;
                         }
                     }
+                    if let Some(ginfo) = self.globals.get(name) {
+                        if let Some(pt) = ginfo.pointee_type {
+                            return pt;
+                        }
+                        if ginfo.is_array {
+                            return ginfo.ty;
+                        }
+                    }
+                }
+                // For complex base expressions, try to resolve pointee type
+                if let Some(pt) = self.get_pointee_type_of_expr(base) {
+                    return pt;
                 }
                 IrType::I64
             }
             Expr::Deref(inner, _) => {
-                // Dereference of pointer - try to infer the pointed-to type
-                if let Expr::Identifier(name, _) = inner.as_ref() {
-                    if let Some(info) = self.locals.get(name) {
-                        if info.ty == IrType::Ptr {
-                            return IrType::I64; // TODO: track pointed-to type
-                        }
-                    }
+                // Dereference of pointer - resolve pointee type from inner expression
+                if let Some(pt) = self.get_pointee_type_of_expr(inner) {
+                    return pt;
                 }
                 IrType::I64
             }

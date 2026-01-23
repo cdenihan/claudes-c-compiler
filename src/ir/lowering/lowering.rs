@@ -16,6 +16,9 @@ pub(super) struct LocalInfo {
     pub is_array: bool,
     /// The IR type of the variable (I8 for char, I32 for int, I64 for long, Ptr for pointers).
     pub ty: IrType,
+    /// For pointers and arrays, the type of the pointed-to/element type.
+    /// Used for correct loads through pointer dereference and subscript.
+    pub pointee_type: Option<IrType>,
     /// If this is a struct/union variable, its layout for member access.
     pub struct_layout: Option<StructLayout>,
     /// Whether this variable is a struct (not a pointer to struct).
@@ -37,6 +40,8 @@ pub(super) struct GlobalInfo {
     pub elem_size: usize,
     /// Whether this is an array.
     pub is_array: bool,
+    /// For pointers and arrays, the type of the pointed-to/element type.
+    pub pointee_type: Option<IrType>,
     /// If this is a struct/union variable, its layout for member access.
     pub struct_layout: Option<StructLayout>,
     /// Whether this variable is a struct (not a pointer to struct).
@@ -235,11 +240,23 @@ impl Lowerer {
                     0
                 };
 
+                // Determine pointee type for pointer parameters
+                let pointee_type = if ty == IrType::Ptr {
+                    if let Some(orig_param) = func.params.get(i) {
+                        self.pointee_ir_type(&orig_param.type_spec)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
                 self.locals.insert(param.name.clone(), LocalInfo {
                     alloca,
                     elem_size,
                     is_array: false,
                     ty,
+                    pointee_type,
                     struct_layout: None,
                     is_struct: false,
                     alloc_size: 8,
@@ -301,10 +318,12 @@ impl Lowerer {
                     let var_ty = if is_pointer { IrType::Ptr } else { base_ty };
                     let struct_layout = self.get_struct_layout_for_type(&decl.type_spec);
                     let is_struct = struct_layout.is_some() && !is_pointer && !is_array;
+                    let pointee_type = self.compute_pointee_type(&decl.type_spec, &declarator.derived);
                     self.globals.insert(declarator.name.clone(), GlobalInfo {
                         ty: var_ty,
                         elem_size,
                         is_array,
+                        pointee_type,
                         struct_layout,
                         is_struct,
                         array_dim_strides,
@@ -320,7 +339,7 @@ impl Lowerer {
                     // Skip re-declaration without initializer (e.g., `extern int a;`)
                     continue;
                 }
-                // Has initializer: remove the previous zero-init global and re-emit with init
+                // Has initializer: remove the previous zero-init/extern global and re-emit with init
                 self.module.globals.retain(|g| g.name != declarator.name);
             }
 
@@ -338,6 +357,9 @@ impl Lowerer {
                 alloc_size
             };
 
+            // Extern declarations without initializers: track but don't emit storage
+            let is_extern_decl = decl.is_extern && declarator.init.is_none();
+
             // Determine initializer
             let init = if let Some(ref initializer) = declarator.init {
                 self.lower_global_init(initializer, &decl.type_spec, base_ty, is_array, elem_size, actual_alloc_size, &struct_layout, &array_dim_strides)
@@ -346,10 +368,12 @@ impl Lowerer {
             };
 
             // Track this global variable
+            let pointee_type = self.compute_pointee_type(&decl.type_spec, &declarator.derived);
             self.globals.insert(declarator.name.clone(), GlobalInfo {
                 ty: var_ty,
                 elem_size,
                 is_array,
+                pointee_type,
                 struct_layout,
                 is_struct,
                 array_dim_strides,
@@ -383,6 +407,7 @@ impl Lowerer {
                 align,
                 init,
                 is_static,
+                is_extern: is_extern_decl,
             });
         }
     }
@@ -618,6 +643,203 @@ impl Lowerer {
                 self.collect_enum_constants_from_stmt(stmt);
             }
             _ => {}
+        }
+    }
+
+
+    /// Compute the IR type of the pointee for a pointer/array type specifier.
+    /// For `Pointer(Char)`, returns Some(I8).
+    /// For `Pointer(Int)`, returns Some(I32).
+    /// For `Array(Int, _)`, returns Some(I32).
+    pub(super) fn pointee_ir_type(&self, type_spec: &TypeSpecifier) -> Option<IrType> {
+        match type_spec {
+            TypeSpecifier::Pointer(inner) => Some(self.type_spec_to_ir(inner)),
+            TypeSpecifier::Array(inner, _) => Some(self.type_spec_to_ir(inner)),
+            _ => None,
+        }
+    }
+
+    /// Compute the pointee type for a declaration, considering both the base type
+    /// specifier and derived declarators (pointer/array).
+    /// For `char *s` (type_spec=Char, derived=[Pointer]): returns Some(I8)
+    /// For `int *p` (type_spec=Int, derived=[Pointer]): returns Some(I32)
+    /// For `int **pp` (type_spec=Int, derived=[Pointer, Pointer]): returns Some(Ptr)
+    /// For `int a[10]` (type_spec=Int, derived=[Array(10)]): returns Some(I32)
+    pub(super) fn compute_pointee_type(&self, type_spec: &TypeSpecifier, derived: &[DerivedDeclarator]) -> Option<IrType> {
+        // Count pointer and array levels
+        let ptr_count = derived.iter().filter(|d| matches!(d, DerivedDeclarator::Pointer)).count();
+        let has_array = derived.iter().any(|d| matches!(d, DerivedDeclarator::Array(_)));
+
+        if ptr_count > 1 {
+            // Multi-level pointer (e.g., int **pp) - pointee is a pointer
+            Some(IrType::Ptr)
+        } else if ptr_count == 1 {
+            // Single pointer - pointee is the base type
+            if has_array {
+                Some(IrType::Ptr)
+            } else {
+                match type_spec {
+                    TypeSpecifier::Pointer(inner) => Some(self.type_spec_to_ir(inner)),
+                    _ => Some(self.type_spec_to_ir(type_spec)),
+                }
+            }
+        } else if has_array {
+            // Array (e.g., int a[10]) - element type is the base type
+            Some(self.type_spec_to_ir(type_spec))
+        } else {
+            // Check if the type_spec itself is a pointer
+            self.pointee_ir_type(type_spec)
+        }
+    }
+
+    /// Check if an expression has pointer type (for pointer arithmetic).
+    pub(super) fn expr_is_pointer(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Identifier(name, _) => {
+                if let Some(info) = self.locals.get(name) {
+                    return info.ty == IrType::Ptr && !info.is_struct;
+                }
+                if let Some(ginfo) = self.globals.get(name) {
+                    return ginfo.ty == IrType::Ptr && !ginfo.is_struct;
+                }
+                false
+            }
+            Expr::AddressOf(_, _) => true,
+            Expr::PostfixOp(_, inner, _) => self.expr_is_pointer(inner),
+            Expr::UnaryOp(op, inner, _) => {
+                match op {
+                    UnaryOp::PreInc | UnaryOp::PreDec => self.expr_is_pointer(inner),
+                    _ => false,
+                }
+            }
+            Expr::ArraySubscript(base, _, _) => {
+                // Result of subscript on pointer-to-pointer
+                if let Some(pt) = self.get_pointee_type_of_expr(base) {
+                    return pt == IrType::Ptr;
+                }
+                false
+            }
+            Expr::Cast(ref type_spec, _, _) => {
+                matches!(type_spec, TypeSpecifier::Pointer(_))
+            }
+            Expr::StringLiteral(_, _) => true,
+            _ => false,
+        }
+    }
+
+    /// Get the element size for pointer arithmetic on a variable.
+    /// For `int *p`, returns 4. For `char *s`, returns 1.
+    pub(super) fn get_pointer_elem_size(&self, expr: &Expr) -> usize {
+        if let Expr::Identifier(name, _) = expr {
+            if let Some(info) = self.locals.get(name) {
+                if info.elem_size > 0 {
+                    return info.elem_size;
+                }
+                if let Some(pt) = info.pointee_type {
+                    return pt.size();
+                }
+            }
+            if let Some(ginfo) = self.globals.get(name) {
+                if ginfo.elem_size > 0 {
+                    return ginfo.elem_size;
+                }
+                if let Some(pt) = ginfo.pointee_type {
+                    return pt.size();
+                }
+            }
+        }
+        // Default: treat as pointer to 8-byte values
+        8
+    }
+
+    /// Get the element size for a pointer expression (for scaling in pointer arithmetic).
+    pub(super) fn get_pointer_elem_size_from_expr(&self, expr: &Expr) -> usize {
+        match expr {
+            Expr::Identifier(_, _) => {
+                self.get_pointer_elem_size(expr)
+            }
+            Expr::PostfixOp(_, inner, _) => self.get_pointer_elem_size_from_expr(inner),
+            Expr::UnaryOp(op, inner, _) => {
+                match op {
+                    UnaryOp::PreInc | UnaryOp::PreDec => self.get_pointer_elem_size_from_expr(inner),
+                    _ => 8,
+                }
+            }
+            Expr::AddressOf(inner, _) => {
+                // &x: pointer to typeof(x)
+                let ty = self.get_expr_type(inner);
+                ty.size()
+            }
+            Expr::Cast(ref type_spec, _, _) => {
+                if let TypeSpecifier::Pointer(ref inner) = type_spec {
+                    self.sizeof_type(inner)
+                } else {
+                    8
+                }
+            }
+            _ => {
+                // Try using get_pointee_type_of_expr as a fallback
+                if let Some(pt) = self.get_pointee_type_of_expr(expr) {
+                    return pt.size();
+                }
+                8
+            }
+        }
+    }
+
+    /// Get the pointee type for a pointer expression - i.e., what type you get when dereferencing it.
+    pub(super) fn get_pointee_type_of_expr(&self, expr: &Expr) -> Option<IrType> {
+        match expr {
+            Expr::Identifier(name, _) => {
+                if let Some(info) = self.locals.get(name) {
+                    return info.pointee_type;
+                }
+                if let Some(ginfo) = self.globals.get(name) {
+                    return ginfo.pointee_type;
+                }
+                None
+            }
+            Expr::PostfixOp(_, inner, _) => {
+                self.get_pointee_type_of_expr(inner)
+            }
+            Expr::UnaryOp(op, inner, _) => {
+                match op {
+                    UnaryOp::PreInc | UnaryOp::PreDec => {
+                        self.get_pointee_type_of_expr(inner)
+                    }
+                    _ => None,
+                }
+            }
+            Expr::BinaryOp(_, lhs, rhs, _) => {
+                if let Some(pt) = self.get_pointee_type_of_expr(lhs) {
+                    return Some(pt);
+                }
+                self.get_pointee_type_of_expr(rhs)
+            }
+            Expr::Cast(ref type_spec, inner, _) => {
+                if let TypeSpecifier::Pointer(ref pointee_ts) = type_spec {
+                    let pt = self.type_spec_to_ir(pointee_ts);
+                    return Some(pt);
+                }
+                self.get_pointee_type_of_expr(inner)
+            }
+            Expr::Conditional(_, then_expr, else_expr, _) => {
+                if let Some(pt) = self.get_pointee_type_of_expr(then_expr) {
+                    return Some(pt);
+                }
+                self.get_pointee_type_of_expr(else_expr)
+            }
+            Expr::Comma(_, last, _) => {
+                self.get_pointee_type_of_expr(last)
+            }
+            Expr::AddressOf(inner, _) => {
+                let ty = self.get_expr_type(inner);
+                Some(ty)
+            }
+            Expr::Assign(_, rhs, _) => {
+                self.get_pointee_type_of_expr(rhs)
+            }
+            _ => None,
         }
     }
 

@@ -40,10 +40,12 @@ impl Lowerer {
                     let ty = self.type_spec_to_ir(&decl.type_spec);
                     let is_pointer = declarator.derived.iter().any(|d| matches!(d, DerivedDeclarator::Pointer));
                     let var_ty = if is_pointer { IrType::Ptr } else { ty };
+                    let pointee_type = self.compute_pointee_type(&decl.type_spec, &declarator.derived);
                     self.globals.insert(declarator.name.clone(), GlobalInfo {
                         ty: var_ty,
                         elem_size: 0,
                         is_array: false,
+                        pointee_type,
                         struct_layout: None,
                         is_struct: false,
                         array_dim_strides: vec![],
@@ -98,13 +100,16 @@ impl Lowerer {
                     align,
                     init,
                     is_static: true,
+                    is_extern: false,
                 });
 
                 // Track as a global for access via GlobalAddr
+                let pointee_type = self.compute_pointee_type(&decl.type_spec, &declarator.derived);
                 self.globals.insert(static_name.clone(), GlobalInfo {
                     ty: var_ty,
                     elem_size,
                     is_array,
+                    pointee_type,
                     struct_layout: struct_layout.clone(),
                     is_struct,
                     array_dim_strides: array_dim_strides.clone(),
@@ -118,11 +123,13 @@ impl Lowerer {
                     name: static_name,
                 });
 
+                let pointee_type = self.compute_pointee_type(&decl.type_spec, &declarator.derived);
                 self.locals.insert(declarator.name.clone(), LocalInfo {
                     alloca: addr,
                     elem_size,
                     is_array,
                     ty: var_ty,
+                    pointee_type,
                     struct_layout,
                     is_struct,
                     alloc_size: actual_alloc_size,
@@ -141,11 +148,13 @@ impl Lowerer {
                 ty: if is_array || is_struct { IrType::Ptr } else { var_ty },
                 size: actual_alloc_size,
             });
+            let pointee_type = self.compute_pointee_type(&decl.type_spec, &declarator.derived);
             self.locals.insert(declarator.name.clone(), LocalInfo {
                 alloca,
                 elem_size,
                 is_array,
                 ty: var_ty,
+                pointee_type,
                 struct_layout,
                 is_struct,
                 alloc_size: actual_alloc_size,

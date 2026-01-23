@@ -67,6 +67,73 @@ impl Lowerer {
                     _ => {}
                 }
 
+                // Check for pointer arithmetic: ptr + int or int + ptr or ptr - int
+                if matches!(op, BinOp::Add | BinOp::Sub) {
+                    let lhs_is_ptr = self.expr_is_pointer(lhs);
+                    let rhs_is_ptr = self.expr_is_pointer(rhs);
+
+                    if lhs_is_ptr && !rhs_is_ptr {
+                        // ptr + int or ptr - int: scale RHS by element size
+                        let elem_size = self.get_pointer_elem_size_from_expr(lhs);
+                        let lhs_val = self.lower_expr(lhs);
+                        let rhs_val = self.lower_expr(rhs);
+                        let scaled_rhs = if elem_size > 1 {
+                            let scale = Operand::Const(IrConst::I64(elem_size as i64));
+                            let scaled = self.fresh_value();
+                            self.emit(Instruction::BinOp {
+                                dest: scaled,
+                                op: IrBinOp::Mul,
+                                lhs: rhs_val,
+                                rhs: scale,
+                                ty: IrType::I64,
+                            });
+                            Operand::Value(scaled)
+                        } else {
+                            rhs_val
+                        };
+                        let dest = self.fresh_value();
+                        let ir_op = if *op == BinOp::Add { IrBinOp::Add } else { IrBinOp::Sub };
+                        self.emit(Instruction::BinOp { dest, op: ir_op, lhs: lhs_val, rhs: scaled_rhs, ty: IrType::I64 });
+                        return Operand::Value(dest);
+                    } else if rhs_is_ptr && !lhs_is_ptr && *op == BinOp::Add {
+                        // int + ptr: scale LHS by element size
+                        let elem_size = self.get_pointer_elem_size_from_expr(rhs);
+                        let lhs_val = self.lower_expr(lhs);
+                        let rhs_val = self.lower_expr(rhs);
+                        let scaled_lhs = if elem_size > 1 {
+                            let scale = Operand::Const(IrConst::I64(elem_size as i64));
+                            let scaled = self.fresh_value();
+                            self.emit(Instruction::BinOp {
+                                dest: scaled,
+                                op: IrBinOp::Mul,
+                                lhs: lhs_val,
+                                rhs: scale,
+                                ty: IrType::I64,
+                            });
+                            Operand::Value(scaled)
+                        } else {
+                            lhs_val
+                        };
+                        let dest = self.fresh_value();
+                        self.emit(Instruction::BinOp { dest, op: IrBinOp::Add, lhs: scaled_lhs, rhs: rhs_val, ty: IrType::I64 });
+                        return Operand::Value(dest);
+                    } else if lhs_is_ptr && rhs_is_ptr && *op == BinOp::Sub {
+                        // ptr - ptr: result is byte difference / element size
+                        let elem_size = self.get_pointer_elem_size_from_expr(lhs);
+                        let lhs_val = self.lower_expr(lhs);
+                        let rhs_val = self.lower_expr(rhs);
+                        let diff = self.fresh_value();
+                        self.emit(Instruction::BinOp { dest: diff, op: IrBinOp::Sub, lhs: lhs_val, rhs: rhs_val, ty: IrType::I64 });
+                        if elem_size > 1 {
+                            let scale = Operand::Const(IrConst::I64(elem_size as i64));
+                            let dest = self.fresh_value();
+                            self.emit(Instruction::BinOp { dest, op: IrBinOp::SDiv, lhs: Operand::Value(diff), rhs: scale, ty: IrType::I64 });
+                            return Operand::Value(dest);
+                        }
+                        return Operand::Value(diff);
+                    }
+                }
+
                 let lhs_val = self.lower_expr(lhs);
                 let rhs_val = self.lower_expr(rhs);
                 let dest = self.fresh_value();
@@ -408,8 +475,7 @@ impl Lowerer {
             Expr::Deref(inner, _) => {
                 let ptr = self.lower_expr(inner);
                 let dest = self.fresh_value();
-                // TODO: determine the type the pointer points to
-                let deref_ty = IrType::I64;
+                let deref_ty = self.get_pointee_type_of_expr(inner).unwrap_or(IrType::I64);
                 match ptr {
                     Operand::Value(v) => {
                         self.emit(Instruction::Load { dest, ptr: v, ty: deref_ty });
@@ -598,14 +664,20 @@ impl Lowerer {
                     tmp
                 }
             };
-            let one = Operand::Const(IrConst::I64(1));
+            // For pointer types, increment by element size instead of 1
+            let step = if ty == IrType::Ptr {
+                let elem_size = self.get_pointer_elem_size(inner);
+                Operand::Const(IrConst::I64(elem_size as i64))
+            } else {
+                Operand::Const(IrConst::I64(1))
+            };
             let result = self.fresh_value();
             let ir_op = if op == UnaryOp::PreInc { IrBinOp::Add } else { IrBinOp::Sub };
             self.emit(Instruction::BinOp {
                 dest: result,
                 op: ir_op,
                 lhs: Operand::Value(loaded_val),
-                rhs: one,
+                rhs: step,
                 ty: IrType::I64,
             });
             self.store_lvalue_typed(&lv, Operand::Value(result), ty);
@@ -628,14 +700,20 @@ impl Lowerer {
                     tmp
                 }
             };
-            let one = Operand::Const(IrConst::I64(1));
+            // For pointer types, increment by element size instead of 1
+            let step = if ty == IrType::Ptr {
+                let elem_size = self.get_pointer_elem_size(inner);
+                Operand::Const(IrConst::I64(elem_size as i64))
+            } else {
+                Operand::Const(IrConst::I64(1))
+            };
             let result = self.fresh_value();
             let ir_op = if op == PostfixOp::PostInc { IrBinOp::Add } else { IrBinOp::Sub };
             self.emit(Instruction::BinOp {
                 dest: result,
                 op: ir_op,
                 lhs: Operand::Value(loaded_val),
-                rhs: one,
+                rhs: step,
                 ty: IrType::I64,
             });
             self.store_lvalue_typed(&lv, Operand::Value(result), ty);
@@ -665,12 +743,32 @@ impl Lowerer {
                 BinOp::Shr => IrBinOp::AShr,
                 _ => IrBinOp::Add,
             };
+            // For pointer += and -= operations, scale the RHS by element size
+            let actual_rhs = if ty == IrType::Ptr && matches!(op, BinOp::Add | BinOp::Sub) {
+                let elem_size = self.get_pointer_elem_size(lhs);
+                if elem_size > 1 {
+                    let scale = Operand::Const(IrConst::I64(elem_size as i64));
+                    let scaled = self.fresh_value();
+                    self.emit(Instruction::BinOp {
+                        dest: scaled,
+                        op: IrBinOp::Mul,
+                        lhs: rhs_val,
+                        rhs: scale,
+                        ty: IrType::I64,
+                    });
+                    Operand::Value(scaled)
+                } else {
+                    rhs_val
+                }
+            } else {
+                rhs_val
+            };
             let result = self.fresh_value();
             self.emit(Instruction::BinOp {
                 dest: result,
                 op: ir_op,
                 lhs: loaded,
-                rhs: rhs_val,
+                rhs: actual_rhs,
                 ty: IrType::I64,
             });
             self.store_lvalue_typed(&lv, Operand::Value(result), ty);

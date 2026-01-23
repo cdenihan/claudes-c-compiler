@@ -248,13 +248,22 @@ impl Lowerer {
                 if info.elem_size > 0 {
                     return info.elem_size;
                 }
+                // Use pointee_type as fallback
+                if let Some(pt) = info.pointee_type {
+                    return pt.size();
+                }
             }
             if let Some(ginfo) = self.globals.get(name) {
                 if ginfo.elem_size > 0 {
                     return ginfo.elem_size;
                 }
+                if let Some(pt) = ginfo.pointee_type {
+                    return pt.size();
+                }
             }
         }
+        // Default element size: for pointers we don't know the element type,
+        // use 8 bytes as a safe default for pointer dereferencing.
         8
     }
 

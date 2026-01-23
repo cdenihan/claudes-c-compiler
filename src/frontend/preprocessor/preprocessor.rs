@@ -33,6 +33,8 @@ pub struct Preprocessor {
     pragma_once_files: HashSet<PathBuf>,
     /// Whether to actually resolve includes (can be disabled for testing)
     resolve_includes: bool,
+    /// Declarations to inject into the output (from #include processing).
+    pending_injections: Vec<String>,
 }
 
 impl Preprocessor {
@@ -48,6 +50,7 @@ impl Preprocessor {
             include_stack: Vec::new(),
             pragma_once_files: HashSet::new(),
             resolve_includes: true,
+            pending_injections: Vec::new(),
         };
         pp.define_predefined_macros();
         define_builtin_macros(&mut pp.macros);
@@ -347,10 +350,15 @@ impl Preprocessor {
                     // An #include was processed; insert the preprocessed content
                     output.push_str(&included_content);
                     output.push('\n');
-                } else {
-                    // Emit a newline to preserve line numbers
-                    output.push('\n');
                 }
+                // Emit injected declarations from #include processing
+                if !self.pending_injections.is_empty() {
+                    for decl in std::mem::take(&mut self.pending_injections) {
+                        output.push_str(&decl);
+                    }
+                }
+                // Emit a newline to preserve line numbers
+                output.push('\n');
             } else if self.conditionals.is_active() {
                 // Regular line - expand macros if we're in an active conditional
                 let expanded = self.macros.expand_line(line);
@@ -666,6 +674,9 @@ impl Preprocessor {
 
         self.includes.push(include_path.clone());
 
+        // Inject declarations for well-known standard headers
+        self.inject_header_declarations(&include_path);
+
         if !self.resolve_includes {
             return None;
         }
@@ -775,6 +786,28 @@ impl Preprocessor {
         }
 
         None
+    }
+
+    /// Inject essential declarations for standard library headers.
+    /// Since we don't read actual system headers, we inject the key
+    /// type definitions and extern variable declarations that C code
+    /// commonly uses from these headers.
+    fn inject_header_declarations(&mut self, header: &str) {
+        match header {
+            "stdio.h" => {
+                // FILE type and standard streams
+                self.pending_injections.push("typedef struct _IO_FILE FILE;\n".to_string());
+                self.pending_injections.push("extern FILE *stdin;\n".to_string());
+                self.pending_injections.push("extern FILE *stdout;\n".to_string());
+                self.pending_injections.push("extern FILE *stderr;\n".to_string());
+            }
+            "errno.h" => {
+                // errno is typically a macro expanding to (*__errno_location())
+                // but for our purposes, treat it as an extern int
+                self.pending_injections.push("extern int errno;\n".to_string());
+            }
+            _ => {}
+        }
     }
 
     fn handle_define(&mut self, rest: &str) {
