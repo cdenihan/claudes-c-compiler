@@ -212,6 +212,8 @@ fn expand_condition_macros(expr: &str, macros: &MacroTable) -> String {
 
 /// Evaluate a constant expression for #if directives.
 /// Supports: integer literals, defined(X), !, &&, ||, ==, !=, <, >, <=, >=, +, -, *, /, %, (), unary -, ~
+/// Per C99 6.10.1, preprocessor integer expressions use intmax_t (signed) or uintmax_t (unsigned)
+/// depending on whether any operand has a 'u'/'U' suffix.
 pub fn eval_const_expr(expr: &str) -> bool {
     let expr = expr.trim();
     if expr.is_empty() {
@@ -220,14 +222,16 @@ pub fn eval_const_expr(expr: &str) -> bool {
 
     let tokens = tokenize_expr(expr);
     let mut parser = ExprParser::new(&tokens);
-    let result = parser.parse_ternary();
+    let (result, _is_unsigned) = parser.parse_ternary();
     result != 0
 }
 
-/// Simple token for expression evaluation
+/// Simple token for expression evaluation.
+/// Num holds (value_as_i64, is_unsigned). The i64 stores the bit pattern;
+/// for unsigned values, interpret as u64 via `as u64`.
 #[derive(Debug, Clone, PartialEq)]
 enum ExprToken {
-    Num(i64),
+    Num(i64, bool),
     Ident(String),
     Op(String),
     LParen,
@@ -251,18 +255,13 @@ fn tokenize_expr(expr: &str) -> Vec<ExprToken> {
         // Number (decimal, hex, octal)
         if chars[i].is_ascii_digit() {
             let start = i;
-            if chars[i] == '0' && i + 1 < len && (chars[i + 1] == 'x' || chars[i + 1] == 'X') {
+            let (raw_val, is_hex_or_oct) = if chars[i] == '0' && i + 1 < len && (chars[i + 1] == 'x' || chars[i + 1] == 'X') {
                 i += 2;
                 while i < len && chars[i].is_ascii_hexdigit() {
                     i += 1;
                 }
                 let hex_str: String = chars[start + 2..i].iter().collect();
-                let val = i64::from_str_radix(&hex_str, 16).unwrap_or(0);
-                // Skip suffixes (U, L, UL, LL, ULL)
-                while i < len && (chars[i] == 'u' || chars[i] == 'U' || chars[i] == 'l' || chars[i] == 'L') {
-                    i += 1;
-                }
-                tokens.push(ExprToken::Num(val));
+                (u64::from_str_radix(&hex_str, 16).unwrap_or(0), true)
             } else if chars[i] == '0' && i + 1 < len && chars[i + 1].is_ascii_digit() {
                 // Octal
                 i += 1;
@@ -270,22 +269,37 @@ fn tokenize_expr(expr: &str) -> Vec<ExprToken> {
                     i += 1;
                 }
                 let oct_str: String = chars[start + 1..i].iter().collect();
-                let val = i64::from_str_radix(&oct_str, 8).unwrap_or(0);
-                while i < len && (chars[i] == 'u' || chars[i] == 'U' || chars[i] == 'l' || chars[i] == 'L') {
-                    i += 1;
-                }
-                tokens.push(ExprToken::Num(val));
+                (u64::from_str_radix(&oct_str, 8).unwrap_or(0), true)
             } else {
                 while i < len && chars[i].is_ascii_digit() {
                     i += 1;
                 }
                 let num_str: String = chars[start..i].iter().collect();
-                let val = num_str.parse::<i64>().unwrap_or(0);
-                while i < len && (chars[i] == 'u' || chars[i] == 'U' || chars[i] == 'l' || chars[i] == 'L') {
-                    i += 1;
+                (num_str.parse::<u64>().unwrap_or(0), false)
+            };
+            // Parse suffixes (U, L, UL, LL, ULL) - track unsigned
+            let mut is_unsigned = false;
+            while i < len && (chars[i] == 'u' || chars[i] == 'U' || chars[i] == 'l' || chars[i] == 'L') {
+                if chars[i] == 'u' || chars[i] == 'U' {
+                    is_unsigned = true;
                 }
-                tokens.push(ExprToken::Num(val));
+                i += 1;
             }
+            // Per C99: decimal without U suffix: int -> long -> long long
+            // Hex/octal without U suffix: int -> unsigned int -> long -> unsigned long -> long long -> unsigned long long
+            // With U suffix: always unsigned
+            if !is_unsigned && is_hex_or_oct {
+                // Hex/octal: unsigned if value exceeds signed range
+                if raw_val > i64::MAX as u64 {
+                    is_unsigned = true;
+                }
+            }
+            // Decimal without suffix: stays signed even for large values (they become long long)
+            // But if value > i64::MAX (can't happen for decimal u64 parse unless really huge), treat as unsigned
+            if !is_unsigned && !is_hex_or_oct && raw_val > i64::MAX as u64 {
+                is_unsigned = true;
+            }
+            tokens.push(ExprToken::Num(raw_val as i64, is_unsigned));
             continue;
         }
 
@@ -325,7 +339,7 @@ fn tokenize_expr(expr: &str) -> Vec<ExprToken> {
             if i < len && chars[i] == '\'' {
                 i += 1;
             }
-            tokens.push(ExprToken::Num(val));
+            tokens.push(ExprToken::Num(val, false));
             continue;
         }
 
@@ -426,10 +440,16 @@ fn tokenize_expr(expr: &str) -> Vec<ExprToken> {
 }
 
 /// Recursive descent parser for preprocessor constant expressions.
+/// All parse functions return (value_as_i64, is_unsigned).
+/// The i64 stores the bit pattern; when is_unsigned is true, interpret via `as u64`.
+/// Per C99 6.10.1: if either operand is unsigned, convert both to unsigned for the operation.
 struct ExprParser<'a> {
     tokens: &'a [ExprToken],
     pos: usize,
 }
+
+/// Result of a preprocessor expression: (bit_pattern_as_i64, is_unsigned)
+type PpVal = (i64, bool);
 
 impl<'a> ExprParser<'a> {
     fn new(tokens: &'a [ExprToken]) -> Self {
@@ -448,82 +468,103 @@ impl<'a> ExprParser<'a> {
         tok
     }
 
-    fn parse_ternary(&mut self) -> i64 {
+    /// Check if the next token matches a given operator string
+    fn peek_op(&self, op: &str) -> bool {
+        matches!(self.peek(), Some(ExprToken::Op(s)) if s == op)
+    }
+
+    fn parse_ternary(&mut self) -> PpVal {
         let cond = self.parse_or();
-        if self.peek() == Some(&ExprToken::Op("?".to_string())) {
+        if self.peek_op("?") {
             self.advance(); // ?
             let then_val = self.parse_ternary();
-            if self.peek() == Some(&ExprToken::Op(":".to_string())) {
+            if self.peek_op(":") {
                 self.advance(); // :
             }
             let else_val = self.parse_ternary();
-            if cond != 0 { then_val } else { else_val }
+            if cond.0 != 0 { then_val } else { else_val }
         } else {
             cond
         }
     }
 
-    fn parse_or(&mut self) -> i64 {
+    fn parse_or(&mut self) -> PpVal {
         let mut left = self.parse_and();
-        while self.peek() == Some(&ExprToken::Op("||".to_string())) {
+        while self.peek_op("||") {
             self.advance();
             let right = self.parse_and();
-            left = if left != 0 || right != 0 { 1 } else { 0 };
+            // Logical operators always produce signed int result
+            left = (if left.0 != 0 || right.0 != 0 { 1 } else { 0 }, false);
         }
         left
     }
 
-    fn parse_and(&mut self) -> i64 {
+    fn parse_and(&mut self) -> PpVal {
         let mut left = self.parse_bitor();
-        while self.peek() == Some(&ExprToken::Op("&&".to_string())) {
+        while self.peek_op("&&") {
             self.advance();
             let right = self.parse_bitor();
-            left = if left != 0 && right != 0 { 1 } else { 0 };
+            left = (if left.0 != 0 && right.0 != 0 { 1 } else { 0 }, false);
         }
         left
     }
 
-    fn parse_bitor(&mut self) -> i64 {
+    fn parse_bitor(&mut self) -> PpVal {
         let mut left = self.parse_bitxor();
-        while self.peek() == Some(&ExprToken::Op("|".to_string())) {
+        while self.peek_op("|") {
             self.advance();
             let right = self.parse_bitxor();
-            left |= right;
+            let u = left.1 || right.1;
+            left = (left.0 | right.0, u);
         }
         left
     }
 
-    fn parse_bitxor(&mut self) -> i64 {
+    fn parse_bitxor(&mut self) -> PpVal {
         let mut left = self.parse_bitand();
-        while self.peek() == Some(&ExprToken::Op("^".to_string())) {
+        while self.peek_op("^") {
             self.advance();
             let right = self.parse_bitand();
-            left ^= right;
+            let u = left.1 || right.1;
+            left = (left.0 ^ right.0, u);
         }
         left
     }
 
-    fn parse_bitand(&mut self) -> i64 {
+    fn parse_bitand(&mut self) -> PpVal {
         let mut left = self.parse_equality();
-        while self.peek() == Some(&ExprToken::Op("&".to_string())) {
+        while self.peek_op("&") {
             self.advance();
             let right = self.parse_equality();
-            left &= right;
+            let u = left.1 || right.1;
+            left = (left.0 & right.0, u);
         }
         left
     }
 
-    fn parse_equality(&mut self) -> i64 {
+    fn parse_equality(&mut self) -> PpVal {
         let mut left = self.parse_relational();
         loop {
-            if self.peek() == Some(&ExprToken::Op("==".to_string())) {
+            if self.peek_op("==") {
                 self.advance();
                 let right = self.parse_relational();
-                left = if left == right { 1 } else { 0 };
-            } else if self.peek() == Some(&ExprToken::Op("!=".to_string())) {
+                let u = left.1 || right.1;
+                let eq = if u {
+                    (left.0 as u64) == (right.0 as u64)
+                } else {
+                    left.0 == right.0
+                };
+                left = (if eq { 1 } else { 0 }, false);
+            } else if self.peek_op("!=") {
                 self.advance();
                 let right = self.parse_relational();
-                left = if left != right { 1 } else { 0 };
+                let u = left.1 || right.1;
+                let ne = if u {
+                    (left.0 as u64) != (right.0 as u64)
+                } else {
+                    left.0 != right.0
+                };
+                left = (if ne { 1 } else { 0 }, false);
             } else {
                 break;
             }
@@ -531,25 +572,49 @@ impl<'a> ExprParser<'a> {
         left
     }
 
-    fn parse_relational(&mut self) -> i64 {
+    fn parse_relational(&mut self) -> PpVal {
         let mut left = self.parse_shift();
         loop {
-            if self.peek() == Some(&ExprToken::Op("<".to_string())) {
+            if self.peek_op("<") {
                 self.advance();
                 let right = self.parse_shift();
-                left = if left < right { 1 } else { 0 };
-            } else if self.peek() == Some(&ExprToken::Op(">".to_string())) {
+                let u = left.1 || right.1;
+                let cmp = if u {
+                    (left.0 as u64) < (right.0 as u64)
+                } else {
+                    left.0 < right.0
+                };
+                left = (if cmp { 1 } else { 0 }, false);
+            } else if self.peek_op(">") {
                 self.advance();
                 let right = self.parse_shift();
-                left = if left > right { 1 } else { 0 };
-            } else if self.peek() == Some(&ExprToken::Op("<=".to_string())) {
+                let u = left.1 || right.1;
+                let cmp = if u {
+                    (left.0 as u64) > (right.0 as u64)
+                } else {
+                    left.0 > right.0
+                };
+                left = (if cmp { 1 } else { 0 }, false);
+            } else if self.peek_op("<=") {
                 self.advance();
                 let right = self.parse_shift();
-                left = if left <= right { 1 } else { 0 };
-            } else if self.peek() == Some(&ExprToken::Op(">=".to_string())) {
+                let u = left.1 || right.1;
+                let cmp = if u {
+                    (left.0 as u64) <= (right.0 as u64)
+                } else {
+                    left.0 <= right.0
+                };
+                left = (if cmp { 1 } else { 0 }, false);
+            } else if self.peek_op(">=") {
                 self.advance();
                 let right = self.parse_shift();
-                left = if left >= right { 1 } else { 0 };
+                let u = left.1 || right.1;
+                let cmp = if u {
+                    (left.0 as u64) >= (right.0 as u64)
+                } else {
+                    left.0 >= right.0
+                };
+                left = (if cmp { 1 } else { 0 }, false);
             } else {
                 break;
             }
@@ -557,17 +622,30 @@ impl<'a> ExprParser<'a> {
         left
     }
 
-    fn parse_shift(&mut self) -> i64 {
+    fn parse_shift(&mut self) -> PpVal {
         let mut left = self.parse_additive();
         loop {
-            if self.peek() == Some(&ExprToken::Op("<<".to_string())) {
+            if self.peek_op("<<") {
                 self.advance();
                 let right = self.parse_additive();
-                left = left.wrapping_shl(right as u32);
-            } else if self.peek() == Some(&ExprToken::Op(">>".to_string())) {
+                // Shift: result has type of the left operand
+                let shift_amt = right.0 as u32;
+                if left.1 {
+                    left = ((left.0 as u64).wrapping_shl(shift_amt) as i64, true);
+                } else {
+                    left = (left.0.wrapping_shl(shift_amt), left.1);
+                }
+            } else if self.peek_op(">>") {
                 self.advance();
                 let right = self.parse_additive();
-                left = left.wrapping_shr(right as u32);
+                let shift_amt = right.0 as u32;
+                if left.1 {
+                    // Unsigned: logical shift right
+                    left = ((left.0 as u64).wrapping_shr(shift_amt) as i64, true);
+                } else {
+                    // Signed: arithmetic shift right
+                    left = (left.0.wrapping_shr(shift_amt), false);
+                }
             } else {
                 break;
             }
@@ -575,17 +653,20 @@ impl<'a> ExprParser<'a> {
         left
     }
 
-    fn parse_additive(&mut self) -> i64 {
+    fn parse_additive(&mut self) -> PpVal {
         let mut left = self.parse_multiplicative();
         loop {
-            if self.peek() == Some(&ExprToken::Op("+".to_string())) {
+            if self.peek_op("+") {
                 self.advance();
                 let right = self.parse_multiplicative();
-                left = left.wrapping_add(right);
-            } else if self.peek() == Some(&ExprToken::Op("-".to_string())) {
+                let u = left.1 || right.1;
+                // Wrapping add works the same for signed and unsigned at bit level
+                left = (left.0.wrapping_add(right.0), u);
+            } else if self.peek_op("-") {
                 self.advance();
                 let right = self.parse_multiplicative();
-                left = left.wrapping_sub(right);
+                let u = left.1 || right.1;
+                left = (left.0.wrapping_sub(right.0), u);
             } else {
                 break;
             }
@@ -593,28 +674,48 @@ impl<'a> ExprParser<'a> {
         left
     }
 
-    fn parse_multiplicative(&mut self) -> i64 {
+    fn parse_multiplicative(&mut self) -> PpVal {
         let mut left = self.parse_unary();
         loop {
-            if self.peek() == Some(&ExprToken::Op("*".to_string())) {
+            if self.peek_op("*") {
                 self.advance();
                 let right = self.parse_unary();
-                left = left.wrapping_mul(right);
-            } else if self.peek() == Some(&ExprToken::Op("/".to_string())) {
-                self.advance();
-                let right = self.parse_unary();
-                if right != 0 {
-                    left /= right;
+                let u = left.1 || right.1;
+                if u {
+                    left = ((left.0 as u64).wrapping_mul(right.0 as u64) as i64, true);
                 } else {
-                    left = 0;
+                    left = (left.0.wrapping_mul(right.0), false);
                 }
-            } else if self.peek() == Some(&ExprToken::Op("%".to_string())) {
+            } else if self.peek_op("/") {
                 self.advance();
                 let right = self.parse_unary();
-                if right != 0 {
-                    left %= right;
+                let u = left.1 || right.1;
+                if right.0 == 0 {
+                    left = (0, u);
+                } else if u {
+                    left = ((left.0 as u64).wrapping_div(right.0 as u64) as i64, true);
                 } else {
-                    left = 0;
+                    // Avoid signed overflow on i64::MIN / -1
+                    if left.0 == i64::MIN && right.0 == -1 {
+                        left = (i64::MIN, false);
+                    } else {
+                        left = (left.0 / right.0, false);
+                    }
+                }
+            } else if self.peek_op("%") {
+                self.advance();
+                let right = self.parse_unary();
+                let u = left.1 || right.1;
+                if right.0 == 0 {
+                    left = (0, u);
+                } else if u {
+                    left = ((left.0 as u64).wrapping_rem(right.0 as u64) as i64, true);
+                } else {
+                    if left.0 == i64::MIN && right.0 == -1 {
+                        left = (0, false);
+                    } else {
+                        left = (left.0 % right.0, false);
+                    }
                 }
             } else {
                 break;
@@ -623,34 +724,41 @@ impl<'a> ExprParser<'a> {
         left
     }
 
-    fn parse_unary(&mut self) -> i64 {
-        if self.peek() == Some(&ExprToken::Op("!".to_string())) {
+    fn parse_unary(&mut self) -> PpVal {
+        if self.peek_op("!") {
             self.advance();
             let val = self.parse_unary();
-            return if val == 0 { 1 } else { 0 };
+            // Logical NOT always produces signed int
+            return (if val.0 == 0 { 1 } else { 0 }, false);
         }
-        if self.peek() == Some(&ExprToken::Op("-".to_string())) {
+        if self.peek_op("-") {
             self.advance();
             let val = self.parse_unary();
-            return val.wrapping_neg();
+            // Unary minus: if unsigned, the result is still unsigned (wrapping)
+            if val.1 {
+                return ((val.0 as u64).wrapping_neg() as i64, true);
+            } else {
+                return (val.0.wrapping_neg(), false);
+            }
         }
-        if self.peek() == Some(&ExprToken::Op("+".to_string())) {
+        if self.peek_op("+") {
             self.advance();
             return self.parse_unary();
         }
-        if self.peek() == Some(&ExprToken::Op("~".to_string())) {
+        if self.peek_op("~") {
             self.advance();
             let val = self.parse_unary();
-            return !val;
+            // Bitwise NOT preserves signedness
+            return (!val.0, val.1);
         }
         self.parse_primary()
     }
 
-    fn parse_primary(&mut self) -> i64 {
+    fn parse_primary(&mut self) -> PpVal {
         match self.peek().cloned() {
-            Some(ExprToken::Num(n)) => {
+            Some(ExprToken::Num(n, u)) => {
                 self.advance();
-                n
+                (n, u)
             }
             Some(ExprToken::LParen) => {
                 self.advance();
@@ -671,15 +779,15 @@ impl<'a> ExprParser<'a> {
                 };
                 // The identifier - in our evaluation, we've already resolved
                 // defined() to 0 or 1, so identifiers here mean "not defined"
-                let _ident = if let Some(ExprToken::Ident(_)) = self.peek() {
+                if let Some(ExprToken::Ident(_)) = self.peek() {
                     self.advance();
-                };
+                }
                 if self.peek() == Some(&ExprToken::RParen) {
                     self.advance();
                 }
                 // If we reach here during evaluation, the macro was not resolved
                 // at expansion time, so it's not defined
-                0
+                (0, false)
             }
             Some(ExprToken::Ident(ref name)) => {
                 let name = name.clone();
@@ -687,14 +795,14 @@ impl<'a> ExprParser<'a> {
                 // Undefined identifiers in #if evaluate to 0
                 // Special case: "true" and "false"
                 match name.as_str() {
-                    "true" => 1,
-                    "false" => 0,
-                    _ => 0,
+                    "true" => (1, false),
+                    "false" => (0, false),
+                    _ => (0, false),
                 }
             }
             _ => {
                 self.advance(); // skip unknown
-                0
+                (0, false)
             }
         }
     }
