@@ -1,0 +1,8 @@
+Implement __builtin_va_arg support and add missing float limit macros.
+
+This includes:
+1. Adding __FLT_MAX_10_EXP__, __FLT_MIN_10_EXP__, __DBL_MAX_10_EXP__, __DBL_MIN_10_EXP__,
+   __LDBL_MAX_10_EXP__, __LDBL_MIN_10_EXP__ preprocessor macros
+2. Parsing __builtin_va_arg(ap, type) as a special expression (second arg is type-name)
+3. IR lowering for va_arg with proper ABI handling
+4. x86-64, ARM64, and RISC-V codegen for va_arg
