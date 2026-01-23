@@ -71,33 +71,51 @@ impl RiscvCodegen {
     }
 
     /// Emit prologue: allocate stack and save ra/s0.
+    ///
+    /// Stack layout (s0 points to top of frame = old sp):
+    ///   s0 - 8:  saved ra
+    ///   s0 - 16: saved s0
+    ///   s0 - 16 - ...: local data (allocas and value slots)
+    ///   sp: bottom of frame
     fn emit_prologue_riscv(&mut self, frame_size: i64) {
-        if Self::fits_imm12(-frame_size) {
+        // Small-frame path requires ALL immediates to fit in 12 bits:
+        // -frame_size (sp adjust), frame_size-8 and frame_size-16 (save offsets),
+        // and frame_size (s0 setup). Since fits_imm12 checks [-2048, 2047],
+        // we check both -frame_size AND frame_size.
+        if Self::fits_imm12(-frame_size) && Self::fits_imm12(frame_size) {
+            // Small frame: all offsets fit in 12-bit immediates
             self.state.emit(&format!("    addi sp, sp, -{}", frame_size));
             self.state.emit(&format!("    sd ra, {}(sp)", frame_size - 8));
             self.state.emit(&format!("    sd s0, {}(sp)", frame_size - 16));
             self.state.emit(&format!("    addi s0, sp, {}", frame_size));
         } else {
+            // Large frame: save ra/s0 at top of frame (s0-8, s0-16) to avoid
+            // collision with local data that grows downward from s0-16.
             self.state.emit(&format!("    li t0, {}", frame_size));
             self.state.emit("    sub sp, sp, t0");
-            self.state.emit("    sd ra, 0(sp)");
-            self.state.emit("    sd s0, 8(sp)");
-            self.state.emit(&format!("    li t0, {}", frame_size));
-            self.state.emit("    add s0, sp, t0");
+            // t0 still has frame_size; compute s0 = sp + frame_size = old_sp
+            self.state.emit("    add t0, sp, t0");
+            // Save ra and old s0 at top of frame (relative to new s0)
+            self.state.emit("    sd ra, -8(t0)");
+            self.state.emit("    sd s0, -16(t0)");
+            self.state.emit("    mv s0, t0");
         }
     }
 
     /// Emit epilogue: restore ra/s0 and deallocate stack.
     fn emit_epilogue_riscv(&mut self, frame_size: i64) {
-        if Self::fits_imm12(-frame_size) {
+        if Self::fits_imm12(-frame_size) && Self::fits_imm12(frame_size) {
+            // Small frame: restore from known sp offsets
             self.state.emit(&format!("    ld ra, {}(sp)", frame_size - 8));
             self.state.emit(&format!("    ld s0, {}(sp)", frame_size - 16));
             self.state.emit(&format!("    addi sp, sp, {}", frame_size));
         } else {
-            self.state.emit("    ld ra, 0(sp)");
-            self.state.emit("    ld s0, 8(sp)");
-            self.state.emit(&format!("    li t0, {}", frame_size));
-            self.state.emit("    add sp, sp, t0");
+            // Large frame: restore from s0-relative offsets (always fit in imm12).
+            // Load saved values before adjusting sp to avoid reading below sp.
+            self.state.emit("    ld ra, -8(s0)");
+            self.state.emit("    ld t0, -16(s0)");
+            self.state.emit("    mv sp, s0");
+            self.state.emit("    mv s0, t0");
         }
     }
 
@@ -762,12 +780,12 @@ impl ArchCodegen for RiscvCodegen {
 
     fn emit_va_arg(&mut self, dest: &Value, va_list_ptr: &Value, _result_ty: IrType) {
         // RISC-V LP64D: va_list is just a void* (pointer to the next arg on stack).
-        // Load va_list pointer
+        // Load va_list pointer address into t1
         if let Some(slot) = self.state.get_slot(va_list_ptr.0) {
             if self.state.is_alloca(va_list_ptr.0) {
-                self.state.emit(&format!("    addi t1, s0, {}", slot.0));
+                self.emit_addi_s0("t1", slot.0);
             } else {
-                self.state.emit(&format!("    ld t1, {}(s0)", slot.0));
+                self.emit_load_from_s0("t1", slot.0, "ld");
             }
         }
         // Load the current va_list pointer value (points to next arg)
@@ -778,9 +796,7 @@ impl ArchCodegen for RiscvCodegen {
         self.state.emit("    addi t2, t2, 8");
         self.state.emit("    sd t2, 0(t1)");
         // Store result
-        if let Some(slot) = self.state.get_slot(dest.0) {
-            self.state.emit(&format!("    sd t0, {}(s0)", slot.0));
-        }
+        self.store_t0_to(dest);
     }
 
     fn emit_va_start(&mut self, va_list_ptr: &Value) {
@@ -789,9 +805,9 @@ impl ArchCodegen for RiscvCodegen {
         // The variadic args start after the named GP params.
         if let Some(slot) = self.state.get_slot(va_list_ptr.0) {
             if self.state.is_alloca(va_list_ptr.0) {
-                self.state.emit(&format!("    addi t0, s0, {}", slot.0));
+                self.emit_addi_s0("t0", slot.0);
             } else {
-                self.state.emit(&format!("    ld t0, {}(s0)", slot.0));
+                self.emit_load_from_s0("t0", slot.0, "ld");
             }
         }
 
@@ -800,15 +816,12 @@ impl ArchCodegen for RiscvCodegen {
             // a0 is at -(va_save_area_offset + 64), a1 at -(va_save_area_offset + 56), etc.
             // Variadic args start at a[named_gp_count], which is at:
             let vararg_offset = -(self.va_save_area_offset as i64) - 64 + (self.va_named_gp_count as i64) * 8;
-            if vararg_offset >= -2048 && vararg_offset <= 2047 {
-                self.state.emit(&format!("    addi t1, s0, {}", vararg_offset));
-            } else {
-                self.state.emit(&format!("    li t1, {}", vararg_offset));
-                self.state.emit("    add t1, s0, t1");
-            }
+            self.emit_addi_s0("t1", vararg_offset);
         } else {
-            // All registers used by named params; variadic args are on the caller's stack
-            self.state.emit("    addi t1, s0, 16");
+            // All registers used by named params; variadic args are on the caller's stack.
+            // s0 points to the old sp, and stack-passed args start at s0 + 0 (the return
+            // address slot in the caller's frame is above, args are at positive offsets).
+            self.state.emit("    mv t1, s0");
         }
         self.state.emit("    sd t1, 0(t0)");
     }
@@ -821,17 +834,17 @@ impl ArchCodegen for RiscvCodegen {
         // Copy va_list (just 8 bytes on RISC-V - a single pointer)
         if let Some(src_slot) = self.state.get_slot(src_ptr.0) {
             if self.state.is_alloca(src_ptr.0) {
-                self.state.emit(&format!("    addi t1, s0, {}", src_slot.0));
+                self.emit_addi_s0("t1", src_slot.0);
             } else {
-                self.state.emit(&format!("    ld t1, {}(s0)", src_slot.0));
+                self.emit_load_from_s0("t1", src_slot.0, "ld");
             }
         }
         self.state.emit("    ld t2, 0(t1)");
         if let Some(dest_slot) = self.state.get_slot(dest_ptr.0) {
             if self.state.is_alloca(dest_ptr.0) {
-                self.state.emit(&format!("    addi t0, s0, {}", dest_slot.0));
+                self.emit_addi_s0("t0", dest_slot.0);
             } else {
-                self.state.emit(&format!("    ld t0, {}(s0)", dest_slot.0));
+                self.emit_load_from_s0("t0", dest_slot.0, "ld");
             }
         }
         self.state.emit("    sd t2, 0(t0)");

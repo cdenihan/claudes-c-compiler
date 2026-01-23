@@ -1,6 +1,6 @@
 use crate::frontend::parser::ast::*;
 use crate::ir::ir::*;
-use crate::common::types::{IrType, StructField, StructLayout, CType};
+use crate::common::types::{IrType, StructLayout, CType};
 use super::lowering::Lowerer;
 
 impl Lowerer {
@@ -12,14 +12,14 @@ impl Lowerer {
             TypeSpecifier::Struct(tag, Some(fields)) => {
                 // Recursively register nested struct/union types in fields
                 self.register_nested_struct_types(fields);
-                let layout = self.compute_struct_layout(fields, false);
+                let layout = self.compute_struct_union_layout(fields, false);
                 let key = self.struct_layout_key(tag, false);
                 self.struct_layouts.insert(key, layout);
             }
             TypeSpecifier::Union(tag, Some(fields)) => {
                 // Recursively register nested struct/union types in fields
                 self.register_nested_struct_types(fields);
-                let layout = self.compute_struct_layout(fields, true);
+                let layout = self.compute_struct_union_layout(fields, true);
                 let key = self.struct_layout_key(tag, true);
                 self.struct_layouts.insert(key, layout);
             }
@@ -71,38 +71,18 @@ impl Lowerer {
         }
     }
 
-    /// Compute struct/union layout from AST field declarations.
-    fn compute_struct_layout(&self, fields: &[StructFieldDecl], is_union: bool) -> StructLayout {
-        let struct_fields: Vec<StructField> = fields.iter().map(|f| {
-            let bit_width = f.bit_width.as_ref().and_then(|bw| {
-                self.eval_const_expr(bw).and_then(|c| c.to_u32())
-            });
-            StructField {
-                name: f.name.clone().unwrap_or_default(),
-                ty: self.type_spec_to_ctype(&f.type_spec),
-                bit_width,
-            }
-        }).collect();
-
-        if is_union {
-            StructLayout::for_union(&struct_fields)
-        } else {
-            StructLayout::for_struct(&struct_fields)
-        }
-    }
-
     /// Get the cached struct layout for a TypeSpecifier, if it's a struct/union type.
     pub(super) fn get_struct_layout_for_type(&self, ts: &TypeSpecifier) -> Option<StructLayout> {
         let ts = self.resolve_type_spec(ts);
         match ts {
             TypeSpecifier::Struct(_, Some(fields)) => {
-                Some(self.compute_struct_layout(&fields, false))
+                Some(self.compute_struct_union_layout(&fields, false))
             }
             TypeSpecifier::Struct(Some(tag), None) => {
                 self.struct_layouts.get(&format!("struct.{}", tag)).cloned()
             }
             TypeSpecifier::Union(_, Some(fields)) => {
-                Some(self.compute_struct_layout(&fields, true))
+                Some(self.compute_struct_union_layout(&fields, true))
             }
             TypeSpecifier::Union(Some(tag), None) => {
                 self.struct_layouts.get(&format!("union.{}", tag)).cloned()
@@ -207,7 +187,7 @@ impl Lowerer {
 
                 // Check if this is an sret call (struct > 8 bytes with hidden pointer)
                 let is_sret = if let Expr::Identifier(name, _) = func_expr.as_ref() {
-                    self.sret_functions.contains_key(name)
+                    self.func_meta.sret_functions.contains_key(name)
                 } else {
                     false
                 };
@@ -413,7 +393,7 @@ impl Lowerer {
             Expr::FunctionCall(func, _, _) => {
                 // Function returning a struct pointer
                 if let Expr::Identifier(name, _) = func.as_ref() {
-                    if let Some(ctype) = self.function_return_ctypes.get(name) {
+                    if let Some(ctype) = self.func_meta.return_ctypes.get(name) {
                         if let CType::Pointer(pointee) = ctype {
                             return self.struct_layout_from_ctype(pointee);
                         }
@@ -582,7 +562,7 @@ impl Lowerer {
             Expr::FunctionCall(func, _, _) => {
                 // Function returning a struct: look up the return CType
                 if let Expr::Identifier(name, _) = func.as_ref() {
-                    if let Some(ctype) = self.function_return_ctypes.get(name) {
+                    if let Some(ctype) = self.func_meta.return_ctypes.get(name) {
                         match ctype {
                             CType::Struct(st) => return Some(StructLayout::for_struct(&st.fields)),
                             CType::Union(st) => return Some(StructLayout::for_union(&st.fields)),

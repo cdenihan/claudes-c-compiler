@@ -1,6 +1,0 @@
-COMPLETED: Fix function pointer return type for float/double:
-1. Fixed extract_return_type_from_ctype in expr.rs to peel spurious Pointer wrapper
-2. Fixed get_expr_type for FunctionCall to handle (*fptr)(...) deref syntax
-3. Handled both global fptrs and parameter fptrs correctly
-4. Added peel_ptr_from_return_type and extract_func_ptr_return_type helpers
-Result: 0 regressions, 131 tests fixed in 0179 suite (function pointer tests)

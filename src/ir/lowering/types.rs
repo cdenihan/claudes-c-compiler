@@ -73,32 +73,10 @@ impl Lowerer {
                 let src_val = self.eval_const_expr(inner)?;
 
                 // Handle float source types: use value-based conversion, not bit manipulation
-                match &src_val {
-                    IrConst::F64(v) => {
-                        let fv = *v;
-                        return Some(match target_ir_ty {
-                            IrType::F64 => IrConst::F64(fv),
-                            IrType::F32 => IrConst::F32(fv as f32),
-                            IrType::I8 | IrType::U8 => IrConst::I8(fv as i8),
-                            IrType::I16 | IrType::U16 => IrConst::I16(fv as i16),
-                            IrType::I32 | IrType::U32 => IrConst::I32(fv as i32),
-                            IrType::I64 | IrType::U64 | IrType::Ptr => IrConst::I64(fv as i64),
-                            _ => return None,
-                        });
+                if let Some(fv) = src_val.to_f64() {
+                    if matches!(&src_val, IrConst::F32(_) | IrConst::F64(_) | IrConst::LongDouble(_)) {
+                        return IrConst::cast_float_to_target(fv, target_ir_ty);
                     }
-                    IrConst::F32(v) => {
-                        let fv = *v;
-                        return Some(match target_ir_ty {
-                            IrType::F64 => IrConst::F64(fv as f64),
-                            IrType::F32 => IrConst::F32(fv),
-                            IrType::I8 | IrType::U8 => IrConst::I8(fv as i8),
-                            IrType::I16 | IrType::U16 => IrConst::I16(fv as i16),
-                            IrType::I32 | IrType::U32 => IrConst::I32(fv as i32),
-                            IrType::I64 | IrType::U64 | IrType::Ptr => IrConst::I64(fv as i64),
-                            _ => return None,
-                        });
-                    }
-                    _ => {}
                 }
 
                 // Integer source: use bit-based cast chain evaluation
@@ -160,16 +138,7 @@ impl Lowerer {
             Expr::Conditional(cond, then_e, else_e, _) => {
                 // Ternary in constant expr: evaluate condition and pick branch
                 let cond_val = self.eval_const_expr(cond)?;
-                let is_true = match cond_val {
-                    IrConst::I64(v) => v != 0,
-                    IrConst::I32(v) => v != 0,
-                    IrConst::I8(v) => v != 0,
-                    IrConst::I16(v) => v != 0,
-                    IrConst::F32(v) => v != 0.0,
-                    IrConst::F64(v) => v != 0.0,
-                    _ => return None,
-                };
-                if is_true {
+                if cond_val.is_nonzero() {
                     self.eval_const_expr(then_e)
                 } else {
                     self.eval_const_expr(else_e)
@@ -177,16 +146,7 @@ impl Lowerer {
             }
             Expr::UnaryOp(UnaryOp::LogicalNot, inner, _) => {
                 let val = self.eval_const_expr(inner)?;
-                let result = match val {
-                    IrConst::I64(v) => if v == 0 { 1i64 } else { 0 },
-                    IrConst::I32(v) => if v == 0 { 1i64 } else { 0 },
-                    IrConst::I8(v) => if v == 0 { 1i64 } else { 0 },
-                    IrConst::I16(v) => if v == 0 { 1i64 } else { 0 },
-                    IrConst::F32(v) => if v == 0.0 { 1i64 } else { 0 },
-                    IrConst::F64(v) => if v == 0.0 { 1i64 } else { 0 },
-                    _ => return None,
-                };
-                Some(IrConst::I64(result))
+                Some(IrConst::I64(if val.is_nonzero() { 0 } else { 1 }))
             }
             _ => None,
         }
@@ -525,8 +485,8 @@ impl Lowerer {
             || (!matches!(lhs, IrConst::F32(_)) && !matches!(rhs, IrConst::F32(_)));
 
         // Convert both operands to f64 for computation
-        let l = self.const_to_f64(lhs)?;
-        let r = self.const_to_f64(rhs)?;
+        let l = lhs.to_f64()?;
+        let r = rhs.to_f64()?;
 
         match op {
             // Arithmetic operations return float
@@ -559,20 +519,6 @@ impl Lowerer {
             BinOp::LogicalOr => Some(IrConst::I64(if l != 0.0 || r != 0.0 { 1 } else { 0 })),
             // Bitwise/shift operations are not valid on floats
             _ => None,
-        }
-    }
-
-    /// Convert an IrConst to f64 for floating-point constant evaluation.
-    fn const_to_f64(&self, c: &IrConst) -> Option<f64> {
-        match c {
-            IrConst::F64(v) => Some(*v),
-            IrConst::F32(v) => Some(*v as f64),
-            IrConst::LongDouble(v) => Some(*v),
-            IrConst::I64(v) => Some(*v as f64),
-            IrConst::I32(v) => Some(*v as f64),
-            IrConst::I16(v) => Some(*v as f64),
-            IrConst::I8(v) => Some(*v as f64),
-            IrConst::Zero => Some(0.0),
         }
     }
 
@@ -624,11 +570,6 @@ impl Lowerer {
     /// Convert an IrConst to i64. Delegates to IrConst::to_i64().
     pub(super) fn const_to_i64(&self, c: &IrConst) -> Option<i64> {
         c.to_i64()
-    }
-
-    /// Coerce an IrConst to match a target IrType. Delegates to IrConst::coerce_to().
-    pub(super) fn coerce_const_to_type(&self, val: IrConst, target_ty: IrType) -> IrConst {
-        val.coerce_to(target_ty)
     }
 
     /// Check if a TypeSpecifier resolves to long double.
@@ -881,20 +822,20 @@ impl Lowerer {
             Expr::FunctionCall(func, _, _) => {
                 // Look up the return type of the called function
                 if let Expr::Identifier(name, _) = func.as_ref() {
-                    if let Some(&ret_ty) = self.function_return_types.get(name) {
+                    if let Some(&ret_ty) = self.func_meta.return_types.get(name) {
                         return ret_ty;
                     }
-                    if let Some(&ret_ty) = self.function_ptr_return_types.get(name) {
+                    if let Some(&ret_ty) = self.func_meta.ptr_return_types.get(name) {
                         return ret_ty;
                     }
                 }
                 // For (*fptr)(...) calls, check the inner identifier
                 if let Expr::Deref(inner, _) = func.as_ref() {
                     if let Expr::Identifier(name, _) = inner.as_ref() {
-                        if let Some(&ret_ty) = self.function_return_types.get(name) {
+                        if let Some(&ret_ty) = self.func_meta.return_types.get(name) {
                             return ret_ty;
                         }
-                        if let Some(&ret_ty) = self.function_ptr_return_types.get(name) {
+                        if let Some(&ret_ty) = self.func_meta.ptr_return_types.get(name) {
                             return ret_ty;
                         }
                     }
@@ -1189,8 +1130,8 @@ impl Lowerer {
             "rintf", "nearbyintf", "erff", "erfcf", "tgammaf", "lgammaf",
         ];
         for name in f_f {
-            self.function_return_types.insert(name.to_string(), F32);
-            self.function_param_types.insert(name.to_string(), vec![F32]);
+            self.func_meta.return_types.insert(name.to_string(), F32);
+            self.func_meta.param_types.insert(name.to_string(), vec![F32]);
         }
         // double func(double) - double-precision math
         let d_d: &[&str] = &[
@@ -1201,35 +1142,35 @@ impl Lowerer {
             "rint", "nearbyint", "erf", "erfc", "tgamma", "lgamma",
         ];
         for name in d_d {
-            self.function_return_types.insert(name.to_string(), F64);
-            self.function_param_types.insert(name.to_string(), vec![F64]);
+            self.func_meta.return_types.insert(name.to_string(), F64);
+            self.func_meta.param_types.insert(name.to_string(), vec![F64]);
         }
         // float func(float, float) - two-arg single-precision
         let f_ff: &[&str] = &["atan2f", "powf", "fmodf", "remainderf", "copysignf", "fminf", "fmaxf", "fdimf", "hypotf"];
         for name in f_ff {
-            self.function_return_types.insert(name.to_string(), F32);
-            self.function_param_types.insert(name.to_string(), vec![F32, F32]);
+            self.func_meta.return_types.insert(name.to_string(), F32);
+            self.func_meta.param_types.insert(name.to_string(), vec![F32, F32]);
         }
         // double func(double, double) - two-arg double-precision
         let d_dd: &[&str] = &["atan2", "pow", "fmod", "remainder", "copysign", "fmin", "fmax", "fdim", "hypot"];
         for name in d_dd {
-            self.function_return_types.insert(name.to_string(), F64);
-            self.function_param_types.insert(name.to_string(), vec![F64, F64]);
+            self.func_meta.return_types.insert(name.to_string(), F64);
+            self.func_meta.param_types.insert(name.to_string(), vec![F64, F64]);
         }
         // int/long returning functions
-        self.function_return_types.insert("abs".to_string(), I32);
-        self.function_param_types.insert("abs".to_string(), vec![I32]);
-        self.function_return_types.insert("labs".to_string(), I64);
-        self.function_param_types.insert("labs".to_string(), vec![I64]);
+        self.func_meta.return_types.insert("abs".to_string(), I32);
+        self.func_meta.param_types.insert("abs".to_string(), vec![I32]);
+        self.func_meta.return_types.insert("labs".to_string(), I64);
+        self.func_meta.param_types.insert("labs".to_string(), vec![I64]);
         // float func(float, int)
-        self.function_return_types.insert("ldexpf".to_string(), F32);
-        self.function_param_types.insert("ldexpf".to_string(), vec![F32, I32]);
-        self.function_return_types.insert("ldexp".to_string(), F64);
-        self.function_param_types.insert("ldexp".to_string(), vec![F64, I32]);
-        self.function_return_types.insert("scalbnf".to_string(), F32);
-        self.function_param_types.insert("scalbnf".to_string(), vec![F32, I32]);
-        self.function_return_types.insert("scalbn".to_string(), F64);
-        self.function_param_types.insert("scalbn".to_string(), vec![F64, I32]);
+        self.func_meta.return_types.insert("ldexpf".to_string(), F32);
+        self.func_meta.param_types.insert("ldexpf".to_string(), vec![F32, I32]);
+        self.func_meta.return_types.insert("ldexp".to_string(), F64);
+        self.func_meta.param_types.insert("ldexp".to_string(), vec![F64, I32]);
+        self.func_meta.return_types.insert("scalbnf".to_string(), F32);
+        self.func_meta.param_types.insert("scalbnf".to_string(), vec![F32, I32]);
+        self.func_meta.return_types.insert("scalbn".to_string(), F64);
+        self.func_meta.param_types.insert("scalbn".to_string(), vec![F64, I32]);
     }
 
     pub(super) fn type_spec_to_ir(&self, ts: &TypeSpecifier) -> IrType {
@@ -1257,56 +1198,74 @@ impl Lowerer {
         }
     }
 
+    /// Get the (size, alignment) for a scalar type specifier. Returns None for
+    /// compound types (arrays, structs, unions) that need recursive computation.
+    fn scalar_type_size_align(ts: &TypeSpecifier) -> Option<(usize, usize)> {
+        // For scalar types, size == alignment on x86-64 (except LongDouble).
+        match ts {
+            TypeSpecifier::Void | TypeSpecifier::Bool => Some((1, 1)),
+            TypeSpecifier::Char | TypeSpecifier::UnsignedChar => Some((1, 1)),
+            TypeSpecifier::Short | TypeSpecifier::UnsignedShort => Some((2, 2)),
+            TypeSpecifier::Int | TypeSpecifier::UnsignedInt
+            | TypeSpecifier::Signed | TypeSpecifier::Unsigned => Some((4, 4)),
+            TypeSpecifier::Long | TypeSpecifier::UnsignedLong
+            | TypeSpecifier::LongLong | TypeSpecifier::UnsignedLongLong => Some((8, 8)),
+            TypeSpecifier::Float => Some((4, 4)),
+            TypeSpecifier::Double => Some((8, 8)),
+            TypeSpecifier::LongDouble => Some((16, 16)),
+            TypeSpecifier::Pointer(_) => Some((8, 8)),
+            TypeSpecifier::Enum(_, _) => Some((4, 4)),
+            TypeSpecifier::TypedefName(_) => Some((8, 8)), // fallback for unresolved typedefs
+            _ => None,
+        }
+    }
+
+    /// Look up a struct/union layout by tag name, returning the full layout.
+    fn get_struct_union_layout_by_tag(&self, kind: &str, tag: &str) -> Option<&StructLayout> {
+        let key = format!("{}.{}", kind, tag);
+        self.struct_layouts.get(&key)
+    }
+
+    /// Compute a StructLayout from inline field definitions.
+    pub(super) fn compute_struct_union_layout(&self, fields: &[StructFieldDecl], is_union: bool) -> StructLayout {
+        let struct_fields: Vec<StructField> = fields.iter().map(|f| {
+            let bit_width = f.bit_width.as_ref().and_then(|bw| {
+                self.eval_const_expr(bw).and_then(|c| c.to_u32())
+            });
+            StructField {
+                name: f.name.clone().unwrap_or_default(),
+                ty: self.type_spec_to_ctype(&f.type_spec),
+                bit_width,
+            }
+        }).collect();
+        if is_union {
+            StructLayout::for_union(&struct_fields)
+        } else {
+            StructLayout::for_struct(&struct_fields)
+        }
+    }
+
     pub(super) fn sizeof_type(&self, ts: &TypeSpecifier) -> usize {
         let ts = self.resolve_type_spec(ts);
+        // Fast path: scalar types have fixed size
+        if let Some((size, _)) = Self::scalar_type_size_align(ts) {
+            return size;
+        }
         match ts {
-            TypeSpecifier::Void => 1, // GCC extension: sizeof(void) == 1
-            TypeSpecifier::Bool => 1, // _Bool is 1 byte
-            TypeSpecifier::Char | TypeSpecifier::UnsignedChar => 1,
-            TypeSpecifier::Short | TypeSpecifier::UnsignedShort => 2,
-            TypeSpecifier::Int | TypeSpecifier::UnsignedInt => 4,
-            TypeSpecifier::Long | TypeSpecifier::UnsignedLong
-            | TypeSpecifier::LongLong | TypeSpecifier::UnsignedLongLong => 8,
-            TypeSpecifier::Float => 4,
-            TypeSpecifier::Double => 8,
-            TypeSpecifier::LongDouble => 16,
-            TypeSpecifier::Pointer(_) => 8,
             TypeSpecifier::Array(elem, Some(size_expr)) => {
                 let elem_size = self.sizeof_type(elem);
-                let n = self.expr_as_array_size(size_expr);
-                if let Some(n) = n {
-                    return elem_size * (n as usize);
-                }
-                elem_size
+                self.expr_as_array_size(size_expr)
+                    .map(|n| elem_size * n as usize)
+                    .unwrap_or(elem_size)
             }
             TypeSpecifier::Struct(_, Some(fields)) | TypeSpecifier::Union(_, Some(fields)) => {
                 let is_union = matches!(ts, TypeSpecifier::Union(_, _));
-                let struct_fields: Vec<StructField> = fields.iter().map(|f| {
-                    let bit_width = f.bit_width.as_ref().and_then(|bw| {
-                        self.eval_const_expr(bw).and_then(|c| c.to_u32())
-                    });
-                    StructField {
-                        name: f.name.clone().unwrap_or_default(),
-                        ty: self.type_spec_to_ctype(&f.type_spec),
-                        bit_width,
-                    }
-                }).collect();
-                let layout = if is_union {
-                    StructLayout::for_union(&struct_fields)
-                } else {
-                    StructLayout::for_struct(&struct_fields)
-                };
-                layout.size
+                self.compute_struct_union_layout(fields, is_union).size
             }
-            TypeSpecifier::Struct(Some(tag), None) => {
-                let key = format!("struct.{}", tag);
-                self.struct_layouts.get(&key).map(|l| l.size).unwrap_or(8)
-            }
-            TypeSpecifier::Union(Some(tag), None) => {
-                let key = format!("union.{}", tag);
-                self.struct_layouts.get(&key).map(|l| l.size).unwrap_or(8)
-            }
-            TypeSpecifier::Enum(_, _) => 4, // enums are always int-sized
+            TypeSpecifier::Struct(Some(tag), None) =>
+                self.get_struct_union_layout_by_tag("struct", tag).map(|l| l.size).unwrap_or(8),
+            TypeSpecifier::Union(Some(tag), None) =>
+                self.get_struct_union_layout_by_tag("union", tag).map(|l| l.size).unwrap_or(8),
             _ => 8,
         }
     }
@@ -1314,35 +1273,22 @@ impl Lowerer {
     /// Compute the alignment of a type in bytes (_Alignof).
     pub(super) fn alignof_type(&self, ts: &TypeSpecifier) -> usize {
         let ts = self.resolve_type_spec(ts);
+        // Fast path: scalar types have fixed alignment
+        if let Some((_, align)) = Self::scalar_type_size_align(ts) {
+            return align;
+        }
         match ts {
-            TypeSpecifier::Void => 1,
-            TypeSpecifier::Bool => 1,
-            TypeSpecifier::Char | TypeSpecifier::UnsignedChar => 1,
-            TypeSpecifier::Short | TypeSpecifier::UnsignedShort => 2,
-            TypeSpecifier::Int | TypeSpecifier::UnsignedInt => 4,
-            TypeSpecifier::Long | TypeSpecifier::UnsignedLong
-            | TypeSpecifier::LongLong | TypeSpecifier::UnsignedLongLong => 8,
-            TypeSpecifier::Float => 4,
-            TypeSpecifier::Double => 8,
-            TypeSpecifier::Pointer(_) => 8,
             TypeSpecifier::Array(elem, _) => self.alignof_type(elem),
             TypeSpecifier::Struct(_, Some(fields)) | TypeSpecifier::Union(_, Some(fields)) => {
-                let mut max_align = 1;
-                for f in fields {
-                    let a = self.alignof_type(&f.type_spec);
-                    if a > max_align { max_align = a; }
-                }
-                max_align
+                fields.iter()
+                    .map(|f| self.alignof_type(&f.type_spec))
+                    .max()
+                    .unwrap_or(1)
             }
-            TypeSpecifier::Struct(Some(tag), None) => {
-                let key = format!("struct.{}", tag);
-                self.struct_layouts.get(&key).map(|l| l.align).unwrap_or(8)
-            }
-            TypeSpecifier::Union(Some(tag), None) => {
-                let key = format!("union.{}", tag);
-                self.struct_layouts.get(&key).map(|l| l.align).unwrap_or(8)
-            }
-            TypeSpecifier::Enum(_, _) => 4,
+            TypeSpecifier::Struct(Some(tag), None) =>
+                self.get_struct_union_layout_by_tag("struct", tag).map(|l| l.align).unwrap_or(8),
+            TypeSpecifier::Union(Some(tag), None) =>
+                self.get_struct_union_layout_by_tag("union", tag).map(|l| l.align).unwrap_or(8),
             _ => 8,
         }
     }
@@ -2136,7 +2082,7 @@ impl Lowerer {
             Expr::StringLiteral(_, _) => Some(CType::Pointer(Box::new(CType::Char))),
             Expr::FunctionCall(func, _, _) => {
                 if let Expr::Identifier(name, _) = func.as_ref() {
-                    if let Some(ctype) = self.function_return_ctypes.get(name) {
+                    if let Some(ctype) = self.func_meta.return_ctypes.get(name) {
                         return Some(ctype.clone());
                     }
                 }

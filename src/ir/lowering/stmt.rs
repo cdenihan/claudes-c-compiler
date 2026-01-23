@@ -1,7 +1,7 @@
 use crate::frontend::parser::ast::*;
 use crate::ir::ir::*;
-use crate::common::types::{IrType, CType, StructLayout, StructField};
-use super::lowering::{Lowerer, LocalInfo, GlobalInfo};
+use crate::common::types::{IrType, CType, StructLayout};
+use super::lowering::{Lowerer, LocalInfo, GlobalInfo, SwitchFrame};
 
 impl Lowerer {
     pub(super) fn lower_compound_stmt(&mut self, compound: &CompoundStmt) {
@@ -106,7 +106,7 @@ impl Lowerer {
                     if ptr_count > 0 {
                         ret_ty = IrType::Ptr;
                     }
-                    self.function_return_types.insert(declarator.name.clone(), ret_ty);
+                    self.func_meta.return_types.insert(declarator.name.clone(), ret_ty);
                     let param_tys: Vec<IrType> = params.iter().map(|p| {
                         self.type_spec_to_ir(&p.type_spec)
                     }).collect();
@@ -114,11 +114,11 @@ impl Lowerer {
                         matches!(self.resolve_type_spec(&p.type_spec), TypeSpecifier::Bool)
                     }).collect();
                     if !variadic || !param_tys.is_empty() {
-                        self.function_param_types.insert(declarator.name.clone(), param_tys);
-                        self.function_param_bool_flags.insert(declarator.name.clone(), param_bool_flags);
+                        self.func_meta.param_types.insert(declarator.name.clone(), param_tys);
+                        self.func_meta.param_bool_flags.insert(declarator.name.clone(), param_bool_flags);
                     }
                     if variadic {
-                        self.function_variadic.insert(declarator.name.clone());
+                        self.func_meta.variadic.insert(declarator.name.clone());
                     }
                     // Remove from locals if previously added (e.g., shadowed by this declaration)
                     self.locals.remove(&declarator.name);
@@ -328,11 +328,11 @@ impl Lowerer {
             for d in &declarator.derived {
                 if let DerivedDeclarator::FunctionPointer(params, _) = d {
                     let ret_ty = self.type_spec_to_ir(&decl.type_spec);
-                    self.function_ptr_return_types.insert(declarator.name.clone(), ret_ty);
+                    self.func_meta.ptr_return_types.insert(declarator.name.clone(), ret_ty);
                     let param_tys: Vec<IrType> = params.iter().map(|p| {
                         self.type_spec_to_ir(&p.type_spec)
                     }).collect();
-                    self.function_ptr_param_types.insert(declarator.name.clone(), param_tys);
+                    self.func_meta.ptr_param_types.insert(declarator.name.clone(), param_tys);
                     break;
                 }
             }
@@ -963,12 +963,14 @@ impl Lowerer {
                 let body_label = self.fresh_label("switch_body");
 
                 // Push switch context
-                self.switch_end_labels.push(end_label.clone());
+                self.switch_stack.push(SwitchFrame {
+                    end_label: end_label.clone(),
+                    cases: Vec::new(),
+                    default_label: None,
+                    val_alloca: switch_alloca,
+                    expr_type: switch_expr_ty,
+                });
                 self.break_labels.push(end_label.clone());
-                self.switch_cases.push(Vec::new());
-                self.switch_default.push(None);
-                self.switch_val_allocas.push(switch_alloca);
-                self.switch_expr_types.push(switch_expr_ty);
 
                 // Jump to dispatch (which will be emitted after the body)
                 self.terminate(Terminator::Branch(dispatch_label.clone()));
@@ -981,12 +983,10 @@ impl Lowerer {
                 self.terminate(Terminator::Branch(end_label.clone()));
 
                 // Pop switch context and collect the case/default info
-                self.switch_end_labels.pop();
+                let switch_frame = self.switch_stack.pop();
                 self.break_labels.pop();
-                let cases = self.switch_cases.pop().unwrap_or_default();
-                let default_label = self.switch_default.pop().flatten();
-                self.switch_val_allocas.pop();
-                self.switch_expr_types.pop();
+                let cases = switch_frame.as_ref().map(|f| f.cases.clone()).unwrap_or_default();
+                let default_label = switch_frame.as_ref().and_then(|f| f.default_label.clone());
 
                 // Now emit the dispatch chain: a series of comparison blocks
                 // that check each case value and branch accordingly.
@@ -1048,7 +1048,7 @@ impl Lowerer {
                 // Truncate case value to the switch controlling expression type.
                 // C requires case constants to be converted to the promoted type
                 // of the controlling expression (e.g., case 2^33 in switch(int) -> 0).
-                if let Some(switch_ty) = self.switch_expr_types.last() {
+                if let Some(switch_ty) = self.switch_stack.last().map(|f| &f.expr_type) {
                     case_val = match switch_ty {
                         IrType::I8 => case_val as i8 as i64,
                         IrType::U8 => case_val as u8 as i64,
@@ -1064,8 +1064,8 @@ impl Lowerer {
                 let label = self.fresh_label("case");
 
                 // Register this case with the enclosing switch
-                if let Some(cases) = self.switch_cases.last_mut() {
-                    cases.push((case_val, label.clone()));
+                if let Some(frame) = self.switch_stack.last_mut() {
+                    frame.cases.push((case_val, label.clone()));
                 }
 
                 // Terminate current block and start the case block.
@@ -1078,8 +1078,8 @@ impl Lowerer {
                 let label = self.fresh_label("default");
 
                 // Register as default with enclosing switch
-                if let Some(default) = self.switch_default.last_mut() {
-                    *default = Some(label.clone());
+                if let Some(frame) = self.switch_stack.last_mut() {
+                    frame.default_label = Some(label.clone());
                 }
 
                 // Fallthrough from previous case

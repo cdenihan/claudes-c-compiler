@@ -473,9 +473,11 @@ impl Lowerer {
         rhs_val
     }
 
-    /// Try to lower assignment to a bitfield member. Returns Some if the LHS is a bitfield.
-    fn try_lower_bitfield_assign(&mut self, lhs: &Expr, rhs: &Expr) -> Option<Operand> {
-        let (base_expr, field_name, is_pointer) = match lhs {
+    /// Resolve a bitfield member access expression, returning the field's address and
+    /// bitfield metadata. Returns None if the expression is not a bitfield access.
+    /// This helper deduplicates the common preamble in bitfield assign/compound-assign/inc-dec.
+    fn resolve_bitfield_lvalue(&mut self, expr: &Expr) -> Option<(Value, IrType, u32, u32)> {
+        let (base_expr, field_name, is_pointer) = match expr {
             Expr::MemberAccess(base, field, _) => (base.as_ref(), field.as_str(), false),
             Expr::PointerMemberAccess(base, field, _) => (base.as_ref(), field.as_str(), true),
             _ => return None,
@@ -504,6 +506,27 @@ impl Lowerer {
             offset: Operand::Const(IrConst::I64(field_offset as i64)),
             ty: storage_ty,
         });
+
+        Some((field_addr, storage_ty, bit_offset, bit_width))
+    }
+
+    /// Mask a value to bit_width bits and return the masked operand.
+    fn mask_to_bitwidth(&mut self, val: Operand, bit_width: u32) -> Operand {
+        let mask = (1u64 << bit_width) - 1;
+        let masked = self.fresh_value();
+        self.emit(Instruction::BinOp {
+            dest: masked,
+            op: IrBinOp::And,
+            ty: IrType::I64,
+            lhs: val,
+            rhs: Operand::Const(IrConst::I64(mask as i64)),
+        });
+        Operand::Value(masked)
+    }
+
+    /// Try to lower assignment to a bitfield member. Returns Some if the LHS is a bitfield.
+    fn try_lower_bitfield_assign(&mut self, lhs: &Expr, rhs: &Expr) -> Option<Operand> {
+        let (field_addr, storage_ty, bit_offset, bit_width) = self.resolve_bitfield_lvalue(lhs)?;
 
         // Evaluate RHS
         let rhs_val = self.lower_expr(rhs);
@@ -512,49 +535,12 @@ impl Lowerer {
         self.store_bitfield(field_addr, storage_ty, bit_offset, bit_width, rhs_val.clone());
 
         // Return the masked value (what was actually stored)
-        let mask = (1u64 << bit_width) - 1;
-        let masked = self.fresh_value();
-        self.emit(Instruction::BinOp {
-            dest: masked,
-            op: IrBinOp::And,
-            ty: IrType::I64,
-            lhs: rhs_val,
-            rhs: Operand::Const(IrConst::I64(mask as i64)),
-        });
-        Some(Operand::Value(masked))
+        Some(self.mask_to_bitwidth(rhs_val, bit_width))
     }
 
     /// Try to lower compound assignment to a bitfield member (e.g., s.bf += val).
     fn try_lower_bitfield_compound_assign(&mut self, op: &BinOp, lhs: &Expr, rhs: &Expr) -> Option<Operand> {
-        let (base_expr, field_name, is_pointer) = match lhs {
-            Expr::MemberAccess(base, field, _) => (base.as_ref(), field.as_str(), false),
-            Expr::PointerMemberAccess(base, field, _) => (base.as_ref(), field.as_str(), true),
-            _ => return None,
-        };
-
-        let (field_offset, storage_ty, bitfield) = if is_pointer {
-            self.resolve_pointer_member_access_full(base_expr, field_name)
-        } else {
-            self.resolve_member_access_full(base_expr, field_name)
-        };
-
-        let (bit_offset, bit_width) = bitfield?;
-
-        // Compute base address
-        let base_addr = if is_pointer {
-            let ptr_val = self.lower_expr(base_expr);
-            self.operand_to_value(ptr_val)
-        } else {
-            self.get_struct_base_addr(base_expr)
-        };
-
-        let field_addr = self.fresh_value();
-        self.emit(Instruction::GetElementPtr {
-            dest: field_addr,
-            base: base_addr,
-            offset: Operand::Const(IrConst::I64(field_offset as i64)),
-            ty: storage_ty,
-        });
+        let (field_addr, storage_ty, bit_offset, bit_width) = self.resolve_bitfield_lvalue(lhs)?;
 
         // Load and extract current bitfield value
         let loaded = self.fresh_value();
@@ -580,16 +566,7 @@ impl Lowerer {
         self.store_bitfield(field_addr, storage_ty, bit_offset, bit_width, Operand::Value(result));
 
         // Return the new value masked to bit_width
-        let mask = (1u64 << bit_width) - 1;
-        let masked = self.fresh_value();
-        self.emit(Instruction::BinOp {
-            dest: masked,
-            op: IrBinOp::And,
-            ty: IrType::I64,
-            lhs: Operand::Value(result),
-            rhs: Operand::Const(IrConst::I64(mask as i64)),
-        });
-        Some(Operand::Value(masked))
+        Some(self.mask_to_bitwidth(Operand::Value(result), bit_width))
     }
 
     /// Store a value into a bitfield: load storage unit, clear field bits, OR in new value, store back.
@@ -691,7 +668,7 @@ impl Lowerer {
 
         // Check if this call needs sret (returns struct > 8 bytes)
         let sret_size = if let Expr::Identifier(name, _) = func {
-            self.sret_functions.get(name).copied()
+            self.func_meta.sret_functions.get(name).copied()
         } else {
             None
         };
@@ -717,7 +694,7 @@ impl Lowerer {
             let variadic = self.is_function_variadic(name);
             let n_fixed = if variadic {
                 // Number of declared parameters in the prototype
-                self.function_param_types.get(name)
+                self.func_meta.param_types.get(name)
                     .map(|p| p.len())
                     .unwrap_or(arg_vals.len()) // fallback: treat all as fixed
             } else {
@@ -788,9 +765,9 @@ impl Lowerer {
                 let arg_types: Vec<IrType> = args.iter().map(|a| self.get_expr_type(a)).collect();
                 let arg_vals: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
                 let dest = self.fresh_value();
-                let variadic = self.function_variadic.contains(libc_name.as_str());
+                let variadic = self.func_meta.variadic.contains(libc_name.as_str());
                 let n_fixed = if variadic {
-                    self.function_param_types.get(libc_name.as_str()).map(|p| p.len()).unwrap_or(arg_vals.len())
+                    self.func_meta.param_types.get(libc_name.as_str()).map(|p| p.len()).unwrap_or(arg_vals.len())
                 } else { arg_vals.len() };
                 self.emit(Instruction::Call {
                     dest: Some(dest), func: libc_name.clone(),
@@ -827,95 +804,19 @@ impl Lowerer {
                         }
                         Some(Operand::Const(IrConst::I64(0)))
                     }
-                    BuiltinIntrinsic::Clz => {
-                        if !args.is_empty() {
-                            let arg = self.lower_expr(&args[0]);
-                            // Determine operand size: clz=32, clzl/clzll=64
-                            let ty = if name.ends_with("ll") || name.ends_with('l') {
-                                IrType::I64
-                            } else {
-                                IrType::I32
-                            };
-                            let dest = self.fresh_value();
-                            self.emit(Instruction::UnaryOp { dest, op: IrUnaryOp::Clz, src: arg, ty });
-                            Some(Operand::Value(dest))
-                        } else {
-                            Some(Operand::Const(IrConst::I64(0)))
-                        }
-                    }
-                    BuiltinIntrinsic::Ctz => {
-                        if !args.is_empty() {
-                            let arg = self.lower_expr(&args[0]);
-                            let ty = if name.ends_with("ll") || name.ends_with('l') {
-                                IrType::I64
-                            } else {
-                                IrType::I32
-                            };
-                            let dest = self.fresh_value();
-                            self.emit(Instruction::UnaryOp { dest, op: IrUnaryOp::Ctz, src: arg, ty });
-                            Some(Operand::Value(dest))
-                        } else {
-                            Some(Operand::Const(IrConst::I64(0)))
-                        }
-                    }
-                    BuiltinIntrinsic::Bswap => {
-                        if !args.is_empty() {
-                            let arg = self.lower_expr(&args[0]);
-                            let ty = if name.contains("64") {
-                                IrType::I64
-                            } else if name.contains("16") {
-                                IrType::I16
-                            } else {
-                                IrType::I32
-                            };
-                            let dest = self.fresh_value();
-                            self.emit(Instruction::UnaryOp { dest, op: IrUnaryOp::Bswap, src: arg, ty });
-                            Some(Operand::Value(dest))
-                        } else {
-                            Some(Operand::Const(IrConst::I64(0)))
-                        }
-                    }
-                    BuiltinIntrinsic::Popcount => {
-                        if !args.is_empty() {
-                            let arg = self.lower_expr(&args[0]);
-                            let ty = if name.ends_with("ll") || name.ends_with('l') {
-                                IrType::I64
-                            } else {
-                                IrType::I32
-                            };
-                            let dest = self.fresh_value();
-                            self.emit(Instruction::UnaryOp { dest, op: IrUnaryOp::Popcount, src: arg, ty });
-                            Some(Operand::Value(dest))
-                        } else {
-                            Some(Operand::Const(IrConst::I64(0)))
-                        }
-                    }
-                    BuiltinIntrinsic::Parity => {
-                        if !args.is_empty() {
-                            let arg = self.lower_expr(&args[0]);
-                            let ty = if name.ends_with("ll") || name.ends_with('l') {
-                                IrType::I64
-                            } else {
-                                IrType::I32
-                            };
-                            // parity = popcount & 1
-                            let pop = self.fresh_value();
-                            self.emit(Instruction::UnaryOp { dest: pop, op: IrUnaryOp::Popcount, src: arg, ty });
-                            let dest = self.fresh_value();
-                            self.emit(Instruction::BinOp { dest, op: IrBinOp::And, lhs: Operand::Value(pop), rhs: Operand::Const(IrConst::I64(1)), ty });
-                            Some(Operand::Value(dest))
-                        } else {
-                            Some(Operand::Const(IrConst::I64(0)))
-                        }
-                    }
+                    BuiltinIntrinsic::Clz => self.lower_unary_intrinsic(name, args, IrUnaryOp::Clz),
+                    BuiltinIntrinsic::Ctz => self.lower_unary_intrinsic(name, args, IrUnaryOp::Ctz),
+                    BuiltinIntrinsic::Bswap => self.lower_bswap_intrinsic(name, args),
+                    BuiltinIntrinsic::Popcount => self.lower_unary_intrinsic(name, args, IrUnaryOp::Popcount),
+                    BuiltinIntrinsic::Parity => self.lower_parity_intrinsic(name, args),
                     _ => {
                         let cleaned_name = name.strip_prefix("__builtin_").unwrap_or(name).to_string();
                         let arg_types: Vec<IrType> = args.iter().map(|a| self.get_expr_type(a)).collect();
                         let arg_vals: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
                         let dest = self.fresh_value();
-                        let variadic = self.function_variadic.contains(cleaned_name.as_str());
+                        let variadic = self.func_meta.variadic.contains(cleaned_name.as_str());
                         let n_fixed = if variadic {
-                            self.function_param_types.get(cleaned_name.as_str()).map(|p| p.len()).unwrap_or(arg_vals.len())
+                            self.func_meta.param_types.get(cleaned_name.as_str()).map(|p| p.len()).unwrap_or(arg_vals.len())
                         } else { arg_vals.len() };
                         self.emit(Instruction::Call {
                             dest: Some(dest), func: cleaned_name,
@@ -926,6 +827,59 @@ impl Lowerer {
                 }
             }
         }
+    }
+
+    /// Determine the operand width for a suffix-encoded intrinsic (clz, ctz, popcount, etc.).
+    /// Names ending in "ll" or "l" use I64, otherwise I32.
+    fn intrinsic_type_from_suffix(name: &str) -> IrType {
+        if name.ends_with("ll") || name.ends_with('l') { IrType::I64 } else { IrType::I32 }
+    }
+
+    /// Lower a simple unary intrinsic (CLZ, CTZ, Popcount) that takes one integer arg.
+    fn lower_unary_intrinsic(&mut self, name: &str, args: &[Expr], ir_op: IrUnaryOp) -> Option<Operand> {
+        if args.is_empty() {
+            return Some(Operand::Const(IrConst::I64(0)));
+        }
+        let arg = self.lower_expr(&args[0]);
+        let ty = Self::intrinsic_type_from_suffix(name);
+        let dest = self.fresh_value();
+        self.emit(Instruction::UnaryOp { dest, op: ir_op, src: arg, ty });
+        Some(Operand::Value(dest))
+    }
+
+    /// Lower __builtin_bswap{16,32,64} - type determined by numeric suffix.
+    fn lower_bswap_intrinsic(&mut self, name: &str, args: &[Expr]) -> Option<Operand> {
+        if args.is_empty() {
+            return Some(Operand::Const(IrConst::I64(0)));
+        }
+        let arg = self.lower_expr(&args[0]);
+        let ty = if name.contains("64") {
+            IrType::I64
+        } else if name.contains("16") {
+            IrType::I16
+        } else {
+            IrType::I32
+        };
+        let dest = self.fresh_value();
+        self.emit(Instruction::UnaryOp { dest, op: IrUnaryOp::Bswap, src: arg, ty });
+        Some(Operand::Value(dest))
+    }
+
+    /// Lower __builtin_parity{,l,ll} - implemented as popcount & 1.
+    fn lower_parity_intrinsic(&mut self, name: &str, args: &[Expr]) -> Option<Operand> {
+        if args.is_empty() {
+            return Some(Operand::Const(IrConst::I64(0)));
+        }
+        let arg = self.lower_expr(&args[0]);
+        let ty = Self::intrinsic_type_from_suffix(name);
+        let pop = self.fresh_value();
+        self.emit(Instruction::UnaryOp { dest: pop, op: IrUnaryOp::Popcount, src: arg, ty });
+        let dest = self.fresh_value();
+        self.emit(Instruction::BinOp {
+            dest, op: IrBinOp::And,
+            lhs: Operand::Value(pop), rhs: Operand::Const(IrConst::I64(1)), ty,
+        });
+        Some(Operand::Value(dest))
     }
 
     /// Try to lower a GCC atomic builtin (__atomic_* or __sync_*).
@@ -1393,15 +1347,15 @@ impl Lowerer {
     /// and default argument promotions for variadic args.
     fn lower_call_arguments(&mut self, func: &Expr, args: &[Expr]) -> (Vec<Operand>, Vec<IrType>) {
         let param_types: Option<Vec<IrType>> = if let Expr::Identifier(name, _) = func {
-            self.function_param_types.get(name).cloned()
-                .or_else(|| self.function_ptr_param_types.get(name).cloned())
+            self.func_meta.param_types.get(name).cloned()
+                .or_else(|| self.func_meta.ptr_param_types.get(name).cloned())
         } else {
             None
         };
 
         // Get _Bool parameter flags for normalization
         let param_bool_flags: Option<Vec<bool>> = if let Expr::Identifier(name, _) = func {
-            self.function_param_bool_flags.get(name).cloned()
+            self.func_meta.param_bool_flags.get(name).cloned()
         } else {
             None
         };
@@ -1491,7 +1445,7 @@ impl Lowerer {
                     indirect_ret_ty
                 } else {
                     // Direct call - look up return type
-                    let ret_ty = self.function_return_types.get(name).copied().unwrap_or(IrType::I64);
+                    let ret_ty = self.func_meta.return_types.get(name).copied().unwrap_or(IrType::I64);
                     self.emit(Instruction::Call {
                         dest: Some(dest), func: name.clone(),
                         args: arg_vals, arg_types, return_type: ret_ty, is_variadic, num_fixed_args,
@@ -1951,9 +1905,22 @@ impl Lowerer {
     // Member access (s.field, p->field)
     // -----------------------------------------------------------------------
 
-    fn lower_member_access(&mut self, base_expr: &Expr, field_name: &str) -> Operand {
-        let (field_offset, field_ty, bitfield) = self.resolve_member_access_full(base_expr, field_name);
-        let base_addr = self.get_struct_base_addr(base_expr);
+    /// Unified member access lowering for both direct (s.field) and pointer (p->field) access.
+    fn lower_member_access_impl(&mut self, base_expr: &Expr, field_name: &str, is_pointer: bool) -> Operand {
+        // Resolve field metadata and compute base address
+        let (field_offset, field_ty, bitfield) = if is_pointer {
+            self.resolve_pointer_member_access_full(base_expr, field_name)
+        } else {
+            self.resolve_member_access_full(base_expr, field_name)
+        };
+
+        let base_addr = if is_pointer {
+            let ptr_val = self.lower_expr(base_expr);
+            self.operand_to_value(ptr_val)
+        } else {
+            self.get_struct_base_addr(base_expr)
+        };
+
         let field_addr = self.fresh_value();
         self.emit(Instruction::GetElementPtr {
             dest: field_addr, base: base_addr,
@@ -1962,8 +1929,8 @@ impl Lowerer {
         });
 
         // Array and struct fields return address (don't load)
-        if self.field_is_array(base_expr, field_name, false)
-            || self.field_is_struct(base_expr, field_name, false)
+        if self.field_is_array(base_expr, field_name, is_pointer)
+            || self.field_is_struct(base_expr, field_name, is_pointer)
         {
             return Operand::Value(field_addr);
         }
@@ -1977,31 +1944,12 @@ impl Lowerer {
         Operand::Value(dest)
     }
 
+    fn lower_member_access(&mut self, base_expr: &Expr, field_name: &str) -> Operand {
+        self.lower_member_access_impl(base_expr, field_name, false)
+    }
+
     fn lower_pointer_member_access(&mut self, base_expr: &Expr, field_name: &str) -> Operand {
-        let ptr_val = self.lower_expr(base_expr);
-        let base_addr = self.operand_to_value(ptr_val);
-        let (field_offset, field_ty, bitfield) = self.resolve_pointer_member_access_full(base_expr, field_name);
-        let field_addr = self.fresh_value();
-        self.emit(Instruction::GetElementPtr {
-            dest: field_addr, base: base_addr,
-            offset: Operand::Const(IrConst::I64(field_offset as i64)),
-            ty: field_ty,
-        });
-
-        // Array and struct fields return address (don't load)
-        if self.field_is_array(base_expr, field_name, true)
-            || self.field_is_struct(base_expr, field_name, true)
-        {
-            return Operand::Value(field_addr);
-        }
-        let dest = self.fresh_value();
-        self.emit(Instruction::Load { dest, ptr: field_addr, ty: field_ty });
-
-        // Bitfield: extract the relevant bits
-        if let Some((bit_offset, bit_width)) = bitfield {
-            return self.extract_bitfield(dest, field_ty, bit_offset, bit_width);
-        }
-        Operand::Value(dest)
+        self.lower_member_access_impl(base_expr, field_name, true)
     }
 
     /// Extract a bitfield value from a loaded storage unit.
@@ -2216,35 +2164,7 @@ impl Lowerer {
 
     /// Try to lower bitfield increment/decrement using read-modify-write.
     fn try_lower_bitfield_inc_dec(&mut self, inner: &Expr, is_inc: bool, return_new: bool) -> Option<Operand> {
-        let (base_expr, field_name, is_pointer) = match inner {
-            Expr::MemberAccess(base, field, _) => (base.as_ref(), field.as_str(), false),
-            Expr::PointerMemberAccess(base, field, _) => (base.as_ref(), field.as_str(), true),
-            _ => return None,
-        };
-
-        let (field_offset, storage_ty, bitfield) = if is_pointer {
-            self.resolve_pointer_member_access_full(base_expr, field_name)
-        } else {
-            self.resolve_member_access_full(base_expr, field_name)
-        };
-
-        let (bit_offset, bit_width) = bitfield?;
-
-        // Compute base address
-        let base_addr = if is_pointer {
-            let ptr_val = self.lower_expr(base_expr);
-            self.operand_to_value(ptr_val)
-        } else {
-            self.get_struct_base_addr(base_expr)
-        };
-
-        let field_addr = self.fresh_value();
-        self.emit(Instruction::GetElementPtr {
-            dest: field_addr,
-            base: base_addr,
-            offset: Operand::Const(IrConst::I64(field_offset as i64)),
-            ty: storage_ty,
-        });
+        let (field_addr, storage_ty, bit_offset, bit_width) = self.resolve_bitfield_lvalue(inner)?;
 
         // Load and extract current bitfield value
         let loaded = self.fresh_value();
@@ -2266,17 +2186,8 @@ impl Lowerer {
         self.store_bitfield(field_addr, storage_ty, bit_offset, bit_width, Operand::Value(result));
 
         // Return value masked to bit_width
-        let mask = (1u64 << bit_width) - 1;
         let ret_val = if return_new { Operand::Value(result) } else { current_val };
-        let masked = self.fresh_value();
-        self.emit(Instruction::BinOp {
-            dest: masked,
-            op: IrBinOp::And,
-            ty: IrType::I64,
-            lhs: ret_val,
-            rhs: Operand::Const(IrConst::I64(mask as i64)),
-        });
-        Some(Operand::Value(masked))
+        Some(self.mask_to_bitwidth(ret_val, bit_width))
     }
 
     /// Get the step value and operation type for increment/decrement.
@@ -2530,7 +2441,7 @@ impl Lowerer {
             Expr::Sizeof(_, _) => IrType::U64,  // sizeof returns size_t (unsigned long)
             Expr::FunctionCall(func, _, _) => {
                 if let Expr::Identifier(name, _) = func.as_ref() {
-                    if let Some(&ret_ty) = self.function_return_types.get(name.as_str()) {
+                    if let Some(&ret_ty) = self.func_meta.return_types.get(name.as_str()) {
                         return ret_ty;
                     }
                 }
@@ -2619,8 +2530,8 @@ impl Lowerer {
 
     /// Check if a function is variadic.
     fn is_function_variadic(&self, name: &str) -> bool {
-        if self.function_variadic.contains(name) { return true; }
-        if self.function_param_types.contains_key(name) { return false; }
+        if self.func_meta.variadic.contains(name) { return true; }
+        if self.func_meta.param_types.contains_key(name) { return false; }
         // Fallback: common variadic libc functions
         matches!(name, "printf" | "fprintf" | "sprintf" | "snprintf" | "scanf" | "sscanf"
             | "fscanf" | "dprintf" | "vprintf" | "vfprintf" | "vsprintf" | "vsnprintf"

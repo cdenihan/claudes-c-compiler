@@ -66,6 +66,39 @@ pub(super) enum LValue {
     Address(Value),
 }
 
+/// A single level of switch statement context, pushed/popped as switches nest.
+#[derive(Debug)]
+pub(super) struct SwitchFrame {
+    pub end_label: String,
+    pub cases: Vec<(i64, String)>,
+    pub default_label: Option<String>,
+    pub val_alloca: Value,
+    pub expr_type: IrType,
+}
+
+/// Metadata about known functions (return types, param types, variadic status, etc.).
+/// Tracks function signatures so that calls can insert proper casts and ABI handling.
+#[derive(Debug, Default)]
+pub(super) struct FunctionMeta {
+    /// Function name -> return type mapping for inserting narrowing casts after calls.
+    pub return_types: HashMap<String, IrType>,
+    /// Function name -> parameter types mapping for inserting implicit argument casts.
+    pub param_types: HashMap<String, Vec<IrType>>,
+    /// Function name -> flags indicating which parameters are _Bool (need normalization to 0/1).
+    pub param_bool_flags: HashMap<String, Vec<bool>>,
+    /// Function name -> is_variadic flag for calling convention handling.
+    pub variadic: HashSet<String>,
+    /// Function pointer variable name -> return type mapping.
+    pub ptr_return_types: HashMap<String, IrType>,
+    /// Function pointer variable name -> parameter types mapping.
+    pub ptr_param_types: HashMap<String, Vec<IrType>>,
+    /// Function name -> return CType mapping (for pointer-returning functions).
+    pub return_ctypes: HashMap<String, CType>,
+    /// Functions that return structs > 8 bytes and need hidden sret pointer.
+    /// Maps function name to the struct return size.
+    pub sret_functions: HashMap<String, usize>,
+}
+
 /// Lowers AST to IR (alloca-based, not yet SSA).
 pub struct Lowerer {
     pub(super) next_value: u32,
@@ -96,14 +129,8 @@ pub struct Lowerer {
     // Loop context for break/continue
     pub(super) break_labels: Vec<String>,
     pub(super) continue_labels: Vec<String>,
-    // Switch context
-    pub(super) switch_end_labels: Vec<String>,
-    pub(super) switch_cases: Vec<Vec<(i64, String)>>,
-    pub(super) switch_default: Vec<Option<String>>,
-    /// Alloca holding the switch expression value for the current switch.
-    pub(super) switch_val_allocas: Vec<Value>,
-    /// The type of the controlling expression for each nested switch.
-    pub(super) switch_expr_types: Vec<IrType>,
+    /// Stack of switch statement contexts (one frame per nesting level).
+    pub(super) switch_stack: Vec<SwitchFrame>,
     /// Struct/union layouts indexed by tag name (or anonymous id).
     pub(super) struct_layouts: HashMap<String, StructLayout>,
     /// Enum constant values collected from enum definitions.
@@ -115,26 +142,11 @@ pub struct Lowerer {
     pub(super) user_labels: HashMap<String, String>,
     /// Typedef mappings (name -> underlying TypeSpecifier).
     pub(super) typedefs: HashMap<String, TypeSpecifier>,
-    /// Function name -> return type mapping for inserting narrowing casts after calls.
-    pub(super) function_return_types: HashMap<String, IrType>,
-    /// Function name -> parameter types mapping for inserting implicit argument casts.
-    pub(super) function_param_types: HashMap<String, Vec<IrType>>,
-    /// Function name -> flags indicating which parameters are _Bool (need normalization to 0/1).
-    pub(super) function_param_bool_flags: HashMap<String, Vec<bool>>,
-    /// Function name -> is_variadic flag for calling convention handling.
-    pub(super) function_variadic: HashSet<String>,
-    /// Function pointer variable name -> return type mapping.
-    pub(super) function_ptr_return_types: HashMap<String, IrType>,
-    /// Function pointer variable name -> parameter types mapping.
-    pub(super) function_ptr_param_types: HashMap<String, Vec<IrType>>,
+    /// Metadata about known functions (signatures, variadic status, etc.)
+    pub(super) func_meta: FunctionMeta,
     /// Mapping from bare static local variable names to their mangled global names.
     /// e.g., "x" -> "main.x.0" for `static int x;` inside `main()`.
     pub(super) static_local_names: HashMap<String, String>,
-    /// Function name -> return CType mapping (for pointer-returning functions).
-    pub(super) function_return_ctypes: HashMap<String, CType>,
-    /// Functions that return structs > 8 bytes and need hidden sret pointer.
-    /// Maps function name to the struct return size.
-    pub(super) sret_functions: HashMap<String, usize>,
     /// In the current function being lowered, the alloca holding the sret pointer
     /// (hidden first parameter). None if the function does not use sret.
     pub(super) current_sret_ptr: Option<Value>,
@@ -161,25 +173,14 @@ impl Lowerer {
             defined_functions: HashSet::new(),
             break_labels: Vec::new(),
             continue_labels: Vec::new(),
-            switch_end_labels: Vec::new(),
-            switch_cases: Vec::new(),
-            switch_default: Vec::new(),
-            switch_val_allocas: Vec::new(),
-            switch_expr_types: Vec::new(),
+            switch_stack: Vec::new(),
             struct_layouts: HashMap::new(),
             enum_constants: HashMap::new(),
             const_local_values: HashMap::new(),
             user_labels: HashMap::new(),
             typedefs: HashMap::new(),
-            function_return_types: HashMap::new(),
-            function_param_types: HashMap::new(),
-            function_param_bool_flags: HashMap::new(),
-            function_variadic: HashSet::new(),
-            function_ptr_return_types: HashMap::new(),
-            function_ptr_param_types: HashMap::new(),
+            func_meta: FunctionMeta::default(),
             static_local_names: HashMap::new(),
-            function_return_ctypes: HashMap::new(),
-            sret_functions: HashMap::new(),
             current_sret_ptr: None,
         }
     }
@@ -225,11 +226,11 @@ impl Lowerer {
             if let ExternalDecl::FunctionDef(func) = decl {
                 self.known_functions.insert(func.name.clone());
                 let ret_ty = self.type_spec_to_ir(&func.return_type);
-                self.function_return_types.insert(func.name.clone(), ret_ty);
+                self.func_meta.return_types.insert(func.name.clone(), ret_ty);
                 // Track CType for pointer-returning functions
                 if ret_ty == IrType::Ptr {
                     let ret_ctype = self.type_spec_to_ctype(&func.return_type);
-                    self.function_return_ctypes.insert(func.name.clone(), ret_ctype);
+                    self.func_meta.return_ctypes.insert(func.name.clone(), ret_ctype);
                 }
                 // Detect struct returns > 8 bytes that need sret (hidden pointer) convention
                 {
@@ -237,7 +238,7 @@ impl Lowerer {
                     if matches!(resolved, TypeSpecifier::Struct(_, _) | TypeSpecifier::Union(_, _)) {
                         let size = self.sizeof_type(&func.return_type);
                         if size > 8 {
-                            self.sret_functions.insert(func.name.clone(), size);
+                            self.func_meta.sret_functions.insert(func.name.clone(), size);
                         }
                     }
                 }
@@ -255,11 +256,11 @@ impl Lowerer {
                     matches!(self.resolve_type_spec(&p.type_spec), TypeSpecifier::Bool)
                 }).collect();
                 if !func.variadic || !param_tys.is_empty() {
-                    self.function_param_types.insert(func.name.clone(), param_tys);
-                    self.function_param_bool_flags.insert(func.name.clone(), param_bool_flags);
+                    self.func_meta.param_types.insert(func.name.clone(), param_tys);
+                    self.func_meta.param_bool_flags.insert(func.name.clone(), param_bool_flags);
                 }
                 if func.variadic {
-                    self.function_variadic.insert(func.name.clone());
+                    self.func_meta.variadic.insert(func.name.clone());
                 }
             }
             // Also detect function declarations (extern prototypes)
@@ -285,7 +286,7 @@ impl Lowerer {
                         if ptr_count > 0 {
                             ret_ty = IrType::Ptr;
                         }
-                        self.function_return_types.insert(declarator.name.clone(), ret_ty);
+                        self.func_meta.return_types.insert(declarator.name.clone(), ret_ty);
                         // Track CType for pointer-returning functions
                         if ret_ty == IrType::Ptr {
                             let base_ctype = self.type_spec_to_ctype(&decl.type_spec);
@@ -298,7 +299,7 @@ impl Lowerer {
                             } else {
                                 base_ctype
                             };
-                            self.function_return_ctypes.insert(declarator.name.clone(), ret_ctype);
+                            self.func_meta.return_ctypes.insert(declarator.name.clone(), ret_ctype);
                         }
                         // Detect struct returns > 8 bytes that need sret
                         if ptr_count == 0 {
@@ -306,7 +307,7 @@ impl Lowerer {
                             if matches!(resolved, TypeSpecifier::Struct(_, _) | TypeSpecifier::Union(_, _)) {
                                 let size = self.sizeof_type(&decl.type_spec);
                                 if size > 8 {
-                                    self.sret_functions.insert(declarator.name.clone(), size);
+                                    self.func_meta.sret_functions.insert(declarator.name.clone(), size);
                                 }
                             }
                         }
@@ -317,11 +318,11 @@ impl Lowerer {
                             matches!(self.resolve_type_spec(&p.type_spec), TypeSpecifier::Bool)
                         }).collect();
                         if !variadic || !param_tys.is_empty() {
-                            self.function_param_types.insert(declarator.name.clone(), param_tys);
-                            self.function_param_bool_flags.insert(declarator.name.clone(), param_bool_flags);
+                            self.func_meta.param_types.insert(declarator.name.clone(), param_tys);
+                            self.func_meta.param_bool_flags.insert(declarator.name.clone(), param_bool_flags);
                         }
                         if *variadic {
-                            self.function_variadic.insert(declarator.name.clone());
+                            self.func_meta.variadic.insert(declarator.name.clone());
                         }
                     }
                 }
@@ -397,7 +398,7 @@ impl Lowerer {
         self.current_return_is_bool = matches!(self.resolve_type_spec(&func.return_type), TypeSpecifier::Bool);
 
         // Check if this function uses sret (returns struct > 8 bytes via hidden pointer)
-        let uses_sret = self.sret_functions.contains_key(&func.name);
+        let uses_sret = self.func_meta.sret_functions.contains_key(&func.name);
 
         let mut params: Vec<IrParam> = Vec::new();
         // If sret, prepend hidden pointer parameter
@@ -533,11 +534,11 @@ impl Lowerer {
                                 _ => ret_ty,
                             };
                             if let Some(ref name) = p.name {
-                                self.function_ptr_return_types.insert(name.clone(), ret_ty);
+                                self.func_meta.ptr_return_types.insert(name.clone(), ret_ty);
                                 let param_tys: Vec<IrType> = fptr_params.iter().map(|fp| {
                                     self.type_spec_to_ir(&fp.type_spec)
                                 }).collect();
-                                self.function_ptr_param_types.insert(name.clone(), param_tys);
+                                self.func_meta.ptr_param_types.insert(name.clone(), param_tys);
                             }
                         }
                     }
@@ -888,7 +889,7 @@ impl Lowerer {
                 // Try to evaluate as a constant
                 if let Some(val) = self.eval_const_expr(expr) {
                     // Convert integer constants to float if target type is float/double
-                    let val = self.coerce_const_to_type(val, base_ty);
+                    let val = val.coerce_to(base_ty);
                     // If target is long double, promote F64 to LongDouble for proper encoding
                     let val = if is_long_double_target {
                         match val {
@@ -1102,7 +1103,7 @@ impl Lowerer {
                                 let val = match &item.init {
                                     Initializer::Expr(expr) => {
                                         let raw = self.eval_const_expr(expr).unwrap_or(self.zero_const(base_ty));
-                                        self.coerce_const_to_type(raw, base_ty)
+                                        raw.coerce_to(base_ty)
                                     }
                                     Initializer::List(sub_items) => {
                                         // Nested list - flatten
@@ -1111,7 +1112,7 @@ impl Lowerer {
                                             self.flatten_global_init_item(&sub.init, base_ty, &mut sub_vals);
                                         }
                                         let raw = sub_vals.into_iter().next().unwrap_or(self.zero_const(base_ty));
-                                        self.coerce_const_to_type(raw, base_ty)
+                                        raw.coerce_to(base_ty)
                                     }
                                 };
                                 values[current_idx] = val;
@@ -1132,7 +1133,7 @@ impl Lowerer {
                 if !is_array && items.len() >= 1 {
                     if let Initializer::Expr(expr) = &items[0].init {
                         if let Some(val) = self.eval_const_expr(expr) {
-                            return GlobalInit::Scalar(self.coerce_const_to_type(val, base_ty));
+                            return GlobalInit::Scalar(val.coerce_to(base_ty));
                         }
                         // Try address expression
                         if let Some(addr_init) = self.eval_global_addr_expr(expr) {
@@ -1681,7 +1682,7 @@ impl Lowerer {
                                 if byte_offset >= field_size { break; }
                                 if let Initializer::Expr(ref e) = ni.init {
                                     if let Some(val) = self.eval_const_expr(e) {
-                                        let val = self.coerce_const_to_type(val, elem_ty);
+                                        let val = val.coerce_to(elem_ty);
                                         self.write_const_to_bytes(&mut bytes, byte_offset, &val, elem_ty);
                                     }
                                 }
@@ -2306,7 +2307,7 @@ impl Lowerer {
                 }
                 // Fallback: check IrType return type
                 if let Expr::Identifier(name, _) = func.as_ref() {
-                    if let Some(&ret_ty) = self.function_return_types.get(name.as_str()) {
+                    if let Some(&ret_ty) = self.func_meta.return_types.get(name.as_str()) {
                         return ret_ty == IrType::Ptr;
                     }
                 }
@@ -2574,7 +2575,7 @@ impl Lowerer {
                         }
                     } else if let Some(val) = self.eval_const_expr(expr) {
                         // Bare scalar: fills one base element, no sub-array padding
-                        values.push(self.coerce_const_to_type(val, base_ty));
+                        values.push(val.coerce_to(base_ty));
                     } else {
                         values.push(self.zero_const(base_ty));
                     }
@@ -2588,7 +2589,7 @@ impl Lowerer {
         match init {
             Initializer::Expr(expr) => {
                 if let Some(val) = self.eval_const_expr(expr) {
-                    values.push(self.coerce_const_to_type(val, base_ty));
+                    values.push(val.coerce_to(base_ty));
                 } else {
                     values.push(self.zero_const(base_ty));
                 }

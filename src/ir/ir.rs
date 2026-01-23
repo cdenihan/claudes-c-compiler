@@ -278,6 +278,49 @@ pub fn f64_to_x87_bytes(val: f64) -> [u8; 10] {
 }
 
 impl IrConst {
+    /// Returns true if this constant is nonzero (for truthiness checks in const eval).
+    /// Returns None for Zero variant (which is always false).
+    pub fn is_nonzero(&self) -> bool {
+        match self {
+            IrConst::I8(v) => *v != 0,
+            IrConst::I16(v) => *v != 0,
+            IrConst::I32(v) => *v != 0,
+            IrConst::I64(v) => *v != 0,
+            IrConst::F32(v) => *v != 0.0,
+            IrConst::F64(v) => *v != 0.0,
+            IrConst::LongDouble(v) => *v != 0.0,
+            IrConst::Zero => false,
+        }
+    }
+
+    /// Extract as f64 (works for all numeric types).
+    pub fn to_f64(&self) -> Option<f64> {
+        match self {
+            IrConst::I8(v) => Some(*v as f64),
+            IrConst::I16(v) => Some(*v as f64),
+            IrConst::I32(v) => Some(*v as f64),
+            IrConst::I64(v) => Some(*v as f64),
+            IrConst::F32(v) => Some(*v as f64),
+            IrConst::F64(v) => Some(*v),
+            IrConst::LongDouble(v) => Some(*v),
+            IrConst::Zero => Some(0.0),
+        }
+    }
+
+    /// Cast a float value (as f64) to the target IR type, producing a new IrConst.
+    /// Used to deduplicate F32/F64/LongDouble -> target cast logic in const eval.
+    pub fn cast_float_to_target(fv: f64, target: IrType) -> Option<IrConst> {
+        Some(match target {
+            IrType::F64 => IrConst::F64(fv),
+            IrType::F32 => IrConst::F32(fv as f32),
+            IrType::I8 | IrType::U8 => IrConst::I8(fv as i8),
+            IrType::I16 | IrType::U16 => IrConst::I16(fv as i16),
+            IrType::I32 | IrType::U32 => IrConst::I32(fv as i32),
+            IrType::I64 | IrType::U64 | IrType::Ptr => IrConst::I64(fv as i64),
+            _ => return None,
+        })
+    }
+
     /// Extract as i64 (integer constants only; floats return None).
     pub fn to_i64(&self) -> Option<i64> {
         match self {
