@@ -228,6 +228,10 @@ fn emit_global_def(out: &mut AsmOutput, g: &IrGlobal, ptr_dir: PtrDirective) {
         }
         GlobalInit::String(s) => {
             out.emit(&format!("    .asciz \"{}\"", escape_string(s)));
+            let string_bytes = s.len() + 1; // string + null terminator
+            if g.size > string_bytes {
+                out.emit(&format!("    .zero {}", g.size - string_bytes));
+            }
         }
         GlobalInit::GlobalAddr(label) => {
             out.emit(&format!("    {} {}", ptr_dir.as_str(), label));
