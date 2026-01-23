@@ -93,6 +93,7 @@ impl Lowerer {
                     ty: var_ty,
                     struct_layout,
                     is_struct,
+                    alloc_size: actual_alloc_size,
                 });
 
                 self.next_static_local += 1;
@@ -114,6 +115,7 @@ impl Lowerer {
                 ty: var_ty,
                 struct_layout,
                 is_struct,
+                alloc_size: actual_alloc_size,
             });
 
             if let Some(ref init) = declarator.init {

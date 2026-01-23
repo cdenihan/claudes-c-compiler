@@ -205,6 +205,152 @@ impl Lowerer {
         }
     }
 
+    /// Compute sizeof for an expression operand (sizeof expr).
+    /// Returns the size in bytes of the expression's type.
+    pub(super) fn sizeof_expr(&self, expr: &Expr) -> usize {
+        match expr {
+            // Integer literal: type int (4 bytes)
+            Expr::IntLiteral(_, _) => 4,
+            // Float literal: type double (8 bytes) by default in C
+            Expr::FloatLiteral(_, _) => 8,
+            // Char literal: type int in C (4 bytes)
+            Expr::CharLiteral(_, _) => 4,
+            // String literal: array of char, size = length + 1 (null terminator)
+            Expr::StringLiteral(s, _) => s.len() + 1,
+
+            // Variable: look up its alloc_size or type
+            Expr::Identifier(name, _) => {
+                if let Some(info) = self.locals.get(name) {
+                    if info.is_array || info.is_struct {
+                        return info.alloc_size;
+                    }
+                    return info.ty.size();
+                }
+                if let Some(ginfo) = self.globals.get(name) {
+                    if ginfo.is_array || ginfo.is_struct {
+                        for g in &self.module.globals {
+                            if g.name == *name {
+                                return g.size;
+                            }
+                        }
+                    }
+                    return ginfo.ty.size();
+                }
+                4 // default: int
+            }
+
+            // Dereference: element type size
+            Expr::Deref(inner, _) => {
+                if let Expr::Identifier(name, _) = inner.as_ref() {
+                    if let Some(info) = self.locals.get(name) {
+                        if info.elem_size > 0 {
+                            return info.elem_size;
+                        }
+                    }
+                    if let Some(ginfo) = self.globals.get(name) {
+                        if ginfo.elem_size > 0 {
+                            return ginfo.elem_size;
+                        }
+                    }
+                }
+                8 // TODO: better type tracking for nested derefs
+            }
+
+            // Array subscript: element type size
+            Expr::ArraySubscript(base, _, _) => {
+                if let Expr::Identifier(name, _) = base.as_ref() {
+                    if let Some(info) = self.locals.get(name) {
+                        if info.elem_size > 0 {
+                            return info.elem_size;
+                        }
+                    }
+                    if let Some(ginfo) = self.globals.get(name) {
+                        if ginfo.elem_size > 0 {
+                            return ginfo.elem_size;
+                        }
+                    }
+                }
+                4 // default: int element
+            }
+
+            // sizeof(sizeof(...)) -> size_t = 8 on 64-bit
+            Expr::Sizeof(_, _) => 8,
+
+            // Cast: size of the target type
+            Expr::Cast(target_type, _, _) => {
+                self.sizeof_type(target_type)
+            }
+
+            // Member access: member field size
+            Expr::MemberAccess(base_expr, field_name, _) => {
+                let (_, field_ty) = self.resolve_member_access(base_expr, field_name);
+                field_ty.size()
+            }
+            Expr::PointerMemberAccess(base_expr, field_name, _) => {
+                let (_, field_ty) = self.resolve_pointer_member_access(base_expr, field_name);
+                field_ty.size()
+            }
+
+            // Address-of: pointer (8 bytes)
+            Expr::AddressOf(_, _) => 8,
+
+            // Unary operations
+            Expr::UnaryOp(op, inner, _) => {
+                match op {
+                    UnaryOp::LogicalNot => 4, // result is int
+                    UnaryOp::Neg | UnaryOp::Plus | UnaryOp::BitNot => {
+                        self.sizeof_expr(inner).max(4) // integer promotion
+                    }
+                    UnaryOp::PreInc | UnaryOp::PreDec => self.sizeof_expr(inner),
+                }
+            }
+
+            // Postfix operations preserve the operand type
+            Expr::PostfixOp(_, inner, _) => self.sizeof_expr(inner),
+
+            // Binary operations
+            Expr::BinaryOp(op, lhs, rhs, _) => {
+                match op {
+                    // Comparison/logical: result is int
+                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le
+                    | BinOp::Gt | BinOp::Ge | BinOp::LogicalAnd | BinOp::LogicalOr => 4,
+                    // Arithmetic/bitwise: usual arithmetic conversions
+                    _ => {
+                        let ls = self.sizeof_expr(lhs);
+                        let rs = self.sizeof_expr(rhs);
+                        ls.max(rs).max(4) // integer promotion
+                    }
+                }
+            }
+
+            // Conditional: common type of both branches
+            Expr::Conditional(_, then_e, else_e, _) => {
+                let ts = self.sizeof_expr(then_e);
+                let es = self.sizeof_expr(else_e);
+                ts.max(es)
+            }
+
+            // Assignment: type of the left-hand side
+            Expr::Assign(lhs, _, _) | Expr::CompoundAssign(_, lhs, _, _) => {
+                self.sizeof_expr(lhs)
+            }
+
+            // Comma: type of the right expression
+            Expr::Comma(_, rhs, _) => {
+                self.sizeof_expr(rhs)
+            }
+
+            // Function call: default to int (4 bytes)
+            Expr::FunctionCall(_, _, _) => 4,
+
+            // Compound literal: size of the type
+            Expr::CompoundLiteral(ts, _, _) => self.sizeof_type(ts),
+
+            // Default
+            _ => 4,
+        }
+    }
+
     /// Get the element size for a compound literal type.
     /// For arrays, returns the element size; for scalars/structs, returns the full size.
     pub(super) fn compound_literal_elem_size(&self, ts: &TypeSpecifier) -> usize {

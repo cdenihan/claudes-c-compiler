@@ -1562,8 +1562,11 @@ impl Parser {
                     self.advance();
                     if self.is_type_specifier() {
                         if let Some(ts) = self.parse_type_specifier() {
-                            // Skip abstract declarator (pointers, arrays, function pointers)
+                            // Parse abstract declarator: wrap type in Pointer for each *
+                            let mut result_type = ts;
                             while self.consume_if(&TokenKind::Star) {
+                                result_type = TypeSpecifier::Pointer(Box::new(result_type));
+                                // Skip const/volatile/restrict qualifiers after *
                                 loop {
                                     match self.peek() {
                                         TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict => {
@@ -1573,13 +1576,17 @@ impl Parser {
                                     }
                                 }
                             }
-                            // Skip array dimensions: sizeof(int[10])
+                            // Parse array dimensions: sizeof(int[10])
                             while matches!(self.peek(), TokenKind::LBracket) {
                                 self.advance();
-                                while !matches!(self.peek(), TokenKind::RBracket | TokenKind::Eof) {
-                                    self.advance();
-                                }
+                                // Parse the array size expression
+                                let size_expr = if !matches!(self.peek(), TokenKind::RBracket) {
+                                    Some(Box::new(self.parse_assignment_expr()))
+                                } else {
+                                    None
+                                };
                                 self.consume_if(&TokenKind::RBracket);
+                                result_type = TypeSpecifier::Array(Box::new(result_type), size_expr);
                             }
                             // Handle function pointer in sizeof: sizeof(void (*)(int))
                             if matches!(self.peek(), TokenKind::LParen) {
@@ -1587,7 +1594,7 @@ impl Parser {
                             }
                             if matches!(self.peek(), TokenKind::RParen) {
                                 self.expect(&TokenKind::RParen);
-                                return Expr::Sizeof(Box::new(SizeofArg::Type(ts)), span);
+                                return Expr::Sizeof(Box::new(SizeofArg::Type(result_type)), span);
                             }
                         }
                     }

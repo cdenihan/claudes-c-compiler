@@ -20,6 +20,8 @@ pub(super) struct LocalInfo {
     pub struct_layout: Option<StructLayout>,
     /// Whether this variable is a struct (not a pointer to struct).
     pub is_struct: bool,
+    /// The total allocation size of this variable (for sizeof).
+    pub alloc_size: usize,
 }
 
 /// Information about a global variable tracked by the lowerer.
@@ -224,6 +226,7 @@ impl Lowerer {
                     ty,
                     struct_layout: None,
                     is_struct: false,
+                    alloc_size: 8, // parameter is always passed in a register (pointer-sized)
                 });
             }
         }

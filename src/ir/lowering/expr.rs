@@ -371,7 +371,7 @@ impl Lowerer {
             Expr::Sizeof(arg, _) => {
                 let size = match arg.as_ref() {
                     SizeofArg::Type(ts) => self.sizeof_type(ts),
-                    SizeofArg::Expr(_) => 4, // TODO: compute type of expression
+                    SizeofArg::Expr(expr) => self.sizeof_expr(expr),
                 };
                 Operand::Const(IrConst::I64(size as i64))
             }
