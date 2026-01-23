@@ -446,33 +446,51 @@ impl Lowerer {
             }
 
             // If this global already exists (e.g., `extern int a; int a = 0;`),
-            // only emit the definition with an initializer, or skip duplicates.
+            // handle tentative definitions and re-declarations correctly.
             if self.globals.contains_key(&declarator.name) {
                 if declarator.init.is_none() {
-                    // Skip re-declaration without initializer (e.g., `extern int a;`)
-                    continue;
+                    // Check if this is a tentative definition (non-extern without init)
+                    // that needs to be emitted because only an extern was previously tracked
+                    let already_emitted = self.module.globals.iter().any(|g| g.name == declarator.name);
+                    if already_emitted {
+                        // Already defined in .data/.bss, skip duplicate
+                        continue;
+                    }
+                    // Not yet emitted: this is a tentative definition after an extern declaration.
+                    // Fall through to emit it as zero-initialized.
+                } else {
+                    // Has initializer: remove the previous zero-init/extern global and re-emit with init
+                    self.module.globals.retain(|g| g.name != declarator.name);
                 }
-                // Has initializer: remove the previous zero-init/extern global and re-emit with init
-                self.module.globals.retain(|g| g.name != declarator.name);
             }
 
             let base_ty = self.type_spec_to_ir(&decl.type_spec);
-            let (mut alloc_size, elem_size, is_array, is_pointer, array_dim_strides) = self.compute_decl_info(&decl.type_spec, &declarator.derived);
+            let (mut alloc_size, elem_size, is_array, is_pointer, mut array_dim_strides) = self.compute_decl_info(&decl.type_spec, &declarator.derived);
             let var_ty = if is_pointer { IrType::Ptr } else { base_ty };
 
-            // Fix alloc size for unsized char arrays initialized with string literals
-            if is_array && (base_ty == IrType::I8 || base_ty == IrType::U8) {
-                let has_unsized_array = declarator.derived.iter().any(|d| {
-                    matches!(d, DerivedDeclarator::Array(None))
-                });
-                if has_unsized_array {
-                    if let Some(ref init) = declarator.init {
-                        if let Initializer::Expr(expr) = init {
-                            if let Expr::StringLiteral(s, _) = expr {
-                                alloc_size = s.as_bytes().len() + 1;
+            // For unsized arrays (int a[] = {...}), compute actual size from initializer
+            let is_unsized_array = is_array && declarator.derived.iter().any(|d| {
+                matches!(d, DerivedDeclarator::Array(None))
+            });
+            if is_unsized_array {
+                if let Some(ref init) = declarator.init {
+                    match init {
+                        Initializer::Expr(expr) => {
+                            // Fix alloc size for unsized char arrays initialized with string literals
+                            if base_ty == IrType::I8 || base_ty == IrType::U8 {
+                                if let Expr::StringLiteral(s, _) = expr {
+                                    alloc_size = s.as_bytes().len() + 1;
+                                }
                             }
-                        } else if let Initializer::List(items) = init {
-                            alloc_size = items.len();
+                        }
+                        Initializer::List(items) => {
+                            let actual_count = self.compute_init_list_array_size(items);
+                            if elem_size > 0 {
+                                alloc_size = actual_count * elem_size;
+                                if array_dim_strides.len() == 1 {
+                                    array_dim_strides = vec![elem_size];
+                                }
+                            }
                         }
                     }
                 }
@@ -621,18 +639,50 @@ impl Lowerer {
                         return GlobalInit::Compound(elements);
                     }
 
-                    let mut values = Vec::with_capacity(num_elems);
+                    let mut values = vec![self.zero_const(base_ty); num_elems];
                     // For multi-dim arrays, flatten nested init lists
                     if array_dim_strides.len() > 1 {
-                        self.flatten_global_array_init(items, array_dim_strides, base_ty, &mut values);
-                    } else {
-                        for item in items {
-                            self.flatten_global_init_item(&item.init, base_ty, &mut values);
+                        let mut flat = Vec::with_capacity(num_elems);
+                        self.flatten_global_array_init(items, array_dim_strides, base_ty, &mut flat);
+                        for (i, v) in flat.into_iter().enumerate() {
+                            if i < num_elems {
+                                values[i] = v;
+                            }
                         }
-                    }
-                    // Zero-fill remaining elements
-                    while values.len() < num_elems {
-                        values.push(self.zero_const(base_ty));
+                    } else {
+                        // Support designated initializers: [idx] = val
+                        let mut current_idx = 0usize;
+                        for item in items {
+                            // Check for index designator
+                            if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
+                                if let Some(idx) = self.eval_const_expr(idx_expr) {
+                                    current_idx = match idx {
+                                        IrConst::I8(v) => v as usize,
+                                        IrConst::I16(v) => v as usize,
+                                        IrConst::I32(v) => v as usize,
+                                        IrConst::I64(v) => v as usize,
+                                        _ => current_idx,
+                                    };
+                                }
+                            }
+                            if current_idx < num_elems {
+                                let val = match &item.init {
+                                    Initializer::Expr(expr) => {
+                                        self.eval_const_expr(expr).unwrap_or(self.zero_const(base_ty))
+                                    }
+                                    Initializer::List(sub_items) => {
+                                        // Nested list - flatten
+                                        let mut sub_vals = Vec::new();
+                                        for sub in sub_items {
+                                            self.flatten_global_init_item(&sub.init, base_ty, &mut sub_vals);
+                                        }
+                                        sub_vals.into_iter().next().unwrap_or(self.zero_const(base_ty))
+                                    }
+                                };
+                                values[current_idx] = val;
+                            }
+                            current_idx += 1;
+                        }
                     }
                     return GlobalInit::Array(values);
                 }
@@ -666,44 +716,61 @@ impl Lowerer {
 
     /// Lower a struct initializer list to a GlobalInit::Array of field values.
     /// Emits each field's value at its appropriate position, with padding bytes as zeros.
+    /// Supports designated initializers like {.b = 2, .a = 1}.
     fn lower_struct_global_init(
         &self,
         items: &[InitializerItem],
         layout: &StructLayout,
     ) -> GlobalInit {
-        // Strategy: emit one IrConst per field in order, using the field's IR type.
-        // The backend will emit the appropriate .byte/.short/.long/.quad directives.
-        // We use GlobalInit::StructInit to avoid confusion with array semantics.
-        // But since we only have Array variant, we'll emit field values in order
-        // and have the backend emit them with proper sizes using field_types.
-
-        // For simplicity, emit as Array where each element corresponds to a field.
-        // The codegen will need to know the type of each field to emit proper directives.
-        // Since GlobalInit::Array emits all values with the same type, we'll use a
-        // different approach: emit raw bytes as I8 constants.
         let total_size = layout.size;
         let mut bytes = vec![0u8; total_size];
 
-        // Fill in field values from initializer items
-        let mut item_idx = 0;
-        for field_layout in &layout.fields {
-            if item_idx >= items.len() {
+        // Track current field index for positional (non-designated) initializers
+        let mut current_field_idx = 0usize;
+
+        for item in items {
+            // Determine which field this initializer targets
+            let field_idx = if let Some(Designator::Field(ref name)) = item.designators.first() {
+                // Designated initializer: find field by name
+                layout.fields.iter().position(|f| f.name == *name).unwrap_or(current_field_idx)
+            } else {
+                // Positional: use current field index
+                current_field_idx
+            };
+
+            if field_idx >= layout.fields.len() {
                 break;
             }
-            let item = &items[item_idx];
-            item_idx += 1;
+
+            let field_layout = &layout.fields[field_idx];
 
             // Evaluate the initializer expression
-            let val = if let Initializer::Expr(expr) = &item.init {
-                self.eval_const_expr(expr).unwrap_or(IrConst::I64(0))
-            } else {
-                IrConst::I64(0)
+            let val = match &item.init {
+                Initializer::Expr(expr) => {
+                    self.eval_const_expr(expr).unwrap_or(IrConst::I64(0))
+                }
+                Initializer::List(sub_items) => {
+                    // Nested struct initializer or nested list
+                    // For now, try to evaluate first item as scalar
+                    if let Some(first) = sub_items.first() {
+                        if let Initializer::Expr(expr) = &first.init {
+                            self.eval_const_expr(expr).unwrap_or(IrConst::I64(0))
+                        } else {
+                            IrConst::I64(0)
+                        }
+                    } else {
+                        IrConst::I64(0)
+                    }
+                }
             };
 
             // Convert value to bytes and place at field offset
             let field_offset = field_layout.offset;
             let field_ir_ty = IrType::from_ctype(&field_layout.ty);
             self.write_const_to_bytes(&mut bytes, field_offset, &val, field_ir_ty);
+
+            // Advance positional counter past this field
+            current_field_idx = field_idx + 1;
         }
 
         // Emit as array of I8 (byte) constants

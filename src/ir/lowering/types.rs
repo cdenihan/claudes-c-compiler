@@ -233,6 +233,42 @@ impl Lowerer {
         Some(IrConst::I64(result))
     }
 
+    /// Compute the effective array size from an initializer list with potential designators.
+    /// Returns the minimum array size needed to hold all designated (and positional) elements.
+    pub(super) fn compute_init_list_array_size(&self, items: &[InitializerItem]) -> usize {
+        let mut max_idx = 0usize;
+        let mut current_idx = 0usize;
+        for item in items {
+            if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
+                if let Some(idx) = self.eval_const_expr_for_designator(idx_expr) {
+                    current_idx = idx;
+                }
+            }
+            if current_idx >= max_idx {
+                max_idx = current_idx + 1;
+            }
+            current_idx += 1;
+        }
+        // At minimum, the array size equals items.len() for non-designated cases
+        max_idx.max(items.len())
+    }
+
+    /// Evaluate a constant expression and return as usize (for array index designators).
+    pub(super) fn eval_const_expr_for_designator(&self, expr: &Expr) -> Option<usize> {
+        if let Some(val) = self.eval_const_expr(expr) {
+            match val {
+                IrConst::I8(v) => Some(v as usize),
+                IrConst::I16(v) => Some(v as usize),
+                IrConst::I32(v) => Some(v as usize),
+                IrConst::I64(v) => Some(v as usize),
+                IrConst::Zero => Some(0),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
     /// Convert an IrConst to i64.
     pub(super) fn const_to_i64(&self, c: &IrConst) -> Option<i64> {
         match c {

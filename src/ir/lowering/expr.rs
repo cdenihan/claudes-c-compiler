@@ -510,43 +510,87 @@ impl Lowerer {
             Expr::CompoundLiteral(ref type_spec, ref init, _) => {
                 // Compound literal: (type){initializer}
                 // Allocate a local, initialize it, and return its address or value.
-                // For now, treat it as an alloca with the initializer, similar to a local var.
                 let ty = self.type_spec_to_ir(type_spec);
                 let size = self.sizeof_type(type_spec);
                 let alloca = self.fresh_value();
                 self.emit(Instruction::Alloca { dest: alloca, size, ty });
-                // Initialize the compound literal - for simple scalar initializers
+
+                // Check if this is a struct compound literal
+                let struct_layout = self.get_struct_layout_for_type(type_spec);
+
                 match init.as_ref() {
                     Initializer::Expr(expr) => {
                         let val = self.lower_expr(expr);
                         self.emit(Instruction::Store { val, ptr: alloca, ty });
                     }
                     Initializer::List(items) => {
-                        // Initialize elements
-                        let elem_size = self.compound_literal_elem_size(type_spec);
-                        for (i, item) in items.iter().enumerate() {
-                            let val = match &item.init {
-                                Initializer::Expr(expr) => self.lower_expr(expr),
-                                _ => Operand::Const(IrConst::I64(0)), // TODO: nested lists
-                            };
-                            if i == 0 && items.len() == 1 && elem_size == size {
-                                // Simple scalar in braces
-                                self.emit(Instruction::Store { val, ptr: alloca, ty });
-                            } else {
-                                // Array/struct element: compute offset
-                                let offset_val = Operand::Const(IrConst::I64((i * elem_size) as i64));
-                                let elem_ptr = self.fresh_value();
+                        if let Some(layout) = struct_layout {
+                            // Struct compound literal with possible designators
+                            self.zero_init_alloca(alloca, layout.size);
+                            let mut current_field_idx = 0usize;
+                            for item in items.iter() {
+                                let field_idx = if let Some(Designator::Field(ref name)) = item.designators.first() {
+                                    layout.fields.iter().position(|f| f.name == *name).unwrap_or(current_field_idx)
+                                } else {
+                                    current_field_idx
+                                };
+                                if field_idx >= layout.fields.len() { break; }
+                                let field = &layout.fields[field_idx].clone();
+                                let field_ty = self.ctype_to_ir(&field.ty);
+                                let val = match &item.init {
+                                    Initializer::Expr(expr) => self.lower_expr(expr),
+                                    _ => Operand::Const(IrConst::I64(0)),
+                                };
+                                let field_addr = self.fresh_value();
                                 self.emit(Instruction::GetElementPtr {
-                                    dest: elem_ptr,
+                                    dest: field_addr,
                                     base: alloca,
-                                    offset: offset_val,
-                                    ty,
+                                    offset: Operand::Const(IrConst::I64(field.offset as i64)),
+                                    ty: field_ty,
                                 });
-                                let store_ty = if elem_size <= 1 { IrType::I8 }
-                                    else if elem_size <= 2 { IrType::I16 }
-                                    else if elem_size <= 4 { IrType::I32 }
-                                    else { IrType::I64 };
-                                self.emit(Instruction::Store { val, ptr: elem_ptr, ty: store_ty });
+                                self.emit(Instruction::Store { val, ptr: field_addr, ty: field_ty });
+                                current_field_idx = field_idx + 1;
+                            }
+                        } else {
+                            // Array or scalar compound literal
+                            let elem_size = self.compound_literal_elem_size(type_spec);
+                            let has_designators = items.iter().any(|item| !item.designators.is_empty());
+                            if has_designators {
+                                self.zero_init_alloca(alloca, size);
+                            }
+
+                            let mut current_idx = 0usize;
+                            for item in items.iter() {
+                                // Check for index designator
+                                if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
+                                    if let Some(idx_val) = self.eval_const_expr_for_designator(idx_expr) {
+                                        current_idx = idx_val;
+                                    }
+                                }
+
+                                let val = match &item.init {
+                                    Initializer::Expr(expr) => self.lower_expr(expr),
+                                    _ => Operand::Const(IrConst::I64(0)),
+                                };
+                                if current_idx == 0 && items.len() == 1 && elem_size == size {
+                                    // Simple scalar in braces
+                                    self.emit(Instruction::Store { val, ptr: alloca, ty });
+                                } else {
+                                    let offset_val = Operand::Const(IrConst::I64((current_idx * elem_size) as i64));
+                                    let elem_ptr = self.fresh_value();
+                                    self.emit(Instruction::GetElementPtr {
+                                        dest: elem_ptr,
+                                        base: alloca,
+                                        offset: offset_val,
+                                        ty,
+                                    });
+                                    let store_ty = if elem_size <= 1 { IrType::I8 }
+                                        else if elem_size <= 2 { IrType::I16 }
+                                        else if elem_size <= 4 { IrType::I32 }
+                                        else { IrType::I64 };
+                                    self.emit(Instruction::Store { val, ptr: elem_ptr, ty: store_ty });
+                                }
+                                current_idx += 1;
                             }
                         }
                     }
@@ -562,6 +606,13 @@ impl Lowerer {
                 Operand::Const(IrConst::I64(size as i64))
             }
             Expr::AddressOf(inner, _) => {
+                // Special case: &(compound_literal) - compound literal creates an alloca,
+                // taking its address just returns the alloca address
+                if let Expr::CompoundLiteral(..) = inner.as_ref() {
+                    // Lower the compound literal (which returns Operand::Value(alloca))
+                    let val = self.lower_expr(inner);
+                    return val;
+                }
                 // Try to get the lvalue address
                 if let Some(lv) = self.lower_lvalue(inner) {
                     let addr = self.lvalue_addr(&lv);
@@ -582,10 +633,9 @@ impl Lowerer {
                     self.emit(Instruction::GlobalAddr { dest, name: name.clone() });
                     return Operand::Value(dest);
                 }
-                // TODO: handle other cases
-                let dest = self.fresh_value();
-                self.emit(Instruction::GlobalAddr { dest, name: "unknown".to_string() });
-                Operand::Value(dest)
+                // For other expressions (e.g., &*ptr), just lower the inner expression
+                let val = self.lower_expr(inner);
+                return val;
             }
             Expr::Deref(inner, _) => {
                 let ptr = self.lower_expr(inner);

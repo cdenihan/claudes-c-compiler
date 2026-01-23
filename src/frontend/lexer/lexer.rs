@@ -129,21 +129,36 @@ impl Lexer {
             return Token::new(TokenKind::IntLiteral(value as i64), Span::new(start as u32, self.pos as u32, self.file_id));
         }
 
-        // Handle octal
+        // Handle octal (but not if followed by '.' or 'e'/'E' which makes it a float)
         if self.input[self.pos] == b'0' && self.peek_next().map_or(false, |c| c.is_ascii_digit()) {
+            // Save position to backtrack if this turns out to be a float
+            let saved_pos = self.pos;
             self.pos += 1;
             let oct_start = self.pos;
             while self.pos < self.input.len() && self.input[self.pos] >= b'0' && self.input[self.pos] <= b'7' {
                 self.pos += 1;
             }
-            let oct_str = std::str::from_utf8(&self.input[oct_start..self.pos]).unwrap_or("0");
-            let value = u64::from_str_radix(oct_str, 8).unwrap_or(0);
-            let is_unsigned = self.peek_int_suffix_unsigned();
-            self.skip_int_suffix();
-            if is_unsigned || value > i64::MAX as u64 {
-                return Token::new(TokenKind::UIntLiteral(value), Span::new(start as u32, self.pos as u32, self.file_id));
+            // Check if this is actually a float (e.g., 000.001)
+            if self.pos < self.input.len() && (self.input[self.pos] == b'.' || self.input[self.pos] == b'e' || self.input[self.pos] == b'E') {
+                // Backtrack and parse as decimal float
+                self.pos = saved_pos;
+                // Fall through to decimal/float parsing below
+            } else {
+                // Also check for digits 8/9 which make this a decimal, not octal
+                if self.pos < self.input.len() && (self.input[self.pos] == b'8' || self.input[self.pos] == b'9') {
+                    self.pos = saved_pos;
+                    // Fall through to decimal parsing
+                } else {
+                    let oct_str = std::str::from_utf8(&self.input[oct_start..self.pos]).unwrap_or("0");
+                    let value = u64::from_str_radix(oct_str, 8).unwrap_or(0);
+                    let is_unsigned = self.peek_int_suffix_unsigned();
+                    self.skip_int_suffix();
+                    if is_unsigned || value > i64::MAX as u64 {
+                        return Token::new(TokenKind::UIntLiteral(value), Span::new(start as u32, self.pos as u32, self.file_id));
+                    }
+                    return Token::new(TokenKind::IntLiteral(value as i64), Span::new(start as u32, self.pos as u32, self.file_id));
+                }
             }
-            return Token::new(TokenKind::IntLiteral(value as i64), Span::new(start as u32, self.pos as u32, self.file_id));
         }
 
         // Decimal integer or float

@@ -77,24 +77,34 @@ impl Lowerer {
             }
 
             let base_ty = self.type_spec_to_ir(&decl.type_spec);
-            let (mut alloc_size, elem_size, is_array, is_pointer, array_dim_strides) = self.compute_decl_info(&decl.type_spec, &declarator.derived);
+            let (mut alloc_size, elem_size, is_array, is_pointer, mut array_dim_strides) = self.compute_decl_info(&decl.type_spec, &declarator.derived);
             let var_ty = if is_pointer { IrType::Ptr } else { base_ty };
 
-            // Fix alloc size for unsized char arrays initialized with string literals.
-            // For `char s[] = "hello"`, allocate strlen+1 bytes instead of default 256.
-            if is_array && (base_ty == IrType::I8 || base_ty == IrType::U8) {
-                let has_unsized_array = declarator.derived.iter().any(|d| {
-                    matches!(d, DerivedDeclarator::Array(None))
-                });
-                if has_unsized_array {
-                    if let Some(ref init) = declarator.init {
-                        if let Initializer::Expr(expr) = init {
-                            if let Expr::StringLiteral(s, _) = expr {
-                                alloc_size = s.as_bytes().len() + 1; // +1 for null terminator
+            // For unsized arrays (int a[] = {...}), compute actual size from initializer
+            let is_unsized_array = is_array && declarator.derived.iter().any(|d| {
+                matches!(d, DerivedDeclarator::Array(None))
+            });
+            if is_unsized_array {
+                if let Some(ref init) = declarator.init {
+                    match init {
+                        Initializer::Expr(expr) => {
+                            // Fix alloc size for unsized char arrays initialized with string literals.
+                            // For `char s[] = "hello"`, allocate strlen+1 bytes instead of default 256.
+                            if base_ty == IrType::I8 || base_ty == IrType::U8 {
+                                if let Expr::StringLiteral(s, _) = expr {
+                                    alloc_size = s.as_bytes().len() + 1; // +1 for null terminator
+                                }
                             }
-                        } else if let Initializer::List(items) = init {
-                            // char s[] = {'a', 'b', ...} - size from list length
-                            alloc_size = items.len();
+                        }
+                        Initializer::List(items) => {
+                            let actual_count = self.compute_init_list_array_size(items);
+                            if elem_size > 0 {
+                                alloc_size = actual_count * elem_size;
+                                // Update strides for 1D unsized array
+                                if array_dim_strides.len() == 1 {
+                                    array_dim_strides = vec![elem_size];
+                                }
+                            }
                         }
                     }
                 }
@@ -253,10 +263,25 @@ impl Lowerer {
                     Initializer::List(items) => {
                         if is_struct {
                             // Initialize struct fields from initializer list
+                            // Supports designated initializers: {.b = 2, .a = 1}
                             if let Some(layout) = self.locals.get(&declarator.name).and_then(|l| l.struct_layout.clone()) {
-                                for (i, item) in items.iter().enumerate() {
-                                    if i >= layout.fields.len() { break; }
-                                    let field = &layout.fields[i];
+                                // Zero-initialize first if any designators are present
+                                let has_designators = items.iter().any(|item| !item.designators.is_empty());
+                                if has_designators {
+                                    self.zero_init_alloca(alloca, layout.size);
+                                }
+
+                                let mut current_field_idx = 0usize;
+                                for item in items.iter() {
+                                    // Determine target field from designator or position
+                                    let field_idx = if let Some(Designator::Field(ref name)) = item.designators.first() {
+                                        layout.fields.iter().position(|f| f.name == *name).unwrap_or(current_field_idx)
+                                    } else {
+                                        current_field_idx
+                                    };
+
+                                    if field_idx >= layout.fields.len() { break; }
+                                    let field = &layout.fields[field_idx];
                                     let field_offset = field.offset;
                                     let field_ty = IrType::from_ctype(&field.ty);
                                     let val = match &item.init {
@@ -271,6 +296,7 @@ impl Lowerer {
                                         ty: field_ty,
                                     });
                                     self.emit(Instruction::Store { val, ptr: field_addr, ty: field_ty });
+                                    current_field_idx = field_idx + 1;
                                 }
                             }
                         } else if is_array && elem_size > 0 {
@@ -279,14 +305,24 @@ impl Lowerer {
                                 self.zero_init_alloca(alloca, alloc_size);
                                 self.lower_array_init_list(items, alloca, base_ty, &array_dim_strides);
                             } else {
-                                // 1D array: zero-fill first if partially initialized,
-                                // then store each explicit element at its correct offset.
+                                // 1D array: supports designated initializers [idx] = val
+                                // Also zero-fill first if partially initialized.
                                 let num_elems = alloc_size / elem_size.max(1);
-                                if items.len() < num_elems {
-                                    // Partial initialization: zero the entire array first
+                                let has_designators = items.iter().any(|item| !item.designators.is_empty());
+                                if has_designators || items.len() < num_elems {
+                                    // Partial initialization or designators: zero the entire array first
                                     self.zero_init_alloca(alloca, alloc_size);
                                 }
-                                for (i, item) in items.iter().enumerate() {
+
+                                let mut current_idx = 0usize;
+                                for item in items.iter() {
+                                    // Check for index designator
+                                    if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
+                                        if let Some(idx_val) = self.eval_const_expr_for_designator(idx_expr) {
+                                            current_idx = idx_val;
+                                        }
+                                    }
+
                                     let val = match &item.init {
                                         Initializer::Expr(e) => {
                                             // Handle string literal in char array init list:
@@ -295,7 +331,7 @@ impl Lowerer {
                                                 if let Expr::StringLiteral(s, _) = e {
                                                     // Copy string bytes into array at offset
                                                     let bytes = s.as_bytes();
-                                                    let base_offset = i * elem_size;
+                                                    let base_offset = current_idx * elem_size;
                                                     for (j, &byte) in bytes.iter().enumerate() {
                                                         let byte_val = Operand::Const(IrConst::I8(byte as i8));
                                                         let byte_offset = Operand::Const(IrConst::I64((base_offset + j) as i64));
@@ -326,7 +362,7 @@ impl Lowerer {
                                         }
                                         _ => Operand::Const(IrConst::I64(0)),
                                     };
-                                    let offset_val = Operand::Const(IrConst::I64((i * elem_size) as i64));
+                                    let offset_val = Operand::Const(IrConst::I64((current_idx * elem_size) as i64));
                                     let elem_addr = self.fresh_value();
                                     self.emit(Instruction::GetElementPtr {
                                         dest: elem_addr,
@@ -335,6 +371,7 @@ impl Lowerer {
                                         ty: base_ty,
                                     });
                                     self.emit(Instruction::Store { val, ptr: elem_addr, ty: base_ty });
+                                    current_idx += 1;
                                 }
                             }
                         }
