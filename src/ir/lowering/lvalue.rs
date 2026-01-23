@@ -11,6 +11,12 @@ impl Lowerer {
             Expr::Identifier(name, _) => {
                 // Check locals first so inner-scope locals shadow outer static locals
                 if let Some(info) = self.locals.get(name).cloned() {
+                    // Static locals: emit fresh GlobalAddr at point of use
+                    if let Some(ref global_name) = info.static_global_name {
+                        let addr = self.fresh_value();
+                        self.emit(Instruction::GlobalAddr { dest: addr, name: global_name.clone() });
+                        return Some(LValue::Address(addr));
+                    }
                     return Some(LValue::Variable(info.alloca));
                 }
                 // Static local variables: resolve through mangled name
@@ -176,6 +182,18 @@ impl Lowerer {
             Expr::Identifier(name, _) => {
                 // Check locals first so inner-scope locals shadow statics
                 if let Some(info) = self.locals.get(name).cloned() {
+                    // Static locals: emit fresh GlobalAddr at point of use
+                    if let Some(ref global_name) = info.static_global_name {
+                        let addr = self.fresh_value();
+                        self.emit(Instruction::GlobalAddr { dest: addr, name: global_name.clone() });
+                        if info.is_array {
+                            return Operand::Value(addr);
+                        } else {
+                            let loaded = self.fresh_value();
+                            self.emit(Instruction::Load { dest: loaded, ptr: addr, ty: IrType::Ptr });
+                            return Operand::Value(loaded);
+                        }
+                    }
                     if info.is_array {
                         return Operand::Value(info.alloca);
                     } else {

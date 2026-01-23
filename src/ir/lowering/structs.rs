@@ -104,6 +104,12 @@ impl Lowerer {
                     return addr;
                 }
                 if let Some(info) = self.locals.get(name).cloned() {
+                    // Static locals: emit fresh GlobalAddr
+                    if let Some(ref global_name) = info.static_global_name {
+                        let addr = self.fresh_value();
+                        self.emit(Instruction::GlobalAddr { dest: addr, name: global_name.clone() });
+                        return addr;
+                    }
                     if info.is_struct {
                         // The alloca is the struct base address
                         return info.alloca;

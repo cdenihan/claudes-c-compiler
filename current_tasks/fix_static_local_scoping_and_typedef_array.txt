@@ -1,27 +1,34 @@
-Task: Fix static local variable scoping and incomplete array typedef initialization
-Status: IN PROGRESS
+Task: Fix static local variable scoping, incomplete array typedef, and float conditions
+Status: COMPLETED
 
-Problems to fix:
-1. Static local variables are inserted into self.locals during declaration,
-   causing their GlobalAddr to be emitted in the wrong basic block.
-   When goto/switch skips the declaration, the GlobalAddr is unreachable,
-   but later uses of the variable try to reference it.
-   Fix: Don't insert static locals into self.locals. They are already
-   handled by static_local_names + globals lookup in expr.rs and lvalue.rs.
+Fixes implemented:
+1. Static local variables: Don't emit GlobalAddr at declaration point (which may be
+   in an unreachable block due to goto/switch). Instead, store the global name in
+   LocalInfo and emit a fresh GlobalAddr at each use site.
+   Also fixed extern within block to properly remove from static_local_names.
 
-   Affected tests:
+   Tests fixed:
    - wacc_chapter_10_valid_extra_credit_goto_skip_static_initializer
    - wacc_chapter_10_valid_extra_credit_switch_skip_static_initializer
    - wacc_chapter_10_valid_shadow_static_local_var
 
-2. Incomplete array type via typedef (typedef int a[]) produces globals
-   with wrong size (sizeof element instead of sizeof array) and no initializer data.
-   Fix: Properly compute array size from initializer for typedefs with
-   incomplete array type.
+2. Incomplete array type via typedef: Fixed is_unsized_array detection to check
+   resolved typedef type, and fixed base_ty computation for typedef'd arrays.
 
-   Affected tests:
-   - compiler_suite_0030_0114 (typedef int a[]; a x = {1,2,3};)
+   Tests fixed:
+   - compiler_suite_0030_0114
 
-3. Additional small fixes identified during investigation:
-   - Static initializer float-to-int and int-to-float conversion improvements
-   - unsigned int compound assignment type conversion
+3. Float condition branching: Added lower_condition_expr() that masks off the sign
+   bit for floating-point values used as conditions (if/while/for/do-while/ternary/
+   logical operators). This ensures -0.0 is falsy and NaN is truthy, without needing
+   FP comparison which mishandles NaN via ucomisd parity flag.
+   Also fixed LogicalNot (!) for float operands.
+
+   Tests fixed:
+   - wacc_chapter_19_whole_pipeline_all_types_fold_negative_zero
+
+Results:
+  x86 wacc: 697 → 701 (+4)
+  ARM wacc: 697 → 701 (+4)
+  RISC-V wacc: 695 → 699 (+4)
+  No regressions on any architecture.

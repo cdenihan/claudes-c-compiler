@@ -77,6 +77,9 @@ impl Lowerer {
             // they reference a global symbol, not a local variable
             if decl.is_extern {
                 self.locals.remove(&declarator.name);
+                // Also remove from static_local_names so that the extern name
+                // resolves to the true global, not a same-named static local
+                self.static_local_names.remove(&declarator.name);
                 if !self.globals.contains_key(&declarator.name) {
                     let ty = self.type_spec_to_ir(&decl.type_spec);
                     let is_pointer = declarator.derived.iter().any(|d| matches!(d, DerivedDeclarator::Pointer));
@@ -141,8 +144,16 @@ impl Lowerer {
                 }
             }
 
-            let base_ty = self.type_spec_to_ir(&decl.type_spec);
+            let mut base_ty = self.type_spec_to_ir(&decl.type_spec);
             let (mut alloc_size, elem_size, is_array, is_pointer, mut array_dim_strides) = self.compute_decl_info(&decl.type_spec, &declarator.derived);
+            // For typedef'd array types (e.g., typedef int a[]; a x = {...}),
+            // type_spec_to_ir returns Ptr (array decays to pointer), but we need
+            // the element type for correct storage/initialization.
+            if is_array && base_ty == IrType::Ptr && !is_pointer {
+                if let TypeSpecifier::Array(ref elem, _) = self.resolve_type_spec(&decl.type_spec) {
+                    base_ty = self.type_spec_to_ir(elem);
+                }
+            }
             // _Bool type check: only for direct scalar variables, not pointers or arrays
             let has_derived_ptr = declarator.derived.iter().any(|d| matches!(d, DerivedDeclarator::Pointer));
             let is_bool_type = matches!(self.resolve_type_spec(&decl.type_spec), TypeSpecifier::Bool)
@@ -173,10 +184,14 @@ impl Lowerer {
                 base_ty
             };
 
-            // For unsized arrays (int a[] = {...}), compute actual size from initializer
-            let is_unsized_array = is_array && declarator.derived.iter().any(|d| {
-                matches!(d, DerivedDeclarator::Array(None))
-            });
+            // For unsized arrays (int a[] = {...} or typedef int a[]; a x = {1,2,3}),
+            // compute actual size from initializer
+            let is_unsized_array = is_array && (
+                declarator.derived.iter().any(|d| {
+                    matches!(d, DerivedDeclarator::Array(None))
+                })
+                || matches!(self.resolve_type_spec(&decl.type_spec), TypeSpecifier::Array(_, None))
+            );
             if is_unsized_array {
                 if let Some(ref init) = declarator.init {
                     match init {
@@ -284,20 +299,14 @@ impl Lowerer {
                     c_type: c_type.clone(),
                 });
 
-                // Also add an alias so the local name resolves to the global
-                // We emit a GlobalAddr to get the address, then treat it like an alloca.
-                // Note: We must still add to locals for type info even though we access
-                // the global via static_local_names in identifier resolution.
-                let addr = self.fresh_value();
-                self.emit(Instruction::GlobalAddr {
-                    dest: addr,
-                    name: static_name,
-                });
-
+                // Store type info in locals so type lookups work, but do NOT emit
+                // a GlobalAddr here. The declaration may be in an unreachable block
+                // (skipped by goto/switch). Instead, set static_global_name so that
+                // each use site emits a fresh GlobalAddr in its own basic block.
                 let pointee_type = self.compute_pointee_type(&decl.type_spec, &declarator.derived);
                 let is_bool = matches!(self.resolve_type_spec(&decl.type_spec), TypeSpecifier::Bool) && !is_pointer && !is_array;
                 self.locals.insert(declarator.name.clone(), LocalInfo {
-                    alloca: addr,
+                    alloca: Value(0), // placeholder; not used for static locals
                     elem_size,
                     is_array,
                     ty: var_ty,
@@ -308,6 +317,7 @@ impl Lowerer {
                     array_dim_strides: array_dim_strides.clone(),
                     c_type,
                     is_bool,
+                    static_global_name: Some(static_name),
                 });
 
                 self.next_static_local += 1;
@@ -337,6 +347,7 @@ impl Lowerer {
                 array_dim_strides: array_dim_strides.clone(),
                 c_type,
                 is_bool,
+                static_global_name: None,
             });
 
             // Track function pointer return and param types for correct calling convention
@@ -784,7 +795,7 @@ impl Lowerer {
                 self.lower_compound_stmt(compound);
             }
             Stmt::If(cond, then_stmt, else_stmt, _span) => {
-                let cond_val = self.lower_expr(cond);
+                let cond_val = self.lower_condition_expr(cond);
                 let then_label = self.fresh_label("then");
                 let else_label = self.fresh_label("else");
                 let end_label = self.fresh_label("endif");
@@ -828,7 +839,7 @@ impl Lowerer {
                 self.terminate(Terminator::Branch(cond_label.clone()));
 
                 self.start_block(cond_label);
-                let cond_val = self.lower_expr(cond);
+                let cond_val = self.lower_condition_expr(cond);
                 self.terminate(Terminator::CondBranch {
                     cond: cond_val,
                     true_label: body_label.clone(),
@@ -872,7 +883,7 @@ impl Lowerer {
                 // Condition
                 self.start_block(cond_label);
                 if let Some(cond) = cond {
-                    let cond_val = self.lower_expr(cond);
+                    let cond_val = self.lower_condition_expr(cond);
                     self.terminate(Terminator::CondBranch {
                         cond: cond_val,
                         true_label: body_label.clone(),
@@ -919,7 +930,7 @@ impl Lowerer {
                 self.terminate(Terminator::Branch(cond_label.clone()));
 
                 self.start_block(cond_label);
-                let cond_val = self.lower_expr(cond);
+                let cond_val = self.lower_condition_expr(cond);
                 self.terminate(Terminator::CondBranch {
                     cond: cond_val,
                     true_label: body_label,

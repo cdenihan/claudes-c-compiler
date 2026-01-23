@@ -10,7 +10,35 @@ use crate::common::types::{IrType, CType};
 use super::lowering::Lowerer;
 
 impl Lowerer {
-    /// Lower an expression to an IR operand. This is the main dispatch function.
+    /// Lower a condition expression, ensuring floating-point values are properly
+    /// tested for truthiness. The backend's CondBranch uses integer testq, which
+    /// doesn't handle -0.0 correctly (bit pattern 0x8000000000000000 is non-zero
+    /// but -0.0 should be falsy). We fix this by masking off the sign bit so that
+    /// both +0.0 and -0.0 become zero, while NaN and non-zero values remain truthy.
+    pub(super) fn lower_condition_expr(&mut self, expr: &Expr) -> Operand {
+        let expr_ty = self.infer_expr_type(expr);
+        let val = self.lower_expr(expr);
+        if matches!(expr_ty, IrType::F32 | IrType::F64 | IrType::F128) {
+            // Mask off the sign bit: AND with 0x7FFF... so that -0.0 becomes +0.0 (all zeros).
+            // NaN has non-zero exponent+mantissa bits, so it stays truthy.
+            let mask = match expr_ty {
+                IrType::F32 => Operand::Const(IrConst::I64(0x7FFFFFFFi64)),
+                _ => Operand::Const(IrConst::I64(0x7FFFFFFFFFFFFFFFi64)),
+            };
+            let result = self.fresh_value();
+            self.emit(Instruction::BinOp {
+                dest: result,
+                op: IrBinOp::And,
+                lhs: val,
+                rhs: mask,
+                ty: IrType::I64,
+            });
+            Operand::Value(result)
+        } else {
+            val
+        }
+    }
+
     pub(super) fn lower_expr(&mut self, expr: &Expr) -> Operand {
         match expr {
             // Literals
@@ -107,6 +135,18 @@ impl Lowerer {
         // Local variables: arrays/structs decay to address, scalars are loaded.
         // Check locals first so that inner-scope locals shadow outer static locals.
         if let Some(info) = self.locals.get(name).cloned() {
+            // Static locals: emit fresh GlobalAddr at point of use (the declaration
+            // may be in an unreachable block due to goto/switch skip)
+            if let Some(ref global_name) = info.static_global_name {
+                let addr = self.fresh_value();
+                self.emit(Instruction::GlobalAddr { dest: addr, name: global_name.clone() });
+                if info.is_array || info.is_struct {
+                    return Operand::Value(addr);
+                }
+                let dest = self.fresh_value();
+                self.emit(Instruction::Load { dest, ptr: addr, ty: info.ty });
+                return Operand::Value(dest);
+            }
             if info.is_array || info.is_struct {
                 return Operand::Value(info.alloca);
             }
@@ -434,11 +474,30 @@ impl Lowerer {
                 self.maybe_narrow(dest, promoted_ty)
             }
             UnaryOp::LogicalNot => {
+                let inner_ty = self.infer_expr_type(inner);
                 let val = self.lower_expr(inner);
+                // For floats, mask off sign bit so -0.0 is treated as zero
+                let cmp_val = if matches!(inner_ty, IrType::F32 | IrType::F64 | IrType::F128) {
+                    let mask = match inner_ty {
+                        IrType::F32 => Operand::Const(IrConst::I64(0x7FFFFFFFi64)),
+                        _ => Operand::Const(IrConst::I64(0x7FFFFFFFFFFFFFFFi64)),
+                    };
+                    let masked = self.fresh_value();
+                    self.emit(Instruction::BinOp {
+                        dest: masked,
+                        op: IrBinOp::And,
+                        lhs: val,
+                        rhs: mask,
+                        ty: IrType::I64,
+                    });
+                    Operand::Value(masked)
+                } else {
+                    val
+                };
                 let dest = self.fresh_value();
                 self.emit(Instruction::Cmp {
                     dest, op: IrCmpOp::Eq,
-                    lhs: val, rhs: Operand::Const(IrConst::I64(0)),
+                    lhs: cmp_val, rhs: Operand::Const(IrConst::I64(0)),
                     ty: IrType::I64,
                 });
                 Operand::Value(dest)
@@ -1460,8 +1519,15 @@ impl Lowerer {
 
                 if is_local_fptr {
                     let info = self.locals.get(name).unwrap().clone();
+                    let base_addr = if let Some(ref global_name) = info.static_global_name {
+                        let addr = self.fresh_value();
+                        self.emit(Instruction::GlobalAddr { dest: addr, name: global_name.clone() });
+                        addr
+                    } else {
+                        info.alloca
+                    };
                     let ptr_val = self.fresh_value();
-                    self.emit(Instruction::Load { dest: ptr_val, ptr: info.alloca, ty: IrType::Ptr });
+                    self.emit(Instruction::Load { dest: ptr_val, ptr: base_addr, ty: IrType::Ptr });
                     self.emit(Instruction::CallIndirect {
                         dest: Some(dest), func_ptr: Operand::Value(ptr_val),
                         args: arg_vals, arg_types, return_type: indirect_ret_ty, is_variadic, num_fixed_args,
@@ -1533,7 +1599,7 @@ impl Lowerer {
     // -----------------------------------------------------------------------
 
     fn lower_conditional(&mut self, cond: &Expr, then_expr: &Expr, else_expr: &Expr) -> Operand {
-        let cond_val = self.lower_expr(cond);
+        let cond_val = self.lower_condition_expr(cond);
         let result_alloca = self.fresh_value();
         self.emit(Instruction::Alloca { dest: result_alloca, ty: IrType::I64, size: 8 });
 
@@ -2122,7 +2188,7 @@ impl Lowerer {
         let rhs_label = self.fresh_label(&format!("{}_rhs", prefix));
         let end_label = self.fresh_label(&format!("{}_end", prefix));
 
-        let lhs_val = self.lower_expr(lhs);
+        let lhs_val = self.lower_condition_expr(lhs);
 
         // Store default result (0 for &&, 1 for ||)
         let default_val = if is_and { 0 } else { 1 };
@@ -2138,9 +2204,9 @@ impl Lowerer {
         };
         self.terminate(Terminator::CondBranch { cond: lhs_val, true_label, false_label });
 
-        // RHS evaluation
+        // RHS evaluation: use lower_condition_expr to properly handle float rhs
         self.start_block(rhs_label);
-        let rhs_val = self.lower_expr(rhs);
+        let rhs_val = self.lower_condition_expr(rhs);
         let rhs_bool = self.fresh_value();
         self.emit(Instruction::Cmp {
             dest: rhs_bool, op: IrCmpOp::Ne,

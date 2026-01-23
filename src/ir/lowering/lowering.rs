@@ -33,6 +33,10 @@ pub(super) struct LocalInfo {
     pub c_type: Option<CType>,
     /// Whether this variable has _Bool type (needs value clamping to 0/1).
     pub is_bool: bool,
+    /// For static local variables: the mangled global name. When set, accesses should
+    /// emit a fresh GlobalAddr instruction instead of using `alloca`, because the
+    /// declaration may be in an unreachable basic block (skipped by goto/switch).
+    pub static_global_name: Option<String>,
 }
 
 /// Information about a global variable tracked by the lowerer.
@@ -536,6 +540,7 @@ impl Lowerer {
                         array_dim_strides,
                         c_type,
                         is_bool,
+                        static_global_name: None,
                     });
 
                     // For function pointer parameters, register their return type and
@@ -598,6 +603,7 @@ impl Lowerer {
                 array_dim_strides: vec![],
                 c_type: None,
                 is_bool: false,
+                static_global_name: None,
             });
         }
 
@@ -785,8 +791,16 @@ impl Lowerer {
                 }
             }
 
-            let base_ty = self.type_spec_to_ir(&decl.type_spec);
+            let mut base_ty = self.type_spec_to_ir(&decl.type_spec);
             let (mut alloc_size, elem_size, is_array, is_pointer, mut array_dim_strides) = self.compute_decl_info(&decl.type_spec, &declarator.derived);
+            // For typedef'd array types (e.g., typedef int a[]; a x = {...}),
+            // type_spec_to_ir returns Ptr (array decays to pointer), but we need
+            // the element type for correct data emission.
+            if is_array && base_ty == IrType::Ptr && !is_pointer {
+                if let TypeSpecifier::Array(ref elem, _) = self.resolve_type_spec(&decl.type_spec) {
+                    base_ty = self.type_spec_to_ir(elem);
+                }
+            }
             // For array-of-pointers or array-of-function-pointers, element type is Ptr
             let is_array_of_pointers = is_array && {
                 let ptr_pos = declarator.derived.iter().position(|d| matches!(d, DerivedDeclarator::Pointer));
@@ -797,10 +811,14 @@ impl Lowerer {
                 matches!(d, DerivedDeclarator::FunctionPointer(_, _) | DerivedDeclarator::Function(_, _)));
             let var_ty = if is_pointer || is_array_of_pointers || is_array_of_func_ptrs { IrType::Ptr } else { base_ty };
 
-            // For unsized arrays (int a[] = {...}), compute actual size from initializer
-            let is_unsized_array = is_array && declarator.derived.iter().any(|d| {
-                matches!(d, DerivedDeclarator::Array(None))
-            });
+            // For unsized arrays (int a[] = {...} or typedef int a[]; a x = {1,2,3}),
+            // compute actual size from initializer
+            let is_unsized_array = is_array && (
+                declarator.derived.iter().any(|d| {
+                    matches!(d, DerivedDeclarator::Array(None))
+                })
+                || matches!(self.resolve_type_spec(&decl.type_spec), TypeSpecifier::Array(_, None))
+            );
             if is_unsized_array {
                 if let Some(ref init) = declarator.init {
                     match init {
