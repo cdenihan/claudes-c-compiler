@@ -1,0 +1,28 @@
+MEDIUM PRIORITY: Further refactoring of large functions in IR lowering module
+
+The initial refactoring pass (SwitchFrame/FunctionMeta, bitfield helpers, intrinsic
+consolidation, member access unification) reduced 162 lines. These functions remain:
+
+1. try_lower_atomic_builtin (expr.rs, ~445 lines)
+   - Chain of ~25 if-name-matches blocks for __atomic_* and __sync_* builtins
+   - Each block follows the same pattern: check name, parse args, emit 1-2 IR instructions
+   - Should be refactored to use a table-driven approach: map function name -> handler
+   - The __sync_* variants are identical to __atomic_* but with hardcoded SeqCst ordering
+
+2. fill_struct_global_bytes (lowering.rs, ~333 lines)
+   - Handles global struct initialization with designators, nested structs, arrays
+   - Deeply nested match arms that are hard to follow
+   - Should be broken into: fill_scalar, fill_array_of_structs, fill_designated_field,
+     fill_flat_array, fill_string_literal sub-functions
+
+3. lower_global_init (lowering.rs, ~292 lines)
+   - Handles all global initializer forms (scalar, array, string, compound, struct)
+   - The Initializer::List arm (lines 939-1123) is a single match arm with 184 lines
+   - Should be split into lower_array_global_init, lower_struct_global_init, etc.
+
+4. get_expr_type (types.rs, ~250 lines)
+   - Type inference for expressions, split across two match blocks with fallthrough
+   - The two match blocks should be unified into one clean dispatch
+
+5. lower_function (lowering.rs, ~286 lines)
+   - Could be split into: lower_function_params, lower_function_body, emit_implicit_return
