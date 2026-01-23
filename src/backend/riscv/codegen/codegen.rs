@@ -320,14 +320,9 @@ impl ArchCodegen for RiscvCodegen {
             self.va_save_area_offset = space;
             space += 64; // 8 registers * 8 bytes
 
-            // Count named integer params
-            let mut named_gp = 0usize;
-            for param in &func.params {
-                if !param.ty.is_float() {
-                    named_gp += 1;
-                }
-            }
-            self.va_named_gp_count = named_gp.min(8);
+            // Count named params. On RISC-V, all params in variadic functions
+            // go through integer registers (a0-a7), including named float params.
+            self.va_named_gp_count = func.params.len().min(8);
         }
 
         space
@@ -644,7 +639,7 @@ impl ArchCodegen for RiscvCodegen {
 
     fn emit_call(&mut self, args: &[Operand], arg_types: &[IrType], direct_name: Option<&str>,
                  func_ptr: Option<&Operand>, dest: Option<Value>, return_type: IrType,
-                 is_variadic: bool) {
+                 is_variadic: bool, _num_fixed_args: usize) {
         let float_arg_regs = ["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"];
         let mut int_idx = 0usize;
         let mut float_idx = 0usize;

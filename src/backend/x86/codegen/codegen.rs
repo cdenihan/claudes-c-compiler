@@ -748,7 +748,7 @@ impl ArchCodegen for X86Codegen {
 
     fn emit_call(&mut self, args: &[Operand], arg_types: &[IrType], direct_name: Option<&str>,
                  func_ptr: Option<&Operand>, dest: Option<Value>, return_type: IrType,
-                 _is_variadic: bool) {
+                 _is_variadic: bool, _num_fixed_args: usize) {
         // Classify args: float args go in xmm regs, others in int regs
         let mut stack_args: Vec<&Operand> = Vec::new();
         let mut int_idx = 0usize;

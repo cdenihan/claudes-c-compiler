@@ -305,6 +305,7 @@ mod tests {
                     arg_types: vec![],
                     return_type: IrType::I32,
                     is_variadic: true,
+                    num_fixed_args: 0,
                 },
             ],
             terminator: Terminator::Return(None),

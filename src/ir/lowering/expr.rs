@@ -672,15 +672,24 @@ impl Lowerer {
             None
         };
 
-        // Determine variadic status
-        let call_variadic = if let Expr::Identifier(name, _) = func {
-            self.is_function_variadic(name)
+        // Determine variadic status and number of fixed (named) args
+        let (call_variadic, num_fixed_args) = if let Expr::Identifier(name, _) = func {
+            let variadic = self.is_function_variadic(name);
+            let n_fixed = if variadic {
+                // Number of declared parameters in the prototype
+                self.function_param_types.get(name)
+                    .map(|p| p.len())
+                    .unwrap_or(arg_vals.len()) // fallback: treat all as fixed
+            } else {
+                arg_vals.len()
+            };
+            (variadic, n_fixed)
         } else {
-            false
+            (false, arg_vals.len())
         };
 
         // Dispatch: direct call, function pointer call, or indirect call
-        let call_ret_ty = self.emit_call_instruction(func, dest, arg_vals, arg_types, call_variadic);
+        let call_ret_ty = self.emit_call_instruction(func, dest, arg_vals, arg_types, call_variadic, num_fixed_args);
 
         // For sret calls, the struct data is now in the alloca - return its address
         if let Some(alloca) = sret_alloca {
@@ -740,9 +749,12 @@ impl Lowerer {
                 let arg_vals: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
                 let dest = self.fresh_value();
                 let variadic = self.function_variadic.contains(libc_name.as_str());
+                let n_fixed = if variadic {
+                    self.function_param_types.get(libc_name.as_str()).map(|p| p.len()).unwrap_or(arg_vals.len())
+                } else { arg_vals.len() };
                 self.emit(Instruction::Call {
                     dest: Some(dest), func: libc_name.clone(),
-                    args: arg_vals, arg_types, return_type: IrType::I64, is_variadic: variadic,
+                    args: arg_vals, arg_types, return_type: IrType::I64, is_variadic: variadic, num_fixed_args: n_fixed,
                 });
                 Some(Operand::Value(dest))
             }
@@ -781,9 +793,12 @@ impl Lowerer {
                         let arg_vals: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
                         let dest = self.fresh_value();
                         let variadic = self.function_variadic.contains(cleaned_name.as_str());
+                        let n_fixed = if variadic {
+                            self.function_param_types.get(cleaned_name.as_str()).map(|p| p.len()).unwrap_or(arg_vals.len())
+                        } else { arg_vals.len() };
                         self.emit(Instruction::Call {
                             dest: Some(dest), func: cleaned_name,
-                            args: arg_vals, arg_types, return_type: IrType::I64, is_variadic: variadic,
+                            args: arg_vals, arg_types, return_type: IrType::I64, is_variadic: variadic, num_fixed_args: n_fixed,
                         });
                         Some(Operand::Value(dest))
                     }
@@ -1305,6 +1320,7 @@ impl Lowerer {
         arg_vals: Vec<Operand>,
         arg_types: Vec<IrType>,
         is_variadic: bool,
+        num_fixed_args: usize,
     ) -> IrType {
         // Determine indirect call return type from function pointer CType info
         let indirect_ret_ty = self.get_func_ptr_return_ir_type(func);
@@ -1321,10 +1337,9 @@ impl Lowerer {
                     let info = self.locals.get(name).unwrap().clone();
                     let ptr_val = self.fresh_value();
                     self.emit(Instruction::Load { dest: ptr_val, ptr: info.alloca, ty: IrType::Ptr });
-                    let ret_ty = self.function_ptr_return_types.get(name).copied().unwrap_or(IrType::I64);
                     self.emit(Instruction::CallIndirect {
                         dest: Some(dest), func_ptr: Operand::Value(ptr_val),
-                        args: arg_vals, arg_types, return_type: indirect_ret_ty, is_variadic,
+                        args: arg_vals, arg_types, return_type: indirect_ret_ty, is_variadic, num_fixed_args,
                     });
                     indirect_ret_ty
                 } else if is_global_fptr {
@@ -1332,10 +1347,9 @@ impl Lowerer {
                     self.emit(Instruction::GlobalAddr { dest: addr, name: name.clone() });
                     let ptr_val = self.fresh_value();
                     self.emit(Instruction::Load { dest: ptr_val, ptr: addr, ty: IrType::Ptr });
-                    let ret_ty = self.function_ptr_return_types.get(name).copied().unwrap_or(IrType::I64);
                     self.emit(Instruction::CallIndirect {
                         dest: Some(dest), func_ptr: Operand::Value(ptr_val),
-                        args: arg_vals, arg_types, return_type: indirect_ret_ty, is_variadic,
+                        args: arg_vals, arg_types, return_type: indirect_ret_ty, is_variadic, num_fixed_args,
                     });
                     indirect_ret_ty
                 } else {
@@ -1343,26 +1357,28 @@ impl Lowerer {
                     let ret_ty = self.function_return_types.get(name).copied().unwrap_or(IrType::I64);
                     self.emit(Instruction::Call {
                         dest: Some(dest), func: name.clone(),
-                        args: arg_vals, arg_types, return_type: ret_ty, is_variadic,
+                        args: arg_vals, arg_types, return_type: ret_ty, is_variadic, num_fixed_args,
                     });
                     ret_ty
                 }
             }
             Expr::Deref(inner, _) => {
                 // (*func_ptr)(args...) - dereference is a no-op for function pointers
+                let n = arg_vals.len();
                 let func_ptr = self.lower_expr(inner);
                 self.emit(Instruction::CallIndirect {
                     dest: Some(dest), func_ptr, args: arg_vals, arg_types,
-                    return_type: indirect_ret_ty, is_variadic: false,
+                    return_type: indirect_ret_ty, is_variadic: false, num_fixed_args: n,
                 });
                 indirect_ret_ty
             }
             _ => {
                 // General expression as callee (e.g., array[i](...), struct.fptr(...))
+                let n = arg_vals.len();
                 let func_ptr = self.lower_expr(func);
                 self.emit(Instruction::CallIndirect {
                     dest: Some(dest), func_ptr, args: arg_vals, arg_types,
-                    return_type: indirect_ret_ty, is_variadic: false,
+                    return_type: indirect_ret_ty, is_variadic: false, num_fixed_args: n,
                 });
                 indirect_ret_ty
             }

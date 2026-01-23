@@ -10,11 +10,14 @@ pub struct ArmCodegen {
     /// Frame size for the current function (needed for epilogue in terminators).
     current_frame_size: i64,
     current_return_type: IrType,
-    /// For variadic functions: offset from SP where the register save area starts.
-    /// This is where x0-x7 are saved so va_arg can access them.
-    va_save_area_offset: i64,
-    /// Number of named (non-variadic) integer params for current variadic function.
+    /// For variadic functions: offset from SP where the GP register save area starts (x0-x7).
+    va_gp_save_offset: i64,
+    /// For variadic functions: offset from SP where the FP register save area starts (q0-q7).
+    va_fp_save_offset: i64,
+    /// Number of named (non-variadic) GP params for current variadic function.
     va_named_gp_count: usize,
+    /// Number of named (non-variadic) FP params for current variadic function.
+    va_named_fp_count: usize,
 }
 
 impl ArmCodegen {
@@ -23,8 +26,10 @@ impl ArmCodegen {
             state: CodegenState::new(),
             current_frame_size: 0,
             current_return_type: IrType::I64,
-            va_save_area_offset: 0,
+            va_gp_save_offset: 0,
+            va_fp_save_offset: 0,
             va_named_gp_count: 0,
+            va_named_fp_count: 0,
         }
     }
 
@@ -464,21 +469,32 @@ impl ArchCodegen for ArmCodegen {
             (slot, new_space)
         });
 
-        // For variadic functions, reserve space for the register save area (x0-x7 = 64 bytes)
+        // For variadic functions, reserve space for register save areas:
+        // - GP save area: x0-x7 = 64 bytes (8 regs * 8 bytes)
+        // - FP save area: q0-q7 = 128 bytes (8 regs * 16 bytes each)
         if func.is_variadic {
-            // Align to 8 bytes
+            // GP register save area (64 bytes, 8-byte aligned)
             space = (space + 7) & !7;
-            self.va_save_area_offset = space;
-            space += 64; // 8 registers * 8 bytes
+            self.va_gp_save_offset = space;
+            space += 64; // 8 GP registers * 8 bytes
 
-            // Count named integer params to know where variadic args start
+            // FP register save area (128 bytes, 16-byte aligned)
+            space = (space + 15) & !15;
+            self.va_fp_save_offset = space;
+            space += 128; // 8 FP/SIMD registers * 16 bytes (q0-q7)
+
+            // Count named GP and FP params to know where variadic args start
             let mut named_gp = 0usize;
+            let mut named_fp = 0usize;
             for param in &func.params {
-                if !param.ty.is_float() {
+                if param.ty.is_float() {
+                    named_fp += 1;
+                } else {
                     named_gp += 1;
                 }
             }
             self.va_named_gp_count = named_gp.min(8);
+            self.va_named_fp_count = named_fp.min(8);
         }
 
         space
@@ -501,15 +517,21 @@ impl ArchCodegen for ArmCodegen {
     fn emit_store_params(&mut self, func: &IrFunction) {
         let frame_size = self.current_frame_size;
 
-        // For variadic functions: save all integer register args (x0-x7) to the
-        // register save area first, before any other processing. This allows va_arg
-        // to access any register-passed variadic arguments.
+        // For variadic functions: save all register args to save areas first,
+        // before any other processing. This allows va_arg to access register-passed
+        // variadic arguments.
         if func.is_variadic {
-            let save_base = self.va_save_area_offset;
-            // Save x0-x7 using stp pairs for efficiency
+            // Save x0-x7 to GP register save area using stp pairs
+            let gp_base = self.va_gp_save_offset;
             for i in (0..8).step_by(2) {
-                let offset = save_base + (i as i64) * 8;
+                let offset = gp_base + (i as i64) * 8;
                 self.emit_stp_to_sp(&format!("x{}", i), &format!("x{}", i + 1), offset);
+            }
+            // Save q0-q7 to FP register save area using stp pairs (128-bit each)
+            let fp_base = self.va_fp_save_offset;
+            for i in (0..8).step_by(2) {
+                let offset = fp_base + (i as i64) * 16;
+                self.emit_stp_to_sp(&format!("q{}", i), &format!("q{}", i + 1), offset);
             }
         }
 
@@ -821,7 +843,7 @@ impl ArchCodegen for ArmCodegen {
 
     fn emit_call(&mut self, args: &[Operand], arg_types: &[IrType], direct_name: Option<&str>,
                  func_ptr: Option<&Operand>, dest: Option<Value>, return_type: IrType,
-                 _is_variadic: bool) {
+                 is_variadic: bool, num_fixed_args: usize) {
         // For indirect calls, load the function pointer into x17 BEFORE
         // setting up arguments, to avoid clobbering x0 (first arg register).
         if func_ptr.is_some() && direct_name.is_none() {
@@ -830,7 +852,10 @@ impl ArchCodegen for ArmCodegen {
             self.state.emit("    mov x17, x0");
         }
 
-        // Classify args: determine which go in registers vs stack
+        // Classify args: determine which go in registers vs stack.
+        // On AArch64 (AAPCS64), both named and variadic float args go in FP registers (d0-d7),
+        // and int args go in GP registers (x0-x7). The callee saves both register sets
+        // and uses va_list with __gr_offs/__vr_offs to access variadic args.
         let mut arg_classes: Vec<char> = Vec::new(); // 'f' = float reg, 'i' = int reg, 's' = stack
         let mut fi = 0usize;
         let mut ii = 0usize;
@@ -860,16 +885,31 @@ impl ArchCodegen for ArmCodegen {
         let num_stack_args = stack_arg_indices.len();
         let stack_arg_space = (((num_stack_args * 8) + 15) / 16) * 16;
 
-        // Phase 1: Load ALL args into temp storage BEFORE adjusting SP.
-        // Register args go into x9-x16. Stack args go into a pre-allocated
-        // save area that we create temporarily.
-        let mut tmp_idx = 0usize;
+        // Phase 1a: Load GP register args into temp registers (x9-x16).
+        // FP args are handled separately since they use a different register bank.
+        let mut gp_tmp_idx = 0usize;
         for (i, arg) in args.iter().enumerate() {
-            if arg_classes[i] == 's' { continue; }
-            if tmp_idx >= 8 { break; }
+            if arg_classes[i] != 'i' { continue; }
+            if gp_tmp_idx >= 8 { break; }
             self.operand_to_x0(arg);
-            self.state.emit(&format!("    mov {}, x0", ARM_TMP_REGS[tmp_idx]));
-            tmp_idx += 1;
+            self.state.emit(&format!("    mov {}, x0", ARM_TMP_REGS[gp_tmp_idx]));
+            gp_tmp_idx += 1;
+        }
+
+        // Phase 1b: Load FP register args directly into d0-d7 (or s0-s7).
+        // FP regs don't conflict with GP temp regs, so this is safe.
+        let mut fp_reg_idx = 0usize;
+        for (i, arg) in args.iter().enumerate() {
+            if arg_classes[i] != 'f' { continue; }
+            if fp_reg_idx >= 8 { break; }
+            let arg_ty = if i < arg_types.len() { Some(arg_types[i]) } else { None };
+            self.operand_to_x0(arg);
+            if arg_ty == Some(IrType::F32) {
+                self.state.emit(&format!("    fmov s{}, w0", fp_reg_idx));
+            } else {
+                self.state.emit(&format!("    fmov d{}, x0", fp_reg_idx));
+            }
+            fp_reg_idx += 1;
         }
 
         // For stack args: load them all before adjusting SP, save to stack
@@ -903,28 +943,19 @@ impl ArchCodegen for ArmCodegen {
             }
         }
 
-        // Phase 2: Move from temp regs to actual arg registers.
-        let mut float_reg_idx = 0usize;
+        // Phase 2: Move GP args from temp regs to actual arg registers (x0-x7).
         let mut int_reg_idx = 0usize;
-        tmp_idx = 0;
+        gp_tmp_idx = 0;
         for (i, _arg) in args.iter().enumerate() {
-            if arg_classes[i] == 's' { continue; }
-            if tmp_idx >= 8 { break; }
-            let arg_ty = if i < arg_types.len() { Some(arg_types[i]) } else { None };
-            if arg_classes[i] == 'f' && float_reg_idx < 8 {
-                if arg_ty == Some(IrType::F32) {
-                    self.state.emit(&format!("    fmov s{}, {}",
-                        float_reg_idx, Self::w_for_x(ARM_TMP_REGS[tmp_idx])));
-                } else {
-                    self.state.emit(&format!("    fmov d{}, {}", float_reg_idx, ARM_TMP_REGS[tmp_idx]));
-                }
-                float_reg_idx += 1;
-            } else if arg_classes[i] == 'i' && int_reg_idx < 8 {
-                self.state.emit(&format!("    mov {}, {}", ARM_ARG_REGS[int_reg_idx], ARM_TMP_REGS[tmp_idx]));
+            if arg_classes[i] != 'i' { continue; }
+            if gp_tmp_idx >= 8 { break; }
+            if int_reg_idx < 8 {
+                self.state.emit(&format!("    mov {}, {}", ARM_ARG_REGS[int_reg_idx], ARM_TMP_REGS[gp_tmp_idx]));
                 int_reg_idx += 1;
             }
-            tmp_idx += 1;
+            gp_tmp_idx += 1;
         }
+        // FP args already in d0-d7 from Phase 1b.
 
         if let Some(name) = direct_name {
             self.state.emit(&format!("    bl {}", name));
@@ -1005,11 +1036,34 @@ impl ArchCodegen for ArmCodegen {
     }
 
     fn emit_va_arg(&mut self, dest: &Value, va_list_ptr: &Value, result_ty: IrType) {
-        // AArch64 AAPCS va_arg: simplified implementation using overflow area only.
-        // va_list is: { void *__stack; void *__gr_top; void *__vr_top; int __gr_offs; int __vr_offs; }
-        // For our simplified va_start (overflow-only), we just use __stack (offset 0).
+        // AArch64 AAPCS64 va_arg implementation.
+        // va_list layout:
+        //   [x1+0]  __stack    (void*)  - next stack overflow arg
+        //   [x1+8]  __gr_top   (void*)  - end of GP save area
+        //   [x1+16] __vr_top   (void*)  - end of FP/SIMD save area
+        //   [x1+24] __gr_offs  (int32)  - offset from __gr_top (negative means regs available)
+        //   [x1+28] __vr_offs  (int32)  - offset from __vr_top (negative means regs available)
         //
-        // Load va_list pointer
+        // Algorithm for GP types (int, ptr, etc.):
+        //   if __gr_offs < 0:
+        //     addr = __gr_top + __gr_offs
+        //     __gr_offs += 8
+        //   else:
+        //     addr = __stack; __stack += 8
+        //
+        // Algorithm for FP types (float, double):
+        //   if __vr_offs < 0:
+        //     addr = __vr_top + __vr_offs
+        //     __vr_offs += 16
+        //   else:
+        //     addr = __stack; __stack += 8
+
+        let is_fp = result_ty.is_float();
+        let label_id = self.state.next_label_id();
+        let label_stack = format!(".Lva_stack_{}", label_id);
+        let label_done = format!(".Lva_done_{}", label_id);
+
+        // x1 = pointer to va_list struct
         if let Some(slot) = self.state.get_slot(va_list_ptr.0) {
             if self.state.is_alloca(va_list_ptr.0) {
                 self.state.emit(&format!("    add x1, x29, #{}", slot.0));
@@ -1017,32 +1071,69 @@ impl ArchCodegen for ArmCodegen {
                 self.state.emit(&format!("    ldr x1, [x29, #{}]", slot.0));
             }
         }
-        // Load __stack pointer
-        self.state.emit("    ldr x2, [x1]");
-        // Load the value
-        if result_ty == IrType::F32 {
-            self.state.emit("    ldr w0, [x2]");
+
+        if is_fp {
+            // FP type: check __vr_offs
+            self.state.emit("    ldrsw x2, [x1, #28]");  // x2 = __vr_offs (sign-extended)
+            self.state.emit(&format!("    tbz x2, #63, {}", label_stack)); // if >= 0, go to stack
+            // Register save area path: addr = __vr_top + __vr_offs
+            self.state.emit("    ldr x3, [x1, #16]");     // x3 = __vr_top
+            self.state.emit("    add x3, x3, x2");         // x3 = __vr_top + __vr_offs
+            // Advance __vr_offs by 16
+            self.state.emit("    add w2, w2, #16");
+            self.state.emit("    str w2, [x1, #28]");
+            // Load the value from the register save area
+            if result_ty == IrType::F32 {
+                // F32: stored in lower 4 bytes of 16-byte Q register slot
+                self.state.emit("    ldr w0, [x3]");
+            } else {
+                // F64: stored in lower 8 bytes of 16-byte Q register slot
+                self.state.emit("    ldr x0, [x3]");
+            }
+            self.state.emit(&format!("    b {}", label_done));
         } else {
-            self.state.emit("    ldr x0, [x2]");
+            // GP type: check __gr_offs
+            self.state.emit("    ldrsw x2, [x1, #24]");  // x2 = __gr_offs (sign-extended)
+            self.state.emit(&format!("    tbz x2, #63, {}", label_stack)); // if >= 0, go to stack
+            // Register save area path: addr = __gr_top + __gr_offs
+            self.state.emit("    ldr x3, [x1, #8]");      // x3 = __gr_top
+            self.state.emit("    add x3, x3, x2");         // x3 = __gr_top + __gr_offs
+            // Advance __gr_offs by 8
+            self.state.emit("    add w2, w2, #8");
+            self.state.emit("    str w2, [x1, #24]");
+            // Load the value from the register save area
+            self.state.emit("    ldr x0, [x3]");
+            self.state.emit(&format!("    b {}", label_done));
         }
-        // Advance __stack by 8
-        self.state.emit("    add x2, x2, #8");
-        self.state.emit("    str x2, [x1]");
-        // Store result
+
+        // Stack overflow path
+        self.state.emit(&format!("{}:", label_stack));
+        self.state.emit("    ldr x3, [x1]");           // x3 = __stack
+        if result_ty == IrType::F32 {
+            self.state.emit("    ldr w0, [x3]");
+        } else {
+            self.state.emit("    ldr x0, [x3]");
+        }
+        self.state.emit("    add x3, x3, #8");         // advance __stack by 8
+        self.state.emit("    str x3, [x1]");
+
+        self.state.emit(&format!("{}:", label_done));
+        // Store result to dest
         if let Some(slot) = self.state.get_slot(dest.0) {
             self.state.emit(&format!("    str x0, [x29, #{}]", slot.0));
         }
     }
 
     fn emit_va_start(&mut self, va_list_ptr: &Value) {
-        // AArch64 va_start: set __stack to point at the first variadic argument.
-        //
-        // For variadic functions, we save x0-x7 to a register save area on the stack.
-        // The variadic args start after the named GP register params.
-        // If all named params fit in registers (< 8 GP params), variadic args are
-        // in the register save area at offset named_gp_count * 8.
-        // If named params overflow to stack (>= 8 GP params), variadic args are
-        // on the caller's stack frame at x29 + 16.
+        // AArch64 AAPCS64 va_start: initialize the full va_list struct.
+        // va_list layout (32 bytes):
+        //   offset 0:  void *__stack     - next stack overflow arg
+        //   offset 8:  void *__gr_top    - end of GP register save area
+        //   offset 16: void *__vr_top    - end of FP/SIMD register save area
+        //   offset 24: int __gr_offs     - offset from __gr_top to next GP reg arg (negative)
+        //   offset 28: int __vr_offs     - offset from __vr_top to next FP reg arg (negative)
+
+        // x0 = pointer to va_list struct
         if let Some(slot) = self.state.get_slot(va_list_ptr.0) {
             if self.state.is_alloca(va_list_ptr.0) {
                 self.state.emit(&format!("    add x0, x29, #{}", slot.0));
@@ -1051,16 +1142,41 @@ impl ArchCodegen for ArmCodegen {
             }
         }
 
-        if self.va_named_gp_count < 8 {
-            // Variadic args start in the register save area, after named params
-            let vararg_offset = self.va_save_area_offset + (self.va_named_gp_count as i64) * 8;
-            self.emit_add_sp_offset("x1", vararg_offset);
+        // __stack: pointer to the stack overflow area (caller's stack frame above ours).
+        // After prologue: sp = x29, [x29] = saved fp, [x29+8] = saved lr,
+        // [x29+16..x29+frame_size-1] = local slots.
+        // Caller's stack args are at x29 + frame_size (above our frame).
+        let frame_size = self.current_frame_size;
+        if frame_size <= 4095 {
+            self.state.emit(&format!("    add x1, x29, #{}", frame_size));
         } else {
-            // All registers used by named params; variadic args are on the caller's stack
-            // They're at x29 + 16 (past saved fp/lr)
-            self.state.emit("    add x1, x29, #16");
+            self.load_large_imm("x1", frame_size);
+            self.state.emit("    add x1, x29, x1");
         }
-        self.state.emit("    str x1, [x0]");
+        self.state.emit("    str x1, [x0]");  // __stack at offset 0
+
+        // __gr_top: pointer to the end (one past last) of the GP register save area
+        let gr_top_offset = self.va_gp_save_offset + 64; // end of x0-x7 save area
+        self.emit_add_sp_offset("x1", gr_top_offset);
+        self.state.emit("    str x1, [x0, #8]");  // __gr_top at offset 8
+
+        // __vr_top: pointer to the end (one past last) of the FP/SIMD register save area
+        let vr_top_offset = self.va_fp_save_offset + 128; // end of q0-q7 save area
+        self.emit_add_sp_offset("x1", vr_top_offset);
+        self.state.emit("    str x1, [x0, #16]");  // __vr_top at offset 16
+
+        // __gr_offs: negative offset from __gr_top to next unnamed GP reg
+        // = -(8 - named_gp_count) * 8
+        // If all 8 GP regs used by named params, __gr_offs = 0 (meaning overflow to stack)
+        let gr_offs: i32 = -((8 - self.va_named_gp_count as i32) * 8);
+        self.state.emit(&format!("    mov w1, #{}", gr_offs));
+        self.state.emit("    str w1, [x0, #24]");  // __gr_offs at offset 24
+
+        // __vr_offs: negative offset from __vr_top to next unnamed FP/SIMD reg
+        // = -(8 - named_fp_count) * 16
+        let vr_offs: i32 = -((8 - self.va_named_fp_count as i32) * 16);
+        self.state.emit(&format!("    mov w1, #{}", vr_offs));
+        self.state.emit("    str w1, [x0, #28]");  // __vr_offs at offset 28
     }
 
     fn emit_va_end(&mut self, _va_list_ptr: &Value) {

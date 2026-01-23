@@ -920,12 +920,15 @@ impl Lowerer {
             ("__s16", Short),
             ("__s32", Int),
             ("__s64", Long),
-            // <stdarg.h> - va_list is an array type __va_list_tag[1] (24 bytes on x86-64).
-            // We represent it as Array(Char, 24) so it allocates 24 bytes on the stack
-            // and decays to a pointer when passed to functions.
-            ("va_list", Array(Box::new(Char), Some(Box::new(Expr::IntLiteral(24, Span::dummy()))))),
-            ("__builtin_va_list", Array(Box::new(Char), Some(Box::new(Expr::IntLiteral(24, Span::dummy()))))),
-            ("__gnuc_va_list", Array(Box::new(Char), Some(Box::new(Expr::IntLiteral(24, Span::dummy()))))),
+            // <stdarg.h> - va_list is an array type. Size varies by arch:
+            //   x86-64: 24 bytes (gp_offset, fp_offset, overflow_arg_area, reg_save_area)
+            //   AArch64: 32 bytes (__stack, __gr_top, __vr_top, __gr_offs, __vr_offs)
+            //   RISC-V: 8 bytes (just a pointer)
+            // We use 32 bytes (the max) to be safe across all architectures.
+            // va_list decays to a pointer when passed to functions (it's an array type).
+            ("va_list", Array(Box::new(Char), Some(Box::new(Expr::IntLiteral(32, Span::dummy()))))),
+            ("__builtin_va_list", Array(Box::new(Char), Some(Box::new(Expr::IntLiteral(32, Span::dummy()))))),
+            ("__gnuc_va_list", Array(Box::new(Char), Some(Box::new(Expr::IntLiteral(32, Span::dummy()))))),
             // <locale.h>
             ("locale_t", Pointer(Box::new(Void))),
             // <pthread.h> - opaque types, treat as unsigned long or pointer

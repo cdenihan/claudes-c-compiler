@@ -99,10 +99,13 @@ pub enum Instruction {
     Cmp { dest: Value, op: IrCmpOp, lhs: Operand, rhs: Operand, ty: IrType },
 
     /// Function call: %dest = call func(args...)
-    Call { dest: Option<Value>, func: String, args: Vec<Operand>, arg_types: Vec<IrType>, return_type: IrType, is_variadic: bool },
+    /// `num_fixed_args` is the number of named (non-variadic) parameters in the callee's prototype.
+    /// For non-variadic calls, this equals args.len(). For variadic calls, args beyond num_fixed_args
+    /// are variadic and may need different calling convention handling (e.g., floats in GP regs on AArch64).
+    Call { dest: Option<Value>, func: String, args: Vec<Operand>, arg_types: Vec<IrType>, return_type: IrType, is_variadic: bool, num_fixed_args: usize },
 
     /// Indirect function call through a pointer: %dest = call_indirect ptr(args...)
-    CallIndirect { dest: Option<Value>, func_ptr: Operand, args: Vec<Operand>, arg_types: Vec<IrType>, return_type: IrType, is_variadic: bool },
+    CallIndirect { dest: Option<Value>, func_ptr: Operand, args: Vec<Operand>, arg_types: Vec<IrType>, return_type: IrType, is_variadic: bool, num_fixed_args: usize },
 
     /// Get element pointer (for arrays/structs)
     GetElementPtr { dest: Value, base: Value, offset: Operand, ty: IrType },
