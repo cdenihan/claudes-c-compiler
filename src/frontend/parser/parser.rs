@@ -1580,8 +1580,21 @@ impl Parser {
                         break;
                     }
                 }
+                // GNU old-style designator: field: value (equivalent to .field = value)
+                if designators.is_empty() {
+                    if let TokenKind::Identifier(name) = self.peek().clone() {
+                        if self.pos + 1 < self.tokens.len() && matches!(self.tokens[self.pos + 1].kind, TokenKind::Colon) {
+                            self.advance(); // consume identifier
+                            self.advance(); // consume colon
+                            designators.push(Designator::Field(name));
+                        }
+                    }
+                }
                 if !designators.is_empty() {
-                    self.expect(&TokenKind::Assign);
+                    // C99 style uses '=', GNU old-style already consumed ':'
+                    if matches!(self.peek(), TokenKind::Assign) {
+                        self.advance();
+                    }
                 }
                 let init = self.parse_initializer();
                 items.push(InitializerItem { designators, init });

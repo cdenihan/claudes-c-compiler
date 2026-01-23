@@ -797,11 +797,45 @@ impl ArchCodegen for ArmCodegen {
                     }
                 }
                 IrUnaryOp::Not => self.state.emit("    mvn x0, x0"),
+                _ => {} // Clz/Ctz/Bswap/Popcount not applicable to floats
             }
         } else {
             match op {
                 IrUnaryOp::Neg => self.state.emit("    neg x0, x0"),
                 IrUnaryOp::Not => self.state.emit("    mvn x0, x0"),
+                IrUnaryOp::Clz => {
+                    if ty == IrType::I32 || ty == IrType::U32 {
+                        self.state.emit("    clz w0, w0");
+                    } else {
+                        self.state.emit("    clz x0, x0");
+                    }
+                }
+                IrUnaryOp::Ctz => {
+                    if ty == IrType::I32 || ty == IrType::U32 {
+                        self.state.emit("    rbit w0, w0");
+                        self.state.emit("    clz w0, w0");
+                    } else {
+                        self.state.emit("    rbit x0, x0");
+                        self.state.emit("    clz x0, x0");
+                    }
+                }
+                IrUnaryOp::Bswap => {
+                    if ty == IrType::I16 || ty == IrType::U16 {
+                        self.state.emit("    rev w0, w0");
+                        self.state.emit("    lsr w0, w0, #16");
+                    } else if ty == IrType::I32 || ty == IrType::U32 {
+                        self.state.emit("    rev w0, w0");
+                    } else {
+                        self.state.emit("    rev x0, x0");
+                    }
+                }
+                IrUnaryOp::Popcount => {
+                    // Use NEON cnt instruction: move to vector, count bits per byte, sum
+                    self.state.emit("    fmov d0, x0");
+                    self.state.emit("    cnt v0.8b, v0.8b");
+                    self.state.emit("    uaddlv h0, v0.8b");
+                    self.state.emit("    fmov w0, s0");
+                }
             }
         }
         self.store_x0_to(dest);

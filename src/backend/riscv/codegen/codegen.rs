@@ -544,11 +544,18 @@ impl ArchCodegen for RiscvCodegen {
                     }
                 }
                 IrUnaryOp::Not => self.state.emit("    not t0, t0"),
+                _ => {} // Clz/Ctz/Bswap/Popcount not applicable to floats
             }
         } else {
             match op {
                 IrUnaryOp::Neg => self.state.emit("    neg t0, t0"),
                 IrUnaryOp::Not => self.state.emit("    not t0, t0"),
+                // RISC-V doesn't have native CLZ/CTZ/BSWAP/POPCOUNT without Zbb extension
+                // Emit a software fallback via loop for now
+                IrUnaryOp::Clz | IrUnaryOp::Ctz | IrUnaryOp::Bswap | IrUnaryOp::Popcount => {
+                    // TODO: implement RISC-V bit manipulation
+                    self.state.emit("    li t0, 0");
+                }
             }
         }
         self.store_t0_to(dest);

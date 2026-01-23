@@ -454,6 +454,10 @@ pub enum IrBinOp {
 pub enum IrUnaryOp {
     Neg,
     Not,
+    Clz,
+    Ctz,
+    Bswap,
+    Popcount,
 }
 
 /// Comparison operations.

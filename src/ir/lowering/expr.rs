@@ -827,6 +827,87 @@ impl Lowerer {
                         }
                         Some(Operand::Const(IrConst::I64(0)))
                     }
+                    BuiltinIntrinsic::Clz => {
+                        if !args.is_empty() {
+                            let arg = self.lower_expr(&args[0]);
+                            // Determine operand size: clz=32, clzl/clzll=64
+                            let ty = if name.ends_with("ll") || name.ends_with('l') {
+                                IrType::I64
+                            } else {
+                                IrType::I32
+                            };
+                            let dest = self.fresh_value();
+                            self.emit(Instruction::UnaryOp { dest, op: IrUnaryOp::Clz, src: arg, ty });
+                            Some(Operand::Value(dest))
+                        } else {
+                            Some(Operand::Const(IrConst::I64(0)))
+                        }
+                    }
+                    BuiltinIntrinsic::Ctz => {
+                        if !args.is_empty() {
+                            let arg = self.lower_expr(&args[0]);
+                            let ty = if name.ends_with("ll") || name.ends_with('l') {
+                                IrType::I64
+                            } else {
+                                IrType::I32
+                            };
+                            let dest = self.fresh_value();
+                            self.emit(Instruction::UnaryOp { dest, op: IrUnaryOp::Ctz, src: arg, ty });
+                            Some(Operand::Value(dest))
+                        } else {
+                            Some(Operand::Const(IrConst::I64(0)))
+                        }
+                    }
+                    BuiltinIntrinsic::Bswap => {
+                        if !args.is_empty() {
+                            let arg = self.lower_expr(&args[0]);
+                            let ty = if name.contains("64") {
+                                IrType::I64
+                            } else if name.contains("16") {
+                                IrType::I16
+                            } else {
+                                IrType::I32
+                            };
+                            let dest = self.fresh_value();
+                            self.emit(Instruction::UnaryOp { dest, op: IrUnaryOp::Bswap, src: arg, ty });
+                            Some(Operand::Value(dest))
+                        } else {
+                            Some(Operand::Const(IrConst::I64(0)))
+                        }
+                    }
+                    BuiltinIntrinsic::Popcount => {
+                        if !args.is_empty() {
+                            let arg = self.lower_expr(&args[0]);
+                            let ty = if name.ends_with("ll") || name.ends_with('l') {
+                                IrType::I64
+                            } else {
+                                IrType::I32
+                            };
+                            let dest = self.fresh_value();
+                            self.emit(Instruction::UnaryOp { dest, op: IrUnaryOp::Popcount, src: arg, ty });
+                            Some(Operand::Value(dest))
+                        } else {
+                            Some(Operand::Const(IrConst::I64(0)))
+                        }
+                    }
+                    BuiltinIntrinsic::Parity => {
+                        if !args.is_empty() {
+                            let arg = self.lower_expr(&args[0]);
+                            let ty = if name.ends_with("ll") || name.ends_with('l') {
+                                IrType::I64
+                            } else {
+                                IrType::I32
+                            };
+                            // parity = popcount & 1
+                            let pop = self.fresh_value();
+                            self.emit(Instruction::UnaryOp { dest: pop, op: IrUnaryOp::Popcount, src: arg, ty });
+                            let dest = self.fresh_value();
+                            self.emit(Instruction::BinOp { dest, op: IrBinOp::And, lhs: Operand::Value(pop), rhs: Operand::Const(IrConst::I64(1)), ty });
+                            Some(Operand::Value(dest))
+                        } else {
+                            Some(Operand::Const(IrConst::I64(0)))
+                        }
+                    }
                     _ => {
                         let cleaned_name = name.strip_prefix("__builtin_").unwrap_or(name).to_string();
                         let arg_types: Vec<IrType> = args.iter().map(|a| self.get_expr_type(a)).collect();

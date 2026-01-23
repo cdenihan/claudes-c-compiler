@@ -687,11 +687,25 @@ impl ArchCodegen for X86Codegen {
                     }
                 }
                 IrUnaryOp::Not => self.state.emit("    notq %rax"),
+                _ => {} // Clz/Ctz/Bswap/Popcount not applicable to floats
             }
         } else {
             match op {
                 IrUnaryOp::Neg => self.state.emit("    negq %rax"),
                 IrUnaryOp::Not => self.state.emit("    notq %rax"),
+                IrUnaryOp::Clz => {
+                    self.state.emit("    bsrq %rax, %rax");
+                    self.state.emit("    xorq $63, %rax");
+                }
+                IrUnaryOp::Ctz => {
+                    self.state.emit("    tzcntq %rax, %rax");
+                }
+                IrUnaryOp::Bswap => {
+                    self.state.emit("    bswapq %rax");
+                }
+                IrUnaryOp::Popcount => {
+                    self.state.emit("    popcntq %rax, %rax");
+                }
             }
         }
         self.store_rax_to(dest);

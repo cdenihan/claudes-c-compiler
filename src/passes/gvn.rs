@@ -49,7 +49,7 @@ enum BinOpKey {
 /// Hashable unary operation identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum UnaryOpKey {
-    Neg, Not,
+    Neg, Not, Clz, Ctz, Bswap, Popcount,
 }
 
 /// Hashable comparison operation identifier.
@@ -265,6 +265,10 @@ fn unaryop_to_key(op: IrUnaryOp) -> UnaryOpKey {
     match op {
         IrUnaryOp::Neg => UnaryOpKey::Neg,
         IrUnaryOp::Not => UnaryOpKey::Not,
+        IrUnaryOp::Clz => UnaryOpKey::Clz,
+        IrUnaryOp::Ctz => UnaryOpKey::Ctz,
+        IrUnaryOp::Bswap => UnaryOpKey::Bswap,
+        IrUnaryOp::Popcount => UnaryOpKey::Popcount,
     }
 }
 

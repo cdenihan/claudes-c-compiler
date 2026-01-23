@@ -148,6 +148,10 @@ fn fold_unaryop(op: IrUnaryOp, src: i64) -> Option<i64> {
     Some(match op {
         IrUnaryOp::Neg => src.wrapping_neg(),
         IrUnaryOp::Not => !src,
+        IrUnaryOp::Clz => (src as u64).leading_zeros() as i64,
+        IrUnaryOp::Ctz => if src == 0 { 64 } else { (src as u64).trailing_zeros() as i64 },
+        IrUnaryOp::Bswap => (src as u64).swap_bytes() as i64,
+        IrUnaryOp::Popcount => (src as u64).count_ones() as i64,
     })
 }
 
