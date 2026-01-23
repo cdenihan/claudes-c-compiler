@@ -405,6 +405,18 @@ impl Lowerer {
                                     current_idx += 1;
                                 }
                             }
+                        } else {
+                            // Scalar with braces: int x = { 1 };
+                            // C11 6.7.9: A scalar can be initialized with a braced expression.
+                            if let Some(first) = items.first() {
+                                if let Initializer::Expr(expr) = &first.init {
+                                    let val = self.lower_expr(expr);
+                                    let expr_ty = self.get_expr_type(expr);
+                                    let val = self.emit_implicit_cast(val, expr_ty, var_ty);
+                                    let val = if is_bool { self.emit_bool_normalize(val) } else { val };
+                                    self.emit(Instruction::Store { val, ptr: alloca, ty: var_ty });
+                                }
+                            }
                         }
                     }
                 }

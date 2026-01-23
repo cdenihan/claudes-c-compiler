@@ -904,6 +904,20 @@ impl Lowerer {
                     return self.lower_struct_global_init(items, layout);
                 }
 
+                // Scalar with braces: int x = { 1 };
+                // C11 6.7.9: A scalar can be initialized with a single braced expression.
+                if !is_array && items.len() >= 1 {
+                    if let Initializer::Expr(expr) = &items[0].init {
+                        if let Some(val) = self.eval_const_expr(expr) {
+                            return GlobalInit::Scalar(self.coerce_const_to_type(val, base_ty));
+                        }
+                        // Try address expression
+                        if let Some(addr_init) = self.eval_global_addr_expr(expr) {
+                            return addr_init;
+                        }
+                    }
+                }
+
                 // Fallback: try to emit as an array of I32 constants
                 // (handles cases like plain `{1, 2, 3}` without type info)
                 let mut values = Vec::new();
