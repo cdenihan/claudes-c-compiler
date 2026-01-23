@@ -412,7 +412,7 @@ impl Lowerer {
                                                     &s_layout.fields[0]
                                                 };
                                                 let field_ty = IrType::from_ctype(&field.ty);
-                                                let val = self.lower_expr(e);
+                                                let val = self.lower_and_cast_init_expr(e, field_ty);
                                                 let field_addr = self.fresh_value();
                                                 self.emit(Instruction::GetElementPtr {
                                                     dest: field_addr,
@@ -513,7 +513,7 @@ impl Lowerer {
 
             match &item.init {
                 Initializer::Expr(e) => {
-                    let val = self.lower_expr(e);
+                    let val = self.lower_and_cast_init_expr(e, field_ty);
                     let field_addr = self.fresh_value();
                     self.emit(Instruction::GetElementPtr {
                         dest: field_addr,
@@ -566,7 +566,7 @@ impl Lowerer {
                 let elem_size = elem_ty.size();
                 for (i, item) in items.iter().enumerate() {
                     if let Initializer::Expr(e) = &item.init {
-                        let val = self.lower_expr(e);
+                        let val = self.lower_and_cast_init_expr(e, elem_ir_ty);
                         let elem_addr = self.fresh_value();
                         self.emit(Instruction::GetElementPtr {
                             dest: elem_addr,
@@ -582,8 +582,8 @@ impl Lowerer {
                 // Scalar field with nested braces (e.g., int x = {5})
                 if let Some(first) = items.first() {
                     if let Initializer::Expr(e) = &first.init {
-                        let val = self.lower_expr(e);
                         let field_ir_ty = IrType::from_ctype(field_ctype);
+                        let val = self.lower_and_cast_init_expr(e, field_ir_ty);
                         self.emit(Instruction::Store { val, ptr: base, ty: field_ir_ty });
                     }
                 }
@@ -666,8 +666,8 @@ impl Lowerer {
         }
     }
 
-    /// Lower an expression and cast it to the target array element type.
-    fn lower_and_cast_init_expr(&mut self, expr: &Expr, target_ty: IrType) -> Operand {
+    /// Lower an expression and cast it to the target type (e.g., int to float).
+    pub(super) fn lower_and_cast_init_expr(&mut self, expr: &Expr, target_ty: IrType) -> Operand {
         let val = self.lower_expr(expr);
         let expr_ty = self.get_expr_type(expr);
         self.emit_implicit_cast(val, expr_ty, target_ty)

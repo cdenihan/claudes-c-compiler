@@ -9,15 +9,17 @@ impl Lowerer {
     pub(super) fn lower_lvalue(&mut self, expr: &Expr) -> Option<LValue> {
         match expr {
             Expr::Identifier(name, _) => {
+                // Check locals first so inner-scope locals shadow statics
+                if let Some(info) = self.locals.get(name).cloned() {
+                    return Some(LValue::Variable(info.alloca));
+                }
                 // Static local variables: resolve through mangled name
                 if let Some(mangled) = self.static_local_names.get(name).cloned() {
                     let addr = self.fresh_value();
                     self.emit(Instruction::GlobalAddr { dest: addr, name: mangled });
                     return Some(LValue::Address(addr));
                 }
-                if let Some(info) = self.locals.get(name).cloned() {
-                    Some(LValue::Variable(info.alloca))
-                } else if self.globals.contains_key(name) {
+                if self.globals.contains_key(name) {
                     // Global variable: emit GlobalAddr to get its address
                     let addr = self.fresh_value();
                     self.emit(Instruction::GlobalAddr { dest: addr, name: name.clone() });
@@ -172,6 +174,16 @@ impl Lowerer {
     pub(super) fn get_array_base_addr(&mut self, base: &Expr) -> Operand {
         match base {
             Expr::Identifier(name, _) => {
+                // Check locals first so inner-scope locals shadow statics
+                if let Some(info) = self.locals.get(name).cloned() {
+                    if info.is_array {
+                        return Operand::Value(info.alloca);
+                    } else {
+                        let loaded = self.fresh_value();
+                        self.emit(Instruction::Load { dest: loaded, ptr: info.alloca, ty: IrType::Ptr });
+                        return Operand::Value(loaded);
+                    }
+                }
                 // Static locals: resolve via mangled name from globals
                 if let Some(mangled) = self.static_local_names.get(name).cloned() {
                     if let Some(ginfo) = self.globals.get(&mangled).cloned() {
@@ -184,15 +196,6 @@ impl Lowerer {
                             self.emit(Instruction::Load { dest: loaded, ptr: addr, ty: IrType::Ptr });
                             return Operand::Value(loaded);
                         }
-                    }
-                }
-                if let Some(info) = self.locals.get(name).cloned() {
-                    if info.is_array {
-                        return Operand::Value(info.alloca);
-                    } else {
-                        let loaded = self.fresh_value();
-                        self.emit(Instruction::Load { dest: loaded, ptr: info.alloca, ty: IrType::Ptr });
-                        return Operand::Value(loaded);
                     }
                 }
                 if let Some(ginfo) = self.globals.get(name).cloned() {

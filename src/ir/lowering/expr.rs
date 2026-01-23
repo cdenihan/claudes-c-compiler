@@ -94,6 +94,17 @@ impl Lowerer {
             return Operand::Const(IrConst::I64(val));
         }
 
+        // Local variables: arrays/structs decay to address, scalars are loaded
+        // Check locals BEFORE static_local_names so inner-scope locals shadow statics.
+        if let Some(info) = self.locals.get(name).cloned() {
+            if info.is_array || info.is_struct {
+                return Operand::Value(info.alloca);
+            }
+            let dest = self.fresh_value();
+            self.emit(Instruction::Load { dest, ptr: info.alloca, ty: info.ty });
+            return Operand::Value(dest);
+        }
+
         // Static local variables: resolve through static_local_names to their
         // mangled global name. Emit GlobalAddr at point of use so it works
         // regardless of control flow (goto can skip the declaration).
@@ -108,16 +119,6 @@ impl Lowerer {
                 self.emit(Instruction::Load { dest, ptr: addr, ty: ginfo.ty });
                 return Operand::Value(dest);
             }
-        }
-
-        // Local variables: arrays/structs decay to address, scalars are loaded
-        if let Some(info) = self.locals.get(name).cloned() {
-            if info.is_array || info.is_struct {
-                return Operand::Value(info.alloca);
-            }
-            let dest = self.fresh_value();
-            self.emit(Instruction::Load { dest, ptr: info.alloca, ty: info.ty });
-            return Operand::Value(dest);
         }
 
         // Global variables
@@ -1571,7 +1572,7 @@ impl Lowerer {
                 None => break,
             };
             let field = &layout.fields[field_idx].clone();
-            let field_ty = self.ir_type_for_elem_size(field.ty.size());
+            let field_ty = IrType::from_ctype(&field.ty);
 
             let field_addr = self.fresh_value();
             self.emit(Instruction::GetElementPtr {
@@ -1596,7 +1597,7 @@ impl Lowerer {
                             size: field.ty.size(),
                         });
                     } else {
-                        let val = self.lower_expr(expr);
+                        let val = self.lower_and_cast_init_expr(expr, field_ty);
                         self.emit(Instruction::Store { val, ptr: field_addr, ty: field_ty });
                     }
                 }

@@ -147,7 +147,11 @@ impl StructLayout {
                     bit_width: None,
                 });
 
-                offset += field_size;
+                // Flexible array member (e.g., int f[]) contributes 0 to struct size
+                let is_flexible_array = matches!(&field.ty, CType::Array(_, None));
+                if !is_flexible_array {
+                    offset += field_size;
+                }
             }
         }
 
