@@ -1135,9 +1135,23 @@ impl Lowerer {
                 self.emit(Instruction::Load { dest: result, ptr: result_alloca, ty: IrType::I64 });
                 Operand::Value(result)
             }
-            Expr::Cast(_, inner, _) => {
-                // TODO: implement proper casts
-                self.lower_expr(inner)
+            Expr::Cast(ref target_type, inner, _) => {
+                let src = self.lower_expr(inner);
+                let to_ty = self.type_spec_to_ir(target_type);
+                // For pointer casts or same-type casts, just pass through
+                if to_ty == IrType::Ptr || to_ty == IrType::I64 {
+                    src
+                } else {
+                    // Emit a cast instruction for type conversions
+                    let dest = self.fresh_value();
+                    self.emit(Instruction::Cast {
+                        dest,
+                        src,
+                        from_ty: IrType::I64, // TODO: track actual source type
+                        to_ty,
+                    });
+                    Operand::Value(dest)
+                }
             }
             Expr::Sizeof(arg, _) => {
                 let size = match arg.as_ref() {

@@ -7,6 +7,9 @@ pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
     typedefs: Vec<String>,
+    /// Set to true when parse_type_specifier encounters a `typedef` keyword.
+    /// Used by declaration parsers to register the declared names as typedefs.
+    parsing_typedef: bool,
 }
 
 impl Parser {
@@ -14,8 +17,52 @@ impl Parser {
         Self {
             tokens,
             pos: 0,
-            typedefs: Vec::new(),
+            typedefs: Self::builtin_typedefs(),
+            parsing_typedef: false,
         }
+    }
+
+    /// Standard C typedef names that are commonly provided by system headers.
+    /// Since we don't actually include system headers, we pre-seed these.
+    fn builtin_typedefs() -> Vec<String> {
+        [
+            // <stddef.h>
+            "size_t", "ssize_t", "ptrdiff_t", "wchar_t", "wint_t",
+            // <stdint.h>
+            "int8_t", "int16_t", "int32_t", "int64_t",
+            "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+            "intptr_t", "uintptr_t",
+            "intmax_t", "uintmax_t",
+            "int_least8_t", "int_least16_t", "int_least32_t", "int_least64_t",
+            "uint_least8_t", "uint_least16_t", "uint_least32_t", "uint_least64_t",
+            "int_fast8_t", "int_fast16_t", "int_fast32_t", "int_fast64_t",
+            "uint_fast8_t", "uint_fast16_t", "uint_fast32_t", "uint_fast64_t",
+            // <stdio.h>
+            "FILE", "fpos_t",
+            // <signal.h>
+            "sig_atomic_t",
+            // <time.h>
+            "time_t", "clock_t", "timer_t", "clockid_t",
+            // <sys/types.h>
+            "off_t", "pid_t", "uid_t", "gid_t", "mode_t", "dev_t", "ino_t",
+            "nlink_t", "blksize_t", "blkcnt_t",
+            // GNU/glibc common types
+            "ulong", "ushort", "uint",
+            "__u8", "__u16", "__u32", "__u64",
+            "__s8", "__s16", "__s32", "__s64",
+            // <stdarg.h>
+            "va_list", "__builtin_va_list", "__gnuc_va_list",
+            // <locale.h>
+            "locale_t",
+            // <pthread.h>
+            "pthread_t", "pthread_mutex_t", "pthread_cond_t",
+            "pthread_key_t", "pthread_attr_t", "pthread_once_t",
+            "pthread_mutexattr_t", "pthread_condattr_t",
+            // <setjmp.h>
+            "jmp_buf", "sigjmp_buf",
+            // <dirent.h>
+            "DIR",
+        ].iter().map(|s| s.to_string()).collect()
     }
 
     pub fn parse(&mut self) -> TranslationUnit {
@@ -91,7 +138,8 @@ impl Parser {
             TokenKind::Const | TokenKind::Volatile | TokenKind::Static | TokenKind::Extern |
             TokenKind::Register | TokenKind::Typedef | TokenKind::Inline | TokenKind::Bool |
             TokenKind::Typeof | TokenKind::Attribute | TokenKind::Extension |
-            TokenKind::Noreturn | TokenKind::Restrict => true,
+            TokenKind::Noreturn | TokenKind::Restrict | TokenKind::Complex |
+            TokenKind::Atomic | TokenKind::Auto => true,
             TokenKind::Identifier(name) => self.typedefs.contains(name),
             _ => false,
         }
@@ -106,6 +154,26 @@ impl Parser {
         if self.at_eof() {
             return None;
         }
+
+        // Handle top-level asm("..."); directives
+        if matches!(self.peek(), TokenKind::Asm) {
+            self.advance();
+            // Skip optional volatile
+            self.consume_if(&TokenKind::Volatile);
+            if matches!(self.peek(), TokenKind::LParen) {
+                self.skip_balanced_parens();
+            }
+            self.consume_if(&TokenKind::Semicolon);
+            // Return an empty declaration
+            return Some(ExternalDecl::Declaration(Declaration {
+                type_spec: TypeSpecifier::Void,
+                declarators: Vec::new(),
+                span: Span::dummy(),
+            }));
+        }
+
+        // Reset typedef flag before each declaration
+        self.parsing_typedef = false;
 
         // Try to parse a type + name, then determine if it's a function def or declaration
         let start = self.peek_span();
@@ -131,6 +199,7 @@ impl Parser {
             && matches!(self.peek(), TokenKind::LBrace);
 
         if is_funcdef {
+            self.parsing_typedef = false; // function defs are never typedefs
             let (params, variadic) = if let Some(DerivedDeclarator::Function(p, v)) = derived.last() {
                 (p.clone(), *v)
             } else {
@@ -176,9 +245,14 @@ impl Parser {
                 });
             }
 
-            // Check if typedef
-            if matches!(type_spec, TypeSpecifier::Int) {
-                // TODO: handle typedef properly
+            // Register typedef names if this was a typedef declaration
+            if self.parsing_typedef {
+                for decl in &declarators {
+                    if !decl.name.is_empty() {
+                        self.typedefs.push(decl.name.clone());
+                    }
+                }
+                self.parsing_typedef = false;
             }
 
             self.expect(&TokenKind::Semicolon);
@@ -233,12 +307,17 @@ impl Parser {
             match self.peek() {
                 TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict
                 | TokenKind::Static | TokenKind::Extern | TokenKind::Register
-                | TokenKind::Inline | TokenKind::Noreturn => {
+                | TokenKind::Inline | TokenKind::Noreturn | TokenKind::Auto => {
                     self.advance();
                 }
                 TokenKind::Typedef => {
                     self.advance();
-                    // TODO: track typedef
+                    self.parsing_typedef = true;
+                }
+                TokenKind::Complex => {
+                    // _Complex modifier: skip it, we'll treat complex types as their base type
+                    // TODO: properly support _Complex types
+                    self.advance();
                 }
                 TokenKind::Attribute => {
                     self.advance();
@@ -246,6 +325,16 @@ impl Parser {
                 }
                 TokenKind::Extension => {
                     self.advance();
+                }
+                TokenKind::Atomic => {
+                    // _Atomic qualifier: skip it for now
+                    // TODO: properly support _Atomic
+                    self.advance();
+                    // _Atomic can be followed by (type) for _Atomic(int)
+                    if matches!(self.peek(), TokenKind::LParen) {
+                        self.skip_balanced_parens();
+                        return Some(TypeSpecifier::Int); // TODO: parse the actual type
+                    }
                 }
                 _ => break,
             }
@@ -371,7 +460,20 @@ impl Parser {
             _ => return None,
         };
 
-        // Skip any trailing attributes
+        // Skip any trailing type qualifiers and attributes
+        loop {
+            match self.peek() {
+                TokenKind::Complex => {
+                    // _Complex after base type (e.g., "double _Complex")
+                    // TODO: properly support _Complex types
+                    self.advance();
+                }
+                TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict => {
+                    self.advance();
+                }
+                _ => break,
+            }
+        }
         self.skip_gcc_extensions();
 
         Some(base)
@@ -635,6 +737,16 @@ impl Parser {
             }
         }
 
+        // Register typedef names if this was a typedef declaration
+        if self.parsing_typedef {
+            for decl in &declarators {
+                if !decl.name.is_empty() {
+                    self.typedefs.push(decl.name.clone());
+                }
+            }
+            self.parsing_typedef = false;
+        }
+
         self.expect(&TokenKind::Semicolon);
         Some(Declaration { type_spec, declarators, span: start })
     }
@@ -828,6 +940,23 @@ impl Parser {
                     Stmt::Expr(Some(expr))
                 }
             }
+            TokenKind::Asm => {
+                // Skip inline asm statement: asm [volatile] [goto] (...)  ;
+                self.advance();
+                // Skip optional qualifiers: volatile, goto, inline
+                while matches!(self.peek(), TokenKind::Volatile)
+                    || matches!(self.peek(), TokenKind::Goto)
+                    || matches!(self.peek(), TokenKind::Inline)
+                {
+                    self.advance();
+                }
+                if matches!(self.peek(), TokenKind::LParen) {
+                    self.skip_balanced_parens();
+                }
+                self.consume_if(&TokenKind::Semicolon);
+                // TODO: properly lower inline asm
+                Stmt::Expr(None)
+            }
             TokenKind::Semicolon => {
                 self.advance();
                 Stmt::Expr(None)
@@ -1019,14 +1148,14 @@ impl Parser {
     }
 
     fn parse_cast_expr(&mut self) -> Expr {
-        // TODO: implement cast expressions properly
-        // For now, treat (type)expr as cast
+        // Try to parse (type-name)expr as a cast expression
         if matches!(self.peek(), TokenKind::LParen) {
             let save = self.pos;
+            let save_typedef = self.parsing_typedef;
             self.advance();
             if self.is_type_specifier() {
                 if let Some(type_spec) = self.parse_type_specifier() {
-                    // Skip pointer
+                    // Skip pointer declarators
                     while self.consume_if(&TokenKind::Star) {}
                     if matches!(self.peek(), TokenKind::RParen) {
                         let span = self.peek_span();
@@ -1037,6 +1166,7 @@ impl Parser {
                 }
             }
             self.pos = save;
+            self.parsing_typedef = save_typedef;
         }
         self.parse_unary_expr()
     }
@@ -1216,6 +1346,24 @@ impl Parser {
                 let expr = self.parse_expr();
                 self.expect(&TokenKind::RParen);
                 expr
+            }
+            TokenKind::Asm => {
+                // GCC asm expression: asm [volatile] (string : outputs : inputs : clobbers)
+                let span = self.peek_span();
+                self.advance();
+                // Skip optional volatile
+                self.consume_if(&TokenKind::Volatile);
+                if matches!(self.peek(), TokenKind::LParen) {
+                    self.skip_balanced_parens();
+                }
+                // TODO: properly handle inline asm
+                Expr::IntLiteral(0, span)
+            }
+            TokenKind::Extension => {
+                // __extension__ can prefix expressions
+                let span = self.peek_span();
+                self.advance();
+                self.parse_cast_expr()
             }
             _ => {
                 let span = self.peek_span();

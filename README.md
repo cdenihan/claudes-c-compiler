@@ -4,14 +4,15 @@ A C compiler written in Rust, targeting x86-64, AArch64, and RISC-V 64.
 
 ## Status
 
-**Initial scaffold complete.** The basic compilation pipeline is functional:
-- Lexer, preprocessor (strip-only), parser, semantic analysis (stub)
-- IR lowering (AST -> alloca-based IR)
+**Basic compilation pipeline functional.** Supports:
+- Preprocessor (macros, conditionals, built-in headers)
+- Lexer with source locations, parser with typedef tracking
+- IR lowering with type-aware operations
 - Code generation for x86-64, AArch64, and RISC-V 64
 - Assembly and linking via system tools (gcc/gas)
 
 ### Test Results (1% sample)
-- x86-64: ~22% passing
+- x86-64: ~25% passing
 - AArch64: ~12% passing
 - RISC-V 64: ~17% passing
 
@@ -50,13 +51,25 @@ A C compiler written in Rust, targeting x86-64, AArch64, and RISC-V 64.
   - Read/write access to globals from any function
   - Constant expression evaluation for initializers
 
+### Recent Additions
+- **Typedef tracking**: parser correctly registers typedef names from `typedef` declarations
+  (both top-level and local), enabling cast expressions like `(mytype)expr` with user-defined types
+- **Built-in type names**: standard C type names (`size_t`, `int32_t`, `FILE`, etc.) pre-seeded
+  for correct parsing without full header inclusion
+- **Cast expression lowering**: emits proper IR Cast instructions for type-narrowing casts
+- **_Complex type handling**: parses and skips `_Complex`/`__complex__` type modifier
+- **Inline asm skipping**: parses and skips `asm`/`__asm__` statements and expressions
+- **GCC extension keywords**: `__volatile__`, `__const__`, `__inline__`, `__restrict__`,
+  `__signed__`, `__noreturn__` recognized as their standard equivalents
+
 ### What's Not Yet Implemented
-- Full #include resolution (only built-in headers for now)
+- Full `#include` resolution (only built-in headers for now)
 - Type checking (sema is a stub)
-- Structs, unions, enums (parsed but not lowered)
+- Structs, unions, enums (parsed but not lowered to IR)
 - Floating point
 - Static local variables
-- Type casts
+- Full cast semantics (truncation/sign-extension in some cases)
+- Inline assembly (parsed but skipped)
 - Native assembler/linker (currently uses gcc)
 - Optimization passes
 
@@ -85,7 +98,7 @@ target/debug/ccc-riscv -o output input.c
 ```
 src/
   frontend/
-    preprocessor/       Strip preprocessor directives (TODO: full expansion)
+    preprocessor/       Macro expansion, conditionals, built-in headers
     lexer/              Tokenize C source with source locations
     parser/             Recursive descent parser, produces AST
     sema/               Semantic analysis (TODO: type checking)
