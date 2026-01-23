@@ -78,6 +78,46 @@ impl Lowerer {
                 continue;
             }
 
+            // Handle block-scope function declarations: int f(int);
+            // These declare an external function, not a local variable.
+            // Register in known_functions and skip local variable allocation.
+            {
+                let mut ptr_count = 0;
+                let mut func_info = None;
+                for d in &declarator.derived {
+                    match d {
+                        DerivedDeclarator::Pointer => ptr_count += 1,
+                        DerivedDeclarator::Function(p, v) => {
+                            func_info = Some((p.clone(), *v));
+                            break;
+                        }
+                        DerivedDeclarator::FunctionPointer(_, _) => break,
+                        _ => {}
+                    }
+                }
+                if let Some((params, variadic)) = func_info {
+                    // This is a function declaration, not a variable
+                    self.known_functions.insert(declarator.name.clone());
+                    let mut ret_ty = self.type_spec_to_ir(&decl.type_spec);
+                    if ptr_count > 0 {
+                        ret_ty = IrType::Ptr;
+                    }
+                    self.function_return_types.insert(declarator.name.clone(), ret_ty);
+                    let param_tys: Vec<IrType> = params.iter().map(|p| {
+                        self.type_spec_to_ir(&p.type_spec)
+                    }).collect();
+                    if !variadic || !param_tys.is_empty() {
+                        self.function_param_types.insert(declarator.name.clone(), param_tys);
+                    }
+                    if variadic {
+                        self.function_variadic.insert(declarator.name.clone());
+                    }
+                    // Remove from locals if previously added (e.g., shadowed by this declaration)
+                    self.locals.remove(&declarator.name);
+                    continue;
+                }
+            }
+
             let base_ty = self.type_spec_to_ir(&decl.type_spec);
             let (mut alloc_size, elem_size, is_array, is_pointer, mut array_dim_strides) = self.compute_decl_info(&decl.type_spec, &declarator.derived);
             // _Bool type check: only for direct scalar variables, not pointers or arrays
