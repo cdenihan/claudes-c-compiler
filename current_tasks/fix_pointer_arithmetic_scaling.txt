@@ -1,0 +1,22 @@
+Task: Fix pointer arithmetic to scale by pointed-to type size
+Status: In Progress
+
+Problem:
+Pointer arithmetic (p + n, p - n, p++, p--) does not scale by the size of the
+pointed-to type. For example, if p is int*, then p + 1 should add sizeof(int)=4
+bytes to the address, but currently it adds 1 byte.
+
+This causes wrong results for:
+- pointer increment/decrement (p++, p--)
+- pointer addition/subtraction (p + n, p - n)
+- pointer difference (p1 - p2 should divide by sizeof)
+- array subscript via pointer (equivalent to *(p + i))
+
+The fix is in ir/lowering/expr.rs to multiply the offset by the element size
+when lowering pointer arithmetic operations (BinaryOp::Add, Sub on pointer types,
+and UnaryOp::PreInc, PreDec, PostInc, PostDec on pointer types).
+
+Also need to check that p[i] indexing (already via GEP) properly scales.
+
+Files to modify:
+- src/ir/lowering/expr.rs - scale pointer arithmetic
