@@ -1,6 +1,6 @@
 use crate::frontend::parser::ast::*;
 use crate::ir::ir::*;
-use crate::common::types::IrType;
+use crate::common::types::{IrType, StructLayout, CType};
 use super::lowering::{Lowerer, LocalInfo, GlobalInfo};
 
 impl Lowerer {
@@ -275,10 +275,55 @@ impl Lowerer {
                                 self.init_struct_fields(alloca, items, &layout);
                             }
                         } else if is_array && elem_size > 0 {
+                            // Check if this is an array of structs
+                            let elem_struct_layout = self.locals.get(&declarator.name)
+                                .and_then(|l| l.struct_layout.clone());
                             if array_dim_strides.len() > 1 {
                                 // Multi-dimensional array init: zero first, then fill
                                 self.zero_init_alloca(alloca, alloc_size);
                                 self.lower_array_init_list(items, alloca, base_ty, &array_dim_strides);
+                            } else if let Some(ref s_layout) = elem_struct_layout {
+                                // Array of structs: init each element using struct layout
+                                self.zero_init_alloca(alloca, alloc_size);
+                                let mut current_idx = 0usize;
+                                for item in items.iter() {
+                                    if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
+                                        if let Some(idx_val) = self.eval_const_expr_for_designator(idx_expr) {
+                                            current_idx = idx_val;
+                                        }
+                                    }
+                                    let base_byte_offset = current_idx * elem_size;
+                                    let elem_base = self.fresh_value();
+                                    self.emit(Instruction::GetElementPtr {
+                                        dest: elem_base,
+                                        base: alloca,
+                                        offset: Operand::Const(IrConst::I64(base_byte_offset as i64)),
+                                        ty: IrType::I8,
+                                    });
+                                    match &item.init {
+                                        Initializer::List(sub_items) => {
+                                            // Initialize struct fields from sub-list
+                                            self.lower_local_struct_init(sub_items, elem_base, s_layout);
+                                        }
+                                        Initializer::Expr(e) => {
+                                            // Single expr: assign to first field
+                                            if !s_layout.fields.is_empty() {
+                                                let field = &s_layout.fields[0];
+                                                let field_ty = IrType::from_ctype(&field.ty);
+                                                let val = self.lower_expr(e);
+                                                let field_addr = self.fresh_value();
+                                                self.emit(Instruction::GetElementPtr {
+                                                    dest: field_addr,
+                                                    base: elem_base,
+                                                    offset: Operand::Const(IrConst::I64(field.offset as i64)),
+                                                    ty: field_ty,
+                                                });
+                                                self.emit(Instruction::Store { val, ptr: field_addr, ty: field_ty });
+                                            }
+                                        }
+                                    }
+                                    current_idx += 1;
+                                }
                             } else {
                                 // 1D array: supports designated initializers [idx] = val
                                 // Also zero-fill first if partially initialized.
@@ -316,6 +361,106 @@ impl Lowerer {
                                 }
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Initialize a local struct from an initializer list.
+    /// `base` is the base address of the struct in memory.
+    fn lower_local_struct_init(
+        &mut self,
+        items: &[InitializerItem],
+        base: Value,
+        layout: &StructLayout,
+    ) {
+        let mut current_field_idx = 0usize;
+        for item in items {
+            let field_idx = if let Some(Designator::Field(ref name)) = item.designators.first() {
+                layout.fields.iter().position(|f| f.name == *name).unwrap_or(current_field_idx)
+            } else {
+                let mut idx = current_field_idx;
+                while idx < layout.fields.len() && layout.fields[idx].name.is_empty() {
+                    idx += 1;
+                }
+                idx
+            };
+
+            if field_idx >= layout.fields.len() { break; }
+            let field = &layout.fields[field_idx];
+            let field_offset = field.offset;
+            let field_ty = IrType::from_ctype(&field.ty);
+
+            match &item.init {
+                Initializer::Expr(e) => {
+                    let val = self.lower_expr(e);
+                    let field_addr = self.fresh_value();
+                    self.emit(Instruction::GetElementPtr {
+                        dest: field_addr,
+                        base,
+                        offset: Operand::Const(IrConst::I64(field_offset as i64)),
+                        ty: field_ty,
+                    });
+                    self.emit(Instruction::Store { val, ptr: field_addr, ty: field_ty });
+                }
+                Initializer::List(sub_items) => {
+                    let field_addr = self.fresh_value();
+                    self.emit(Instruction::GetElementPtr {
+                        dest: field_addr,
+                        base,
+                        offset: Operand::Const(IrConst::I64(field_offset as i64)),
+                        ty: field_ty,
+                    });
+                    self.lower_struct_field_init_list(sub_items, field_addr, &field.ty);
+                }
+            }
+            current_field_idx = field_idx + 1;
+        }
+    }
+
+    /// Initialize a struct field from a nested initializer list.
+    /// Handles sub-struct fields and array fields.
+    fn lower_struct_field_init_list(
+        &mut self,
+        items: &[InitializerItem],
+        base: Value,
+        field_ctype: &CType,
+    ) {
+        match field_ctype {
+            CType::Struct(st) => {
+                let sub_layout = StructLayout::for_struct(&st.fields);
+                self.lower_local_struct_init(items, base, &sub_layout);
+            }
+            CType::Union(st) => {
+                let sub_layout = StructLayout::for_union(&st.fields);
+                self.lower_local_struct_init(items, base, &sub_layout);
+            }
+            CType::Array(ref elem_ty, _) => {
+                // Array field: init elements sequentially
+                let elem_ir_ty = IrType::from_ctype(elem_ty);
+                let elem_size = elem_ty.size();
+                for (i, item) in items.iter().enumerate() {
+                    if let Initializer::Expr(e) = &item.init {
+                        let val = self.lower_expr(e);
+                        let elem_addr = self.fresh_value();
+                        self.emit(Instruction::GetElementPtr {
+                            dest: elem_addr,
+                            base,
+                            offset: Operand::Const(IrConst::I64((i * elem_size) as i64)),
+                            ty: elem_ir_ty,
+                        });
+                        self.emit(Instruction::Store { val, ptr: elem_addr, ty: elem_ir_ty });
+                    }
+                }
+            }
+            _ => {
+                // Scalar field with nested braces (e.g., int x = {5})
+                if let Some(first) = items.first() {
+                    if let Initializer::Expr(e) = &first.init {
+                        let val = self.lower_expr(e);
+                        let field_ir_ty = IrType::from_ctype(field_ctype);
+                        self.emit(Instruction::Store { val, ptr: base, ty: field_ir_ty });
                     }
                 }
             }

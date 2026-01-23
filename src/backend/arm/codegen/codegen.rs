@@ -222,30 +222,6 @@ impl ArmCodegen {
         }
     }
 
-    /// Load operand to x0 with an sp delta adjustment.
-    /// Used when SP has been decremented for stack overflow args, so sp-relative
-    /// offsets need to be increased by the delta to access the correct frame slots.
-    fn operand_to_x0_with_sp_delta(&mut self, op: &Operand, sp_delta: usize) {
-        match op {
-            Operand::Const(_) => {
-                // Constants don't use sp-relative addressing
-                self.operand_to_x0(op);
-            }
-            Operand::Value(v) => {
-                if let Some(slot) = self.state.get_slot(v.0) {
-                    let adjusted_offset = slot.0 + sp_delta as i64;
-                    if self.state.is_alloca(v.0) {
-                        self.emit_add_sp_offset("x0", adjusted_offset);
-                    } else {
-                        self.emit_load_from_sp("x0", adjusted_offset, "ldr");
-                    }
-                } else {
-                    self.state.emit("    mov x0, #0");
-                }
-            }
-        }
-    }
-
     /// Store x0 to a value's stack slot.
     fn store_x0_to(&mut self, dest: &Value) {
         if let Some(slot) = self.state.get_slot(dest.0) {
@@ -753,9 +729,6 @@ impl ArchCodegen for ArmCodegen {
     fn emit_call(&mut self, args: &[Operand], arg_types: &[IrType], direct_name: Option<&str>,
                  func_ptr: Option<&Operand>, dest: Option<Value>, return_type: IrType,
                  _is_variadic: bool) {
-        let mut float_reg_idx = 0usize;
-        let mut int_reg_idx = 0usize;
-
         // For indirect calls, load the function pointer into x17 BEFORE
         // setting up arguments, to avoid clobbering x0 (first arg register).
         if func_ptr.is_some() && direct_name.is_none() {
@@ -764,74 +737,92 @@ impl ArchCodegen for ArmCodegen {
             self.state.emit("    mov x17, x0");
         }
 
-        // Phase 1: Classify arguments as register or stack-passed.
-        // AAPCS64: int args in x0-x7, float args in d0-d7, overflow on stack.
-        let mut reg_args: Vec<(usize, bool)> = Vec::new(); // (arg_idx, is_float)
-        let mut stack_args: Vec<(usize, bool)> = Vec::new(); // (arg_idx, is_float)
+        // Classify args: determine which go in registers vs stack
+        let mut arg_classes: Vec<char> = Vec::new(); // 'f' = float reg, 'i' = int reg, 's' = stack
+        let mut fi = 0usize;
+        let mut ii = 0usize;
         for (i, _arg) in args.iter().enumerate() {
-            let arg_ty = if i < arg_types.len() {
-                Some(arg_types[i])
-            } else {
-                None
-            };
-            let is_float_arg = if let Some(ty) = arg_ty {
+            let arg_ty = if i < arg_types.len() { Some(arg_types[i]) } else { None };
+            let is_float = if let Some(ty) = arg_ty {
                 ty.is_float()
             } else {
                 matches!(args[i], Operand::Const(IrConst::F32(_) | IrConst::F64(_)))
             };
-            if is_float_arg && float_reg_idx < 8 {
-                reg_args.push((i, true));
-                float_reg_idx += 1;
-            } else if !is_float_arg && int_reg_idx < 8 {
-                reg_args.push((i, false));
-                int_reg_idx += 1;
+            if is_float && fi < 8 {
+                arg_classes.push('f');
+                fi += 1;
+            } else if !is_float && ii < 8 {
+                arg_classes.push('i');
+                ii += 1;
             } else {
-                stack_args.push((i, is_float_arg));
+                arg_classes.push('s');
             }
         }
 
-        // Phase 2: Load register args into temp registers first (while SP is still normal).
-        let num_reg_args = reg_args.len().min(8);
-        for (tmp_idx, &(arg_idx, _is_float)) in reg_args.iter().enumerate().take(num_reg_args) {
-            self.operand_to_x0(&args[arg_idx]);
+        // Count stack arguments
+        let stack_arg_indices: Vec<usize> = args.iter().enumerate()
+            .filter(|(i, _)| arg_classes[*i] == 's')
+            .map(|(i, _)| i)
+            .collect();
+        let num_stack_args = stack_arg_indices.len();
+        let stack_arg_space = (((num_stack_args * 8) + 15) / 16) * 16;
+
+        // Phase 1: Load ALL args into temp storage BEFORE adjusting SP.
+        // Register args go into x9-x16. Stack args go into a pre-allocated
+        // save area that we create temporarily.
+        let mut tmp_idx = 0usize;
+        for (i, arg) in args.iter().enumerate() {
+            if arg_classes[i] == 's' { continue; }
+            if tmp_idx >= 8 { break; }
+            self.operand_to_x0(arg);
             self.state.emit(&format!("    mov {}, x0", ARM_TMP_REGS[tmp_idx]));
+            tmp_idx += 1;
         }
 
-        // Phase 3: Handle stack overflow args.
-        // First adjust SP down to make room, then load and store each stack arg.
-        // We use x29 (frame pointer) which equals original SP to access locals,
-        // since operand_to_x0 uses sp-relative addressing.
-        // Strategy: sub sp first, then load each arg using x29-relative addressing
-        // and store to the arg area at [sp, #offset].
-        let stack_space = stack_args.len() * 8;
-        let stack_space_aligned = (stack_space + 15) & !15;
-        if !stack_args.is_empty() {
-            // Adjust SP down for the overflow args
-            self.state.emit(&format!("    sub sp, sp, #{}", stack_space_aligned));
-            // Now SP has moved, but x29 still points to the frame base.
-            // Modify operand_to_x0 calls to use x29 offsets instead of sp offsets.
-            // We save and restore using the offset delta.
-            let sp_delta = stack_space_aligned;
-            for (slot_idx, &(arg_idx, _is_float)) in stack_args.iter().enumerate() {
-                // Load operand value: since SP changed, we need to adjust.
-                // We temporarily use x18 to compute the correct address.
-                self.operand_to_x0_with_sp_delta(&args[arg_idx], sp_delta);
-                let store_offset = slot_idx * 8;
-                if store_offset < 32760 {
-                    self.state.emit(&format!("    str x0, [sp, #{}]", store_offset));
-                } else {
-                    self.state.emit(&format!("    mov x18, #{}", store_offset));
-                    self.state.emit("    str x0, [sp, x18]");
+        // For stack args: load them all before adjusting SP, save to stack
+        if stack_arg_space > 0 {
+            // Pre-decrement SP and store stack args
+            self.emit_sub_sp(stack_arg_space as i64);
+            // Now we need to load operands with adjusted SP offsets
+            let mut stack_offset = 0i64;
+            for &arg_idx in &stack_arg_indices {
+                // For constants, no SP adjustment needed
+                match &args[arg_idx] {
+                    Operand::Const(_) => {
+                        self.operand_to_x0(&args[arg_idx]);
+                    }
+                    Operand::Value(v) => {
+                        // SP moved by stack_arg_space, adjust slot offset
+                        if let Some(slot) = self.state.get_slot(v.0) {
+                            let adjusted = slot.0 + stack_arg_space as i64;
+                            if self.state.is_alloca(v.0) {
+                                self.emit_add_sp_offset("x0", adjusted);
+                            } else {
+                                self.emit_load_from_sp("x0", adjusted, "ldr");
+                            }
+                        } else {
+                            self.state.emit("    mov x0, #0");
+                        }
+                    }
                 }
+                if stack_offset == 0 {
+                    self.state.emit("    str x0, [sp]");
+                } else {
+                    self.state.emit(&format!("    str x0, [sp, #{}]", stack_offset));
+                }
+                stack_offset += 8;
             }
         }
 
-        // Phase 4: Move from temp registers to actual arg registers.
-        float_reg_idx = 0;
-        int_reg_idx = 0;
-        for (tmp_idx, &(_arg_idx, is_float)) in reg_args.iter().enumerate().take(num_reg_args) {
-            if is_float {
-                let arg_ty = if _arg_idx < arg_types.len() { Some(arg_types[_arg_idx]) } else { None };
+        // Phase 2: Move from temp regs to actual arg registers.
+        let mut float_reg_idx = 0usize;
+        let mut int_reg_idx = 0usize;
+        tmp_idx = 0;
+        for (i, _arg) in args.iter().enumerate() {
+            if arg_classes[i] == 's' { continue; }
+            if tmp_idx >= 8 { break; }
+            let arg_ty = if i < arg_types.len() { Some(arg_types[i]) } else { None };
+            if arg_classes[i] == 'f' && float_reg_idx < 8 {
                 if arg_ty == Some(IrType::F32) {
                     self.state.emit(&format!("    fmov s{}, {}",
                         float_reg_idx, Self::w_for_x(ARM_TMP_REGS[tmp_idx])));
@@ -839,29 +830,30 @@ impl ArchCodegen for ArmCodegen {
                     self.state.emit(&format!("    fmov d{}, {}", float_reg_idx, ARM_TMP_REGS[tmp_idx]));
                 }
                 float_reg_idx += 1;
-            } else {
+            } else if arg_classes[i] == 'i' && int_reg_idx < 8 {
                 self.state.emit(&format!("    mov {}, {}", ARM_ARG_REGS[int_reg_idx], ARM_TMP_REGS[tmp_idx]));
                 int_reg_idx += 1;
             }
+            tmp_idx += 1;
         }
 
-        // Phase 5: Emit the call.
         if let Some(name) = direct_name {
             self.state.emit(&format!("    bl {}", name));
         } else if func_ptr.is_some() {
             self.state.emit("    blr x17");
         }
 
-        // Phase 6: Restore stack space used for overflow args.
-        if stack_space_aligned > 0 {
-            self.state.emit(&format!("    add sp, sp, #{}", stack_space_aligned));
+        // Clean up stack args
+        if stack_arg_space > 0 {
+            self.emit_add_sp(stack_arg_space as i64);
         }
 
-        // Phase 7: Handle return value.
         if let Some(dest) = dest {
             if return_type == IrType::F32 {
+                // F32 return value is in s0 per AAPCS64
                 self.state.emit("    fmov w0, s0");
             } else if return_type.is_float() {
+                // F64 return value is in d0 per AAPCS64
                 self.state.emit("    fmov x0, d0");
             }
             self.store_x0_to(&dest);

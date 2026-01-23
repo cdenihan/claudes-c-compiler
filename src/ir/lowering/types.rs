@@ -66,6 +66,38 @@ impl Lowerer {
                     None
                 }
             }
+            Expr::Sizeof(arg, _) => {
+                let size = match arg.as_ref() {
+                    SizeofArg::Type(ts) => self.sizeof_type(ts),
+                    SizeofArg::Expr(e) => self.sizeof_expr(e),
+                };
+                Some(IrConst::I64(size as i64))
+            }
+            Expr::Conditional(cond, then_e, else_e, _) => {
+                // Ternary in constant expr: evaluate condition and pick branch
+                let cond_val = self.eval_const_expr(cond)?;
+                let is_true = match cond_val {
+                    IrConst::I64(v) => v != 0,
+                    IrConst::I32(v) => v != 0,
+                    IrConst::I8(v) => v != 0,
+                    IrConst::I16(v) => v != 0,
+                    _ => return None,
+                };
+                if is_true {
+                    self.eval_const_expr(then_e)
+                } else {
+                    self.eval_const_expr(else_e)
+                }
+            }
+            Expr::UnaryOp(UnaryOp::LogicalNot, inner, _) => {
+                let val = self.eval_const_expr(inner)?;
+                let result = match val {
+                    IrConst::I64(v) => if v == 0 { 1i64 } else { 0 },
+                    IrConst::I32(v) => if v == 0 { 1i64 } else { 0 },
+                    _ => return None,
+                };
+                Some(IrConst::I64(result))
+            }
             _ => None,
         }
     }
@@ -234,6 +266,14 @@ impl Lowerer {
             BinOp::BitXor => l ^ r,
             BinOp::Shl => l.wrapping_shl(r as u32),
             BinOp::Shr => l.wrapping_shr(r as u32),
+            BinOp::Eq => if l == r { 1 } else { 0 },
+            BinOp::Ne => if l != r { 1 } else { 0 },
+            BinOp::Lt => if l < r { 1 } else { 0 },
+            BinOp::Gt => if l > r { 1 } else { 0 },
+            BinOp::Le => if l <= r { 1 } else { 0 },
+            BinOp::Ge => if l >= r { 1 } else { 0 },
+            BinOp::LogicalAnd => if l != 0 && r != 0 { 1 } else { 0 },
+            BinOp::LogicalOr => if l != 0 || r != 0 { 1 } else { 0 },
             _ => return None,
         };
         Some(IrConst::I64(result))
