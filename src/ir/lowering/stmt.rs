@@ -105,9 +105,14 @@ impl Lowerer {
             let struct_layout = self.get_struct_layout_for_type(&decl.type_spec);
             let is_struct = struct_layout.is_some() && !is_pointer && !is_array;
 
-            // For struct variables, use the struct's actual size
+            // For struct variables, use the struct's actual size;
+            // but for arrays of structs, use the full array allocation size.
             let actual_alloc_size = if let Some(ref layout) = struct_layout {
-                layout.size
+                if is_array {
+                    alloc_size
+                } else {
+                    layout.size
+                }
             } else {
                 alloc_size
             };

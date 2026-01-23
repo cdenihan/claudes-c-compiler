@@ -476,7 +476,11 @@ impl Lowerer {
             let is_struct = struct_layout.is_some() && !is_pointer && !is_array;
 
             let actual_alloc_size = if let Some(ref layout) = struct_layout {
-                layout.size
+                if is_array {
+                    alloc_size
+                } else {
+                    layout.size
+                }
             } else {
                 alloc_size
             };
