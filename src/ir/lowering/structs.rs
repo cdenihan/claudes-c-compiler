@@ -236,6 +236,33 @@ impl Lowerer {
                 });
                 inner_addr
             }
+            Expr::FunctionCall(_, _, _) => {
+                // Function returning a struct: call the function, then store
+                // the return value to a temporary alloca so we have an address.
+                // For small structs (<= 8 bytes), the return value in rax IS
+                // the packed struct data, not an address.
+                let struct_size = self.get_struct_size_for_expr(expr);
+                let val = self.lower_expr(expr);
+                let alloca = self.fresh_value();
+                let alloc_size = if struct_size > 0 { struct_size } else { 8 };
+                self.emit(Instruction::Alloca { dest: alloca, size: alloc_size, ty: IrType::I64 });
+                if struct_size <= 8 {
+                    // Small struct: return value is packed data, store directly
+                    self.emit(Instruction::Store { val, ptr: alloca, ty: IrType::I64 });
+                } else {
+                    // Large struct: return value is an address, memcpy
+                    let src_addr = match val {
+                        Operand::Value(v) => v,
+                        Operand::Const(_) => {
+                            let tmp = self.fresh_value();
+                            self.emit(Instruction::Copy { dest: tmp, src: val });
+                            tmp
+                        }
+                    };
+                    self.emit(Instruction::Memcpy { dest: alloca, src: src_addr, size: struct_size });
+                }
+                alloca
+            }
             _ => {
                 let val = self.lower_expr(expr);
                 match val {
@@ -402,6 +429,19 @@ impl Lowerer {
                 // Cast to struct type, or cast wrapping a compound literal
                 self.get_struct_layout_for_type(type_spec)
                     .or_else(|| self.get_layout_for_expr(inner))
+            }
+            Expr::FunctionCall(func, _, _) => {
+                // Function returning a struct: look up the return CType
+                if let Expr::Identifier(name, _) = func.as_ref() {
+                    if let Some(ctype) = self.function_return_ctypes.get(name) {
+                        match ctype {
+                            CType::Struct(st) => return Some(StructLayout::for_struct(&st.fields)),
+                            CType::Union(st) => return Some(StructLayout::for_union(&st.fields)),
+                            _ => {}
+                        }
+                    }
+                }
+                None
             }
             _ => None,
         }
