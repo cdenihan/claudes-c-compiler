@@ -80,6 +80,19 @@ pub(super) struct SwitchFrame {
     pub expr_type: IrType,
 }
 
+/// Information about a function typedef (e.g., `typedef int func_t(int, int);`).
+/// Used to detect when a declaration like `func_t add;` is a function declaration
+/// rather than a variable declaration.
+#[derive(Debug, Clone)]
+pub(super) struct FunctionTypedefInfo {
+    /// The return TypeSpecifier of the function typedef
+    pub return_type: TypeSpecifier,
+    /// Parameters of the function typedef
+    pub params: Vec<ParamDecl>,
+    /// Whether the function is variadic
+    pub variadic: bool,
+}
+
 /// Metadata about known functions (return types, param types, variadic status, etc.).
 /// Tracks function signatures so that calls can insert proper casts and ABI handling.
 #[derive(Debug, Default)]
@@ -148,6 +161,9 @@ pub struct Lowerer {
     pub(super) user_labels: HashMap<String, String>,
     /// Typedef mappings (name -> underlying TypeSpecifier).
     pub(super) typedefs: HashMap<String, TypeSpecifier>,
+    /// Function typedef info (typedef name -> function signature).
+    /// Used to detect declarations like `func_t add;` as function declarations.
+    pub(super) function_typedefs: HashMap<String, FunctionTypedefInfo>,
     /// Metadata about known functions (signatures, variadic status, etc.)
     pub(super) func_meta: FunctionMeta,
     /// Mapping from bare static local variable names to their mangled global names.
@@ -189,6 +205,7 @@ impl Lowerer {
             const_local_values: HashMap::new(),
             user_labels: HashMap::new(),
             typedefs: HashMap::new(),
+            function_typedefs: HashMap::new(),
             func_meta: FunctionMeta::default(),
             static_local_names: HashMap::new(),
             static_functions: HashSet::new(),
@@ -211,6 +228,35 @@ impl Lowerer {
                 if decl.is_typedef {
                     for declarator in &decl.declarators {
                         if !declarator.name.is_empty() {
+                            // Check if this typedef defines a function type
+                            // (e.g., typedef int func_t(int, int);)
+                            let has_func_derived = declarator.derived.iter().any(|d|
+                                matches!(d, DerivedDeclarator::Function(_, _)));
+                            let has_fptr_derived = declarator.derived.iter().any(|d|
+                                matches!(d, DerivedDeclarator::FunctionPointer(_, _)));
+
+                            if has_func_derived && !has_fptr_derived {
+                                // This is a function typedef like typedef int func_t(int x);
+                                // Extract params and variadic from the Function derived
+                                if let Some(DerivedDeclarator::Function(params, variadic)) =
+                                    declarator.derived.iter().find(|d| matches!(d, DerivedDeclarator::Function(_, _)))
+                                {
+                                    // Count pointer levels before the Function derived
+                                    let ptr_count = declarator.derived.iter()
+                                        .take_while(|d| matches!(d, DerivedDeclarator::Pointer))
+                                        .count();
+                                    let mut return_type = decl.type_spec.clone();
+                                    for _ in 0..ptr_count {
+                                        return_type = TypeSpecifier::Pointer(Box::new(return_type));
+                                    }
+                                    self.function_typedefs.insert(declarator.name.clone(), FunctionTypedefInfo {
+                                        return_type,
+                                        params: params.clone(),
+                                        variadic: *variadic,
+                                    });
+                                }
+                            }
+
                             let mut resolved_type = decl.type_spec.clone();
                             // Apply derived declarators, but collect consecutive Array
                             // dims and apply in reverse for correct multi-dim ordering.
@@ -375,6 +421,40 @@ impl Lowerer {
                         }
                         if *variadic {
                             self.func_meta.variadic.insert(declarator.name.clone());
+                        }
+                    } else if declarator.derived.is_empty() || !declarator.derived.iter().any(|d|
+                        matches!(d, DerivedDeclarator::Function(_, _) | DerivedDeclarator::FunctionPointer(_, _)))
+                    {
+                        // Check if the base type is a function typedef
+                        // (e.g., `func_t add;` where func_t is typedef int func_t(int);)
+                        let resolved_name = if let TypeSpecifier::TypedefName(name) = &decl.type_spec {
+                            Some(name.clone())
+                        } else {
+                            None
+                        };
+                        if let Some(ref tname) = resolved_name {
+                            if let Some(fti) = self.function_typedefs.get(tname).cloned() {
+                                self.known_functions.insert(declarator.name.clone());
+                                let ret_ty = self.type_spec_to_ir(&fti.return_type);
+                                self.func_meta.return_types.insert(declarator.name.clone(), ret_ty);
+                                if ret_ty == IrType::Ptr {
+                                    let ret_ctype = self.type_spec_to_ctype(&fti.return_type);
+                                    self.func_meta.return_ctypes.insert(declarator.name.clone(), ret_ctype);
+                                }
+                                let param_tys: Vec<IrType> = fti.params.iter().map(|p| {
+                                    self.type_spec_to_ir(&p.type_spec)
+                                }).collect();
+                                let param_bool_flags: Vec<bool> = fti.params.iter().map(|p| {
+                                    matches!(self.resolve_type_spec(&p.type_spec), TypeSpecifier::Bool)
+                                }).collect();
+                                if !fti.variadic || !param_tys.is_empty() {
+                                    self.func_meta.param_types.insert(declarator.name.clone(), param_tys);
+                                    self.func_meta.param_bool_flags.insert(declarator.name.clone(), param_bool_flags);
+                                }
+                                if fti.variadic {
+                                    self.func_meta.variadic.insert(declarator.name.clone());
+                                }
+                            }
                         }
                     }
                 }
@@ -812,6 +892,16 @@ impl Lowerer {
                 && declarator.init.is_none()
             {
                 continue;
+            }
+
+            // Skip declarations using function typedefs (e.g., `func_t add;` where
+            // func_t is `typedef int func_t(int);`). These declare functions, not variables.
+            if declarator.init.is_none() {
+                if let TypeSpecifier::TypedefName(tname) = &decl.type_spec {
+                    if self.function_typedefs.contains_key(tname) {
+                        continue;
+                    }
+                }
             }
 
             // extern without initializer: track the type but don't emit a .bss entry

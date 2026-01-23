@@ -119,11 +119,14 @@ impl Parser {
     }
 
     fn advance(&mut self) -> &Token {
-        let tok = &self.tokens[self.pos];
         if self.pos < self.tokens.len() {
+            let tok = &self.tokens[self.pos];
             self.pos += 1;
+            tok
+        } else {
+            // Return the last token (should be Eof) to avoid panic
+            &self.tokens[self.tokens.len() - 1]
         }
-        tok
     }
 
     fn expect(&mut self, expected: &TokenKind) -> Span {

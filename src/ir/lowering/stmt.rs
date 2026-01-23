@@ -149,6 +149,33 @@ impl Lowerer {
                     self.locals.remove(&declarator.name);
                     continue;
                 }
+
+                // Also handle typedef-based function declarations in block scope
+                // (e.g., `func_t add;` where func_t is `typedef int func_t(int);`)
+                if declarator.derived.is_empty() && declarator.init.is_none() {
+                    if let TypeSpecifier::TypedefName(tname) = &decl.type_spec {
+                        if let Some(fti) = self.function_typedefs.get(tname).cloned() {
+                            self.known_functions.insert(declarator.name.clone());
+                            let ret_ty = self.type_spec_to_ir(&fti.return_type);
+                            self.func_meta.return_types.insert(declarator.name.clone(), ret_ty);
+                            let param_tys: Vec<IrType> = fti.params.iter().map(|p| {
+                                self.type_spec_to_ir(&p.type_spec)
+                            }).collect();
+                            let param_bool_flags: Vec<bool> = fti.params.iter().map(|p| {
+                                matches!(self.resolve_type_spec(&p.type_spec), TypeSpecifier::Bool)
+                            }).collect();
+                            if !fti.variadic || !param_tys.is_empty() {
+                                self.func_meta.param_types.insert(declarator.name.clone(), param_tys);
+                                self.func_meta.param_bool_flags.insert(declarator.name.clone(), param_bool_flags);
+                            }
+                            if fti.variadic {
+                                self.func_meta.variadic.insert(declarator.name.clone());
+                            }
+                            self.locals.remove(&declarator.name);
+                            continue;
+                        }
+                    }
+                }
             }
 
             let mut base_ty = self.type_spec_to_ir(&decl.type_spec);

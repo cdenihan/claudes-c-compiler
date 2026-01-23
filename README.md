@@ -56,6 +56,11 @@ A C compiler written from scratch in Rust, targeting x86-64, AArch64, and RISC-V
   - Constant expression evaluation for initializers
 
 ### Recent Additions
+- **Function typedef declarations**: Fixed declarations using typedef'd function types
+  (e.g., `typedef int func_t(int); func_t add;`) being emitted as BSS variables instead of
+  being recognized as function forward declarations. Fixes duplicate symbol errors in mbedtls.
+- **Parser EOF crash fix**: Fixed parser `advance()` panicking with index-out-of-bounds when
+  reaching end of token stream during error recovery on very large files.
 - **SSA mem2reg pass**: Full SSA construction implemented via the standard iterated dominance
   frontier algorithm. Promotes scalar stack allocas to SSA registers with phi nodes. Includes:
   dominator tree computation (Cooper-Harvey-Kennedy algorithm), dominance frontier calculation,
@@ -107,11 +112,24 @@ A C compiler written from scratch in Rust, targeting x86-64, AArch64, and RISC-V
 - **GCC extension keywords**: `__volatile__`, `__const__`, `__inline__`, `__restrict__`,
   `__signed__`, `__noreturn__` recognized as their standard equivalents
 
+### Project Build Status
+
+| Project | Status | Notes |
+|---------|--------|-------|
+| lua | PASS | All 6 tests pass |
+| zlib | PASS | Build + self-test + minigzip roundtrip pass |
+| mbedtls | FAIL | Preprocessor macro expansion issues in large files (psa_crypto.c) |
+| libpng | FAIL | Preprocessor conditional issues (PNG_FLOATING_POINT_SUPPORTED) |
+| jq | FAIL | Build timeout |
+| sqlite | FAIL | Not yet tested |
+| libjpeg-turbo | FAIL | Not yet tested |
+| redis | FAIL | Not yet tested |
+
 ### What's Not Yet Implemented
 - Parser support for GNU C extensions in system headers (`__attribute__`, `__asm__` renames)
-- Floating point
+- Floating point (partial - float32/64 work, long double incomplete)
 - Full cast semantics (truncation/sign-extension in some cases)
-- Inline assembly (parsed but skipped)
+- Inline assembly (parsed and executed on x86, skipped on other backends)
 - Native assembler/linker (currently uses gcc)
 
 ## Building
