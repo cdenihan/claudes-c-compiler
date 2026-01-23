@@ -91,6 +91,14 @@ pub(super) enum LValue {
     Address(Value),
 }
 
+/// Result of filling an array/FAM field in fill_struct_global_bytes,
+/// indicating how to advance the item index.
+struct ArrayFillResult {
+    new_item_idx: usize,
+    /// If true, caller should `continue` (skip the default field_idx update).
+    skip_update: bool,
+}
+
 /// A single level of switch statement context, pushed/popped as switches nest.
 #[derive(Debug)]
 pub(super) struct SwitchFrame {
@@ -1546,37 +1554,22 @@ impl Lowerer {
                         return GlobalInit::Compound(elements);
                     }
 
-                    let zero_val = if is_long_double_target {
-                        IrConst::LongDouble(0.0)
-                    } else {
-                        self.zero_const(base_ty)
-                    };
+                    let zero_val = self.typed_zero_const(base_ty, is_long_double_target);
                     let mut values = vec![zero_val; num_elems];
                     // For multi-dim arrays, flatten nested init lists
                     if array_dim_strides.len() > 1 {
-                        // For multi-dim arrays, num_elems is outer dimension count,
-                        // but we need total scalar elements for the flattened init
                         let innermost_stride = array_dim_strides.last().copied().unwrap_or(1).max(1);
                         let total_scalar_elems = if is_long_double_target {
                             total_size / 16
                         } else {
                             total_size / innermost_stride
                         };
-                        let ld_zero = if is_long_double_target {
-                            IrConst::LongDouble(0.0)
-                        } else {
-                            self.zero_const(base_ty)
-                        };
-                        let mut values_flat = vec![ld_zero; total_scalar_elems];
+                        let mut values_flat = vec![self.typed_zero_const(base_ty, is_long_double_target); total_scalar_elems];
                         let mut flat = Vec::with_capacity(total_scalar_elems);
                         self.flatten_global_array_init(items, array_dim_strides, base_ty, &mut flat);
                         for (i, v) in flat.into_iter().enumerate() {
                             if i < total_scalar_elems {
-                                values_flat[i] = if is_long_double_target {
-                                    Self::promote_to_long_double(v)
-                                } else {
-                                    v
-                                };
+                                values_flat[i] = Self::maybe_promote_long_double(v, is_long_double_target);
                             }
                         }
                         return GlobalInit::Array(values_flat);
@@ -1584,7 +1577,6 @@ impl Lowerer {
                         // Support designated initializers: [idx] = val
                         let mut current_idx = 0usize;
                         for item in items {
-                            // Check for index designator
                             if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
                                 if let Some(idx) = self.eval_const_expr(idx_expr).and_then(|c| c.to_usize()) {
                                     current_idx = idx;
@@ -1598,7 +1590,6 @@ impl Lowerer {
                                         self.coerce_const_to_type_with_src(raw, base_ty, expr_ty)
                                     }
                                     Initializer::List(sub_items) => {
-                                        // Nested list - flatten
                                         let mut sub_vals = Vec::new();
                                         for sub in sub_items {
                                             self.flatten_global_init_item(&sub.init, base_ty, &mut sub_vals);
@@ -1607,11 +1598,7 @@ impl Lowerer {
                                         raw.coerce_to(base_ty)
                                     }
                                 };
-                                values[current_idx] = if is_long_double_target {
-                                    Self::promote_to_long_double(val)
-                                } else {
-                                    val
-                                };
+                                values[current_idx] = Self::maybe_promote_long_double(val, is_long_double_target);
                             }
                             current_idx += 1;
                         }
@@ -1719,6 +1706,16 @@ impl Lowerer {
             IrConst::I8(v) => IrConst::LongDouble(v as f64),
             other => other, // LongDouble already or Zero
         }
+    }
+
+    /// Conditionally promote a value to long double based on target type.
+    fn maybe_promote_long_double(val: IrConst, is_long_double: bool) -> IrConst {
+        if is_long_double { Self::promote_to_long_double(val) } else { val }
+    }
+
+    /// Get the appropriate zero constant for a type, considering long double.
+    fn typed_zero_const(&self, base_ty: IrType, is_long_double: bool) -> IrConst {
+        if is_long_double { IrConst::LongDouble(0.0) } else { self.zero_const(base_ty) }
     }
 
     /// Lower a struct initializer list to a GlobalInit::Array of field values.
@@ -1872,6 +1869,9 @@ impl Lowerer {
 
     /// Recursively fill byte buffer for struct global initialization.
     /// Returns the number of initializer items consumed.
+    ///
+    /// Handles nested structs/unions, arrays (including multi-dimensional), string
+    /// literals, designators, flexible array members, and bitfields.
     fn fill_struct_global_bytes(
         &self,
         items: &[InitializerItem],
@@ -1889,24 +1889,7 @@ impl Lowerer {
                 Some(Designator::Field(ref name)) => Some(name.as_str()),
                 _ => None,
             };
-            // Check for array index designator after field designator: .field[idx]
-            let array_start_idx: Option<usize> = if designator_name.is_some() {
-                item.designators.iter().find_map(|d| {
-                    if let Designator::Index(ref idx_expr) = d {
-                        self.eval_const_expr(idx_expr).and_then(|c| c.to_usize())
-                    } else {
-                        None
-                    }
-                })
-            } else {
-                // Check for bare index designator on current field (when field is an array)
-                match item.designators.first() {
-                    Some(Designator::Index(ref idx_expr)) => {
-                        self.eval_const_expr(idx_expr).and_then(|c| c.to_usize())
-                    }
-                    _ => None,
-                }
-            };
+            let array_start_idx = self.extract_index_designator(item, designator_name.is_some());
             let field_idx = match layout.resolve_init_field_idx(designator_name, current_field_idx) {
                 Some(idx) => idx,
                 None => {
@@ -1917,336 +1900,71 @@ impl Lowerer {
             let field_layout = &layout.fields[field_idx];
             let field_offset = base_offset + field_layout.offset;
 
-            // Handle nested designators (e.g., .a.j = 2): drill into sub-struct
             let has_nested_designator = item.designators.len() > 1
                 && matches!(item.designators.first(), Some(Designator::Field(_)));
 
             match &field_layout.ty {
+                // Nested designator into struct/union: drill into sub-composite
                 CType::Struct(st) if has_nested_designator => {
-                    let sub_layout = StructLayout::for_struct(&st.fields);
-                    let sub_item = InitializerItem {
-                        designators: item.designators[1..].to_vec(),
-                        init: item.init.clone(),
-                    };
-                    self.fill_struct_global_bytes(&[sub_item], &sub_layout, bytes, field_offset);
+                    self.fill_nested_designator_composite(
+                        item, &StructLayout::for_struct(&st.fields), bytes, field_offset,
+                    );
                     item_idx += 1;
                 }
                 CType::Union(st) if has_nested_designator => {
-                    let sub_layout = StructLayout::for_union(&st.fields);
-                    let sub_item = InitializerItem {
-                        designators: item.designators[1..].to_vec(),
-                        init: item.init.clone(),
-                    };
-                    self.fill_struct_global_bytes(&[sub_item], &sub_layout, bytes, field_offset);
+                    self.fill_nested_designator_composite(
+                        item, &StructLayout::for_union(&st.fields), bytes, field_offset,
+                    );
                     item_idx += 1;
                 }
+                // Nested designator into array: .field[idx] = val
                 CType::Array(elem_ty, Some(arr_size)) if has_nested_designator => {
-                    // .field[idx] = val: resolve index and write to byte buffer
-                    let elem_size = elem_ty.size();
-                    let elem_ir_ty = IrType::from_ctype(elem_ty);
-                    let idx = item.designators[1..].iter().find_map(|d| {
-                        if let Designator::Index(ref idx_expr) = d {
-                            self.eval_const_expr(idx_expr).and_then(|c| c.to_usize())
-                        } else {
-                            None
-                        }
-                    }).unwrap_or(0);
-                    if idx < *arr_size {
-                        let elem_offset = field_offset + idx * elem_size;
-                        // Check if there are further nested field designators (e.g., .a[2].b = val)
-                        let remaining_field_desigs: Vec<_> = item.designators[1..].iter()
-                            .filter(|d| matches!(d, Designator::Field(_)))
-                            .cloned()
-                            .collect();
-                        if !remaining_field_desigs.is_empty() {
-                            if let Some(sub_layout) = self.get_struct_layout_for_ctype(elem_ty) {
-                                let sub_item = InitializerItem {
-                                    designators: remaining_field_desigs,
-                                    init: item.init.clone(),
-                                };
-                                self.fill_struct_global_bytes(&[sub_item], &sub_layout, bytes, elem_offset);
-                            }
-                        } else if let Initializer::Expr(ref expr) = item.init {
-                            let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
-                            self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
-                        }
-                    }
+                    self.fill_nested_designator_array(item, elem_ty, *arr_size, bytes, field_offset);
                     item_idx += 1;
                 }
+                // Struct or union field (non-nested designator)
                 CType::Struct(st) => {
                     let sub_layout = StructLayout::for_struct(&st.fields);
-                    match &item.init {
-                        Initializer::List(sub_items) => {
-                            // Nested braces: recursively fill inner struct
-                            self.fill_struct_global_bytes(sub_items, &sub_layout, bytes, field_offset);
-                            item_idx += 1;
-                        }
-                        Initializer::Expr(_) => {
-                            // Flat init: consume items for inner struct
-                            let consumed = self.fill_struct_global_bytes(&items[item_idx..], &sub_layout, bytes, field_offset);
-                            if consumed == 0 { item_idx += 1; } else { item_idx += consumed; }
-                        }
-                    }
+                    item_idx += self.fill_composite_field(
+                        &items[item_idx..], &sub_layout, bytes, field_offset,
+                    );
                 }
                 CType::Union(st) => {
                     let sub_layout = StructLayout::for_union(&st.fields);
-                    match &item.init {
-                        Initializer::List(sub_items) => {
-                            self.fill_struct_global_bytes(sub_items, &sub_layout, bytes, field_offset);
-                            item_idx += 1;
-                        }
-                        Initializer::Expr(_) => {
-                            let consumed = self.fill_struct_global_bytes(&items[item_idx..], &sub_layout, bytes, field_offset);
-                            if consumed == 0 { item_idx += 1; } else { item_idx += consumed; }
-                        }
-                    }
+                    item_idx += self.fill_composite_field(
+                        &items[item_idx..], &sub_layout, bytes, field_offset,
+                    );
                 }
+                // Fixed-size array field
                 CType::Array(elem_ty, Some(arr_size)) => {
-                    let elem_size = elem_ty.size();
-                    let elem_ir_ty = IrType::from_ctype(elem_ty);
-                    match &item.init {
-                        Initializer::List(sub_items) => {
-                            // Check for brace-wrapped string literal: { "hello" }
-                            if sub_items.len() == 1 && sub_items[0].designators.is_empty() {
-                                if let Initializer::Expr(Expr::StringLiteral(s, _)) = &sub_items[0].init {
-                                    if matches!(elem_ty.as_ref(), CType::Char | CType::UChar) {
-                                        let str_bytes = s.as_bytes();
-                                        for (i, &b) in str_bytes.iter().enumerate() {
-                                            if i >= *arr_size { break; }
-                                            if field_offset + i < bytes.len() {
-                                                bytes[field_offset + i] = b;
-                                            }
-                                        }
-                                        // null terminator
-                                        if str_bytes.len() < *arr_size && field_offset + str_bytes.len() < bytes.len() {
-                                            bytes[field_offset + str_bytes.len()] = 0;
-                                        }
-                                        item_idx += 1;
-                                        current_field_idx = field_idx + 1;
-                                        continue;
-                                    }
-                                }
-                            }
-                            if matches!(elem_ty.as_ref(), CType::Struct(_) | CType::Union(_)) {
-                                // Array of structs: each sub_item is a struct element initializer.
-                                // Sub-items may be Lists (braced struct init) or Exprs (flat filling).
-                                if let CType::Struct(st) = elem_ty.as_ref() {
-                                    let sub_layout = StructLayout::for_struct(&st.fields);
-                                    let mut sub_idx = 0usize;
-                                    let mut ai = 0usize;
-                                    while ai < *arr_size && sub_idx < sub_items.len() {
-                                        let elem_offset = field_offset + ai * elem_size;
-                                        match &sub_items[sub_idx].init {
-                                            Initializer::List(inner_items) => {
-                                                self.fill_struct_global_bytes(inner_items, &sub_layout, bytes, elem_offset);
-                                                sub_idx += 1;
-                                            }
-                                            Initializer::Expr(_) => {
-                                                let consumed = self.fill_struct_global_bytes(&sub_items[sub_idx..], &sub_layout, bytes, elem_offset);
-                                                sub_idx += consumed;
-                                            }
-                                        }
-                                        ai += 1;
-                                    }
-                                } else if let CType::Union(st) = elem_ty.as_ref() {
-                                    let sub_layout = StructLayout::for_union(&st.fields);
-                                    let mut sub_idx = 0usize;
-                                    for ai in 0..*arr_size {
-                                        if sub_idx >= sub_items.len() { break; }
-                                        let elem_offset = field_offset + ai * elem_size;
-                                        match &sub_items[sub_idx].init {
-                                            Initializer::List(inner_items) => {
-                                                self.fill_struct_global_bytes(inner_items, &sub_layout, bytes, elem_offset);
-                                                sub_idx += 1;
-                                            }
-                                            Initializer::Expr(_) => {
-                                                let consumed = self.fill_struct_global_bytes(&sub_items[sub_idx..], &sub_layout, bytes, elem_offset);
-                                                sub_idx += consumed;
-                                            }
-                                        }
-                                    }
-                                }
-                            } else {
-                                // Array of scalars: each sub_item is a scalar
-                                // Supports [idx]=val designators within the sub-list
-                                let mut ai = 0usize;
-                                for sub_item in sub_items.iter() {
-                                    // Check for index designator: [idx]=val
-                                    if let Some(Designator::Index(ref idx_expr)) = sub_item.designators.first() {
-                                        if let Some(idx) = self.eval_const_expr(idx_expr).and_then(|c| c.to_usize()) {
-                                            ai = idx;
-                                        }
-                                    }
-                                    if ai >= *arr_size { break; }
-                                    let elem_offset = field_offset + ai * elem_size;
-                                    if let Initializer::Expr(expr) = &sub_item.init {
-                                        let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
-                                        self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
-                                    } else if let Initializer::List(inner) = &sub_item.init {
-                                        // Brace-wrapped scalar: {5}
-                                        if let Some(first) = inner.first() {
-                                            if let Initializer::Expr(expr) = &first.init {
-                                                let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
-                                                self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
-                                            }
-                                        }
-                                    }
-                                    ai += 1;
-                                }
-                            }
-                            item_idx += 1;
-                        }
-                        Initializer::Expr(expr) => {
-                            // String literal initializer for char array field
-                            if let Expr::StringLiteral(s, _) = expr {
-                                if matches!(elem_ty.as_ref(), CType::Char | CType::UChar) {
-                                    let str_bytes = s.as_bytes();
-                                    for (i, &b) in str_bytes.iter().enumerate() {
-                                        if i >= *arr_size { break; }
-                                        if field_offset + i < bytes.len() {
-                                            bytes[field_offset + i] = b;
-                                        }
-                                    }
-                                    // null terminator
-                                    if str_bytes.len() < *arr_size && field_offset + str_bytes.len() < bytes.len() {
-                                        bytes[field_offset + str_bytes.len()] = 0;
-                                    }
-                                    item_idx += 1;
-                                    current_field_idx = field_idx + 1;
-                                    continue;
-                                }
-                            }
-                            // Flat initializer: fill array elements from consecutive items
-                            // in the init list. E.g., struct { int a[3]; } x = {1, 2, 3};
-                            // The items 1, 2, 3 fill a[0], a[1], a[2] respectively.
-                            // If an index designator is present (e.g., .a[1]=val), start from that index.
-                            let start_ai = array_start_idx.unwrap_or(0);
-                            if matches!(elem_ty.as_ref(), CType::Struct(_) | CType::Union(_)) {
-                                // Array of structs: consume items for each struct element
-                                if let CType::Struct(st) = elem_ty.as_ref() {
-                                    let sub_layout = StructLayout::for_struct(&st.fields);
-                                    for ai in start_ai..*arr_size {
-                                        if item_idx >= items.len() { break; }
-                                        let elem_offset = field_offset + ai * elem_size;
-                                        let consumed = self.fill_struct_global_bytes(&items[item_idx..], &sub_layout, bytes, elem_offset);
-                                        item_idx += consumed;
-                                    }
-                                } else {
-                                    // Union: take one item per element
-                                    for ai in start_ai..*arr_size {
-                                        if item_idx >= items.len() { break; }
-                                        let elem_offset = field_offset + ai * elem_size;
-                                        if let Initializer::Expr(e) = &items[item_idx].init {
-                                            let val = self.eval_const_expr(e).unwrap_or(IrConst::I64(0));
-                                            self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
-                                        }
-                                        item_idx += 1;
-                                    }
-                                }
-                            } else {
-                                // Array of scalars: consume up to arr_size items starting from start_ai
-                                let mut consumed = 0usize;
-                                let mut ai = start_ai;
-                                while ai < *arr_size && (item_idx + consumed) < items.len() {
-                                    let cur_item = &items[item_idx + consumed];
-                                    // Stop if we hit a designator (targeting a different field)
-                                    if !cur_item.designators.is_empty() && consumed > 0 { break; }
-                                    if let Initializer::Expr(e) = &cur_item.init {
-                                        let val = self.eval_const_expr(e).unwrap_or(IrConst::I64(0));
-                                        let elem_offset = field_offset + ai * elem_size;
-                                        self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
-                                        consumed += 1;
-                                        ai += 1;
-                                    } else {
-                                        break;
-                                    }
-                                }
-                                item_idx += consumed.max(1);
-                            }
-                            // Don't increment item_idx here; it was already advanced in the loop
-                            current_field_idx = field_idx + 1;
-                            continue;
-                        }
+                    let advanced = self.fill_array_field(
+                        items, item_idx, elem_ty, *arr_size,
+                        bytes, field_offset, array_start_idx,
+                    );
+                    if advanced.skip_update {
+                        item_idx = advanced.new_item_idx;
+                        current_field_idx = field_idx + 1;
+                        continue;
                     }
+                    item_idx = advanced.new_item_idx;
                 }
+                // Flexible array member (FAM)
                 CType::Array(elem_ty, None) => {
-                    // Flexible array member (FAM): int values[];
-                    // The byte buffer was already enlarged to accommodate FAM data.
-                    let elem_size = elem_ty.size();
-                    let elem_ir_ty = IrType::from_ctype(elem_ty);
-                    match &item.init {
-                        Initializer::List(sub_items) => {
-                            for (ai, sub_item) in sub_items.iter().enumerate() {
-                                let elem_offset = field_offset + ai * elem_size;
-                                if let Initializer::Expr(expr) = &sub_item.init {
-                                    let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
-                                    if elem_offset + elem_size <= bytes.len() {
-                                        self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
-                                    }
-                                } else if let Initializer::List(inner) = &sub_item.init {
-                                    // Brace-wrapped scalar: {5}
-                                    if let Some(first) = inner.first() {
-                                        if let Initializer::Expr(expr) = &first.init {
-                                            let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
-                                            if elem_offset + elem_size <= bytes.len() {
-                                                self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            item_idx += 1;
-                        }
-                        Initializer::Expr(expr) => {
-                            // Flat init: fill FAM elements from consecutive items
-                            let mut ai = 0usize;
-                            let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
-                            let elem_offset = field_offset + ai * elem_size;
-                            if elem_offset + elem_size <= bytes.len() {
-                                self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
-                            }
-                            ai += 1;
-                            item_idx += 1;
-                            // Continue consuming items without designators
-                            while item_idx < items.len() {
-                                let next_item = &items[item_idx];
-                                if !next_item.designators.is_empty() { break; }
-                                if let Initializer::Expr(e) = &next_item.init {
-                                    let val = self.eval_const_expr(e).unwrap_or(IrConst::I64(0));
-                                    let elem_offset = field_offset + ai * elem_size;
-                                    if elem_offset + elem_size <= bytes.len() {
-                                        self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
-                                    }
-                                    ai += 1;
-                                    item_idx += 1;
-                                } else {
-                                    break;
-                                }
-                            }
-                            current_field_idx = field_idx + 1;
-                            continue;
-                        }
+                    let advanced = self.fill_fam_field(
+                        items, item_idx, elem_ty, bytes, field_offset,
+                    );
+                    if advanced.skip_update {
+                        item_idx = advanced.new_item_idx;
+                        current_field_idx = field_idx + 1;
+                        continue;
                     }
+                    item_idx = advanced.new_item_idx;
                 }
+                // Scalar field (possibly bitfield)
                 _ => {
-                    // Scalar field (possibly bitfield)
                     let field_ir_ty = IrType::from_ctype(&field_layout.ty);
-                    let val = match &item.init {
-                        Initializer::Expr(expr) => {
-                            self.eval_const_expr(expr).unwrap_or(IrConst::I64(0))
-                        }
-                        Initializer::List(sub_items) => {
-                            // Scalar with braces: int x = {5};
-                            if let Some(first) = sub_items.first() {
-                                if let Initializer::Expr(expr) = &first.init {
-                                    self.eval_const_expr(expr).unwrap_or(IrConst::I64(0))
-                                } else { IrConst::I64(0) }
-                            } else { IrConst::I64(0) }
-                        }
-                    };
-
+                    let val = self.eval_init_scalar(&item.init);
                     if let (Some(bit_offset), Some(bit_width)) = (field_layout.bit_offset, field_layout.bit_width) {
-                        // Bitfield: pack into the storage unit bytes using read-modify-write
                         self.write_bitfield_to_bytes(bytes, field_offset, &val, field_ir_ty, bit_offset, bit_width);
                     } else {
                         self.write_const_to_bytes(bytes, field_offset, &val, field_ir_ty);
@@ -2256,14 +1974,361 @@ impl Lowerer {
             }
             current_field_idx = field_idx + 1;
 
-            // For unions, only one member can be active. If this was a flat init
-            // (no field designator), stop after the first field. Designated inits
-            // (.a = 1, .c = 2) are allowed to overwrite - the last designator wins.
             if layout.is_union && designator_name.is_none() {
                 break;
             }
         }
         item_idx
+    }
+
+    // --- fill_struct_global_bytes helpers ---
+
+    /// Extract an array index designator from an initializer item.
+    fn extract_index_designator(&self, item: &InitializerItem, has_field_desig: bool) -> Option<usize> {
+        if has_field_desig {
+            item.designators.iter().find_map(|d| {
+                if let Designator::Index(ref idx_expr) = d {
+                    self.eval_const_expr(idx_expr).and_then(|c| c.to_usize())
+                } else {
+                    None
+                }
+            })
+        } else {
+            match item.designators.first() {
+                Some(Designator::Index(ref idx_expr)) => {
+                    self.eval_const_expr(idx_expr).and_then(|c| c.to_usize())
+                }
+                _ => None,
+            }
+        }
+    }
+
+    /// Evaluate an initializer to a scalar constant (handles both Expr and brace-wrapped List).
+    fn eval_init_scalar(&self, init: &Initializer) -> IrConst {
+        match init {
+            Initializer::Expr(expr) => self.eval_const_expr(expr).unwrap_or(IrConst::I64(0)),
+            Initializer::List(sub_items) => {
+                sub_items.first()
+                    .and_then(|first| {
+                        if let Initializer::Expr(expr) = &first.init {
+                            self.eval_const_expr(expr)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(IrConst::I64(0))
+            }
+        }
+    }
+
+    /// Write a string literal into a byte buffer at the given offset, with null terminator.
+    fn write_string_to_bytes(bytes: &mut [u8], offset: usize, s: &str, max_len: usize) {
+        let str_bytes = s.as_bytes();
+        for (i, &b) in str_bytes.iter().enumerate() {
+            if i >= max_len { break; }
+            if offset + i < bytes.len() {
+                bytes[offset + i] = b;
+            }
+        }
+        if str_bytes.len() < max_len && offset + str_bytes.len() < bytes.len() {
+            bytes[offset + str_bytes.len()] = 0;
+        }
+    }
+
+    /// Handle nested designator drilling into a struct/union sub-field (e.g., .a.b = val).
+    fn fill_nested_designator_composite(
+        &self, item: &InitializerItem, sub_layout: &StructLayout,
+        bytes: &mut [u8], field_offset: usize,
+    ) {
+        let sub_item = InitializerItem {
+            designators: item.designators[1..].to_vec(),
+            init: item.init.clone(),
+        };
+        self.fill_struct_global_bytes(&[sub_item], sub_layout, bytes, field_offset);
+    }
+
+    /// Handle nested designator into an array field (e.g., .field[idx] = val).
+    fn fill_nested_designator_array(
+        &self, item: &InitializerItem, elem_ty: &CType, arr_size: usize,
+        bytes: &mut [u8], field_offset: usize,
+    ) {
+        let elem_size = elem_ty.size();
+        let elem_ir_ty = IrType::from_ctype(elem_ty);
+        let idx = item.designators[1..].iter().find_map(|d| {
+            if let Designator::Index(ref idx_expr) = d {
+                self.eval_const_expr(idx_expr).and_then(|c| c.to_usize())
+            } else {
+                None
+            }
+        }).unwrap_or(0);
+        if idx < arr_size {
+            let elem_offset = field_offset + idx * elem_size;
+            let remaining_field_desigs: Vec<_> = item.designators[1..].iter()
+                .filter(|d| matches!(d, Designator::Field(_)))
+                .cloned()
+                .collect();
+            if !remaining_field_desigs.is_empty() {
+                if let Some(sub_layout) = self.get_struct_layout_for_ctype(elem_ty) {
+                    let sub_item = InitializerItem {
+                        designators: remaining_field_desigs,
+                        init: item.init.clone(),
+                    };
+                    self.fill_struct_global_bytes(&[sub_item], &sub_layout, bytes, elem_offset);
+                }
+            } else if let Initializer::Expr(ref expr) = item.init {
+                let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
+                self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
+            }
+        }
+    }
+
+    /// Fill a composite (struct/union) field from an initializer.
+    /// Returns the number of items consumed.
+    fn fill_composite_field(
+        &self, items: &[InitializerItem], sub_layout: &StructLayout,
+        bytes: &mut [u8], field_offset: usize,
+    ) -> usize {
+        match &items[0].init {
+            Initializer::List(sub_items) => {
+                self.fill_struct_global_bytes(sub_items, sub_layout, bytes, field_offset);
+                1
+            }
+            Initializer::Expr(_) => {
+                let consumed = self.fill_struct_global_bytes(items, sub_layout, bytes, field_offset);
+                if consumed == 0 { 1 } else { consumed }
+            }
+        }
+    }
+
+    /// Fill a fixed-size array field. Handles string literals, arrays of composites,
+    /// arrays of scalars with designators, and flat initialization.
+    fn fill_array_field(
+        &self,
+        items: &[InitializerItem],
+        item_idx: usize,
+        elem_ty: &CType,
+        arr_size: usize,
+        bytes: &mut [u8],
+        field_offset: usize,
+        array_start_idx: Option<usize>,
+    ) -> ArrayFillResult {
+        let item = &items[item_idx];
+        let elem_size = elem_ty.size();
+        let elem_ir_ty = IrType::from_ctype(elem_ty);
+
+        match &item.init {
+            Initializer::List(sub_items) => {
+                // Check for brace-wrapped string literal: { "hello" }
+                if self.try_fill_string_literal_init(sub_items, elem_ty, arr_size, bytes, field_offset) {
+                    return ArrayFillResult { new_item_idx: item_idx + 1, skip_update: true };
+                }
+                if matches!(elem_ty, CType::Struct(_) | CType::Union(_)) {
+                    self.fill_array_of_composites(sub_items, elem_ty, arr_size, elem_size, bytes, field_offset);
+                } else {
+                    self.fill_array_of_scalars(sub_items, arr_size, elem_size, elem_ir_ty, bytes, field_offset);
+                }
+                ArrayFillResult { new_item_idx: item_idx + 1, skip_update: false }
+            }
+            Initializer::Expr(expr) => {
+                // String literal for char array
+                if let Expr::StringLiteral(s, _) = expr {
+                    if matches!(elem_ty, CType::Char | CType::UChar) {
+                        Self::write_string_to_bytes(bytes, field_offset, s, arr_size);
+                        return ArrayFillResult { new_item_idx: item_idx + 1, skip_update: true };
+                    }
+                }
+                // Flat init from consecutive items
+                let start_ai = array_start_idx.unwrap_or(0);
+                let new_idx = if matches!(elem_ty, CType::Struct(_) | CType::Union(_)) {
+                    self.fill_flat_array_of_composites(
+                        items, item_idx, elem_ty, arr_size, elem_size, elem_ir_ty,
+                        bytes, field_offset, start_ai,
+                    )
+                } else {
+                    self.fill_flat_array_of_scalars(
+                        items, item_idx, arr_size, elem_size, elem_ir_ty,
+                        bytes, field_offset, start_ai,
+                    )
+                };
+                ArrayFillResult { new_item_idx: new_idx, skip_update: true }
+            }
+        }
+    }
+
+    /// Fill a flexible array member (FAM) field.
+    fn fill_fam_field(
+        &self,
+        items: &[InitializerItem],
+        item_idx: usize,
+        elem_ty: &CType,
+        bytes: &mut [u8],
+        field_offset: usize,
+    ) -> ArrayFillResult {
+        let elem_size = elem_ty.size();
+        let elem_ir_ty = IrType::from_ctype(elem_ty);
+
+        match &items[item_idx].init {
+            Initializer::List(sub_items) => {
+                for (ai, sub_item) in sub_items.iter().enumerate() {
+                    let elem_offset = field_offset + ai * elem_size;
+                    if elem_offset + elem_size > bytes.len() { break; }
+                    let val = self.eval_init_scalar(&sub_item.init);
+                    self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
+                }
+                ArrayFillResult { new_item_idx: item_idx + 1, skip_update: false }
+            }
+            Initializer::Expr(expr) => {
+                let mut ai = 0usize;
+                let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
+                let elem_offset = field_offset + ai * elem_size;
+                if elem_offset + elem_size <= bytes.len() {
+                    self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
+                }
+                ai += 1;
+                let mut new_idx = item_idx + 1;
+                while new_idx < items.len() {
+                    let next_item = &items[new_idx];
+                    if !next_item.designators.is_empty() { break; }
+                    if let Initializer::Expr(e) = &next_item.init {
+                        let val = self.eval_const_expr(e).unwrap_or(IrConst::I64(0));
+                        let elem_offset = field_offset + ai * elem_size;
+                        if elem_offset + elem_size <= bytes.len() {
+                            self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
+                        }
+                        ai += 1;
+                        new_idx += 1;
+                    } else {
+                        break;
+                    }
+                }
+                ArrayFillResult { new_item_idx: new_idx, skip_update: true }
+            }
+        }
+    }
+
+    /// Try to interpret a brace-wrapped init list as a string literal for a char array.
+    /// Returns true if handled.
+    fn try_fill_string_literal_init(
+        &self, sub_items: &[InitializerItem], elem_ty: &CType, arr_size: usize,
+        bytes: &mut [u8], field_offset: usize,
+    ) -> bool {
+        if sub_items.len() == 1 && sub_items[0].designators.is_empty() {
+            if let Initializer::Expr(Expr::StringLiteral(s, _)) = &sub_items[0].init {
+                if matches!(elem_ty, CType::Char | CType::UChar) {
+                    Self::write_string_to_bytes(bytes, field_offset, s, arr_size);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Fill an array of struct/union elements from a braced sub-item list.
+    fn fill_array_of_composites(
+        &self, sub_items: &[InitializerItem], elem_ty: &CType,
+        arr_size: usize, elem_size: usize, bytes: &mut [u8], field_offset: usize,
+    ) {
+        let sub_layout = self.get_composite_layout(elem_ty);
+        let mut sub_idx = 0usize;
+        let mut ai = 0usize;
+        while ai < arr_size && sub_idx < sub_items.len() {
+            let elem_offset = field_offset + ai * elem_size;
+            match &sub_items[sub_idx].init {
+                Initializer::List(inner_items) => {
+                    self.fill_struct_global_bytes(inner_items, &sub_layout, bytes, elem_offset);
+                    sub_idx += 1;
+                }
+                Initializer::Expr(_) => {
+                    let consumed = self.fill_struct_global_bytes(&sub_items[sub_idx..], &sub_layout, bytes, elem_offset);
+                    sub_idx += consumed;
+                }
+            }
+            ai += 1;
+        }
+    }
+
+    /// Fill an array of scalar elements from a braced sub-item list (with designator support).
+    fn fill_array_of_scalars(
+        &self, sub_items: &[InitializerItem], arr_size: usize,
+        elem_size: usize, elem_ir_ty: IrType, bytes: &mut [u8], field_offset: usize,
+    ) {
+        let mut ai = 0usize;
+        for sub_item in sub_items.iter() {
+            if let Some(Designator::Index(ref idx_expr)) = sub_item.designators.first() {
+                if let Some(idx) = self.eval_const_expr(idx_expr).and_then(|c| c.to_usize()) {
+                    ai = idx;
+                }
+            }
+            if ai >= arr_size { break; }
+            let elem_offset = field_offset + ai * elem_size;
+            let val = self.eval_init_scalar(&sub_item.init);
+            self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
+            ai += 1;
+        }
+    }
+
+    /// Fill flat init of an array of composites from consecutive items.
+    /// Returns the new item_idx.
+    fn fill_flat_array_of_composites(
+        &self, items: &[InitializerItem], mut item_idx: usize,
+        elem_ty: &CType, arr_size: usize, elem_size: usize, elem_ir_ty: IrType,
+        bytes: &mut [u8], field_offset: usize, start_ai: usize,
+    ) -> usize {
+        let sub_layout = self.get_composite_layout(elem_ty);
+        if matches!(elem_ty, CType::Struct(_)) {
+            for ai in start_ai..arr_size {
+                if item_idx >= items.len() { break; }
+                let elem_offset = field_offset + ai * elem_size;
+                let consumed = self.fill_struct_global_bytes(&items[item_idx..], &sub_layout, bytes, elem_offset);
+                item_idx += consumed;
+            }
+        } else {
+            // Union: take one item per element
+            for ai in start_ai..arr_size {
+                if item_idx >= items.len() { break; }
+                let elem_offset = field_offset + ai * elem_size;
+                if let Initializer::Expr(e) = &items[item_idx].init {
+                    let val = self.eval_const_expr(e).unwrap_or(IrConst::I64(0));
+                    self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
+                }
+                item_idx += 1;
+            }
+        }
+        item_idx
+    }
+
+    /// Fill flat init of an array of scalars from consecutive items.
+    /// Returns the new item_idx.
+    fn fill_flat_array_of_scalars(
+        &self, items: &[InitializerItem], item_idx: usize,
+        arr_size: usize, elem_size: usize, elem_ir_ty: IrType,
+        bytes: &mut [u8], field_offset: usize, start_ai: usize,
+    ) -> usize {
+        let mut consumed = 0usize;
+        let mut ai = start_ai;
+        while ai < arr_size && (item_idx + consumed) < items.len() {
+            let cur_item = &items[item_idx + consumed];
+            if !cur_item.designators.is_empty() && consumed > 0 { break; }
+            if let Initializer::Expr(e) = &cur_item.init {
+                let val = self.eval_const_expr(e).unwrap_or(IrConst::I64(0));
+                let elem_offset = field_offset + ai * elem_size;
+                self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
+                consumed += 1;
+                ai += 1;
+            } else {
+                break;
+            }
+        }
+        item_idx + consumed.max(1)
+    }
+
+    /// Get the StructLayout for a composite (struct or union) CType.
+    fn get_composite_layout(&self, ty: &CType) -> StructLayout {
+        match ty {
+            CType::Struct(st) => StructLayout::for_struct(&st.fields),
+            CType::Union(st) => StructLayout::for_union(&st.fields),
+            _ => unreachable!("get_composite_layout called on non-composite type"),
+        }
     }
 
     /// Lower a struct global init that contains address expressions.

@@ -1,24 +1,20 @@
-MEDIUM PRIORITY: Further refactoring of large functions in IR lowering module
+LOW PRIORITY: Remaining refactoring of large functions in IR lowering module
 
-The initial refactoring pass (SwitchFrame/FunctionMeta, bitfield helpers, intrinsic
-consolidation, member access unification) reduced 162 lines. These functions remain:
+Items 1, 2, and 3 have been completed:
+- try_lower_atomic_builtin: converted to table-driven dispatch with classify_fetch_op(),
+  classify_op_fetch(), shared helpers (emit_post_rmw_compute, emit_atomic_xchg,
+  emit_cmpxchg_with_writeback, load_through_ptr, store_through_ptr). Unified __atomic_*
+  and __sync_* variants.
+- fill_struct_global_bytes: extracted 15+ helper functions (write_string_to_bytes,
+  fill_nested_designator_composite, fill_nested_designator_array, fill_composite_field,
+  fill_array_field, fill_fam_field, fill_array_of_composites, fill_array_of_scalars,
+  fill_flat_array_of_composites, fill_flat_array_of_scalars, try_fill_string_literal_init,
+  get_composite_layout, eval_init_scalar, extract_index_designator). Reduced max nesting
+  from 7-8 levels to 3-4.
+- lower_global_init: extracted typed_zero_const(), maybe_promote_long_double() helpers
+  to eliminate repeated long-double promotion patterns.
 
-1. try_lower_atomic_builtin (expr.rs, ~445 lines)
-   - Chain of ~25 if-name-matches blocks for __atomic_* and __sync_* builtins
-   - Each block follows the same pattern: check name, parse args, emit 1-2 IR instructions
-   - Should be refactored to use a table-driven approach: map function name -> handler
-   - The __sync_* variants are identical to __atomic_* but with hardcoded SeqCst ordering
-
-2. fill_struct_global_bytes (lowering.rs, ~333 lines)
-   - Handles global struct initialization with designators, nested structs, arrays
-   - Deeply nested match arms that are hard to follow
-   - Should be broken into: fill_scalar, fill_array_of_structs, fill_designated_field,
-     fill_flat_array, fill_string_literal sub-functions
-
-3. lower_global_init (lowering.rs, ~292 lines)
-   - Handles all global initializer forms (scalar, array, string, compound, struct)
-   - The Initializer::List arm (lines 939-1123) is a single match arm with 184 lines
-   - Should be split into lower_array_global_init, lower_struct_global_init, etc.
+Remaining (lower priority, less severe):
 
 4. get_expr_type (types.rs, ~250 lines)
    - Type inference for expressions, split across two match blocks with fallthrough

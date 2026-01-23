@@ -1088,451 +1088,348 @@ impl Lowerer {
     }
 
     /// Try to lower a GCC atomic builtin (__atomic_* or __sync_*).
+    ///
+    /// Uses table-driven dispatch to avoid repetitive if-name-matches blocks.
+    /// The __atomic_* variants take an explicit ordering argument; __sync_* always use SeqCst.
+    /// The _n variants pass values directly; non-_n variants pass through pointers.
     fn try_lower_atomic_builtin(&mut self, name: &str, args: &[Expr]) -> Option<Operand> {
-        // Determine the value type from the first argument (pointer type -> pointed-to type)
-        // Determine the value type from the first argument (pointer -> pointee type)
         let val_ty = if !args.is_empty() {
             self.get_pointee_ir_type(&args[0]).unwrap_or(IrType::I64)
         } else {
             IrType::I64
         };
 
-        // Parse ordering from a constant argument
-        let get_ordering = |arg: &Expr| -> AtomicOrdering {
-            // Try to extract the constant value (0=relaxed, 1=consume, 2=acquire, etc.)
-            match arg {
-                Expr::IntLiteral(v, _) => match *v as i32 {
-                    0 => AtomicOrdering::Relaxed,
-                    1 | 2 => AtomicOrdering::Acquire,  // consume maps to acquire
-                    3 => AtomicOrdering::Release,
-                    4 => AtomicOrdering::AcqRel,
-                    _ => AtomicOrdering::SeqCst,
-                },
-                _ => AtomicOrdering::SeqCst, // default to strongest
-            }
-        };
-
-        // __atomic_fetch_OP(ptr, val, order) -> old value
-        if let Some(op) = match name {
-            "__atomic_fetch_add" => Some(AtomicRmwOp::Add),
-            "__atomic_fetch_sub" => Some(AtomicRmwOp::Sub),
-            "__atomic_fetch_and" => Some(AtomicRmwOp::And),
-            "__atomic_fetch_or"  => Some(AtomicRmwOp::Or),
-            "__atomic_fetch_xor" => Some(AtomicRmwOp::Xor),
-            "__atomic_fetch_nand" => Some(AtomicRmwOp::Nand),
-            _ => None,
-        } {
-            if args.len() >= 3 {
+        // --- Fetch-op: atomic RMW returning old value ---
+        // __atomic_fetch_OP(ptr, val, order) and __sync_fetch_and_OP(ptr, val) [SeqCst]
+        if let Some((op, is_sync)) = Self::classify_fetch_op(name) {
+            let min_args = if is_sync { 2 } else { 3 };
+            if args.len() >= min_args {
                 let ptr = self.lower_expr(&args[0]);
                 let val = self.lower_expr(&args[1]);
-                let ordering = get_ordering(&args[2]);
+                let ordering = if is_sync {
+                    AtomicOrdering::SeqCst
+                } else {
+                    Self::parse_ordering(&args[2])
+                };
                 let dest = self.fresh_value();
-                self.emit(Instruction::AtomicRmw {
-                    dest, op, ptr, val, ty: val_ty, ordering,
-                });
+                self.emit(Instruction::AtomicRmw { dest, op, ptr, val, ty: val_ty, ordering });
                 return Some(Operand::Value(dest));
             }
         }
 
-        // __atomic_OP_fetch(ptr, val, order) -> new value
-        if let Some(op) = match name {
-            "__atomic_add_fetch" => Some((AtomicRmwOp::Add, IrBinOp::Add)),
-            "__atomic_sub_fetch" => Some((AtomicRmwOp::Sub, IrBinOp::Sub)),
-            "__atomic_and_fetch" => Some((AtomicRmwOp::And, IrBinOp::And)),
-            "__atomic_or_fetch"  => Some((AtomicRmwOp::Or, IrBinOp::Or)),
-            "__atomic_xor_fetch" => Some((AtomicRmwOp::Xor, IrBinOp::Xor)),
-            "__atomic_nand_fetch" => Some((AtomicRmwOp::Nand, IrBinOp::And)), // need special handling
-            _ => None,
-        } {
-            if args.len() >= 3 {
-                let (rmw_op, bin_op) = op;
+        // --- Op-fetch: atomic RMW returning new value (old op val) ---
+        // __atomic_OP_fetch(ptr, val, order) and __sync_OP_and_fetch(ptr, val) [SeqCst]
+        if let Some((rmw_op, bin_op, is_nand, is_sync)) = Self::classify_op_fetch(name) {
+            let min_args = if is_sync { 2 } else { 3 };
+            if args.len() >= min_args {
                 let ptr = self.lower_expr(&args[0]);
                 let val_expr = self.lower_expr(&args[1]);
-                let ordering = get_ordering(&args[2]);
-                // First do the atomic RMW (returns old value)
+                let ordering = if is_sync {
+                    AtomicOrdering::SeqCst
+                } else {
+                    Self::parse_ordering(&args[2])
+                };
                 let old_val = self.fresh_value();
                 self.emit(Instruction::AtomicRmw {
                     dest: old_val, op: rmw_op, ptr, val: val_expr.clone(), ty: val_ty, ordering,
                 });
-                // Then compute new = old op val
-                let new_val = self.fresh_value();
-                if name == "__atomic_nand_fetch" {
-                    // nand: new = ~(old & val)
-                    let and_val = self.fresh_value();
-                    self.emit(Instruction::BinOp {
-                        dest: and_val, op: IrBinOp::And,
-                        lhs: Operand::Value(old_val), rhs: val_expr, ty: val_ty,
-                    });
-                    self.emit(Instruction::UnaryOp {
-                        dest: new_val, op: IrUnaryOp::Not,
-                        src: Operand::Value(and_val), ty: val_ty,
-                    });
-                } else {
-                    self.emit(Instruction::BinOp {
-                        dest: new_val, op: bin_op,
-                        lhs: Operand::Value(old_val), rhs: val_expr, ty: val_ty,
-                    });
-                }
+                let new_val = self.emit_post_rmw_compute(old_val, val_expr, bin_op, is_nand, val_ty);
                 return Some(Operand::Value(new_val));
             }
         }
 
+        // --- Exchange ---
         // __atomic_exchange_n(ptr, val, order) -> old value
-        if name == "__atomic_exchange_n" {
-            if args.len() >= 3 {
-                let ptr = self.lower_expr(&args[0]);
-                let val = self.lower_expr(&args[1]);
-                let ordering = get_ordering(&args[2]);
-                let dest = self.fresh_value();
-                self.emit(Instruction::AtomicRmw {
-                    dest, op: AtomicRmwOp::Xchg, ptr, val, ty: val_ty, ordering,
-                });
-                return Some(Operand::Value(dest));
-            }
+        if name == "__atomic_exchange_n" && args.len() >= 3 {
+            let ptr = self.lower_expr(&args[0]);
+            let val = self.lower_expr(&args[1]);
+            let ordering = Self::parse_ordering(&args[2]);
+            return Some(Operand::Value(self.emit_atomic_xchg(ptr, val, val_ty, ordering)));
         }
-
-        // __atomic_compare_exchange_n(ptr, expected_ptr, desired, weak, success_order, fail_order) -> bool
-        if name == "__atomic_compare_exchange_n" {
-            if args.len() >= 6 {
-                let ptr = self.lower_expr(&args[0]);
-                let expected_ptr_op = self.lower_expr(&args[1]);
-                let expected_ptr_val = self.operand_to_value(expected_ptr_op.clone());
-                // Load expected value from expected_ptr
-                let expected = self.fresh_value();
-                self.emit(Instruction::Load { dest: expected, ptr: expected_ptr_val, ty: val_ty });
-                let desired = self.lower_expr(&args[2]);
-                let success_ordering = get_ordering(&args[4]);
-                let failure_ordering = get_ordering(&args[5]);
-                // Do cmpxchg returning old value
-                let old_val = self.fresh_value();
-                self.emit(Instruction::AtomicCmpxchg {
-                    dest: old_val, ptr, expected: Operand::Value(expected), desired,
-                    ty: val_ty, success_ordering, failure_ordering, returns_bool: false,
-                });
-                // Store old value back to expected_ptr (updates expected on failure)
-                let expected_ptr_val2 = self.operand_to_value(expected_ptr_op);
-                self.emit(Instruction::Store {
-                    val: Operand::Value(old_val), ptr: expected_ptr_val2, ty: val_ty,
-                });
-                // Compare old == expected to produce bool result
-                let result = self.fresh_value();
-                self.emit(Instruction::Cmp {
-                    dest: result, op: IrCmpOp::Eq,
-                    lhs: Operand::Value(old_val), rhs: Operand::Value(expected),
-                    ty: val_ty,
-                });
-                return Some(Operand::Value(result));
-            }
-        }
-
-        // __atomic_compare_exchange(ptr, expected_ptr, desired_ptr, weak, success_order, fail_order) -> bool
-        if name == "__atomic_compare_exchange" {
-            if args.len() >= 6 {
-                let ptr = self.lower_expr(&args[0]);
-                let expected_ptr_op = self.lower_expr(&args[1]);
-                let desired_ptr_val = self.lower_expr(&args[2]);
-                // Load expected and desired from their pointers
-                let expected_ptr_val = self.operand_to_value(expected_ptr_op.clone());
-                let expected = self.fresh_value();
-                self.emit(Instruction::Load { dest: expected, ptr: expected_ptr_val, ty: val_ty });
-                let desired_ptr_v = self.operand_to_value(desired_ptr_val);
-                let desired = self.fresh_value();
-                self.emit(Instruction::Load { dest: desired, ptr: desired_ptr_v, ty: val_ty });
-                let success_ordering = get_ordering(&args[4]);
-                let failure_ordering = get_ordering(&args[5]);
-                // Do cmpxchg returning old value
-                let old_val = self.fresh_value();
-                self.emit(Instruction::AtomicCmpxchg {
-                    dest: old_val, ptr, expected: Operand::Value(expected), desired: Operand::Value(desired),
-                    ty: val_ty, success_ordering, failure_ordering, returns_bool: false,
-                });
-                // Store old value back to expected_ptr (updates expected on failure)
-                let expected_ptr_val2 = self.operand_to_value(expected_ptr_op);
-                self.emit(Instruction::Store {
-                    val: Operand::Value(old_val), ptr: expected_ptr_val2, ty: val_ty,
-                });
-                // Compare old == expected to produce bool result
-                let result = self.fresh_value();
-                self.emit(Instruction::Cmp {
-                    dest: result, op: IrCmpOp::Eq,
-                    lhs: Operand::Value(old_val), rhs: Operand::Value(expected),
-                    ty: val_ty,
-                });
-                return Some(Operand::Value(result));
-            }
-        }
-
         // __atomic_exchange(ptr, val_ptr, ret_ptr, order) -> void
-        if name == "__atomic_exchange" {
-            if args.len() >= 4 {
-                let ptr = self.lower_expr(&args[0]);
-                let val_ptr_op = self.lower_expr(&args[1]);
-                let ret_ptr_op = self.lower_expr(&args[2]);
-                let ordering = get_ordering(&args[3]);
-                // Load value from val_ptr
-                let val_ptr_val = self.operand_to_value(val_ptr_op);
-                let val = self.fresh_value();
-                self.emit(Instruction::Load { dest: val, ptr: val_ptr_val, ty: val_ty });
-                // Do exchange
-                let old_val = self.fresh_value();
-                self.emit(Instruction::AtomicRmw {
-                    dest: old_val, op: AtomicRmwOp::Xchg,
-                    ptr, val: Operand::Value(val), ty: val_ty, ordering,
-                });
-                // Store old value to ret_ptr
-                let ret_ptr_val = self.operand_to_value(ret_ptr_op);
-                self.emit(Instruction::Store {
-                    val: Operand::Value(old_val), ptr: ret_ptr_val, ty: val_ty,
-                });
-                return Some(Operand::Const(IrConst::I64(0)));
-            }
+        if name == "__atomic_exchange" && args.len() >= 4 {
+            let ptr = self.lower_expr(&args[0]);
+            let val_ptr_op = self.lower_expr(&args[1]);
+            let ret_ptr_op = self.lower_expr(&args[2]);
+            let ordering = Self::parse_ordering(&args[3]);
+            let val = self.load_through_ptr(val_ptr_op, val_ty);
+            let old_val = self.emit_atomic_xchg(ptr, Operand::Value(val), val_ty, ordering);
+            self.store_through_ptr(ret_ptr_op, Operand::Value(old_val), val_ty);
+            return Some(Operand::Const(IrConst::I64(0)));
         }
 
+        // --- Compare-exchange ---
+        // __atomic_compare_exchange_n(ptr, expected_ptr, desired, weak, success_order, fail_order)
+        if name == "__atomic_compare_exchange_n" && args.len() >= 6 {
+            let ptr = self.lower_expr(&args[0]);
+            let expected_ptr_op = self.lower_expr(&args[1]);
+            let expected = self.load_through_ptr(expected_ptr_op.clone(), val_ty);
+            let desired = self.lower_expr(&args[2]);
+            return Some(self.emit_cmpxchg_with_writeback(
+                ptr, expected_ptr_op, expected, desired, val_ty,
+                Self::parse_ordering(&args[4]), Self::parse_ordering(&args[5]),
+            ));
+        }
+        // __atomic_compare_exchange(ptr, expected_ptr, desired_ptr, weak, success_order, fail_order)
+        if name == "__atomic_compare_exchange" && args.len() >= 6 {
+            let ptr = self.lower_expr(&args[0]);
+            let expected_ptr_op = self.lower_expr(&args[1]);
+            let desired_ptr_op = self.lower_expr(&args[2]);
+            let expected = self.load_through_ptr(expected_ptr_op.clone(), val_ty);
+            let desired = self.load_through_ptr(desired_ptr_op, val_ty);
+            return Some(self.emit_cmpxchg_with_writeback(
+                ptr, expected_ptr_op, expected, Operand::Value(desired), val_ty,
+                Self::parse_ordering(&args[4]), Self::parse_ordering(&args[5]),
+            ));
+        }
+
+        // --- Load ---
         // __atomic_load_n(ptr, order) -> value
-        if name == "__atomic_load_n" {
-            if args.len() >= 2 {
-                let ptr = self.lower_expr(&args[0]);
-                let ordering = get_ordering(&args[1]);
-                let dest = self.fresh_value();
-                self.emit(Instruction::AtomicLoad {
-                    dest, ptr, ty: val_ty, ordering,
-                });
-                return Some(Operand::Value(dest));
-            }
+        if name == "__atomic_load_n" && args.len() >= 2 {
+            let ptr = self.lower_expr(&args[0]);
+            let ordering = Self::parse_ordering(&args[1]);
+            let dest = self.fresh_value();
+            self.emit(Instruction::AtomicLoad { dest, ptr, ty: val_ty, ordering });
+            return Some(Operand::Value(dest));
+        }
+        // __atomic_load(ptr, ret_ptr, order) -> void
+        if name == "__atomic_load" && args.len() >= 3 {
+            let ptr = self.lower_expr(&args[0]);
+            let ret_ptr = self.lower_expr(&args[1]);
+            let ordering = Self::parse_ordering(&args[2]);
+            let loaded = self.fresh_value();
+            self.emit(Instruction::AtomicLoad { dest: loaded, ptr, ty: val_ty, ordering });
+            self.store_through_ptr(ret_ptr, Operand::Value(loaded), val_ty);
+            return Some(Operand::Const(IrConst::I64(0)));
         }
 
-        // __atomic_load(ptr, ret_ptr, order) -> void (stores result to ret_ptr)
-        if name == "__atomic_load" {
-            if args.len() >= 3 {
-                let ptr = self.lower_expr(&args[0]);
-                let ret_ptr = self.lower_expr(&args[1]);
-                let ordering = get_ordering(&args[2]);
-                let loaded = self.fresh_value();
-                self.emit(Instruction::AtomicLoad {
-                    dest: loaded, ptr, ty: val_ty, ordering,
-                });
-                let ret_ptr_val = self.operand_to_value(ret_ptr);
-                self.emit(Instruction::Store {
-                    val: Operand::Value(loaded), ptr: ret_ptr_val, ty: val_ty,
-                });
-                return Some(Operand::Const(IrConst::I64(0)));
-            }
-        }
-
+        // --- Store ---
         // __atomic_store_n(ptr, val, order) -> void
-        if name == "__atomic_store_n" {
-            if args.len() >= 3 {
-                let ptr = self.lower_expr(&args[0]);
-                let val = self.lower_expr(&args[1]);
-                let ordering = get_ordering(&args[2]);
-                self.emit(Instruction::AtomicStore {
-                    ptr, val, ty: val_ty, ordering,
-                });
-                return Some(Operand::Const(IrConst::I64(0)));
-            }
+        if name == "__atomic_store_n" && args.len() >= 3 {
+            let ptr = self.lower_expr(&args[0]);
+            let val = self.lower_expr(&args[1]);
+            let ordering = Self::parse_ordering(&args[2]);
+            self.emit(Instruction::AtomicStore { ptr, val, ty: val_ty, ordering });
+            return Some(Operand::Const(IrConst::I64(0)));
         }
-
         // __atomic_store(ptr, val_ptr, order) -> void
-        if name == "__atomic_store" {
-            if args.len() >= 3 {
-                let ptr = self.lower_expr(&args[0]);
-                let val_ptr = self.lower_expr(&args[1]);
-                let ordering = get_ordering(&args[2]);
-                // Load value from val_ptr
-                let val_ptr_val = self.operand_to_value(val_ptr);
-                let loaded = self.fresh_value();
-                self.emit(Instruction::Load { dest: loaded, ptr: val_ptr_val, ty: val_ty });
-                self.emit(Instruction::AtomicStore {
-                    ptr, val: Operand::Value(loaded), ty: val_ty, ordering,
-                });
-                return Some(Operand::Const(IrConst::I64(0)));
-            }
+        if name == "__atomic_store" && args.len() >= 3 {
+            let ptr = self.lower_expr(&args[0]);
+            let val_ptr = self.lower_expr(&args[1]);
+            let ordering = Self::parse_ordering(&args[2]);
+            let loaded = self.load_through_ptr(val_ptr, val_ty);
+            self.emit(Instruction::AtomicStore { ptr, val: Operand::Value(loaded), ty: val_ty, ordering });
+            return Some(Operand::Const(IrConst::I64(0)));
         }
 
-        // __atomic_test_and_set(ptr, order)
-        if name == "__atomic_test_and_set" {
-            if args.len() >= 2 {
-                let ptr = self.lower_expr(&args[0]);
-                let ordering = get_ordering(&args[1]);
-                let dest = self.fresh_value();
-                self.emit(Instruction::AtomicRmw {
-                    dest, op: AtomicRmwOp::TestAndSet,
-                    ptr, val: Operand::Const(IrConst::I64(1)),
-                    ty: IrType::I8, ordering,
-                });
-                return Some(Operand::Value(dest));
-            }
+        // --- Test-and-set / clear ---
+        if name == "__atomic_test_and_set" && args.len() >= 2 {
+            let ptr = self.lower_expr(&args[0]);
+            let ordering = Self::parse_ordering(&args[1]);
+            let dest = self.fresh_value();
+            self.emit(Instruction::AtomicRmw {
+                dest, op: AtomicRmwOp::TestAndSet,
+                ptr, val: Operand::Const(IrConst::I64(1)), ty: IrType::I8, ordering,
+            });
+            return Some(Operand::Value(dest));
+        }
+        if name == "__atomic_clear" && args.len() >= 2 {
+            let ptr = self.lower_expr(&args[0]);
+            let ordering = Self::parse_ordering(&args[1]);
+            self.emit(Instruction::AtomicStore {
+                ptr, val: Operand::Const(IrConst::I8(0)), ty: IrType::I8, ordering,
+            });
+            return Some(Operand::Const(IrConst::I64(0)));
         }
 
-        // __atomic_clear(ptr, order) - atomic store 0 to byte
-        if name == "__atomic_clear" {
-            if args.len() >= 2 {
-                let ptr = self.lower_expr(&args[0]);
-                let ordering = get_ordering(&args[1]);
-                self.emit(Instruction::AtomicStore {
-                    ptr, val: Operand::Const(IrConst::I8(0)),
-                    ty: IrType::I8, ordering,
-                });
-                return Some(Operand::Const(IrConst::I64(0)));
-            }
-        }
-
-        // __sync_fetch_and_OP(ptr, val) -> old value (seq_cst)
-        if let Some(op) = match name {
-            "__sync_fetch_and_add" => Some(AtomicRmwOp::Add),
-            "__sync_fetch_and_sub" => Some(AtomicRmwOp::Sub),
-            "__sync_fetch_and_and" => Some(AtomicRmwOp::And),
-            "__sync_fetch_and_or"  => Some(AtomicRmwOp::Or),
-            "__sync_fetch_and_xor" => Some(AtomicRmwOp::Xor),
-            "__sync_fetch_and_nand" => Some(AtomicRmwOp::Nand),
-            _ => None,
-        } {
-            if args.len() >= 2 {
-                let ptr = self.lower_expr(&args[0]);
-                let val = self.lower_expr(&args[1]);
-                let dest = self.fresh_value();
-                self.emit(Instruction::AtomicRmw {
-                    dest, op, ptr, val, ty: val_ty, ordering: AtomicOrdering::SeqCst,
-                });
-                return Some(Operand::Value(dest));
-            }
-        }
-
-        // __sync_OP_and_fetch(ptr, val) -> new value (seq_cst)
-        if let Some(op_info) = match name {
-            "__sync_add_and_fetch" => Some((AtomicRmwOp::Add, IrBinOp::Add)),
-            "__sync_sub_and_fetch" => Some((AtomicRmwOp::Sub, IrBinOp::Sub)),
-            "__sync_and_and_fetch" => Some((AtomicRmwOp::And, IrBinOp::And)),
-            "__sync_or_and_fetch"  => Some((AtomicRmwOp::Or, IrBinOp::Or)),
-            "__sync_xor_and_fetch" => Some((AtomicRmwOp::Xor, IrBinOp::Xor)),
-            "__sync_nand_and_fetch" => Some((AtomicRmwOp::Nand, IrBinOp::And)),
-            _ => None,
-        } {
-            if args.len() >= 2 {
-                let (rmw_op, bin_op) = op_info;
-                let ptr = self.lower_expr(&args[0]);
-                let val_expr = self.lower_expr(&args[1]);
-                let old_val = self.fresh_value();
-                self.emit(Instruction::AtomicRmw {
-                    dest: old_val, op: rmw_op, ptr, val: val_expr.clone(),
-                    ty: val_ty, ordering: AtomicOrdering::SeqCst,
-                });
-                let new_val = self.fresh_value();
-                if name == "__sync_nand_and_fetch" {
-                    let and_val = self.fresh_value();
-                    self.emit(Instruction::BinOp {
-                        dest: and_val, op: IrBinOp::And,
-                        lhs: Operand::Value(old_val), rhs: val_expr, ty: val_ty,
-                    });
-                    self.emit(Instruction::UnaryOp {
-                        dest: new_val, op: IrUnaryOp::Not,
-                        src: Operand::Value(and_val), ty: val_ty,
-                    });
-                } else {
-                    self.emit(Instruction::BinOp {
-                        dest: new_val, op: bin_op,
-                        lhs: Operand::Value(old_val), rhs: val_expr, ty: val_ty,
-                    });
-                }
-                return Some(Operand::Value(new_val));
-            }
-        }
-
+        // --- Sync compare-and-swap ---
         // __sync_val_compare_and_swap(ptr, old, new) -> old value
-        if name == "__sync_val_compare_and_swap" {
-            if args.len() >= 3 {
-                let ptr = self.lower_expr(&args[0]);
-                let expected = self.lower_expr(&args[1]);
-                let desired = self.lower_expr(&args[2]);
-                let dest = self.fresh_value();
-                self.emit(Instruction::AtomicCmpxchg {
-                    dest, ptr, expected, desired,
-                    ty: val_ty,
-                    success_ordering: AtomicOrdering::SeqCst,
-                    failure_ordering: AtomicOrdering::SeqCst,
-                    returns_bool: false,
-                });
-                return Some(Operand::Value(dest));
-            }
-        }
-
         // __sync_bool_compare_and_swap(ptr, old, new) -> bool
-        if name == "__sync_bool_compare_and_swap" {
-            if args.len() >= 3 {
-                let ptr = self.lower_expr(&args[0]);
-                let expected = self.lower_expr(&args[1]);
-                let desired = self.lower_expr(&args[2]);
-                let dest = self.fresh_value();
-                self.emit(Instruction::AtomicCmpxchg {
-                    dest, ptr, expected, desired,
-                    ty: val_ty,
-                    success_ordering: AtomicOrdering::SeqCst,
-                    failure_ordering: AtomicOrdering::SeqCst,
-                    returns_bool: true,
-                });
-                return Some(Operand::Value(dest));
-            }
+        if (name == "__sync_val_compare_and_swap" || name == "__sync_bool_compare_and_swap")
+            && args.len() >= 3
+        {
+            let ptr = self.lower_expr(&args[0]);
+            let expected = self.lower_expr(&args[1]);
+            let desired = self.lower_expr(&args[2]);
+            let returns_bool = name == "__sync_bool_compare_and_swap";
+            let dest = self.fresh_value();
+            self.emit(Instruction::AtomicCmpxchg {
+                dest, ptr, expected, desired, ty: val_ty,
+                success_ordering: AtomicOrdering::SeqCst,
+                failure_ordering: AtomicOrdering::SeqCst,
+                returns_bool,
+            });
+            return Some(Operand::Value(dest));
         }
 
-        // __sync_lock_test_and_set(ptr, val) -> old value (acquire semantics)
-        if name == "__sync_lock_test_and_set" {
-            if args.len() >= 2 {
-                let ptr = self.lower_expr(&args[0]);
-                let val = self.lower_expr(&args[1]);
-                let dest = self.fresh_value();
-                self.emit(Instruction::AtomicRmw {
-                    dest, op: AtomicRmwOp::Xchg, ptr, val,
-                    ty: val_ty, ordering: AtomicOrdering::Acquire,
-                });
-                return Some(Operand::Value(dest));
-            }
+        // --- Sync lock operations ---
+        if name == "__sync_lock_test_and_set" && args.len() >= 2 {
+            let ptr = self.lower_expr(&args[0]);
+            let val = self.lower_expr(&args[1]);
+            return Some(Operand::Value(
+                self.emit_atomic_xchg(ptr, val, val_ty, AtomicOrdering::Acquire),
+            ));
+        }
+        if name == "__sync_lock_release" && !args.is_empty() {
+            let ptr = self.lower_expr(&args[0]);
+            self.emit(Instruction::AtomicStore {
+                ptr, val: Operand::Const(IrConst::I64(0)), ty: val_ty, ordering: AtomicOrdering::Release,
+            });
+            return Some(Operand::Const(IrConst::I64(0)));
         }
 
-        // __sync_lock_release(ptr) -> void (release store of 0)
-        if name == "__sync_lock_release" {
-            if !args.is_empty() {
-                let ptr = self.lower_expr(&args[0]);
-                self.emit(Instruction::AtomicStore {
-                    ptr, val: Operand::Const(IrConst::I64(0)),
-                    ty: val_ty, ordering: AtomicOrdering::Release,
-                });
-                return Some(Operand::Const(IrConst::I64(0)));
-            }
-        }
-
-        // __sync_synchronize() -> void (full memory barrier)
+        // --- Fences ---
         if name == "__sync_synchronize" {
             self.emit(Instruction::Fence { ordering: AtomicOrdering::SeqCst });
             return Some(Operand::Const(IrConst::I64(0)));
         }
-
-        // __atomic_thread_fence(order) -> void
-        if name == "__atomic_thread_fence" {
-            let ordering = if !args.is_empty() { get_ordering(&args[0]) } else { AtomicOrdering::SeqCst };
+        if name == "__atomic_thread_fence" || name == "__atomic_signal_fence" {
+            let ordering = if !args.is_empty() { Self::parse_ordering(&args[0]) } else { AtomicOrdering::SeqCst };
             self.emit(Instruction::Fence { ordering });
             return Some(Operand::Const(IrConst::I64(0)));
         }
 
-        // __atomic_signal_fence(order) -> void (compiler fence, not hardware)
-        if name == "__atomic_signal_fence" {
-            // Signal fence is a compiler-only barrier, emit as fence for correctness
-            let ordering = if !args.is_empty() { get_ordering(&args[0]) } else { AtomicOrdering::SeqCst };
-            self.emit(Instruction::Fence { ordering });
-            return Some(Operand::Const(IrConst::I64(0)));
-        }
-
-        // __atomic_is_lock_free(size, ptr) -> bool
-        // For simplicity, always return 1 (lock-free) for sizes <= 8
-        if name == "__atomic_is_lock_free" {
-            return Some(Operand::Const(IrConst::I64(1)));
-        }
-
-        // __atomic_always_lock_free(size, ptr) -> bool
-        if name == "__atomic_always_lock_free" {
+        // --- Lock-free queries (always true for sizes <= 8) ---
+        if name == "__atomic_is_lock_free" || name == "__atomic_always_lock_free" {
             return Some(Operand::Const(IrConst::I64(1)));
         }
 
         None
+    }
+
+    // --- Atomic builtin helpers ---
+
+    /// Parse a memory ordering constant from an expression.
+    fn parse_ordering(arg: &Expr) -> AtomicOrdering {
+        match arg {
+            Expr::IntLiteral(v, _) => match *v as i32 {
+                0 => AtomicOrdering::Relaxed,
+                1 | 2 => AtomicOrdering::Acquire, // consume maps to acquire
+                3 => AtomicOrdering::Release,
+                4 => AtomicOrdering::AcqRel,
+                _ => AtomicOrdering::SeqCst,
+            },
+            _ => AtomicOrdering::SeqCst,
+        }
+    }
+
+    /// Classify __atomic_fetch_OP / __sync_fetch_and_OP builtins.
+    /// Returns (rmw_op, is_sync).
+    fn classify_fetch_op(name: &str) -> Option<(AtomicRmwOp, bool)> {
+        match name {
+            "__atomic_fetch_add" => Some((AtomicRmwOp::Add, false)),
+            "__atomic_fetch_sub" => Some((AtomicRmwOp::Sub, false)),
+            "__atomic_fetch_and" => Some((AtomicRmwOp::And, false)),
+            "__atomic_fetch_or"  => Some((AtomicRmwOp::Or, false)),
+            "__atomic_fetch_xor" => Some((AtomicRmwOp::Xor, false)),
+            "__atomic_fetch_nand" => Some((AtomicRmwOp::Nand, false)),
+            "__sync_fetch_and_add" => Some((AtomicRmwOp::Add, true)),
+            "__sync_fetch_and_sub" => Some((AtomicRmwOp::Sub, true)),
+            "__sync_fetch_and_and" => Some((AtomicRmwOp::And, true)),
+            "__sync_fetch_and_or"  => Some((AtomicRmwOp::Or, true)),
+            "__sync_fetch_and_xor" => Some((AtomicRmwOp::Xor, true)),
+            "__sync_fetch_and_nand" => Some((AtomicRmwOp::Nand, true)),
+            _ => None,
+        }
+    }
+
+    /// Classify __atomic_OP_fetch / __sync_OP_and_fetch builtins.
+    /// Returns (rmw_op, bin_op_for_recompute, is_nand, is_sync).
+    fn classify_op_fetch(name: &str) -> Option<(AtomicRmwOp, IrBinOp, bool, bool)> {
+        match name {
+            "__atomic_add_fetch" => Some((AtomicRmwOp::Add, IrBinOp::Add, false, false)),
+            "__atomic_sub_fetch" => Some((AtomicRmwOp::Sub, IrBinOp::Sub, false, false)),
+            "__atomic_and_fetch" => Some((AtomicRmwOp::And, IrBinOp::And, false, false)),
+            "__atomic_or_fetch"  => Some((AtomicRmwOp::Or, IrBinOp::Or, false, false)),
+            "__atomic_xor_fetch" => Some((AtomicRmwOp::Xor, IrBinOp::Xor, false, false)),
+            "__atomic_nand_fetch" => Some((AtomicRmwOp::Nand, IrBinOp::And, true, false)),
+            "__sync_add_and_fetch" => Some((AtomicRmwOp::Add, IrBinOp::Add, false, true)),
+            "__sync_sub_and_fetch" => Some((AtomicRmwOp::Sub, IrBinOp::Sub, false, true)),
+            "__sync_and_and_fetch" => Some((AtomicRmwOp::And, IrBinOp::And, false, true)),
+            "__sync_or_and_fetch"  => Some((AtomicRmwOp::Or, IrBinOp::Or, false, true)),
+            "__sync_xor_and_fetch" => Some((AtomicRmwOp::Xor, IrBinOp::Xor, false, true)),
+            "__sync_nand_and_fetch" => Some((AtomicRmwOp::Nand, IrBinOp::And, true, true)),
+            _ => None,
+        }
+    }
+
+    /// After an atomic RMW that returns the old value, compute the new value.
+    /// For nand: ~(old & val). For others: old bin_op val.
+    fn emit_post_rmw_compute(
+        &mut self, old_val: Value, val_expr: Operand, bin_op: IrBinOp, is_nand: bool, ty: IrType,
+    ) -> Value {
+        if is_nand {
+            let and_val = self.fresh_value();
+            self.emit(Instruction::BinOp {
+                dest: and_val, op: IrBinOp::And,
+                lhs: Operand::Value(old_val), rhs: val_expr, ty,
+            });
+            let result = self.fresh_value();
+            self.emit(Instruction::UnaryOp {
+                dest: result, op: IrUnaryOp::Not, src: Operand::Value(and_val), ty,
+            });
+            result
+        } else {
+            let result = self.fresh_value();
+            self.emit(Instruction::BinOp {
+                dest: result, op: bin_op,
+                lhs: Operand::Value(old_val), rhs: val_expr, ty,
+            });
+            result
+        }
+    }
+
+    /// Emit an atomic exchange (xchg) instruction, returning the old value.
+    fn emit_atomic_xchg(
+        &mut self, ptr: Operand, val: Operand, ty: IrType, ordering: AtomicOrdering,
+    ) -> Value {
+        let dest = self.fresh_value();
+        self.emit(Instruction::AtomicRmw {
+            dest, op: AtomicRmwOp::Xchg, ptr, val, ty, ordering,
+        });
+        dest
+    }
+
+    /// Emit a compare-exchange with writeback to expected_ptr and equality comparison.
+    /// Shared by __atomic_compare_exchange and __atomic_compare_exchange_n.
+    fn emit_cmpxchg_with_writeback(
+        &mut self,
+        ptr: Operand,
+        expected_ptr_op: Operand,
+        expected: Value,
+        desired: Operand,
+        ty: IrType,
+        success_ordering: AtomicOrdering,
+        failure_ordering: AtomicOrdering,
+    ) -> Operand {
+        let old_val = self.fresh_value();
+        self.emit(Instruction::AtomicCmpxchg {
+            dest: old_val, ptr, expected: Operand::Value(expected), desired,
+            ty, success_ordering, failure_ordering, returns_bool: false,
+        });
+        // Store old value back to expected_ptr (updates expected on failure)
+        self.store_through_ptr(expected_ptr_op, Operand::Value(old_val), ty);
+        // Compare old == expected to produce bool result
+        let result = self.fresh_value();
+        self.emit(Instruction::Cmp {
+            dest: result, op: IrCmpOp::Eq,
+            lhs: Operand::Value(old_val), rhs: Operand::Value(expected), ty,
+        });
+        Operand::Value(result)
+    }
+
+    /// Load a value through a pointer operand.
+    fn load_through_ptr(&mut self, ptr_op: Operand, ty: IrType) -> Value {
+        let ptr_val = self.operand_to_value(ptr_op);
+        let dest = self.fresh_value();
+        self.emit(Instruction::Load { dest, ptr: ptr_val, ty });
+        dest
+    }
+
+    /// Store a value through a pointer operand.
+    fn store_through_ptr(&mut self, ptr_op: Operand, val: Operand, ty: IrType) {
+        let ptr_val = self.operand_to_value(ptr_op);
+        self.emit(Instruction::Store { val, ptr: ptr_val, ty });
     }
 
     /// Get the IR type of the pointee for a pointer expression.
