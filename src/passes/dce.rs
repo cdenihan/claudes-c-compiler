@@ -128,6 +128,10 @@ fn collect_instruction_uses(inst: &Instruction, used: &mut HashSet<u32>) {
             collect_operand_uses(src, used);
         }
         Instruction::GlobalAddr { .. } => {}
+        Instruction::Memcpy { dest, src, .. } => {
+            used.insert(dest.0);
+            used.insert(src.0);
+        }
     }
 }
 
@@ -158,7 +162,8 @@ fn has_side_effects(inst: &Instruction) -> bool {
     matches!(inst,
         Instruction::Store { .. } |
         Instruction::Call { .. } |
-        Instruction::CallIndirect { .. }
+        Instruction::CallIndirect { .. } |
+        Instruction::Memcpy { .. }
     )
 }
 
@@ -177,6 +182,7 @@ fn get_dest(inst: &Instruction) -> Option<Value> {
         Instruction::Copy { dest, .. } => Some(*dest),
         Instruction::GlobalAddr { dest, .. } => Some(*dest),
         Instruction::Store { .. } => None,
+        Instruction::Memcpy { .. } => None,
     }
 }
 

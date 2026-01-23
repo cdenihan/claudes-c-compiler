@@ -441,6 +441,38 @@ impl ArchCodegen for RiscvCodegen {
         self.store_t0_to(dest);
     }
 
+    fn emit_memcpy(&mut self, dest: &Value, src: &Value, size: usize) {
+        // Load dest address into t1, src address into t2
+        if let Some(dst_slot) = self.state.get_slot(dest.0) {
+            if self.state.is_alloca(dest.0) {
+                self.emit_addi_s0("t1", dst_slot.0);
+            } else {
+                self.emit_load_from_s0("t1", dst_slot.0, "ld");
+            }
+        }
+        if let Some(src_slot) = self.state.get_slot(src.0) {
+            if self.state.is_alloca(src.0) {
+                self.emit_addi_s0("t2", src_slot.0);
+            } else {
+                self.emit_load_from_s0("t2", src_slot.0, "ld");
+            }
+        }
+        // Inline byte-by-byte copy using a loop
+        let label_id = self.state.next_label_id();
+        let loop_label = format!(".Lmemcpy_loop_{}", label_id);
+        let done_label = format!(".Lmemcpy_done_{}", label_id);
+        self.state.emit(&format!("    li t3, {}", size));
+        self.state.emit(&format!("{}:", loop_label));
+        self.state.emit(&format!("    beqz t3, {}", done_label));
+        self.state.emit("    lbu t4, 0(t2)");
+        self.state.emit("    sb t4, 0(t1)");
+        self.state.emit("    addi t1, t1, 1");
+        self.state.emit("    addi t2, t2, 1");
+        self.state.emit("    addi t3, t3, -1");
+        self.state.emit(&format!("    j {}", loop_label));
+        self.state.emit(&format!("{}:", done_label));
+    }
+
     fn emit_return(&mut self, val: Option<&Operand>, frame_size: i64) {
         if let Some(val) = val {
             self.operand_to_t0(val);

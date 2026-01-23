@@ -446,6 +446,27 @@ impl ArchCodegen for X86Codegen {
         self.store_rax_to(dest);
     }
 
+    fn emit_memcpy(&mut self, dest: &Value, src: &Value, size: usize) {
+        // Load dest address into rdi, src address into rsi
+        if let Some(dst_slot) = self.state.get_slot(dest.0) {
+            if self.state.is_alloca(dest.0) {
+                self.state.emit(&format!("    leaq {}(%rbp), %rdi", dst_slot.0));
+            } else {
+                self.state.emit(&format!("    movq {}(%rbp), %rdi", dst_slot.0));
+            }
+        }
+        if let Some(src_slot) = self.state.get_slot(src.0) {
+            if self.state.is_alloca(src.0) {
+                self.state.emit(&format!("    leaq {}(%rbp), %rsi", src_slot.0));
+            } else {
+                self.state.emit(&format!("    movq {}(%rbp), %rsi", src_slot.0));
+            }
+        }
+        // Inline memcpy using rep movsb
+        self.state.emit(&format!("    movq ${}, %rcx", size));
+        self.state.emit("    rep movsb");
+    }
+
     fn emit_return(&mut self, val: Option<&Operand>, _frame_size: i64) {
         if let Some(val) = val {
             self.operand_to_rax(val);

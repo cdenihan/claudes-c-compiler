@@ -109,6 +109,9 @@ pub enum Instruction {
 
     /// Get address of a global
     GlobalAddr { dest: Value, name: String },
+
+    /// Memory copy: memcpy(dest, src, size)
+    Memcpy { dest: Value, src: Value, size: usize },
 }
 
 /// Block terminator.

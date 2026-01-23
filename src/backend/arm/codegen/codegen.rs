@@ -525,6 +525,36 @@ impl ArchCodegen for ArmCodegen {
         self.store_x0_to(dest);
     }
 
+    fn emit_memcpy(&mut self, dest: &Value, src: &Value, size: usize) {
+        // Load dest address into x9, src address into x10
+        if let Some(dst_slot) = self.state.get_slot(dest.0) {
+            if self.state.is_alloca(dest.0) {
+                self.emit_add_sp_offset("x9", dst_slot.0);
+            } else {
+                self.emit_load_from_sp("x9", dst_slot.0, "ldr");
+            }
+        }
+        if let Some(src_slot) = self.state.get_slot(src.0) {
+            if self.state.is_alloca(src.0) {
+                self.emit_add_sp_offset("x10", src_slot.0);
+            } else {
+                self.emit_load_from_sp("x10", src_slot.0, "ldr");
+            }
+        }
+        // Inline byte-by-byte copy using a loop
+        let label_id = self.state.next_label_id();
+        let loop_label = format!(".Lmemcpy_loop_{}", label_id);
+        let done_label = format!(".Lmemcpy_done_{}", label_id);
+        self.load_large_imm("x11", size as i64);
+        self.state.emit(&format!("{}:", loop_label));
+        self.state.emit(&format!("    cbz x11, {}", done_label));
+        self.state.emit("    ldrb w12, [x10], #1");
+        self.state.emit("    strb w12, [x9], #1");
+        self.state.emit("    sub x11, x11, #1");
+        self.state.emit(&format!("    b {}", loop_label));
+        self.state.emit(&format!("{}:", done_label));
+    }
+
     fn emit_return(&mut self, val: Option<&Operand>, frame_size: i64) {
         if let Some(val) = val {
             self.operand_to_x0(val);

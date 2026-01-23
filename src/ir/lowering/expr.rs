@@ -30,8 +30,10 @@ impl Lowerer {
                     return Operand::Const(IrConst::I64(val));
                 }
                 if let Some(info) = self.locals.get(name).cloned() {
-                    if info.is_array {
-                        // Arrays decay to pointer: return the alloca address itself
+                    if info.is_array || info.is_struct {
+                        // Arrays and structs decay to address: return the alloca address itself.
+                        // For structs, this is the base address used for member access and
+                        // for passing by value (caller passes address, callee copies).
                         return Operand::Value(info.alloca);
                     }
                     let dest = self.fresh_value();
@@ -266,14 +268,40 @@ impl Lowerer {
                 self.lower_post_inc_dec(inner, *op)
             }
             Expr::Assign(lhs, rhs, _) => {
-                let rhs_val = self.lower_expr(rhs);
-                let ty = self.get_expr_type(lhs);
-                if let Some(lv) = self.lower_lvalue(lhs) {
-                    self.store_lvalue_typed(&lv, rhs_val.clone(), ty);
-                    return rhs_val;
+                // Check if this is a struct/union assignment (needs memcpy)
+                let lhs_is_struct = self.expr_is_struct_value(lhs);
+                if lhs_is_struct {
+                    // Struct assignment: both sides are addresses, use memcpy
+                    let rhs_val = self.lower_expr(rhs);
+                    let struct_size = self.get_struct_size_for_expr(lhs);
+                    if let Some(lv) = self.lower_lvalue(lhs) {
+                        let dest_addr = self.lvalue_addr(&lv);
+                        let src_addr = match rhs_val {
+                            Operand::Value(v) => v,
+                            Operand::Const(_) => {
+                                let tmp = self.fresh_value();
+                                self.emit(Instruction::Copy { dest: tmp, src: rhs_val.clone() });
+                                tmp
+                            }
+                        };
+                        self.emit(Instruction::Memcpy {
+                            dest: dest_addr,
+                            src: src_addr,
+                            size: struct_size,
+                        });
+                        return Operand::Value(dest_addr);
+                    }
+                    rhs_val
+                } else {
+                    let rhs_val = self.lower_expr(rhs);
+                    let ty = self.get_expr_type(lhs);
+                    if let Some(lv) = self.lower_lvalue(lhs) {
+                        self.store_lvalue_typed(&lv, rhs_val.clone(), ty);
+                        return rhs_val;
+                    }
+                    // Fallback: just return the rhs value
+                    rhs_val
                 }
-                // Fallback: just return the rhs value
-                rhs_val
             }
             Expr::CompoundAssign(op, lhs, rhs, _) => {
                 self.lower_compound_assign(op, lhs, rhs)

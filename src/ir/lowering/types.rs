@@ -109,6 +109,49 @@ impl Lowerer {
         }
     }
 
+    /// Check if an expression refers to a struct/union value (not pointer-to-struct).
+    pub(super) fn expr_is_struct_value(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Identifier(name, _) => {
+                if let Some(info) = self.locals.get(name) {
+                    return info.is_struct;
+                }
+                if let Some(ginfo) = self.globals.get(name) {
+                    return ginfo.is_struct;
+                }
+                false
+            }
+            Expr::Deref(_, _) => {
+                // *ptr where ptr points to struct - could be struct value
+                // TODO: track pointed-to type more precisely
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Get the struct size for a struct-valued expression.
+    pub(super) fn get_struct_size_for_expr(&self, expr: &Expr) -> usize {
+        match expr {
+            Expr::Identifier(name, _) => {
+                if let Some(info) = self.locals.get(name) {
+                    if info.is_struct {
+                        return info.alloc_size;
+                    }
+                }
+                if let Some(ginfo) = self.globals.get(name) {
+                    if ginfo.is_struct {
+                        if let Some(ref layout) = ginfo.struct_layout {
+                            return layout.size;
+                        }
+                    }
+                }
+                8 // fallback
+            }
+            _ => 8,
+        }
+    }
+
     /// Get the IR type for an expression (best-effort, based on locals/globals info).
     pub(super) fn get_expr_type(&self, expr: &Expr) -> IrType {
         match expr {

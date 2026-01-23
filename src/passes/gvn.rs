@@ -217,6 +217,7 @@ fn get_inst_dest(inst: &Instruction) -> Option<Value> {
         Instruction::Copy { dest, .. } => Some(*dest),
         Instruction::GlobalAddr { dest, .. } => Some(*dest),
         Instruction::Store { .. } => None,
+        Instruction::Memcpy { .. } => None,
     }
 }
 

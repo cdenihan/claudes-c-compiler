@@ -29,6 +29,8 @@ pub struct CodegenState {
     pub alloca_values: HashSet<u32>,
     /// Type associated with each alloca (for type-aware loads/stores).
     pub alloca_types: HashMap<u32, IrType>,
+    /// Counter for generating unique labels (e.g., memcpy loops).
+    label_counter: u32,
 }
 
 impl CodegenState {
@@ -39,7 +41,14 @@ impl CodegenState {
             value_locations: HashMap::new(),
             alloca_values: HashSet::new(),
             alloca_types: HashMap::new(),
+            label_counter: 0,
         }
+    }
+
+    pub fn next_label_id(&mut self) -> u32 {
+        let id = self.label_counter;
+        self.label_counter += 1;
+        id
     }
 
     pub fn emit(&mut self, s: &str) {
@@ -121,6 +130,9 @@ pub trait ArchCodegen {
 
     /// Emit a type cast.
     fn emit_cast(&mut self, dest: &Value, src: &Operand, from_ty: IrType, to_ty: IrType);
+
+    /// Emit a memory copy: copy `size` bytes from src address to dest address.
+    fn emit_memcpy(&mut self, dest: &Value, src: &Value, size: usize);
 
     /// Emit a return terminator.
     fn emit_return(&mut self, val: Option<&Operand>, frame_size: i64);
@@ -230,6 +242,9 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction) {
         }
         Instruction::GetElementPtr { dest, base, offset, .. } => {
             cg.emit_gep(dest, base, offset);
+        }
+        Instruction::Memcpy { dest, src, size } => {
+            cg.emit_memcpy(dest, src, *size);
         }
     }
 }

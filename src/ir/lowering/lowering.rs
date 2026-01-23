@@ -235,9 +235,33 @@ impl Lowerer {
         // Start entry block
         self.start_block("entry".to_string());
 
-        // Allocate params as local variables
+        // Allocate params as local variables.
+        //
+        // For struct/union pass-by-value params, the caller passes a pointer to its struct.
+        // We use a two-phase approach:
+        // Phase 1: Emit one alloca per param (ptr-sized for struct params, normal for others).
+        //          This ensures find_param_alloca(n) returns the nth param's receiving alloca.
+        // Phase 2: Emit struct-sized allocas and Memcpy for struct params.
+
+        // Phase 1: one alloca per parameter for receiving the argument register value
+        struct StructParamInfo {
+            ptr_alloca: Value,
+            struct_size: usize,
+            struct_layout: Option<StructLayout>,
+            param_name: String,
+        }
+        let mut struct_params: Vec<StructParamInfo> = Vec::new();
+
         for (i, param) in params.iter().enumerate() {
             if !param.name.is_empty() {
+                let is_struct_param = if let Some(orig_param) = func.params.get(i) {
+                    let resolved = self.resolve_type_spec(&orig_param.type_spec);
+                    matches!(resolved, TypeSpecifier::Struct(_, _) | TypeSpecifier::Union(_, _))
+                } else {
+                    false
+                };
+
+                // Emit the alloca that receives the argument value from the register
                 let alloca = self.fresh_value();
                 let ty = param.ty;
                 self.emit(Instruction::Alloca {
@@ -246,41 +270,82 @@ impl Lowerer {
                     size: ty.size(),
                 });
 
-                // Determine elem_size for pointer parameters from the original type spec.
-                // e.g., for `int *p`, elem_size should be sizeof(int) = 4.
-                let elem_size = if ty == IrType::Ptr {
-                    if let Some(orig_param) = func.params.get(i) {
-                        self.pointee_elem_size(&orig_param.type_spec)
-                    } else {
-                        0
-                    }
+                if is_struct_param {
+                    // Record that we need to create a struct copy for this param
+                    let layout = func.params.get(i)
+                        .and_then(|p| self.get_struct_layout_for_type(&p.type_spec));
+                    let struct_size = layout.as_ref().map_or(8, |l| l.size);
+                    struct_params.push(StructParamInfo {
+                        ptr_alloca: alloca,
+                        struct_size,
+                        struct_layout: layout,
+                        param_name: param.name.clone(),
+                    });
                 } else {
-                    0
-                };
+                    // Normal parameter: register as local immediately
+                    let elem_size = if ty == IrType::Ptr {
+                        func.params.get(i).map_or(0, |p| self.pointee_elem_size(&p.type_spec))
+                    } else { 0 };
 
-                // Determine pointee type for pointer parameters
-                let pointee_type = if ty == IrType::Ptr {
-                    if let Some(orig_param) = func.params.get(i) {
-                        self.pointee_ir_type(&orig_param.type_spec)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+                    let pointee_type = if ty == IrType::Ptr {
+                        func.params.get(i).and_then(|p| self.pointee_ir_type(&p.type_spec))
+                    } else { None };
 
-                self.locals.insert(param.name.clone(), LocalInfo {
-                    alloca,
-                    elem_size,
-                    is_array: false,
-                    ty,
-                    pointee_type,
-                    struct_layout: None,
-                    is_struct: false,
-                    alloc_size: 8,
-                    array_dim_strides: vec![],
-                });
+                    let struct_layout = if ty == IrType::Ptr {
+                        func.params.get(i).and_then(|p| self.get_struct_layout_for_pointer_param(&p.type_spec))
+                    } else { None };
+
+                    self.locals.insert(param.name.clone(), LocalInfo {
+                        alloca,
+                        elem_size,
+                        is_array: false,
+                        ty,
+                        pointee_type,
+                        struct_layout,
+                        is_struct: false,
+                        alloc_size: ty.size(),
+                        array_dim_strides: vec![],
+                    });
+                }
             }
+        }
+
+        // Phase 2: For struct params, emit the struct-sized alloca + memcpy
+        for sp in struct_params {
+            let struct_alloca = self.fresh_value();
+            self.emit(Instruction::Alloca {
+                dest: struct_alloca,
+                ty: IrType::Ptr,
+                size: sp.struct_size,
+            });
+
+            // Load the incoming pointer from the ptr_alloca (stored by emit_store_params)
+            let src_ptr = self.fresh_value();
+            self.emit(Instruction::Load {
+                dest: src_ptr,
+                ptr: sp.ptr_alloca,
+                ty: IrType::Ptr,
+            });
+
+            // Copy struct data from the caller's struct to our local alloca
+            self.emit(Instruction::Memcpy {
+                dest: struct_alloca,
+                src: src_ptr,
+                size: sp.struct_size,
+            });
+
+            // Register the struct alloca as the local variable
+            self.locals.insert(sp.param_name, LocalInfo {
+                alloca: struct_alloca,
+                elem_size: 0,
+                is_array: false,
+                ty: IrType::Ptr,
+                pointee_type: None,
+                struct_layout: sp.struct_layout,
+                is_struct: true,
+                alloc_size: sp.struct_size,
+                array_dim_strides: vec![],
+            });
         }
 
         // Lower body
@@ -687,6 +752,15 @@ impl Lowerer {
         }
     }
 
+
+    /// For a pointer-to-struct parameter type (e.g., `struct TAG *p`), get the
+    /// pointed-to struct's layout. This enables `p->field` access.
+    pub(super) fn get_struct_layout_for_pointer_param(&self, type_spec: &TypeSpecifier) -> Option<StructLayout> {
+        match type_spec {
+            TypeSpecifier::Pointer(inner) => self.get_struct_layout_for_type(inner),
+            _ => None,
+        }
+    }
 
     /// Compute the IR type of the pointee for a pointer/array type specifier.
     /// For `Pointer(Char)`, returns Some(I8).

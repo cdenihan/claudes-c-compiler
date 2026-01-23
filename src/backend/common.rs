@@ -299,5 +299,6 @@ pub fn instruction_dest(inst: &Instruction) -> Option<Value> {
         Instruction::Call { dest, .. }
         | Instruction::CallIndirect { dest, .. } => *dest,
         Instruction::Store { .. } => None,
+        Instruction::Memcpy { .. } => None,
     }
 }
