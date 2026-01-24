@@ -534,7 +534,9 @@ impl Lowerer {
     }
 
     /// Determine the common complex type for binary operations.
-    /// Rules: ComplexLongDouble > ComplexDouble > ComplexFloat
+    /// Per C11 6.3.1.8: integer types rank below float in the type hierarchy,
+    /// so they adopt the complex type of the other operand rather than forcing
+    /// promotion to ComplexDouble.
     pub(super) fn common_complex_type(&self, a: &CType, b: &CType) -> CType {
         // Per C11 6.3.1.8: if one operand is complex and the other is real/integer,
         // the result type is determined by the "usual arithmetic conversions" applied

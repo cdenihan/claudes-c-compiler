@@ -2648,26 +2648,46 @@ impl Lowerer {
             // Get LHS pointer (the complex variable address)
             let lhs_ptr = self.lower_complex_lvalue(lhs);
 
+            // If result type differs from LHS type, convert LHS value to result type
+            let op_lhs_ptr = if result_ct != lhs_ct {
+                let lhs_converted = self.convert_to_complex(
+                    Operand::Value(lhs_ptr), &lhs_ct, &result_ct
+                );
+                self.operand_to_value(lhs_converted)
+            } else {
+                lhs_ptr
+            };
+
             // Lower and convert RHS to complex
             let rhs_val = self.lower_expr(rhs);
             let rhs_complex = self.convert_to_complex(rhs_val, &rhs_ct, &result_ct);
             let rhs_ptr = self.operand_to_value(rhs_complex);
 
-            // Perform the operation
+            // Perform the operation in result_ct
             let result = match op {
-                BinOp::Add => self.lower_complex_add(lhs_ptr, rhs_ptr, &result_ct),
-                BinOp::Sub => self.lower_complex_sub(lhs_ptr, rhs_ptr, &result_ct),
-                BinOp::Mul => self.lower_complex_mul(lhs_ptr, rhs_ptr, &result_ct),
-                BinOp::Div => self.lower_complex_div(lhs_ptr, rhs_ptr, &result_ct),
+                BinOp::Add => self.lower_complex_add(op_lhs_ptr, rhs_ptr, &result_ct),
+                BinOp::Sub => self.lower_complex_sub(op_lhs_ptr, rhs_ptr, &result_ct),
+                BinOp::Mul => self.lower_complex_mul(op_lhs_ptr, rhs_ptr, &result_ct),
+                BinOp::Div => self.lower_complex_div(op_lhs_ptr, rhs_ptr, &result_ct),
                 _ => unreachable!(),
             };
 
-            // Store result back into LHS
-            let result_ptr = self.operand_to_value(result);
-            let comp_size = Self::complex_component_size(&result_ct);
+            // If result type differs from LHS type, convert back to LHS type before storing
+            let store_ptr = if result_ct != lhs_ct {
+                let result_ptr = self.operand_to_value(result);
+                let converted_back = self.convert_to_complex(
+                    Operand::Value(result_ptr), &result_ct, &lhs_ct
+                );
+                self.operand_to_value(converted_back)
+            } else {
+                self.operand_to_value(result)
+            };
+
+            // Store result back into LHS using LHS type size
+            let comp_size = Self::complex_component_size(&lhs_ct);
             self.emit(Instruction::Memcpy {
                 dest: lhs_ptr,
-                src: result_ptr,
+                src: store_ptr,
                 size: comp_size * 2,
             });
 
