@@ -1,5 +1,5 @@
 Task: fix_has_builtin_and_glibc_compat
-Status: in_progress
+Status: completed
 
 Fix __has_builtin to properly detect supported builtins, bump __GNUC_MINOR__ to 8
 for glibc prereq compatibility, and add __float128 -> long double mapping for
