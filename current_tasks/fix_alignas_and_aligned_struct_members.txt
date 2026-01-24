@@ -1,0 +1,14 @@
+Fix _Alignas and __attribute__((aligned(N))) on struct/union members
+
+Currently both _Alignas(N) and __attribute__((aligned(N))) on struct/union
+member declarations are parsed but the alignment values are discarded.
+This causes incorrect struct layout: member offsets and struct sizes/alignments
+don't account for per-field alignment requirements.
+
+Plan:
+1. Add `alignment: Option<usize>` to StructField and StructFieldDecl
+2. Parse _Alignas(N) values instead of skip_balanced_parens()
+3. Wire __attribute__((aligned(N))) through to struct field alignment
+4. Update StructLayout::for_struct_with_packing to use per-field alignment
+5. Update for_union similarly
+6. Also handle _Alignas on the struct type itself
