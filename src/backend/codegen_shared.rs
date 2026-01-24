@@ -1318,14 +1318,40 @@ pub enum CallArgClass {
     /// 128-bit integer in a GP register pair. `base_reg_idx` is the first register.
     I128RegPair { base_reg_idx: usize },
     /// F128 (long double) — handling is arch-specific (x87 on x86, Q-reg on ARM, GP pair on RISC-V).
-    /// `reg_or_stack` indicates whether it goes in registers or overflows to stack.
     F128Reg { reg_idx: usize },
+    /// Small struct (<=16 bytes) passed by value in 1-2 GP registers.
+    StructByValReg { base_reg_idx: usize, size: usize },
+    /// Small struct (<=16 bytes) that overflows to the stack.
+    StructByValStack { size: usize },
+    /// Large struct (>16 bytes) passed on the stack (MEMORY class).
+    LargeStructStack { size: usize },
     /// Argument overflows to the stack (normal 8-byte).
     Stack,
     /// F128 argument overflows to the stack (16-byte aligned).
     F128Stack,
     /// I128 argument overflows to the stack (16-byte aligned).
     I128Stack,
+}
+
+impl CallArgClass {
+    /// Returns true if this argument is passed on the stack (any kind).
+    pub fn is_stack(&self) -> bool {
+        matches!(self, CallArgClass::Stack | CallArgClass::F128Stack |
+                 CallArgClass::I128Stack | CallArgClass::StructByValStack { .. } |
+                 CallArgClass::LargeStructStack { .. })
+    }
+
+    /// Returns the stack space consumed by this argument (0 if register).
+    pub fn stack_bytes(&self) -> usize {
+        match self {
+            CallArgClass::F128Stack | CallArgClass::I128Stack => 16,
+            CallArgClass::StructByValStack { size } | CallArgClass::LargeStructStack { size } => {
+                (*size + 7) & !7 // round up to 8-byte alignment
+            }
+            CallArgClass::Stack => 8,
+            _ => 0,
+        }
+    }
 }
 
 /// ABI configuration for call argument classification.
@@ -1347,9 +1373,12 @@ pub struct CallAbiConfig {
 
 /// Classify all arguments for a function call, returning a `CallArgClass` per argument.
 /// This captures the shared classification logic used identically by all three backends.
+/// `struct_arg_sizes` indicates which args are struct/union by-value: Some(size) for struct
+/// args, None otherwise. Must be the same length as `args` (or shorter, missing = None).
 pub fn classify_call_args(
     args: &[Operand],
     arg_types: &[IrType],
+    struct_arg_sizes: &[Option<usize>],
     is_variadic: bool,
     config: &CallAbiConfig,
 ) -> Vec<CallArgClass> {
@@ -1358,6 +1387,7 @@ pub fn classify_call_args(
     let mut float_idx = 0usize;
 
     for (i, arg) in args.iter().enumerate() {
+        let struct_size = struct_arg_sizes.get(i).copied().flatten();
         let arg_ty = if i < arg_types.len() { Some(arg_types[i]) } else { None };
         let is_long_double = arg_ty.map(|t| t.is_long_double()).unwrap_or(false);
         let is_i128 = arg_ty.map(|t| is_i128_type(t)).unwrap_or(false);
@@ -1369,7 +1399,24 @@ pub fn classify_call_args(
         // Variadic floats go through GP registers on RISC-V
         let force_gp = is_variadic && config.variadic_floats_in_gp && is_float && !is_long_double;
 
-        if is_i128 {
+        // Struct args are classified first (before scalar type checks)
+        if let Some(size) = struct_size {
+            if size <= 16 {
+                // Small struct: pass by value in 1-2 GP registers (INTEGER class)
+                let regs_needed = if size <= 8 { 1 } else { 2 };
+                if int_idx + regs_needed <= config.max_int_regs {
+                    result.push(CallArgClass::StructByValReg { base_reg_idx: int_idx, size });
+                    int_idx += regs_needed;
+                } else {
+                    // Overflow to stack
+                    result.push(CallArgClass::StructByValStack { size });
+                    int_idx = config.max_int_regs;
+                }
+            } else {
+                // Large struct (>16 bytes, MEMORY class): pass on the stack
+                result.push(CallArgClass::LargeStructStack { size });
+            }
+        } else if is_i128 {
             if config.align_i128_pairs && int_idx % 2 != 0 {
                 int_idx += 1;
             }
@@ -1417,6 +1464,35 @@ pub fn classify_call_args(
     }
 
     result
+}
+
+/// Compute the total stack space needed for stack-overflow arguments.
+/// Returns the total bytes needed, 16-byte aligned.
+/// Use this for ARM and RISC-V which pre-allocate stack space with a single SP adjustment.
+pub fn compute_stack_arg_space(arg_classes: &[CallArgClass]) -> usize {
+    let mut total: usize = 0;
+    for cls in arg_classes {
+        if !cls.is_stack() { continue; }
+        // F128 and I128 need 16-byte alignment
+        if matches!(cls, CallArgClass::F128Stack | CallArgClass::I128Stack) {
+            total = (total + 15) & !15;
+        }
+        total += cls.stack_bytes();
+    }
+    (total + 15) & !15 // final 16-byte alignment
+}
+
+/// Compute the raw bytes that will be pushed onto the stack for stack arguments.
+/// Unlike `compute_stack_arg_space`, this does NOT apply final 16-byte alignment,
+/// because x86 uses individual `pushq` instructions and handles alignment separately
+/// via a padding `subq $8, %rsp` before the pushes.
+pub fn compute_stack_push_bytes(arg_classes: &[CallArgClass]) -> usize {
+    let mut total: usize = 0;
+    for cls in arg_classes {
+        if !cls.is_stack() { continue; }
+        total += cls.stack_bytes();
+    }
+    total
 }
 
 // ============================================================================

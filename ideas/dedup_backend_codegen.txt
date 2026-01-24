@@ -46,9 +46,17 @@ Completed items:
   All three backends now use the shared default.
 - CallArgClass enum + classify_call_args(): Shared function call argument classification
   with CallAbiConfig for arch-specific register counts and alignment rules.
+- emit_call: All three backends now use classify_call_args() with struct support
+  (StructByValReg, StructByValStack, LargeStructStack variants). Shared
+  compute_stack_arg_space() (ARM/RISC-V) and compute_stack_push_bytes() (x86).
+  Previously ~1343 lines of duplicated classification logic; now shared.
 
 Remaining opportunities (diminishing returns):
 
 1. Parameter classification: emit_store_params still independently classify params. The
    shared classify_call_args() could be extended to cover this, but the store operations
    are sufficiently arch-specific that the benefit is limited.
+
+2. emit_call emission phases: The register loading, stack arg handling, and return value
+   storage within emit_call are still per-backend (arch-specific instructions). Further
+   extraction would require many new ArchCodegen primitives for diminishing returns.

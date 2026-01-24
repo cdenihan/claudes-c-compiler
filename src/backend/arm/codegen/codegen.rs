@@ -1453,290 +1453,168 @@ impl ArchCodegen for ArmCodegen {
 
     fn emit_call(&mut self, args: &[Operand], arg_types: &[IrType], direct_name: Option<&str>,
                  func_ptr: Option<&Operand>, dest: Option<Value>, return_type: IrType,
-                 is_variadic: bool, num_fixed_args: usize, struct_arg_sizes: &[Option<usize>]) {
+                 _is_variadic: bool, _num_fixed_args: usize, struct_arg_sizes: &[Option<usize>]) {
         // For indirect calls, spill the function pointer to a dedicated stack slot.
-        // We cannot use x17 to hold it across argument setup because x17 is used as
-        // a scratch register by emit_load_from_sp/emit_store_to_sp/emit_add_sp_offset
-        // for large stack offsets (> 4095). Instead, push the function pointer onto
-        // the stack and reload it right before the blr instruction.
+        // x17 is used as scratch by emit_load_from_sp/emit_store_to_sp/emit_add_sp_offset
+        // for large stack offsets, so we spill to stack and reload before blr.
         let indirect_call = func_ptr.is_some() && direct_name.is_none();
         if indirect_call {
-            let ptr = func_ptr.unwrap();
-            self.operand_to_x0(ptr);
-            // Spill function pointer to stack (pre-decrement SP by 16 for alignment)
+            self.operand_to_x0(func_ptr.unwrap());
             self.state.emit("    str x0, [sp, #-16]!");
         }
 
-        // Classify args: determine which go in registers vs stack.
-        // On AArch64 (AAPCS64), ALL float args (both named and variadic) go in FP registers
-        // (d0-d7 / q0-q7), and all int args go in GP registers (x0-x7). Unlike x86-64 and
-        // RISC-V where variadic float args must go through GP registers, AAPCS64 passes them
-        // in FP registers. The callee saves both GP and FP register sets in variadic functions
-        // and va_arg uses __gr_offs/__vr_offs to locate args in the correct save area.
-        // F128 (long double) uses Q registers (128-bit) and consumes one FP register slot.
-        // Arg classes: 'f' = float reg, 'i' = int reg, 's' = stack, 'q' = F128 in Q reg,
-        // 'S' = stack quad (overflow), 'p' = i128 in GP register pair, 'P' = i128 stack,
-        // 'V' = small struct by value in GP regs (<=16 bytes), 'M' = large struct on stack (>16 bytes),
-        // 'v' = small struct overflow to stack
-        let mut arg_classes: Vec<char> = Vec::new();
-        let mut arg_struct_sizes: Vec<usize> = Vec::new(); // struct size for 'V'/'M'/'v' args
-        let mut fi = 0usize;
-        let mut ii = 0usize;
-        let _ = is_variadic; // AAPCS64: variadic status doesn't affect register assignment
-        let _ = num_fixed_args; // AAPCS64: all args use same classification regardless
-        for (i, _arg) in args.iter().enumerate() {
-            let struct_size = struct_arg_sizes.get(i).copied().flatten();
-            let arg_ty = if i < arg_types.len() { Some(arg_types[i]) } else { None };
-            let is_long_double = arg_ty == Some(IrType::F128);
-            let is_i128 = arg_ty.map(|t| is_i128_type(t)).unwrap_or(false);
-            let is_float = if let Some(ty) = arg_ty {
-                ty.is_float()
-            } else {
-                matches!(args[i], Operand::Const(IrConst::F32(_) | IrConst::F64(_)))
-            };
-            if let Some(size) = struct_size {
-                if size <= 16 {
-                    // AAPCS64: Small struct passed by value in 1-2 GP registers
-                    let regs_needed = if size <= 8 { 1 } else { 2 };
-                    if ii + regs_needed <= 8 {
-                        arg_classes.push('V'); // struct by value in GP regs
-                        arg_struct_sizes.push(size);
-                        ii += regs_needed;
-                    } else {
-                        // Overflow to stack
-                        arg_classes.push('v'); // small struct on stack
-                        arg_struct_sizes.push(size);
-                        ii = 8;
-                    }
-                } else {
-                    // AAPCS64: Large struct (>16 bytes) passed on the stack (MEMORY class)
-                    arg_classes.push('M');
-                    arg_struct_sizes.push(size);
-                }
-            } else if is_i128 {
-                // AAPCS64: 128-bit integers go in even-aligned GP register pair
-                if ii % 2 != 0 { ii += 1; } // align to even register
-                if ii + 1 < 8 {
-                    arg_classes.push('p'); // GP register pair
-                    ii += 2;
-                } else {
-                    arg_classes.push('P'); // stack (16 bytes)
-                    ii = 8;
-                }
-                arg_struct_sizes.push(0);
-            } else if is_long_double {
-                if fi < 8 {
-                    arg_classes.push('q');
-                    fi += 1;
-                } else {
-                    arg_classes.push('S');
-                }
-                arg_struct_sizes.push(0);
-            } else if is_float && fi < 8 {
-                arg_classes.push('f');
-                fi += 1;
-                arg_struct_sizes.push(0);
-            } else if !is_float && ii < 8 {
-                arg_classes.push('i');
-                ii += 1;
-                arg_struct_sizes.push(0);
-            } else {
-                arg_classes.push('s');
-                arg_struct_sizes.push(0);
-            }
-        }
-
-        // Count stack arguments - 'S'/'P' need 16 bytes, 's' args need 8 bytes,
-        // 'M' = large struct (raw data on stack), 'v' = small struct overflow to stack
-        let stack_arg_indices: Vec<usize> = args.iter().enumerate()
-            .filter(|(i, _)| matches!(arg_classes[*i], 's' | 'S' | 'P' | 'M' | 'v'))
-            .map(|(i, _)| i)
-            .collect();
-        let mut stack_arg_space: usize = 0;
-        for &idx in &stack_arg_indices {
-            match arg_classes[idx] {
-                'S' | 'P' => {
-                    // Align to 16 bytes for quad/i128
-                    stack_arg_space = (stack_arg_space + 15) & !15;
-                    stack_arg_space += 16;
-                }
-                'M' => {
-                    // Large struct: raw data on stack, 8-byte aligned
-                    let size = arg_struct_sizes[idx];
-                    stack_arg_space += (size + 7) & !7;
-                }
-                'v' => {
-                    // Small struct overflow to stack
-                    let size = arg_struct_sizes[idx];
-                    stack_arg_space += (size + 7) & !7;
-                }
-                _ => {
-                    stack_arg_space += 8;
-                }
-            }
-        }
-        stack_arg_space = (stack_arg_space + 15) & !15; // Final 16-byte alignment
-
-        // For indirect calls, the function pointer was spilled to [sp] with a 16-byte
-        // pre-decrement. All stack slot references must account for this extra offset.
+        // Use shared classification for AAPCS64
+        let config = CallAbiConfig {
+            max_int_regs: 8, max_float_regs: 8,
+            align_i128_pairs: true,
+            f128_in_fp_regs: true, f128_in_gp_pairs: false,
+            variadic_floats_in_gp: false, // AAPCS64: all floats use FP regs
+        };
+        let arg_classes = classify_call_args(args, arg_types, struct_arg_sizes, _is_variadic, &config);
+        let stack_arg_space = compute_stack_arg_space(&arg_classes);
         let fptr_spill: i64 = if indirect_call { 16 } else { 0 };
 
         // Phase 1: Handle stack args FIRST (before GP temp regs are populated).
-        // Stack arg loading uses x17 as scratch for large offsets (not x16,
-        // since x16 is the last GP temp register for call arguments).
         if stack_arg_space > 0 {
-            // Pre-decrement SP and store stack args
             self.emit_sub_sp(stack_arg_space as i64);
-            // Now we need to load operands with adjusted SP offsets
             let mut stack_offset = 0i64;
-            for &arg_idx in &stack_arg_indices {
+            for (arg_idx, arg) in args.iter().enumerate() {
+                if !arg_classes[arg_idx].is_stack() { continue; }
                 let cls = arg_classes[arg_idx];
-                let is_stack_quad = cls == 'S';
-                let is_stack_i128 = cls == 'P';
-                let is_struct_stack = cls == 'M' || cls == 'v';
-                if is_stack_quad || is_stack_i128 {
-                    // Align stack_offset to 16 bytes for quad-precision or i128
+                // Align for 16-byte types
+                if matches!(cls, CallArgClass::F128Stack | CallArgClass::I128Stack) {
                     stack_offset = (stack_offset + 15) & !15;
                 }
-                if is_struct_stack {
-                    // Struct by value on stack: copy raw struct data from memory.
-                    // The operand is the address (alloca pointer) of the struct.
-                    let size = arg_struct_sizes[arg_idx];
-                    let n_dwords = (size + 7) / 8;
-                    // Load struct address into x0
-                    match &args[arg_idx] {
-                        Operand::Value(v) => {
-                            if let Some(slot) = self.state.get_slot(v.0) {
-                                let adjusted = slot.0 + stack_arg_space as i64 + fptr_spill;
-                                if self.state.is_alloca(v.0) {
-                                    self.emit_add_sp_offset("x0", adjusted);
+                match cls {
+                    CallArgClass::StructByValStack { size } | CallArgClass::LargeStructStack { size } => {
+                        let n_dwords = (size + 7) / 8;
+                        match arg {
+                            Operand::Value(v) => {
+                                if let Some(slot) = self.state.get_slot(v.0) {
+                                    let adjusted = slot.0 + stack_arg_space as i64 + fptr_spill;
+                                    if self.state.is_alloca(v.0) {
+                                        self.emit_add_sp_offset("x0", adjusted);
+                                    } else {
+                                        self.emit_load_from_sp("x0", adjusted, "ldr");
+                                    }
                                 } else {
-                                    self.emit_load_from_sp("x0", adjusted, "ldr");
+                                    self.state.emit("    mov x0, #0");
                                 }
-                            } else {
-                                self.state.emit("    mov x0, #0");
                             }
+                            Operand::Const(_) => { self.operand_to_x0(arg); }
                         }
-                        Operand::Const(_) => {
-                            self.operand_to_x0(&args[arg_idx]);
+                        for qi in 0..n_dwords {
+                            let src_off = (qi * 8) as i64;
+                            self.state.emit(&format!("    ldr x1, [x0, #{}]", src_off));
+                            self.emit_store_to_sp("x1", stack_offset + src_off, "str");
                         }
+                        stack_offset += (n_dwords as i64) * 8;
                     }
-                    // x0 now holds the struct address; copy data to stack
-                    for qi in 0..n_dwords {
-                        let src_off = (qi * 8) as i64;
-                        let dst_off = stack_offset + src_off;
-                        self.state.emit(&format!("    ldr x1, [x0, #{}]", src_off));
-                        self.emit_store_to_sp("x1", dst_off, "str");
-                    }
-                    stack_offset += (n_dwords as i64) * 8;
-                    continue;
-                }
-                if is_stack_i128 {
-                    // 128-bit integer stack arg
-                    // Load 128-bit value, adjusting for SP movement
-                    match &args[arg_idx] {
-                        Operand::Const(c) => {
-                            if let IrConst::I128(v) = c {
-                                let low = *v as u64;
-                                let high = (*v >> 64) as u64;
-                                self.emit_load_imm64("x0", low as i64);
-                                self.emit_store_to_sp("x0", stack_offset, "str");
-                                self.emit_load_imm64("x0", high as i64);
-                                self.emit_store_to_sp("x0", stack_offset + 8, "str");
-                            } else {
-                                self.operand_to_x0(&args[arg_idx]);
-                                self.emit_store_to_sp("x0", stack_offset, "str");
-                                self.state.emit("    mov x0, #0");
-                                self.emit_store_to_sp("x0", stack_offset + 8, "str");
-                            }
-                        }
-                        Operand::Value(v) => {
-                            if let Some(slot) = self.state.get_slot(v.0) {
-                                let adjusted = slot.0 + stack_arg_space as i64 + fptr_spill;
-                                if self.state.is_alloca(v.0) {
-                                    self.emit_add_sp_offset("x0", adjusted);
+                    CallArgClass::I128Stack => {
+                        match arg {
+                            Operand::Const(c) => {
+                                if let IrConst::I128(v) = c {
+                                    self.emit_load_imm64("x0", *v as u64 as i64);
+                                    self.emit_store_to_sp("x0", stack_offset, "str");
+                                    self.emit_load_imm64("x0", (*v >> 64) as u64 as i64);
+                                    self.emit_store_to_sp("x0", stack_offset + 8, "str");
+                                } else {
+                                    self.operand_to_x0(arg);
                                     self.emit_store_to_sp("x0", stack_offset, "str");
                                     self.state.emit("    mov x0, #0");
                                     self.emit_store_to_sp("x0", stack_offset + 8, "str");
+                                }
+                            }
+                            Operand::Value(v) => {
+                                if let Some(slot) = self.state.get_slot(v.0) {
+                                    let adjusted = slot.0 + stack_arg_space as i64 + fptr_spill;
+                                    if self.state.is_alloca(v.0) {
+                                        self.emit_add_sp_offset("x0", adjusted);
+                                        self.emit_store_to_sp("x0", stack_offset, "str");
+                                        self.state.emit("    mov x0, #0");
+                                        self.emit_store_to_sp("x0", stack_offset + 8, "str");
+                                    } else {
+                                        self.emit_load_from_sp("x0", adjusted, "ldr");
+                                        self.emit_store_to_sp("x0", stack_offset, "str");
+                                        self.emit_load_from_sp("x0", adjusted + 8, "ldr");
+                                        self.emit_store_to_sp("x0", stack_offset + 8, "str");
+                                    }
                                 } else {
-                                    // 128-bit value: load both halves
-                                    self.emit_load_from_sp("x0", adjusted, "ldr");
+                                    self.state.emit("    mov x0, #0");
                                     self.emit_store_to_sp("x0", stack_offset, "str");
-                                    self.emit_load_from_sp("x0", adjusted + 8, "ldr");
                                     self.emit_store_to_sp("x0", stack_offset + 8, "str");
                                 }
-                            } else {
-                                self.state.emit("    mov x0, #0");
+                            }
+                        }
+                        stack_offset += 16;
+                    }
+                    CallArgClass::F128Stack => {
+                        match arg {
+                            Operand::Const(c) => {
+                                let f64_val = match c {
+                                    IrConst::LongDouble(v) => *v,
+                                    IrConst::F64(v) => *v,
+                                    _ => c.to_f64().unwrap_or(0.0),
+                                };
+                                let bytes = crate::ir::ir::f64_to_f128_bytes(f64_val);
+                                let lo = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                                let hi = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+                                self.emit_load_imm64("x0", lo as i64);
                                 self.emit_store_to_sp("x0", stack_offset, "str");
+                                self.emit_load_imm64("x0", hi as i64);
                                 self.emit_store_to_sp("x0", stack_offset + 8, "str");
                             }
-                        }
-                    }
-                    stack_offset += 16;
-                    continue;
-                }
-                // For constants, no SP adjustment needed
-                match &args[arg_idx] {
-                    Operand::Const(c) => {
-                        if is_stack_quad {
-                            // F128 overflow to stack: emit the quad-precision constant directly
-                            let f64_val = match c {
-                                IrConst::LongDouble(v) => *v,
-                                IrConst::F64(v) => *v,
-                                _ => c.to_f64().unwrap_or(0.0),
-                            };
-                            let bytes = crate::ir::ir::f64_to_f128_bytes(f64_val);
-                            let lo = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-                            let hi = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-                            self.emit_load_imm64("x0", lo as i64);
-                            self.emit_store_to_sp("x0", stack_offset, "str");
-                            self.emit_load_imm64("x0", hi as i64);
-                            self.emit_store_to_sp("x0", stack_offset + 8, "str");
-                        } else {
-                            self.operand_to_x0(&args[arg_idx]);
-                            self.emit_store_to_sp("x0", stack_offset, "str");
-                        }
-                    }
-                    Operand::Value(v) => {
-                        // SP moved by stack_arg_space, adjust slot offset
-                        if let Some(slot) = self.state.get_slot(v.0) {
-                            let adjusted = slot.0 + stack_arg_space as i64 + fptr_spill;
-                            if self.state.is_alloca(v.0) {
-                                self.emit_add_sp_offset("x0", adjusted);
-                            } else {
-                                self.emit_load_from_sp("x0", adjusted, "ldr");
+                            Operand::Value(v) => {
+                                if let Some(slot) = self.state.get_slot(v.0) {
+                                    let adjusted = slot.0 + stack_arg_space as i64 + fptr_spill;
+                                    if self.state.is_alloca(v.0) {
+                                        self.emit_add_sp_offset("x0", adjusted);
+                                    } else {
+                                        self.emit_load_from_sp("x0", adjusted, "ldr");
+                                    }
+                                } else {
+                                    self.state.emit("    mov x0, #0");
+                                }
+                                self.state.emit("    fmov d0, x0");
+                                self.state.emit("    stp x9, x10, [sp, #-16]!");
+                                self.state.emit("    bl __extenddftf2");
+                                self.state.emit("    ldp x9, x10, [sp], #16");
+                                self.state.emit(&format!("    str q0, [sp, #{}]", stack_offset));
                             }
-                        } else {
-                            self.state.emit("    mov x0, #0");
                         }
-                        if is_stack_quad {
-                            // F128 overflow: convert f64 to f128 via __extenddftf2 (returns in q0)
-                            self.state.emit("    fmov d0, x0");
-                            self.state.emit("    stp x9, x10, [sp, #-16]!");
-                            self.state.emit("    bl __extenddftf2");
-                            self.state.emit("    ldp x9, x10, [sp], #16");
-                            // Store q0 (f128 result) to stack arg location
-                            self.state.emit(&format!("    str q0, [sp, #{}]", stack_offset));
-                        } else {
-                            self.emit_store_to_sp("x0", stack_offset, "str");
-                        }
+                        stack_offset += 16;
                     }
+                    CallArgClass::Stack => {
+                        match arg {
+                            Operand::Value(v) => {
+                                if let Some(slot) = self.state.get_slot(v.0) {
+                                    let adjusted = slot.0 + stack_arg_space as i64 + fptr_spill;
+                                    if self.state.is_alloca(v.0) {
+                                        self.emit_add_sp_offset("x0", adjusted);
+                                    } else {
+                                        self.emit_load_from_sp("x0", adjusted, "ldr");
+                                    }
+                                } else {
+                                    self.state.emit("    mov x0, #0");
+                                }
+                            }
+                            Operand::Const(_) => { self.operand_to_x0(arg); }
+                        }
+                        self.emit_store_to_sp("x0", stack_offset, "str");
+                        stack_offset += 8;
+                    }
+                    _ => {}
                 }
-                stack_offset += if is_stack_quad { 16 } else { 8 };
             }
         }
 
-        // Total SP adjustment: stack args + function pointer spill (if indirect call)
         let total_sp_adjust = stack_arg_space as i64 + fptr_spill;
 
-        // Phase 2a: Load GP register args into temp registers (x9-x16).
-        // operand_to_x0 may use x17 as scratch for large SP offsets (via
-        // emit_load_from_sp), which is safe since x17 is not in ARM_TMP_REGS.
+        // Phase 2a: Load GP integer register args into temp registers (x9-x16).
         let mut gp_tmp_idx = 0usize;
         for (i, arg) in args.iter().enumerate() {
-            if arg_classes[i] != 'i' { continue; }
+            if !matches!(arg_classes[i], CallArgClass::IntReg { .. }) { continue; }
             if gp_tmp_idx >= 8 { break; }
-            // If SP was adjusted (stack args or fptr spill), adjust alloca/value offsets
             if total_sp_adjust > 0 {
                 match arg {
                     Operand::Value(v) => {
@@ -1751,9 +1629,7 @@ impl ArchCodegen for ArmCodegen {
                             self.state.emit("    mov x0, #0");
                         }
                     }
-                    Operand::Const(_) => {
-                        self.operand_to_x0(arg);
-                    }
+                    Operand::Const(_) => { self.operand_to_x0(arg); }
                 }
             } else {
                 self.operand_to_x0(arg);
@@ -1762,45 +1638,36 @@ impl ArchCodegen for ArmCodegen {
             gp_tmp_idx += 1;
         }
 
-        // Phase 2b: Load FP register args into d0-d7 (or s0-s7, q0-q7 for F128).
-        // FP regs don't conflict with GP temp regs, so this is safe.
-        //
-        // IMPORTANT: __extenddftf2 (used for F128 variable args) clobbers all
-        // caller-saved FP registers (q0-q7). So we must:
-        // 1. First convert all F128 variable args and save results to temp stack slots
-        // 2. Then load F128 constants directly into their target Q registers
-        // 3. Then load the saved F128 results into their target Q registers
-        // 4. Finally load non-F128 float/double args (which won't be clobbered)
-        let mut fp_reg_idx = 0usize;
+        // Phase 2b: Load FP register args.
+        // F128 args need __extenddftf2 which clobbers all FP regs, so:
+        // 1. Convert F128 variable args, save to temp stack
+        // 2. Load F128 constants directly
+        // 3. Restore F128 variable results
+        // 4. Load non-F128 float/double args last
+        let fp_reg_assignments: Vec<(usize, usize)> = args.iter().enumerate()
+            .filter(|(i, _)| matches!(arg_classes[*i], CallArgClass::FloatReg { .. } | CallArgClass::F128Reg { .. }))
+            .map(|(i, _)| {
+                let reg_idx = match arg_classes[i] {
+                    CallArgClass::FloatReg { reg_idx } | CallArgClass::F128Reg { reg_idx } => reg_idx,
+                    _ => 0,
+                };
+                (i, reg_idx)
+            })
+            .collect();
 
-        // First pass: assign FP register indices to all 'f' and 'q' args
-        let mut fp_reg_assignments: Vec<(usize, usize)> = Vec::new(); // (arg_index, fp_reg_index)
-        for (i, _arg) in args.iter().enumerate() {
-            if arg_classes[i] != 'f' && arg_classes[i] != 'q' { continue; }
-            if fp_reg_idx >= 8 { break; }
-            fp_reg_assignments.push((i, fp_reg_idx));
-            fp_reg_idx += 1;
-        }
-
-        // Count F128 variable args that need __extenddftf2
         let f128_var_count: usize = fp_reg_assignments.iter()
-            .filter(|&&(arg_i, _)| arg_classes[arg_i] == 'q' && matches!(&args[arg_i], Operand::Value(_)))
+            .filter(|&&(arg_i, _)| matches!(arg_classes[arg_i], CallArgClass::F128Reg { .. }) && matches!(&args[arg_i], Operand::Value(_)))
             .count();
-
-        // If we have F128 variable args, allocate temp stack space for their results.
-        // Each F128 value is 16 bytes. We save to temp stack because __extenddftf2
-        // clobbers ALL caller-saved FP registers (q0-q7).
-        let f128_temp_space = f128_var_count * 16;
-        let f128_temp_space_aligned = (f128_temp_space + 15) & !15;
+        let f128_temp_space_aligned = (f128_var_count * 16 + 15) & !15;
         if f128_temp_space_aligned > 0 {
             self.emit_sub_sp(f128_temp_space_aligned as i64);
         }
 
-        // Second pass: Convert F128 variable args via __extenddftf2 and save to temp stack
+        // Convert F128 variable args via __extenddftf2, save to temp stack
         let mut f128_temp_idx = 0usize;
-        let mut f128_temp_slots: Vec<(usize, usize)> = Vec::new(); // (fp_reg_index, temp_slot_offset)
+        let mut f128_temp_slots: Vec<(usize, usize)> = Vec::new();
         for &(arg_i, reg_i) in &fp_reg_assignments {
-            if arg_classes[arg_i] != 'q' { continue; }
+            if !matches!(arg_classes[arg_i], CallArgClass::F128Reg { .. }) { continue; }
             if let Operand::Value(v) = &args[arg_i] {
                 if total_sp_adjust > 0 || f128_temp_space_aligned > 0 {
                     if let Some(slot) = self.state.get_slot(v.0) {
@@ -1816,7 +1683,6 @@ impl ArchCodegen for ArmCodegen {
                 self.state.emit("    stp x9, x10, [sp, #-16]!");
                 self.state.emit("    bl __extenddftf2");
                 self.state.emit("    ldp x9, x10, [sp], #16");
-                // Save the f128 result (in q0) to temp stack slot
                 let temp_off = f128_temp_idx * 16;
                 self.state.emit(&format!("    str q0, [sp, #{}]", temp_off));
                 f128_temp_slots.push((reg_i, temp_off));
@@ -1824,9 +1690,9 @@ impl ArchCodegen for ArmCodegen {
             }
         }
 
-        // Third pass: Load F128 constants directly into target Q registers
+        // Load F128 constants directly into target Q registers
         for &(arg_i, reg_i) in &fp_reg_assignments {
-            if arg_classes[arg_i] != 'q' { continue; }
+            if !matches!(arg_classes[arg_i], CallArgClass::F128Reg { .. }) { continue; }
             if let Operand::Const(c) = &args[arg_i] {
                 let f64_val = match c {
                     IrConst::LongDouble(v) => *v,
@@ -1844,34 +1710,28 @@ impl ArchCodegen for ArmCodegen {
             }
         }
 
-        // Fourth pass: Load saved F128 variable results from temp stack into target Q regs
+        // Restore F128 variable results from temp stack
         for &(reg_i, temp_off) in &f128_temp_slots {
             self.state.emit(&format!("    ldr q{}, [sp, #{}]", reg_i, temp_off));
         }
-
-        // Deallocate F128 temp space
         if f128_temp_space_aligned > 0 {
             self.emit_add_sp(f128_temp_space_aligned as i64);
         }
 
-        // Fifth pass: Load non-F128 FP args (float/double) into their target s/d registers.
-        // This is done LAST because __extenddftf2 clobbers all caller-saved FP regs (q0-q7).
+        // Load non-F128 FP args last (after __extenddftf2 clobbers are done)
         for &(arg_i, reg_i) in &fp_reg_assignments {
-            if arg_classes[arg_i] == 'q' { continue; }
+            if matches!(arg_classes[arg_i], CallArgClass::F128Reg { .. }) { continue; }
             let arg_ty = if arg_i < arg_types.len() { Some(arg_types[arg_i]) } else { None };
             if total_sp_adjust > 0 {
                 match &args[arg_i] {
                     Operand::Value(v) => {
                         if let Some(slot) = self.state.get_slot(v.0) {
-                            let adjusted = slot.0 + total_sp_adjust;
-                            self.emit_load_from_sp("x0", adjusted, "ldr");
+                            self.emit_load_from_sp("x0", slot.0 + total_sp_adjust, "ldr");
                         } else {
                             self.state.emit("    mov x0, #0");
                         }
                     }
-                    Operand::Const(_) => {
-                        self.operand_to_x0(&args[arg_i]);
-                    }
+                    Operand::Const(_) => { self.operand_to_x0(&args[arg_i]); }
                 }
             } else {
                 self.operand_to_x0(&args[arg_i]);
@@ -1883,195 +1743,161 @@ impl ArchCodegen for ArmCodegen {
             }
         }
 
-        // Phase 3: Move GP args from temp regs to actual arg registers (x0-x7).
-        // Track which GP registers are assigned for 'i', 'p', and 'V' classes.
+        // Phase 3: Move GP int args from temp regs to actual arg registers.
+        // Skip over i128 and struct-by-val register slots when counting GP index.
         let mut int_reg_idx = 0usize;
         gp_tmp_idx = 0;
-        for (i, _arg) in args.iter().enumerate() {
-            if arg_classes[i] == 'p' {
-                // i128 pair: skip 2 registers (handled below)
-                if int_reg_idx % 2 != 0 { int_reg_idx += 1; }
-                int_reg_idx += 2;
-                continue;
+        for (i, _) in args.iter().enumerate() {
+            match arg_classes[i] {
+                CallArgClass::I128RegPair { .. } => {
+                    if int_reg_idx % 2 != 0 { int_reg_idx += 1; }
+                    int_reg_idx += 2;
+                }
+                CallArgClass::StructByValReg { size, .. } => {
+                    int_reg_idx += if size <= 8 { 1 } else { 2 };
+                }
+                CallArgClass::IntReg { .. } => {
+                    if gp_tmp_idx < 8 && int_reg_idx < 8 {
+                        self.state.emit(&format!("    mov {}, {}", ARM_ARG_REGS[int_reg_idx], ARM_TMP_REGS[gp_tmp_idx]));
+                        int_reg_idx += 1;
+                    }
+                    gp_tmp_idx += 1;
+                }
+                _ => {}
             }
-            if arg_classes[i] == 'V' {
-                // Struct by value: skip 1-2 registers (handled in Phase 3c)
-                let size = arg_struct_sizes[i];
+        }
+
+        // Phase 3b: Load i128 register pair args directly into target registers.
+        for (i, arg) in args.iter().enumerate() {
+            if let CallArgClass::I128RegPair { base_reg_idx } = arg_classes[i] {
+                let pair_reg_idx = base_reg_idx;
+                if total_sp_adjust > 0 {
+                    match arg {
+                        Operand::Value(v) => {
+                            if let Some(slot) = self.state.get_slot(v.0) {
+                                let adjusted = slot.0 + total_sp_adjust;
+                                if self.state.is_alloca(v.0) {
+                                    self.emit_load_from_sp(ARM_ARG_REGS[pair_reg_idx], adjusted, "ldr");
+                                    self.state.emit(&format!("    mov {}, #0", ARM_ARG_REGS[pair_reg_idx + 1]));
+                                } else {
+                                    self.emit_load_from_sp(ARM_ARG_REGS[pair_reg_idx], adjusted, "ldr");
+                                    self.emit_load_from_sp(ARM_ARG_REGS[pair_reg_idx + 1], adjusted + 8, "ldr");
+                                }
+                            }
+                        }
+                        Operand::Const(c) => {
+                            if let IrConst::I128(v) = c {
+                                self.emit_load_imm64(ARM_ARG_REGS[pair_reg_idx], *v as u64 as i64);
+                                self.emit_load_imm64(ARM_ARG_REGS[pair_reg_idx + 1], (*v >> 64) as u64 as i64);
+                            } else {
+                                self.operand_to_x0(arg);
+                                if pair_reg_idx != 0 {
+                                    self.state.emit(&format!("    mov {}, x0", ARM_ARG_REGS[pair_reg_idx]));
+                                }
+                                self.state.emit(&format!("    mov {}, #0", ARM_ARG_REGS[pair_reg_idx + 1]));
+                            }
+                        }
+                    }
+                } else {
+                    match arg {
+                        Operand::Value(v) => {
+                            if let Some(slot) = self.state.get_slot(v.0) {
+                                if self.state.is_alloca(v.0) {
+                                    self.emit_add_sp_offset(ARM_ARG_REGS[pair_reg_idx], slot.0);
+                                    self.state.emit(&format!("    mov {}, #0", ARM_ARG_REGS[pair_reg_idx + 1]));
+                                } else {
+                                    self.emit_load_from_sp(ARM_ARG_REGS[pair_reg_idx], slot.0, "ldr");
+                                    self.emit_load_from_sp(ARM_ARG_REGS[pair_reg_idx + 1], slot.0 + 8, "ldr");
+                                }
+                            }
+                        }
+                        Operand::Const(c) => {
+                            if let IrConst::I128(v) = c {
+                                self.emit_load_imm64(ARM_ARG_REGS[pair_reg_idx], *v as u64 as i64);
+                                self.emit_load_imm64(ARM_ARG_REGS[pair_reg_idx + 1], (*v >> 64) as u64 as i64);
+                            } else {
+                                self.operand_to_x0(arg);
+                                if pair_reg_idx != 0 {
+                                    self.state.emit(&format!("    mov {}, x0", ARM_ARG_REGS[pair_reg_idx]));
+                                }
+                                self.state.emit(&format!("    mov {}, #0", ARM_ARG_REGS[pair_reg_idx + 1]));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Phase 3c: Load struct-by-value register args into target registers.
+        for (i, arg) in args.iter().enumerate() {
+            if let CallArgClass::StructByValReg { base_reg_idx, size } = arg_classes[i] {
                 let regs_needed = if size <= 8 { 1 } else { 2 };
-                int_reg_idx += regs_needed;
-                continue;
-            }
-            if arg_classes[i] != 'i' { continue; }
-            if gp_tmp_idx >= 8 { break; }
-            if int_reg_idx < 8 {
-                self.state.emit(&format!("    mov {}, {}", ARM_ARG_REGS[int_reg_idx], ARM_TMP_REGS[gp_tmp_idx]));
-                int_reg_idx += 1;
-            }
-            gp_tmp_idx += 1;
-        }
-
-        // Phase 3b: Load i128 register pair args directly into their target registers.
-        // Must be done last since it writes to x0-x7 directly.
-        {
-            let mut pair_reg_idx = 0usize;
-            for (i, _arg) in args.iter().enumerate() {
-                if arg_classes[i] == 'p' {
-                    if pair_reg_idx % 2 != 0 { pair_reg_idx += 1; }
-                    // Load 128-bit value, adjusting for SP if stack args or fptr spill present
-                    if total_sp_adjust > 0 {
-                        match &args[i] {
-                            Operand::Value(v) => {
-                                if let Some(slot) = self.state.get_slot(v.0) {
-                                    let adjusted = slot.0 + total_sp_adjust;
-                                    if self.state.is_alloca(v.0) {
-                                        // Alloca pointer, not 128-bit value
-                                        self.emit_load_from_sp(ARM_ARG_REGS[pair_reg_idx], adjusted, "ldr");
-                                        self.state.emit(&format!("    mov {}, #0", ARM_ARG_REGS[pair_reg_idx + 1]));
-                                    } else {
-                                        self.emit_load_from_sp(ARM_ARG_REGS[pair_reg_idx], adjusted, "ldr");
-                                        self.emit_load_from_sp(ARM_ARG_REGS[pair_reg_idx + 1], adjusted + 8, "ldr");
-                                    }
-                                }
-                            }
-                            Operand::Const(c) => {
-                                if let IrConst::I128(v) = c {
-                                    self.emit_load_imm64(ARM_ARG_REGS[pair_reg_idx], *v as u64 as i64);
-                                    self.emit_load_imm64(ARM_ARG_REGS[pair_reg_idx + 1], (*v >> 64) as u64 as i64);
+                // Load struct address into x17 (scratch)
+                if total_sp_adjust > 0 {
+                    match arg {
+                        Operand::Value(v) => {
+                            if let Some(slot) = self.state.get_slot(v.0) {
+                                let adjusted = slot.0 + total_sp_adjust;
+                                if self.state.is_alloca(v.0) {
+                                    self.emit_add_sp_offset("x17", adjusted);
                                 } else {
-                                    self.operand_to_x0(&args[i]);
-                                    if pair_reg_idx != 0 {
-                                        self.state.emit(&format!("    mov {}, x0", ARM_ARG_REGS[pair_reg_idx]));
-                                    }
-                                    self.state.emit(&format!("    mov {}, #0", ARM_ARG_REGS[pair_reg_idx + 1]));
+                                    self.emit_load_from_sp("x17", adjusted, "ldr");
                                 }
+                            } else {
+                                self.state.emit("    mov x17, #0");
                             }
                         }
-                    } else {
-                        match &args[i] {
-                            Operand::Value(v) => {
-                                if let Some(slot) = self.state.get_slot(v.0) {
-                                    if self.state.is_alloca(v.0) {
-                                        self.emit_add_sp_offset(ARM_ARG_REGS[pair_reg_idx], slot.0);
-                                        self.state.emit(&format!("    mov {}, #0", ARM_ARG_REGS[pair_reg_idx + 1]));
-                                    } else {
-                                        self.emit_load_from_sp(ARM_ARG_REGS[pair_reg_idx], slot.0, "ldr");
-                                        self.emit_load_from_sp(ARM_ARG_REGS[pair_reg_idx + 1], slot.0 + 8, "ldr");
-                                    }
-                                }
-                            }
-                            Operand::Const(c) => {
-                                if let IrConst::I128(v) = c {
-                                    self.emit_load_imm64(ARM_ARG_REGS[pair_reg_idx], *v as u64 as i64);
-                                    self.emit_load_imm64(ARM_ARG_REGS[pair_reg_idx + 1], (*v >> 64) as u64 as i64);
-                                } else {
-                                    self.operand_to_x0(&args[i]);
-                                    if pair_reg_idx != 0 {
-                                        self.state.emit(&format!("    mov {}, x0", ARM_ARG_REGS[pair_reg_idx]));
-                                    }
-                                    self.state.emit(&format!("    mov {}, #0", ARM_ARG_REGS[pair_reg_idx + 1]));
-                                }
-                            }
+                        Operand::Const(_) => {
+                            self.operand_to_x0(arg);
+                            self.state.emit("    mov x17, x0");
                         }
                     }
-                    pair_reg_idx += 2;
-                } else if arg_classes[i] == 'i' {
-                    pair_reg_idx += 1;
-                } else if arg_classes[i] == 'V' {
-                    let size = arg_struct_sizes[i];
-                    pair_reg_idx += if size <= 8 { 1 } else { 2 };
+                } else {
+                    match arg {
+                        Operand::Value(v) => {
+                            if let Some(slot) = self.state.get_slot(v.0) {
+                                if self.state.is_alloca(v.0) {
+                                    self.emit_add_sp_offset("x17", slot.0);
+                                } else {
+                                    self.emit_load_from_sp("x17", slot.0, "ldr");
+                                }
+                            } else {
+                                self.state.emit("    mov x17, #0");
+                            }
+                        }
+                        Operand::Const(_) => {
+                            self.operand_to_x0(arg);
+                            self.state.emit("    mov x17, x0");
+                        }
+                    }
+                }
+                self.state.emit(&format!("    ldr {}, [x17]", ARM_ARG_REGS[base_reg_idx]));
+                if regs_needed > 1 {
+                    self.state.emit(&format!("    ldr {}, [x17, #8]", ARM_ARG_REGS[base_reg_idx + 1]));
                 }
             }
         }
 
-        // Phase 3c: Load struct-by-value register args directly into their target registers.
-        // The operand is a pointer (alloca address) to the struct data.
-        // We load 1-2 dwords from that address into consecutive GP registers.
-        {
-            let mut struct_reg_idx = 0usize;
-            for (i, _arg) in args.iter().enumerate() {
-                match arg_classes[i] {
-                    'i' => { struct_reg_idx += 1; }
-                    'p' => {
-                        if struct_reg_idx % 2 != 0 { struct_reg_idx += 1; }
-                        struct_reg_idx += 2;
-                    }
-                    'V' => {
-                        let size = arg_struct_sizes[i];
-                        let regs_needed = if size <= 8 { 1 } else { 2 };
-                        // Load struct address into x17 (scratch), then load data into arg regs
-                        if total_sp_adjust > 0 {
-                            match &args[i] {
-                                Operand::Value(v) => {
-                                    if let Some(slot) = self.state.get_slot(v.0) {
-                                        let adjusted = slot.0 + total_sp_adjust;
-                                        if self.state.is_alloca(v.0) {
-                                            self.emit_add_sp_offset("x17", adjusted);
-                                        } else {
-                                            self.emit_load_from_sp("x17", adjusted, "ldr");
-                                        }
-                                    } else {
-                                        self.state.emit("    mov x17, #0");
-                                    }
-                                }
-                                Operand::Const(_) => {
-                                    self.operand_to_x0(&args[i]);
-                                    self.state.emit("    mov x17, x0");
-                                }
-                            }
-                        } else {
-                            match &args[i] {
-                                Operand::Value(v) => {
-                                    if let Some(slot) = self.state.get_slot(v.0) {
-                                        if self.state.is_alloca(v.0) {
-                                            self.emit_add_sp_offset("x17", slot.0);
-                                        } else {
-                                            self.emit_load_from_sp("x17", slot.0, "ldr");
-                                        }
-                                    } else {
-                                        self.state.emit("    mov x17, #0");
-                                    }
-                                }
-                                Operand::Const(_) => {
-                                    self.operand_to_x0(&args[i]);
-                                    self.state.emit("    mov x17, x0");
-                                }
-                            }
-                        }
-                        // x17 now holds the struct address; load data into arg regs
-                        self.state.emit(&format!("    ldr {}, [x17]", ARM_ARG_REGS[struct_reg_idx]));
-                        if regs_needed > 1 {
-                            self.state.emit(&format!("    ldr {}, [x17, #8]", ARM_ARG_REGS[struct_reg_idx + 1]));
-                        }
-                        struct_reg_idx += regs_needed;
-                    }
-                    _ => {}
-                }
-            }
-        }
-        // FP args already in d0-d7/q0-q7 from Phase 2b.
-
+        // Emit call instruction
         if let Some(name) = direct_name {
             self.state.emit(&format!("    bl {}", name));
         } else if indirect_call {
-            // Reload function pointer from spill slot. The spill slot is at
-            // [sp + stack_arg_space] because stack args were pushed after the spill.
             let spill_offset = stack_arg_space as i64;
             self.emit_load_from_sp("x17", spill_offset, "ldr");
             self.state.emit("    blr x17");
         }
 
-        // Clean up stack args + function pointer spill slot
+        // Clean up stack
         let total_call_stack = stack_arg_space as i64 + fptr_spill;
         if total_call_stack > 0 {
             self.emit_add_sp(total_call_stack);
         }
 
+        // Store return value
         if let Some(dest) = dest {
             if is_i128_type(return_type) {
-                // 128-bit return: x0 = low, x1 = high per AAPCS64
                 self.store_x0_x1_to(&dest);
             } else if return_type.is_long_double() {
-                // F128 return value is in q0 per AAPCS64.
                 self.state.emit("    bl __trunctfdf2");
                 self.state.emit("    fmov x0, d0");
                 self.store_x0_to(&dest);

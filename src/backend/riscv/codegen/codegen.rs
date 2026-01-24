@@ -1514,403 +1514,263 @@ impl ArchCodegen for RiscvCodegen {
                  is_variadic: bool, _num_fixed_args: usize, struct_arg_sizes: &[Option<usize>]) {
         let float_arg_regs = ["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"];
 
-        // Phase 1: Classify all args into register assignments or stack overflow.
-        // 'I' = GP register, 'F' = FP register, 'Q' = F128 GP register pair,
-        // 'W' = i128 GP register pair, 'S' = stack, 'T' = F128 stack, 'X' = i128 stack,
-        // 'V' = small struct by value in GP regs (<=16 bytes),
-        // 'v' = small struct overflow to stack, 'M' = large struct on stack (>16 bytes)
-        let mut arg_classes: Vec<char> = Vec::new();
-        let mut arg_int_indices: Vec<usize> = Vec::new(); // GP reg index for 'I' or base index for 'Q'/'W'/'V'
-        let mut arg_fp_indices: Vec<usize> = Vec::new();  // FP reg index for 'F'
-        let mut arg_struct_sizes: Vec<usize> = Vec::new(); // struct size for 'V'/'M'/'v' args
-        let mut int_idx = 0usize;
-        let mut float_idx = 0usize;
+        // Use shared classification for RISC-V LP64D ABI
+        let config = CallAbiConfig {
+            max_int_regs: 8, max_float_regs: 8,
+            align_i128_pairs: true,
+            f128_in_fp_regs: false, f128_in_gp_pairs: true,
+            variadic_floats_in_gp: true,
+        };
+        let arg_classes = classify_call_args(args, arg_types, struct_arg_sizes, is_variadic, &config);
+        let stack_arg_space = compute_stack_arg_space(&arg_classes);
 
-        for (i, _arg) in args.iter().enumerate() {
-            let struct_size = struct_arg_sizes.get(i).copied().flatten();
-            let is_long_double = if i < arg_types.len() {
-                arg_types[i].is_long_double()
-            } else {
-                false
-            };
-            let is_i128_arg = if i < arg_types.len() {
-                is_i128_type(arg_types[i])
-            } else {
-                false
-            };
-            let is_float_arg = if i < arg_types.len() {
-                arg_types[i].is_float()
-            } else {
-                matches!(args[i], Operand::Const(IrConst::F32(_) | IrConst::F64(_)))
-            };
-
-            if let Some(size) = struct_size {
-                if size <= 16 {
-                    // RISC-V LP64D: Small struct passed by value in 1-2 GP registers
-                    let regs_needed = if size <= 8 { 1 } else { 2 };
-                    if int_idx + regs_needed <= 8 {
-                        arg_classes.push('V'); // struct by value in GP regs
-                        arg_int_indices.push(int_idx);
-                        arg_fp_indices.push(0);
-                        arg_struct_sizes.push(size);
-                        int_idx += regs_needed;
-                    } else {
-                        // Overflow to stack
-                        arg_classes.push('v'); // small struct on stack
-                        arg_int_indices.push(0);
-                        arg_fp_indices.push(0);
-                        arg_struct_sizes.push(size);
-                        int_idx = 8;
-                    }
-                } else {
-                    // Large struct (>16 bytes): passed on stack (MEMORY class)
-                    arg_classes.push('M');
-                    arg_int_indices.push(0);
-                    arg_fp_indices.push(0);
-                    arg_struct_sizes.push(size);
-                }
-            } else if is_i128_arg {
-                // 128-bit integer: needs aligned register pair
-                if int_idx % 2 != 0 { int_idx += 1; }
-                if int_idx + 1 < 8 {
-                    arg_classes.push('W'); // i128 register pair
-                    arg_int_indices.push(int_idx);
-                    arg_fp_indices.push(0);
-                    int_idx += 2;
-                } else {
-                    arg_classes.push('X'); // i128 stack overflow
-                    arg_int_indices.push(0);
-                    arg_fp_indices.push(0);
-                    int_idx = 8;
-                }
-                arg_struct_sizes.push(0);
-            } else if is_long_double {
-                // Align int_idx to even for register pair
-                if int_idx % 2 != 0 {
-                    int_idx += 1;
-                }
-                if int_idx + 1 < 8 {
-                    arg_classes.push('Q');
-                    arg_int_indices.push(int_idx);
-                    arg_fp_indices.push(0);
-                    int_idx += 2;
-                } else {
-                    arg_classes.push('T'); // F128 stack overflow
-                    arg_int_indices.push(0);
-                    arg_fp_indices.push(0);
-                    int_idx = 8;
-                }
-                arg_struct_sizes.push(0);
-            } else if is_float_arg && !is_variadic && float_idx < 8 {
-                arg_classes.push('F');
-                arg_int_indices.push(0);
-                arg_fp_indices.push(float_idx);
-                float_idx += 1;
-                arg_struct_sizes.push(0);
-            } else if int_idx < 8 {
-                arg_classes.push('I');
-                arg_int_indices.push(int_idx);
-                arg_fp_indices.push(0);
-                int_idx += 1;
-                arg_struct_sizes.push(0);
-            } else {
-                arg_classes.push('S');
-                arg_int_indices.push(0);
-                arg_fp_indices.push(0);
-                arg_struct_sizes.push(0);
-            }
-        }
-
-        // Phase 2: Handle F128 variable args that need __extenddftf2.
-        // Call __extenddftf2 for each, save results to stack temporaries.
-        // Count how many F128 variable reg args we have.
-        let mut f128_var_temps: Vec<(usize, i64)> = Vec::new(); // (arg_index, sp_offset of saved lo:hi)
+        // Phase 1: Handle F128 register args that need __extenddftf2.
+        // Convert f64 -> f128 via __extenddftf2, save results to stack temporaries.
+        let mut f128_var_temps: Vec<(usize, i64)> = Vec::new();
         let mut f128_temp_space: i64 = 0;
         for (i, arg) in args.iter().enumerate() {
-            if arg_classes[i] == 'Q' {
+            if matches!(arg_classes[i], CallArgClass::F128Reg { .. }) {
                 if let Operand::Value(_) = arg {
                     f128_temp_space += 16;
-                    f128_var_temps.push((i, 0)); // offset filled below
+                    f128_var_temps.push((i, 0));
                 }
             }
         }
 
         if f128_temp_space > 0 {
-            // Allocate temp space for F128 conversion results
             self.emit_addi_sp(-f128_temp_space);
             let mut temp_offset: i64 = 0;
             for item in &mut f128_var_temps {
                 item.1 = temp_offset;
                 let arg = &args[item.0];
-                // Load f64 value, call __extenddftf2, save result
                 self.operand_to_t0(arg);
                 self.state.emit("    fmv.d.x fa0, t0");
                 self.state.emit("    call __extenddftf2");
-                // Save a0:a1 to temp space
                 self.emit_store_to_sp("a0", temp_offset, "sd");
                 self.emit_store_to_sp("a1", temp_offset + 8, "sd");
                 temp_offset += 16;
             }
         }
 
-        // Phase 3: Handle stack overflow args.
-        // 'S' = normal stack, 'T' = F128 stack, 'X' = i128 stack,
-        // 'M' = large struct on stack, 'v' = small struct overflow to stack
-        let stack_args: Vec<(usize, char)> = args.iter().enumerate()
-            .filter(|(i, _)| matches!(arg_classes[*i], 'S' | 'T' | 'X' | 'M' | 'v'))
-            .map(|(i, _)| (i, arg_classes[i]))
-            .collect();
-
-        let mut stack_arg_space: usize = 0;
-        if !stack_args.is_empty() {
-            for &(arg_i, cls) in &stack_args {
-                match cls {
-                    'T' | 'X' => {
-                        stack_arg_space = (stack_arg_space + 15) & !15;
-                        stack_arg_space += 16;
-                    }
-                    'M' | 'v' => {
-                        let size = arg_struct_sizes[arg_i];
-                        stack_arg_space += (size + 7) & !7;
-                    }
-                    _ => {
-                        stack_arg_space += 8;
-                    }
-                }
-            }
-            stack_arg_space = (stack_arg_space + 15) & !15;
+        // Phase 2: Handle stack overflow args.
+        if stack_arg_space > 0 {
             self.emit_addi_sp(-(stack_arg_space as i64));
             let mut offset: usize = 0;
-            for &(arg_i, cls) in &stack_args {
-                if cls == 'M' || cls == 'v' {
-                    // Struct by value on stack: copy raw struct data from memory.
-                    // The operand is the address (alloca pointer) of the struct.
-                    let size = arg_struct_sizes[arg_i];
-                    let n_dwords = (size + 7) / 8;
-                    // Load struct address into t0
-                    match &args[arg_i] {
-                        Operand::Value(v) => {
-                            if let Some(slot) = self.state.get_slot(v.0) {
-                                if self.state.is_alloca(v.0) {
-                                    self.emit_addi_s0("t0", slot.0);
+            for (arg_i, arg) in args.iter().enumerate() {
+                if !arg_classes[arg_i].is_stack() { continue; }
+                match arg_classes[arg_i] {
+                    CallArgClass::StructByValStack { size } | CallArgClass::LargeStructStack { size } => {
+                        let n_dwords = (size + 7) / 8;
+                        match arg {
+                            Operand::Value(v) => {
+                                if let Some(slot) = self.state.get_slot(v.0) {
+                                    if self.state.is_alloca(v.0) {
+                                        self.emit_addi_s0("t0", slot.0);
+                                    } else {
+                                        self.emit_load_from_s0("t0", slot.0, "ld");
+                                    }
                                 } else {
-                                    self.emit_load_from_s0("t0", slot.0, "ld");
+                                    self.state.emit("    li t0, 0");
                                 }
-                            } else {
-                                self.state.emit("    li t0, 0");
                             }
+                            Operand::Const(_) => { self.operand_to_t0(arg); }
                         }
-                        Operand::Const(_) => {
-                            self.operand_to_t0(&args[arg_i]);
+                        for qi in 0..n_dwords {
+                            let src_off = (qi * 8) as i64;
+                            self.state.emit(&format!("    ld t1, {}(t0)", src_off));
+                            self.emit_store_to_sp("t1", offset as i64 + src_off, "sd");
                         }
+                        offset += n_dwords * 8;
                     }
-                    // t0 now holds the struct address; copy data to stack
-                    for qi in 0..n_dwords {
-                        let src_off = (qi * 8) as i64;
-                        let dst_off = offset as i64 + src_off;
-                        self.state.emit(&format!("    ld t1, {}(t0)", src_off));
-                        self.emit_store_to_sp("t1", dst_off, "sd");
-                    }
-                    offset += n_dwords * 8;
-                    continue;
-                }
-                if cls == 'X' {
-                    // 128-bit integer stack arg
-                    offset = (offset + 15) & !15;
-                    match &args[arg_i] {
-                        Operand::Const(c) => {
-                            if let IrConst::I128(v) = c {
-                                let low = *v as u64 as i64;
-                                let high = (*v >> 64) as u64 as i64;
-                                self.state.emit(&format!("    li t0, {}", low));
-                                self.emit_store_to_sp("t0", offset as i64, "sd");
-                                self.state.emit(&format!("    li t0, {}", high));
-                                self.emit_store_to_sp("t0", (offset + 8) as i64, "sd");
-                            } else {
-                                self.operand_to_t0(&args[arg_i]);
-                                self.emit_store_to_sp("t0", offset as i64, "sd");
-                                self.emit_store_to_sp("zero", (offset + 8) as i64, "sd");
-                            }
-                        }
-                        Operand::Value(v) => {
-                            if let Some(slot) = self.state.get_slot(v.0) {
-                                if self.state.is_alloca(v.0) {
-                                    self.emit_addi_s0("t0", slot.0);
+                    CallArgClass::I128Stack => {
+                        offset = (offset + 15) & !15;
+                        match arg {
+                            Operand::Const(c) => {
+                                if let IrConst::I128(v) = c {
+                                    self.state.emit(&format!("    li t0, {}", *v as u64 as i64));
+                                    self.emit_store_to_sp("t0", offset as i64, "sd");
+                                    self.state.emit(&format!("    li t0, {}", (*v >> 64) as u64 as i64));
+                                    self.emit_store_to_sp("t0", (offset + 8) as i64, "sd");
+                                } else {
+                                    self.operand_to_t0(arg);
                                     self.emit_store_to_sp("t0", offset as i64, "sd");
                                     self.emit_store_to_sp("zero", (offset + 8) as i64, "sd");
-                                } else {
-                                    self.emit_load_from_s0("t0", slot.0, "ld");
-                                    self.emit_store_to_sp("t0", offset as i64, "sd");
-                                    self.emit_load_from_s0("t0", slot.0 + 8, "ld");
-                                    self.emit_store_to_sp("t0", (offset + 8) as i64, "sd");
+                                }
+                            }
+                            Operand::Value(v) => {
+                                if let Some(slot) = self.state.get_slot(v.0) {
+                                    if self.state.is_alloca(v.0) {
+                                        self.emit_addi_s0("t0", slot.0);
+                                        self.emit_store_to_sp("t0", offset as i64, "sd");
+                                        self.emit_store_to_sp("zero", (offset + 8) as i64, "sd");
+                                    } else {
+                                        self.emit_load_from_s0("t0", slot.0, "ld");
+                                        self.emit_store_to_sp("t0", offset as i64, "sd");
+                                        self.emit_load_from_s0("t0", slot.0 + 8, "ld");
+                                        self.emit_store_to_sp("t0", (offset + 8) as i64, "sd");
+                                    }
                                 }
                             }
                         }
+                        offset += 16;
                     }
-                    offset += 16;
-                } else if cls == 'T' {
-                    offset = (offset + 15) & !15;
-                    match &args[arg_i] {
-                        Operand::Const(ref c) => {
-                            let f64_val = match c {
-                                IrConst::LongDouble(v) => *v,
-                                IrConst::F64(v) => *v,
-                                _ => c.to_f64().unwrap_or(0.0),
-                            };
-                            let bytes = crate::ir::ir::f64_to_f128_bytes(f64_val);
-                            let lo = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
-                            let hi = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
-                            self.state.emit(&format!("    li t0, {}", lo));
-                            self.emit_store_to_sp("t0", offset as i64, "sd");
-                            self.state.emit(&format!("    li t0, {}", hi));
-                            self.emit_store_to_sp("t0", (offset + 8) as i64, "sd");
+                    CallArgClass::F128Stack => {
+                        offset = (offset + 15) & !15;
+                        match arg {
+                            Operand::Const(ref c) => {
+                                let f64_val = match c {
+                                    IrConst::LongDouble(v) => *v,
+                                    IrConst::F64(v) => *v,
+                                    _ => c.to_f64().unwrap_or(0.0),
+                                };
+                                let bytes = crate::ir::ir::f64_to_f128_bytes(f64_val);
+                                let lo = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                                let hi = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
+                                self.state.emit(&format!("    li t0, {}", lo));
+                                self.emit_store_to_sp("t0", offset as i64, "sd");
+                                self.state.emit(&format!("    li t0, {}", hi));
+                                self.emit_store_to_sp("t0", (offset + 8) as i64, "sd");
+                            }
+                            Operand::Value(_) => {
+                                self.operand_to_t0(arg);
+                                self.state.emit("    fmv.d.x fa0, t0");
+                                self.state.emit("    call __extenddftf2");
+                                self.emit_store_to_sp("a0", offset as i64, "sd");
+                                self.emit_store_to_sp("a1", (offset + 8) as i64, "sd");
+                            }
                         }
-                        Operand::Value(ref _v) => {
-                            self.operand_to_t0(&args[arg_i]);
-                            self.state.emit("    fmv.d.x fa0, t0");
-                            self.state.emit("    call __extenddftf2");
-                            self.emit_store_to_sp("a0", offset as i64, "sd");
-                            self.emit_store_to_sp("a1", (offset + 8) as i64, "sd");
-                        }
+                        offset += 16;
                     }
-                    offset += 16;
-                } else {
-                    self.operand_to_t0(&args[arg_i]);
-                    self.emit_store_to_sp("t0", offset as i64, "sd");
-                    offset += 8;
+                    CallArgClass::Stack => {
+                        self.operand_to_t0(arg);
+                        self.emit_store_to_sp("t0", offset as i64, "sd");
+                        offset += 8;
+                    }
+                    _ => {}
                 }
             }
         }
 
-        // Phase 4: Load non-F128 register args.
-        // Load all non-F128 args into their target registers.
-        // Process GP args into temps first, then FP args, then move GP from temp to aX.
-        // Note: t6 is reserved as the large-offset stack scratch register
-        // (used by emit_load_from_s0/emit_store_to_s0), so it must NOT be in this pool.
-        let mut gp_temps: Vec<(usize, &str)> = Vec::new(); // (target_reg_idx, temp_reg)
+        // Phase 3: Load non-F128 register args.
+        // GP args go to temps first, then FP args, then move GP from temp to aX.
+        // t6 is reserved for large-offset stack scratch, so it's excluded from temp pool.
         let temp_regs = ["t3", "t4", "t5", "s2", "s3", "s4", "s5", "s6"];
+        let mut gp_temps: Vec<(usize, &str)> = Vec::new();
         let mut temp_i = 0usize;
         for (i, arg) in args.iter().enumerate() {
-            if arg_classes[i] == 'I' {
-                self.operand_to_t0(arg);
-                if temp_i < temp_regs.len() {
-                    self.state.emit(&format!("    mv {}, t0", temp_regs[temp_i]));
-                    gp_temps.push((arg_int_indices[i], temp_regs[temp_i]));
-                    temp_i += 1;
+            match arg_classes[i] {
+                CallArgClass::IntReg { reg_idx } => {
+                    self.operand_to_t0(arg);
+                    if temp_i < temp_regs.len() {
+                        self.state.emit(&format!("    mv {}, t0", temp_regs[temp_i]));
+                        gp_temps.push((reg_idx, temp_regs[temp_i]));
+                        temp_i += 1;
+                    }
                 }
-            } else if arg_classes[i] == 'F' {
-                let fp_i = arg_fp_indices[i];
-                self.operand_to_t0(arg);
-                let arg_ty = if i < arg_types.len() { Some(arg_types[i]) } else { None };
-                if arg_ty == Some(IrType::F32) {
-                    self.state.emit(&format!("    fmv.w.x {}, t0", float_arg_regs[fp_i]));
-                } else {
-                    self.state.emit(&format!("    fmv.d.x {}, t0", float_arg_regs[fp_i]));
+                CallArgClass::FloatReg { reg_idx } => {
+                    self.operand_to_t0(arg);
+                    let arg_ty = if i < arg_types.len() { Some(arg_types[i]) } else { None };
+                    if arg_ty == Some(IrType::F32) {
+                        self.state.emit(&format!("    fmv.w.x {}, t0", float_arg_regs[reg_idx]));
+                    } else {
+                        self.state.emit(&format!("    fmv.d.x {}, t0", float_arg_regs[reg_idx]));
+                    }
                 }
+                _ => {}
             }
         }
 
-        // Phase 5: Move GP args from temps to actual arg registers.
+        // Move GP args from temps to actual arg registers
         for (target_idx, temp_reg) in &gp_temps {
             self.state.emit(&format!("    mv {}, {}", RISCV_ARG_REGS[*target_idx], temp_reg));
         }
 
-        // Phase 6: Load F128 register args into their target register pairs.
-        for (i, _arg) in args.iter().enumerate() {
-            if arg_classes[i] != 'Q' { continue; }
-            let base_reg = arg_int_indices[i];
-            match &args[i] {
-                Operand::Const(ref c) => {
-                    let f64_val = match c {
-                        IrConst::LongDouble(v) => *v,
-                        IrConst::F64(v) => *v,
-                        _ => c.to_f64().unwrap_or(0.0),
-                    };
-                    let bytes = crate::ir::ir::f64_to_f128_bytes(f64_val);
-                    let lo = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
-                    let hi = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
-                    self.state.emit(&format!("    li {}, {}", RISCV_ARG_REGS[base_reg], lo));
-                    self.state.emit(&format!("    li {}, {}", RISCV_ARG_REGS[base_reg + 1], hi));
-                }
-                Operand::Value(_) => {
-                    // Load from temp space (saved in Phase 2)
-                    let temp_info = f128_var_temps.iter().find(|t| t.0 == i).unwrap();
-                    // Adjust offset for stack_arg_space
-                    let offset = temp_info.1 + stack_arg_space as i64;
-                    self.emit_load_from_sp(RISCV_ARG_REGS[base_reg], offset, "ld");
-                    self.emit_load_from_sp(RISCV_ARG_REGS[base_reg + 1], offset + 8, "ld");
+        // Phase 4: Load F128 register pair args
+        for (i, arg) in args.iter().enumerate() {
+            if let CallArgClass::F128Reg { reg_idx: base_reg } = arg_classes[i] {
+                match arg {
+                    Operand::Const(ref c) => {
+                        let f64_val = match c {
+                            IrConst::LongDouble(v) => *v,
+                            IrConst::F64(v) => *v,
+                            _ => c.to_f64().unwrap_or(0.0),
+                        };
+                        let bytes = crate::ir::ir::f64_to_f128_bytes(f64_val);
+                        let lo = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                        let hi = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
+                        self.state.emit(&format!("    li {}, {}", RISCV_ARG_REGS[base_reg], lo));
+                        self.state.emit(&format!("    li {}, {}", RISCV_ARG_REGS[base_reg + 1], hi));
+                    }
+                    Operand::Value(_) => {
+                        let temp_info = f128_var_temps.iter().find(|t| t.0 == i).unwrap();
+                        let offset = temp_info.1 + stack_arg_space as i64;
+                        self.emit_load_from_sp(RISCV_ARG_REGS[base_reg], offset, "ld");
+                        self.emit_load_from_sp(RISCV_ARG_REGS[base_reg + 1], offset + 8, "ld");
+                    }
                 }
             }
         }
 
-        // Phase 7: Load i128 register pair args into their target register pairs.
-        for (i, _arg) in args.iter().enumerate() {
-            if arg_classes[i] != 'W' { continue; }
-            let base_reg = arg_int_indices[i];
-            match &args[i] {
-                Operand::Const(c) => {
-                    if let IrConst::I128(v) = c {
-                        let low = *v as u64 as i64;
-                        let high = (*v >> 64) as u64 as i64;
-                        self.state.emit(&format!("    li {}, {}", RISCV_ARG_REGS[base_reg], low));
-                        self.state.emit(&format!("    li {}, {}", RISCV_ARG_REGS[base_reg + 1], high));
-                    } else {
-                        self.operand_to_t0(&args[i]);
-                        self.state.emit(&format!("    mv {}, t0", RISCV_ARG_REGS[base_reg]));
-                        self.state.emit(&format!("    mv {}, zero", RISCV_ARG_REGS[base_reg + 1]));
-                    }
-                }
-                Operand::Value(v) => {
-                    if let Some(slot) = self.state.get_slot(v.0) {
-                        if self.state.is_alloca(v.0) {
-                            self.emit_addi_s0(RISCV_ARG_REGS[base_reg], slot.0);
-                            self.state.emit(&format!("    mv {}, zero", RISCV_ARG_REGS[base_reg + 1]));
+        // Phase 5: Load i128 register pair args
+        for (i, arg) in args.iter().enumerate() {
+            if let CallArgClass::I128RegPair { base_reg_idx } = arg_classes[i] {
+                match arg {
+                    Operand::Const(c) => {
+                        if let IrConst::I128(v) = c {
+                            self.state.emit(&format!("    li {}, {}", RISCV_ARG_REGS[base_reg_idx], *v as u64 as i64));
+                            self.state.emit(&format!("    li {}, {}", RISCV_ARG_REGS[base_reg_idx + 1], (*v >> 64) as u64 as i64));
                         } else {
-                            self.emit_load_from_s0(RISCV_ARG_REGS[base_reg], slot.0, "ld");
-                            self.emit_load_from_s0(RISCV_ARG_REGS[base_reg + 1], slot.0 + 8, "ld");
+                            self.operand_to_t0(arg);
+                            self.state.emit(&format!("    mv {}, t0", RISCV_ARG_REGS[base_reg_idx]));
+                            self.state.emit(&format!("    mv {}, zero", RISCV_ARG_REGS[base_reg_idx + 1]));
+                        }
+                    }
+                    Operand::Value(v) => {
+                        if let Some(slot) = self.state.get_slot(v.0) {
+                            if self.state.is_alloca(v.0) {
+                                self.emit_addi_s0(RISCV_ARG_REGS[base_reg_idx], slot.0);
+                                self.state.emit(&format!("    mv {}, zero", RISCV_ARG_REGS[base_reg_idx + 1]));
+                            } else {
+                                self.emit_load_from_s0(RISCV_ARG_REGS[base_reg_idx], slot.0, "ld");
+                                self.emit_load_from_s0(RISCV_ARG_REGS[base_reg_idx + 1], slot.0 + 8, "ld");
+                            }
                         }
                     }
                 }
             }
         }
 
-        // Phase 8: Load struct-by-value register args directly into their target registers.
-        // The operand is a pointer (alloca address) to the struct data.
-        // Load 1-2 dwords from that address into consecutive GP registers.
-        for (i, _arg) in args.iter().enumerate() {
-            if arg_classes[i] != 'V' { continue; }
-            let base_reg = arg_int_indices[i];
-            let size = arg_struct_sizes[i];
-            let regs_needed = if size <= 8 { 1 } else { 2 };
-            // Load struct address into t0
-            match &args[i] {
-                Operand::Value(v) => {
-                    if let Some(slot) = self.state.get_slot(v.0) {
-                        if self.state.is_alloca(v.0) {
-                            self.emit_addi_s0("t0", slot.0);
+        // Phase 6: Load struct-by-value register args
+        for (i, arg) in args.iter().enumerate() {
+            if let CallArgClass::StructByValReg { base_reg_idx, size } = arg_classes[i] {
+                let regs_needed = if size <= 8 { 1 } else { 2 };
+                match arg {
+                    Operand::Value(v) => {
+                        if let Some(slot) = self.state.get_slot(v.0) {
+                            if self.state.is_alloca(v.0) {
+                                self.emit_addi_s0("t0", slot.0);
+                            } else {
+                                self.emit_load_from_s0("t0", slot.0, "ld");
+                            }
                         } else {
-                            self.emit_load_from_s0("t0", slot.0, "ld");
+                            self.state.emit("    li t0, 0");
                         }
-                    } else {
-                        self.state.emit("    li t0, 0");
                     }
+                    Operand::Const(_) => { self.operand_to_t0(arg); }
                 }
-                Operand::Const(_) => {
-                    self.operand_to_t0(&args[i]);
+                self.state.emit(&format!("    ld {}, 0(t0)", RISCV_ARG_REGS[base_reg_idx]));
+                if regs_needed > 1 {
+                    self.state.emit(&format!("    ld {}, 8(t0)", RISCV_ARG_REGS[base_reg_idx + 1]));
                 }
-            }
-            // t0 now holds the struct address; load data into arg regs
-            self.state.emit(&format!("    ld {}, 0(t0)", RISCV_ARG_REGS[base_reg]));
-            if regs_needed > 1 {
-                self.state.emit(&format!("    ld {}, 8(t0)", RISCV_ARG_REGS[base_reg + 1]));
             }
         }
 
-        // Clean up F128 temp space before the call (only if no stack overflow args below it)
+        // Clean up F128 temp space before call (only if no stack args below it)
         if f128_temp_space > 0 && stack_arg_space == 0 {
             self.emit_addi_sp(f128_temp_space);
         }
 
+        // Emit call
         if let Some(name) = direct_name {
             self.state.emit(&format!("    call {}", name));
         } else if let Some(ptr) = func_ptr {
@@ -1919,31 +1779,26 @@ impl ArchCodegen for RiscvCodegen {
             self.state.emit("    jalr ra, t2, 0");
         }
 
-        // Clean up stack space after call
+        // Clean up stack
         if stack_arg_space > 0 {
-            // Both stack overflow args and f128 temp space (if any) need cleanup
             let cleanup = (stack_arg_space as i64) + f128_temp_space;
             self.emit_addi_sp(cleanup);
         }
 
+        // Store return value
         if let Some(dest) = dest {
             if let Some(slot) = self.state.get_slot(dest.0) {
                 if is_i128_type(return_type) {
-                    // 128-bit return: a0 = low, a1 = high per RISC-V LP64D ABI
                     self.emit_store_to_s0("a0", slot.0, "sd");
                     self.emit_store_to_s0("a1", slot.0 + 8, "sd");
                 } else if return_type.is_long_double() {
-                    // F128 return value is in a0:a1 (GP register pair).
-                    // Convert from f128 back to f64 using __trunctfdf2.
                     self.state.emit("    call __trunctfdf2");
                     self.state.emit("    fmv.x.d t0, fa0");
                     self.emit_store_to_s0("t0", slot.0, "sd");
                 } else if return_type == IrType::F32 {
-                    // F32 return value is in fa0 as single-precision
                     self.state.emit("    fmv.x.w t0, fa0");
                     self.emit_store_to_s0("t0", slot.0, "sd");
                 } else if return_type.is_float() {
-                    // F64 return value is in fa0 as double-precision
                     self.state.emit("    fmv.x.d t0, fa0");
                     self.emit_store_to_s0("t0", slot.0, "sd");
                 } else {
