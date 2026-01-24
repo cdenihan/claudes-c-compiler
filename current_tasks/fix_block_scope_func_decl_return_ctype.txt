@@ -1,0 +1,14 @@
+Fix: block-scope function declarations set return_ctype to None
+
+Bug: register_block_func_meta() in stmt_init.rs always sets return_ctype: None
+for block-scope function declarations (e.g., `struct tag1 stfunc1();` inside main()).
+
+This causes get_layout_for_expr() to fail to find the struct layout when
+doing member access on the return value (e.g., `stfunc1().stia`), falling
+back to offset 0 and type I32. The field access returns wrong values.
+
+Fix: compute return_ctype in register_block_func_meta the same way
+register_function_meta does - by resolving the CType from the type specifier
+and wrapping with pointer layers as needed.
+
+Status: IN PROGRESS
