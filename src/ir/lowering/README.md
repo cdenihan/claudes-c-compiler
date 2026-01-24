@@ -14,13 +14,27 @@ because it handles every C language construct.
   initializers (nested, designated, bitfield, flexible array members), array initializers
   (multi-dimensional, flat, pointer arrays), compound literals, and scalar initializers.
   Entry point is `lower_global_init()`. Uses `push_zero_bytes()` for padding emission.
-- **expr.rs** - Expression lowering. `lower_expr()` dispatches to focused helpers:
-  - Binary ops: `lower_binary_op` → `try_lower_pointer_arithmetic` / `lower_arithmetic_binop`
-  - Calls: `lower_function_call` → `try_lower_builtin_call` / `try_lower_atomic_builtin`
-  - Intrinsics: `lower_unary_intrinsic` (CLZ/CTZ/Popcount), `lower_bswap_intrinsic`, `lower_parity_intrinsic`
-  - Member access: `lower_member_access_impl` (unified for `.` and `->`)
-  - Bitfield ops: `resolve_bitfield_lvalue` → `store_bitfield` / `extract_bitfield` / `mask_to_bitwidth`
-  - Short-circuit (&&, ||), ternary, casts, compound literals, address-of, deref
+- **expr.rs** - Core expression lowering. `lower_expr()` dispatches all AST `Expr` nodes.
+  Contains: literals, identifiers, binary/unary ops, pointer arithmetic, casts, ternary,
+  compound literals, sizeof, address-of, deref, member access, short-circuit (&&/||),
+  inc/dec, and utility helpers (type inference, common_type, implicit casts).
+- **expr_builtins.rs** - Builtin function intrinsics: `try_lower_builtin_call()` dispatches
+  `__builtin_*` functions via the `BuiltinKind` enum. Includes FP classification builtins
+  (fpclassify, isnan, isinf, isfinite, isnormal, signbit) using bit manipulation, and
+  intrinsic helpers for CLZ/CTZ/bswap/popcount/parity.
+- **expr_atomics.rs** - Atomic builtin lowering: `try_lower_atomic_builtin()` handles all
+  `__atomic_*` and `__sync_*` operations. Uses table-driven dispatch for fetch-op and
+  op-fetch families (via `classify_fetch_op`/`classify_op_fetch`), plus sequential matching
+  for exchange, compare-exchange, load, store, test-and-set, fences, and lock-free queries.
+- **expr_calls.rs** - Function call lowering: `lower_function_call()` handles argument
+  evaluation with implicit casts (`lower_call_arguments`), call dispatch to direct/indirect
+  calls (`emit_call_instruction`), sret/two-register return classification, and variadic
+  function detection. Extracts shared `classify_struct_return()` helper.
+- **expr_assign.rs** - Assignment and compound assignment: `lower_assign()` (including
+  struct copy via memcpy), `lower_compound_assign()` (complex, scalar+complex-RHS, and
+  standard scalar paths). Bitfield helpers: `resolve_bitfield_lvalue`, `store_bitfield`,
+  `extract_bitfield`, `truncate_to_bitfield_value`. Arithmetic conversion helpers:
+  `usual_arithmetic_conversions`, `promote_for_op`, `narrow_from_op`.
 - **stmt.rs** - Statement lowering: control flow (if/while/for/switch/goto), declarations,
   and array initializer list processing
 - **lvalue.rs** - Lvalue resolution (what has an address) and array address computation

@@ -1,0 +1,434 @@
+//! Function call lowering: argument preparation, call dispatch, and result handling.
+//!
+//! Extracted from expr.rs. This module handles:
+//! - `lower_function_call`: the main entry point for FunctionCall expressions
+//! - `lower_call_arguments`: argument evaluation with implicit casts and promotions
+//! - `emit_call_instruction`: dispatch to direct, function-pointer, or indirect calls
+//! - `classify_struct_return`: shared sret/two-reg classification logic
+//! - Helpers: maybe_narrow_call_result, is_function_variadic, get_func_ptr_return_ir_type
+
+use crate::frontend::parser::ast::*;
+use crate::ir::ir::*;
+use crate::common::types::{IrType, CType};
+use super::lowering::Lowerer;
+
+impl Lowerer {
+    /// Classify a struct return size into sret (>16 bytes) or two-register (9-16 bytes).
+    /// Returns (sret_size, two_reg_size).
+    fn classify_struct_return(size: usize) -> (Option<usize>, Option<usize>) {
+        if size > 16 {
+            (Some(size), None)
+        } else if size > 8 {
+            (None, Some(size))
+        } else {
+            (None, None)
+        }
+    }
+
+    /// Check if an identifier is a function pointer variable rather than a direct function.
+    fn is_func_ptr_variable(&self, name: &str) -> bool {
+        (self.locals.contains_key(name) && !self.known_functions.contains(name))
+            || (!self.locals.contains_key(name) && self.globals.contains_key(name)
+                && !self.known_functions.contains(name))
+    }
+
+    pub(super) fn lower_function_call(&mut self, func: &Expr, args: &[Expr]) -> Operand {
+        // Resolve __builtin_* functions first
+        if let Expr::Identifier(name, _) = func {
+            if let Some(result) = self.try_lower_builtin_call(name, args) {
+                return result;
+            }
+        }
+
+        // Determine sret/two-reg return convention
+        let (sret_size, two_reg_size) = if let Expr::Identifier(name, _) = func {
+            if self.is_func_ptr_variable(name) {
+                // Indirect call through function pointer variable
+                match self.get_call_return_struct_size(func) {
+                    Some(size) => Self::classify_struct_return(size),
+                    None => (None, None),
+                }
+            } else {
+                // Direct function call - look up by function name
+                (
+                    self.func_meta.sret_functions.get(name).copied(),
+                    self.func_meta.two_reg_return_functions.get(name).copied(),
+                )
+            }
+        } else {
+            // Non-identifier function expression (e.g., (*fptr)(), array[i]())
+            match self.get_call_return_struct_size(func) {
+                Some(size) => Self::classify_struct_return(size),
+                None => (None, None),
+            }
+        };
+
+        // Lower arguments with implicit casts
+        let (mut arg_vals, mut arg_types) = self.lower_call_arguments(func, args);
+
+        // Decompose complex double/float arguments into (real, imag) pairs for ABI compliance
+        let param_ctypes_for_decompose = if let Expr::Identifier(name, _) = func {
+            self.func_meta.param_ctypes.get(name).cloned()
+        } else {
+            None
+        };
+        self.decompose_complex_call_args(&mut arg_vals, &mut arg_types, &param_ctypes_for_decompose, args);
+
+        let dest = self.fresh_value();
+
+        // For sret calls, allocate space and prepend hidden pointer argument
+        let sret_alloca = if let Some(size) = sret_size {
+            let alloca = self.fresh_value();
+            self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size });
+            arg_vals.insert(0, Operand::Value(alloca));
+            arg_types.insert(0, IrType::Ptr);
+            Some(alloca)
+        } else {
+            None
+        };
+
+        // Determine variadic status and number of fixed args
+        let (call_variadic, num_fixed_args) = if let Expr::Identifier(name, _) = func {
+            let variadic = self.is_function_variadic(name);
+            let n_fixed = if variadic {
+                if let Some(pctypes) = self.func_meta.param_ctypes.get(name) {
+                    pctypes.iter().map(|ct| {
+                        if matches!(ct, CType::ComplexDouble) { 2 } else { 1 }
+                    }).sum()
+                } else {
+                    self.func_meta.param_types.get(name)
+                        .map(|p| p.len())
+                        .unwrap_or(arg_vals.len())
+                }
+            } else {
+                arg_vals.len()
+            };
+            (variadic, n_fixed)
+        } else {
+            (false, arg_vals.len())
+        };
+
+        // Dispatch: direct call, function pointer call, or indirect call
+        let call_ret_ty = self.emit_call_instruction(func, dest, arg_vals, arg_types, call_variadic, num_fixed_args, two_reg_size, sret_size);
+
+        // For sret calls, the struct data is now in the alloca - return its address
+        if let Some(alloca) = sret_alloca {
+            return Operand::Value(alloca);
+        }
+
+        // For two-register struct returns (9-16 bytes), unpack I128 into struct alloca
+        if let Some(size) = two_reg_size {
+            return self.unpack_two_reg_return(dest, size);
+        }
+
+        // For complex returns (non-sret), store into complex alloca
+        if sret_size.is_none() {
+            if let Expr::Identifier(name, _) = func {
+                if let Some(ret_ct) = self.func_return_ctypes.get(name).cloned() {
+                    if let Some(result) = self.handle_complex_return(dest, &ret_ct) {
+                        return result;
+                    }
+                }
+            }
+        }
+
+        // Narrow the result if the return type is sub-64-bit integer
+        self.maybe_narrow_call_result(dest, call_ret_ty)
+    }
+
+    /// Unpack a two-register (I128) struct return into a struct alloca.
+    fn unpack_two_reg_return(&mut self, dest: Value, size: usize) -> Operand {
+        let alloca = self.fresh_value();
+        self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size });
+        // Extract low 8 bytes (rax)
+        let lo = self.fresh_value();
+        self.emit(Instruction::Cast { dest: lo, src: Operand::Value(dest), from_ty: IrType::I128, to_ty: IrType::I64 });
+        self.emit(Instruction::Store { val: Operand::Value(lo), ptr: alloca, ty: IrType::I64 });
+        // Extract high bytes (rdx): shift right by 64
+        let shifted = self.fresh_value();
+        self.emit(Instruction::BinOp { dest: shifted, op: IrBinOp::LShr, lhs: Operand::Value(dest), rhs: Operand::Const(IrConst::I64(64)), ty: IrType::I128 });
+        let hi = self.fresh_value();
+        self.emit(Instruction::Cast { dest: hi, src: Operand::Value(shifted), from_ty: IrType::I128, to_ty: IrType::I64 });
+        let hi_ptr = self.fresh_value();
+        self.emit(Instruction::GetElementPtr { dest: hi_ptr, base: alloca, offset: Operand::Const(IrConst::I64(8)), ty: IrType::I64 });
+        self.emit(Instruction::Store { val: Operand::Value(hi), ptr: hi_ptr, ty: IrType::I64 });
+        Operand::Value(alloca)
+    }
+
+    /// Handle complex return types (ComplexFloat, ComplexDouble).
+    /// Returns Some(result) if the return was complex, None otherwise.
+    fn handle_complex_return(&mut self, dest: Value, ret_ct: &CType) -> Option<Operand> {
+        match ret_ct {
+            CType::ComplexFloat => {
+                // _Complex float: packed {real, imag} in a single I64 register
+                let alloca = self.fresh_value();
+                self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: 8 });
+                self.emit(Instruction::Store { val: Operand::Value(dest), ptr: alloca, ty: IrType::I64 });
+                Some(Operand::Value(alloca))
+            }
+            CType::ComplexDouble => {
+                // _Complex double: real in xmm0 (dest), imag in xmm1 (second return)
+                let imag_val = self.fresh_value();
+                self.emit(Instruction::GetReturnF64Second { dest: imag_val });
+                let alloca = self.fresh_value();
+                self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: 16 });
+                self.emit(Instruction::Store { val: Operand::Value(dest), ptr: alloca, ty: IrType::F64 });
+                let imag_ptr = self.fresh_value();
+                self.emit(Instruction::BinOp {
+                    dest: imag_ptr, op: IrBinOp::Add,
+                    lhs: Operand::Value(alloca), rhs: Operand::Const(IrConst::I64(8)),
+                    ty: IrType::I64,
+                });
+                self.emit(Instruction::Store { val: Operand::Value(imag_val), ptr: imag_ptr, ty: IrType::F64 });
+                Some(Operand::Value(alloca))
+            }
+            _ => None,
+        }
+    }
+
+    /// Lower function call arguments, applying implicit casts for parameter types
+    /// and default argument promotions for variadic args.
+    pub(super) fn lower_call_arguments(&mut self, func: &Expr, args: &[Expr]) -> (Vec<Operand>, Vec<IrType>) {
+        let func_name = if let Expr::Identifier(name, _) = func { Some(name.as_str()) } else { None };
+        let param_types: Option<Vec<IrType>> = func_name.and_then(|name|
+            self.func_meta.param_types.get(name).cloned()
+                .or_else(|| self.func_meta.ptr_param_types.get(name).cloned())
+        );
+        let param_ctypes: Option<Vec<CType>> = func_name.and_then(|name|
+            self.func_meta.param_ctypes.get(name).cloned()
+        );
+        let param_bool_flags: Option<Vec<bool>> = func_name.and_then(|name|
+            self.func_meta.param_bool_flags.get(name).cloned()
+        );
+        let pre_call_variadic = func_name.map_or(false, |name|
+            self.is_function_variadic(name)
+        );
+
+        let mut arg_types = Vec::with_capacity(args.len());
+        let arg_vals: Vec<Operand> = args.iter().enumerate().map(|(i, a)| {
+            let mut val = self.lower_expr(a);
+            let arg_ty = self.get_expr_type(a);
+
+            // Convert complex arguments to the declared parameter complex type if they differ
+            if let Some(ref pctypes) = param_ctypes {
+                if i < pctypes.len() && pctypes[i].is_complex() {
+                    let arg_ct = self.expr_ctype(a);
+                    if arg_ct.is_complex() && arg_ct != pctypes[i] {
+                        let ptr = self.operand_to_value(val);
+                        val = self.complex_to_complex(ptr, &arg_ct, &pctypes[i]);
+                    } else if !arg_ct.is_complex() {
+                        val = self.real_to_complex(val, &arg_ct, &pctypes[i]);
+                    }
+                } else if i < pctypes.len() && !pctypes[i].is_complex() {
+                    let arg_ct = self.expr_ctype(a);
+                    if arg_ct.is_complex() {
+                        let ptr = self.operand_to_value(val);
+                        let real_part = self.load_complex_real(ptr, &arg_ct);
+                        let comp_ir_ty = Self::complex_component_ir_type(&arg_ct);
+                        let param_ty = param_types.as_ref()
+                            .and_then(|pt| pt.get(i).copied())
+                            .unwrap_or(comp_ir_ty);
+                        let cast_val = self.emit_implicit_cast(real_part, comp_ir_ty, param_ty);
+                        arg_types.push(param_ty);
+                        return cast_val;
+                    }
+                }
+            }
+
+            // Spill non-sret struct return values to a temporary alloca
+            if let Expr::FunctionCall(func_expr, _, _) = a {
+                let is_struct_ret = matches!(
+                    self.get_expr_ctype(a),
+                    Some(CType::Struct(_)) | Some(CType::Union(_))
+                );
+                if is_struct_ret {
+                    let returns_address = if let Expr::Identifier(name, _) = func_expr.as_ref() {
+                        self.func_meta.sret_functions.contains_key(name)
+                            || self.func_meta.two_reg_return_functions.contains_key(name)
+                    } else {
+                        let struct_size = self.struct_value_size(a).unwrap_or(8);
+                        struct_size > 8
+                    };
+                    if !returns_address {
+                        let struct_size = self.struct_value_size(a).unwrap_or(8);
+                        let alloc_size = if struct_size > 0 { struct_size } else { 8 };
+                        let alloca = self.fresh_value();
+                        self.emit(Instruction::Alloca { dest: alloca, size: alloc_size, ty: IrType::I64 });
+                        self.emit(Instruction::Store { val, ptr: alloca, ty: IrType::I64 });
+                        val = Operand::Value(alloca);
+                    }
+                }
+            }
+
+            let is_bool_param = param_bool_flags.as_ref()
+                .map_or(false, |flags| i < flags.len() && flags[i]);
+
+            if let Some(ref ptypes) = param_types {
+                if i < ptypes.len() {
+                    let param_ty = ptypes[i];
+                    arg_types.push(param_ty);
+                    let cast_val = self.emit_implicit_cast(val, arg_ty, param_ty);
+                    if is_bool_param {
+                        return self.emit_bool_normalize(cast_val);
+                    }
+                    return cast_val;
+                }
+            }
+            if arg_ty == IrType::F32 && (pre_call_variadic || param_types.is_some()) {
+                arg_types.push(IrType::F64);
+                return self.emit_implicit_cast(val, IrType::F32, IrType::F64);
+            }
+            arg_types.push(arg_ty);
+            val
+        }).collect();
+
+        (arg_vals, arg_types)
+    }
+
+    /// Emit the actual call instruction (direct, indirect via fptr, or general indirect).
+    /// Returns the effective return type for narrowing.
+    fn emit_call_instruction(
+        &mut self,
+        func: &Expr,
+        dest: Value,
+        arg_vals: Vec<Operand>,
+        arg_types: Vec<IrType>,
+        is_variadic: bool,
+        num_fixed_args: usize,
+        two_reg_size: Option<usize>,
+        _sret_size: Option<usize>,
+    ) -> IrType {
+        let mut indirect_ret_ty = self.get_func_ptr_return_ir_type(func);
+        if two_reg_size.is_some() {
+            indirect_ret_ty = IrType::I128;
+        }
+
+        match func {
+            Expr::Identifier(name, _) => {
+                if self.is_func_ptr_variable(name) {
+                    // Function pointer variable: load pointer and call indirect
+                    let func_ptr = self.load_func_ptr_variable(name);
+                    self.emit(Instruction::CallIndirect {
+                        dest: Some(dest), func_ptr: Operand::Value(func_ptr),
+                        args: arg_vals, arg_types, return_type: indirect_ret_ty, is_variadic, num_fixed_args,
+                    });
+                    indirect_ret_ty
+                } else {
+                    // Direct call
+                    let mut ret_ty = self.func_meta.return_types.get(name).copied().unwrap_or(IrType::I64);
+                    if self.func_meta.two_reg_return_functions.contains_key(name) {
+                        ret_ty = IrType::I128;
+                    }
+                    self.emit(Instruction::Call {
+                        dest: Some(dest), func: name.clone(),
+                        args: arg_vals, arg_types, return_type: ret_ty, is_variadic, num_fixed_args,
+                    });
+                    ret_ty
+                }
+            }
+            Expr::Deref(inner, _) => {
+                let n = arg_vals.len();
+                let func_ptr = self.lower_expr(inner);
+                self.emit(Instruction::CallIndirect {
+                    dest: Some(dest), func_ptr, args: arg_vals, arg_types,
+                    return_type: indirect_ret_ty, is_variadic: false, num_fixed_args: n,
+                });
+                indirect_ret_ty
+            }
+            _ => {
+                let n = arg_vals.len();
+                let func_ptr = self.lower_expr(func);
+                self.emit(Instruction::CallIndirect {
+                    dest: Some(dest), func_ptr, args: arg_vals, arg_types,
+                    return_type: indirect_ret_ty, is_variadic: false, num_fixed_args: n,
+                });
+                indirect_ret_ty
+            }
+        }
+    }
+
+    /// Load a function pointer from a local or global variable.
+    fn load_func_ptr_variable(&mut self, name: &str) -> Value {
+        let base_addr = if let Some(info) = self.locals.get(name).cloned() {
+            if let Some(ref global_name) = info.static_global_name {
+                let addr = self.fresh_value();
+                self.emit(Instruction::GlobalAddr { dest: addr, name: global_name.clone() });
+                addr
+            } else {
+                info.alloca
+            }
+        } else {
+            // Global function pointer
+            let addr = self.fresh_value();
+            self.emit(Instruction::GlobalAddr { dest: addr, name: name.to_string() });
+            addr
+        };
+        let ptr_val = self.fresh_value();
+        self.emit(Instruction::Load { dest: ptr_val, ptr: base_addr, ty: IrType::Ptr });
+        ptr_val
+    }
+
+    /// Narrow call result if return type is sub-64-bit integer.
+    /// 128-bit return values are already correctly handled.
+    pub(super) fn maybe_narrow_call_result(&mut self, dest: Value, ret_ty: IrType) -> Operand {
+        if ret_ty != IrType::I64 && ret_ty != IrType::Ptr
+            && ret_ty != IrType::Void && ret_ty.is_integer()
+            && ret_ty != IrType::I128 && ret_ty != IrType::U128
+        {
+            let narrowed = self.emit_cast_val(Operand::Value(dest), IrType::I64, ret_ty);
+            Operand::Value(narrowed)
+        } else {
+            Operand::Value(dest)
+        }
+    }
+
+    /// Check if a function is variadic.
+    pub(super) fn is_function_variadic(&self, name: &str) -> bool {
+        if self.func_meta.variadic.contains(name) { return true; }
+        if self.func_meta.param_types.contains_key(name) { return false; }
+        matches!(name, "printf" | "fprintf" | "sprintf" | "snprintf" | "scanf" | "sscanf"
+            | "fscanf" | "dprintf" | "vprintf" | "vfprintf" | "vsprintf" | "vsnprintf"
+            | "syslog" | "err" | "errx" | "warn" | "warnx" | "asprintf" | "vasprintf"
+            | "open" | "fcntl" | "ioctl" | "execl" | "execlp" | "execle")
+    }
+
+    /// Determine the return type of a function pointer expression for indirect calls.
+    fn get_func_ptr_return_ir_type(&self, func_expr: &Expr) -> IrType {
+        if let Some(ctype) = self.get_expr_ctype(func_expr) {
+            return Self::extract_return_type_from_ctype(&ctype);
+        }
+        if let Expr::Deref(inner, _) = func_expr {
+            if let Some(ctype) = self.get_expr_ctype(inner) {
+                return Self::extract_return_type_from_ctype(&ctype);
+            }
+        }
+        IrType::I64
+    }
+
+    pub(super) fn extract_return_type_from_ctype(ctype: &CType) -> IrType {
+        match ctype {
+            CType::Pointer(inner) => {
+                match inner.as_ref() {
+                    CType::Function(ft) => Self::ir_type_from_func_return(&ft.return_type),
+                    CType::Pointer(ret) => {
+                        match ret.as_ref() {
+                            CType::Float => IrType::F32,
+                            CType::Double => IrType::F64,
+                            _ => IrType::I64,
+                        }
+                    }
+                    CType::Float => IrType::F32,
+                    CType::Double => IrType::F64,
+                    _ => IrType::I64,
+                }
+            }
+            CType::Function(ft) => Self::ir_type_from_func_return(&ft.return_type),
+            _ => IrType::I64,
+        }
+    }
+
+    /// Convert a function's return CType to IrType.
+    fn ir_type_from_func_return(return_type: &CType) -> IrType {
+        Self::peel_ptr_from_return_type(return_type)
+    }
+}

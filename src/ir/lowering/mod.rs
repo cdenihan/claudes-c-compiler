@@ -1,5 +1,9 @@
 pub mod lowering;
 pub mod expr;
+pub mod expr_builtins;
+pub mod expr_atomics;
+pub mod expr_calls;
+pub mod expr_assign;
 pub mod stmt;
 pub mod lvalue;
 pub mod types;
