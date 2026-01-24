@@ -15,6 +15,12 @@ impl Parser {
     pub(super) fn parse_external_decl(&mut self) -> Option<ExternalDecl> {
         self.skip_gcc_extensions();
 
+        // Handle #pragma pack directives (emitted as synthetic tokens by preprocessor)
+        while self.handle_pragma_pack_token() {
+            // Consume semicolons after pragma pack synthetic tokens
+            self.consume_if(&TokenKind::Semicolon);
+        }
+
         if self.at_eof() {
             return None;
         }

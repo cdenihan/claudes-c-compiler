@@ -319,10 +319,12 @@ impl Parser {
         };
         let (packed3, _) = self.parse_gcc_attributes();
         is_packed = is_packed || packed3;
+        // Apply current #pragma pack alignment to struct definition
+        let max_field_align = self.pragma_pack_align;
         if is_struct {
-            TypeSpecifier::Struct(name, fields, is_packed)
+            TypeSpecifier::Struct(name, fields, is_packed, max_field_align)
         } else {
-            TypeSpecifier::Union(name, fields, is_packed)
+            TypeSpecifier::Union(name, fields, is_packed, max_field_align)
         }
     }
 

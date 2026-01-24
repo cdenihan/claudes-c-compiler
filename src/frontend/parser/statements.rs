@@ -19,6 +19,13 @@ impl Parser {
 
         while !matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
             self.skip_gcc_extensions();
+            // Handle #pragma pack directives within function bodies
+            while self.handle_pragma_pack_token() {
+                self.consume_if(&TokenKind::Semicolon);
+            }
+            if matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
+                break;
+            }
             if matches!(self.peek(), TokenKind::StaticAssert) {
                 // _Static_assert - skip entirely (no codegen needed)
                 self.advance();

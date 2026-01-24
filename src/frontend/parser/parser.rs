@@ -31,6 +31,11 @@ pub struct Parser {
     pub(super) parsing_inline: bool,
     /// Set to true when parse_type_specifier encounters a `const` qualifier.
     pub(super) parsing_const: bool,
+    /// Stack for #pragma pack alignment values.
+    /// Current effective alignment is the last element (or None for default).
+    pub(super) pragma_pack_stack: Vec<Option<usize>>,
+    /// Current #pragma pack alignment. None means default (natural) alignment.
+    pub(super) pragma_pack_align: Option<usize>,
 }
 
 impl Parser {
@@ -45,6 +50,8 @@ impl Parser {
             parsing_extern: false,
             parsing_inline: false,
             parsing_const: false,
+            pragma_pack_stack: Vec::new(),
+            pragma_pack_align: None,
         }
     }
 
@@ -339,6 +346,47 @@ impl Parser {
                 }
                 _ => break,
             }
+        }
+    }
+
+    // === Pragma pack handling ===
+
+    /// Check if current token is a pragma pack directive and handle it.
+    /// Returns true if a pragma pack token was consumed.
+    pub(super) fn handle_pragma_pack_token(&mut self) -> bool {
+        match self.peek().clone() {
+            TokenKind::PragmaPackSet(n) => {
+                self.advance();
+                self.pragma_pack_align = if n == 0 { None } else { Some(n) };
+                true
+            }
+            TokenKind::PragmaPackPush(n) => {
+                self.advance();
+                // Push current alignment onto stack
+                self.pragma_pack_stack.push(self.pragma_pack_align);
+                // Set new alignment (0 means push without changing)
+                if n != 0 {
+                    self.pragma_pack_align = Some(n);
+                }
+                true
+            }
+            TokenKind::PragmaPackPop => {
+                self.advance();
+                // Pop previous alignment from stack
+                if let Some(prev) = self.pragma_pack_stack.pop() {
+                    self.pragma_pack_align = prev;
+                } else {
+                    // Stack underflow: reset to default
+                    self.pragma_pack_align = None;
+                }
+                true
+            }
+            TokenKind::PragmaPackReset => {
+                self.advance();
+                self.pragma_pack_align = None;
+                true
+            }
+            _ => false,
         }
     }
 

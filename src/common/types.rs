@@ -103,6 +103,8 @@ impl StructLayout {
         let mut bf_bit_pos = 0u32;       // current bit position within the storage unit
         let mut bf_unit_size = 0usize;   // size of the current storage unit in bytes
         let mut in_bitfield = false;
+        // For packed structs with pack(1), track total bit position for contiguous bitfield packing
+        let is_packed_1 = max_field_align == Some(1);
 
         for field in fields {
             let natural_align = field.ty.align();
@@ -119,42 +121,84 @@ impl StructLayout {
                 if bw == 0 {
                     // Zero-width bitfield: force alignment to next storage unit boundary
                     if in_bitfield {
-                        offset = bf_unit_offset + bf_unit_size;
+                        if is_packed_1 {
+                            // For packed(1), advance to next byte boundary
+                            let total_bits = (bf_unit_offset * 8) as u32 + bf_bit_pos;
+                            offset = align_up((total_bits as usize + 7) / 8, 1);
+                        } else {
+                            offset = bf_unit_offset + bf_unit_size;
+                        }
                     }
                     offset = align_up(offset, field_align);
                     in_bitfield = false;
                     bf_bit_pos = 0;
-                    // Don't emit a field layout for zero-width bitfields
                     continue;
                 }
 
                 let unit_bits = (field_size * 8) as u32;
 
-                if !in_bitfield || bf_bit_pos + bw > unit_bits || bf_unit_size != field_size {
-                    // Start a new storage unit
-                    if in_bitfield {
-                        offset = bf_unit_offset + bf_unit_size;
+                if is_packed_1 {
+                    // For pack(1), allow bitfields to span across storage unit boundaries.
+                    // We track a contiguous bit stream.
+                    if !in_bitfield {
+                        // Start new bitfield sequence at current offset
+                        bf_unit_offset = offset;
+                        bf_bit_pos = 0;
+                        bf_unit_size = field_size;
+                        in_bitfield = true;
                     }
-                    offset = align_up(offset, field_align);
-                    bf_unit_offset = offset;
-                    bf_unit_size = field_size;
-                    bf_bit_pos = 0;
-                    in_bitfield = true;
+                    // The field's storage unit starts at the byte containing the current bit position
+                    let total_bit_offset = (bf_unit_offset * 8) as u32 + bf_bit_pos;
+                    let byte_offset = (total_bit_offset / 8) as usize;
+                    let bit_in_byte = total_bit_offset % 8;
+                    // For packed bitfields, we need to use the field's declared type size
+                    // as the storage unit, placed at the byte boundary
+                    let storage_offset = byte_offset;
+                    let bit_offset_in_storage = bit_in_byte;
+
+                    field_layouts.push(StructFieldLayout {
+                        name: field.name.clone(),
+                        offset: storage_offset,
+                        ty: field.ty.clone(),
+                        bit_offset: Some(bit_offset_in_storage),
+                        bit_width: Some(bw),
+                    });
+
+                    bf_bit_pos += bw;
+                } else {
+                    // Standard (non-packed) bitfield layout
+                    if !in_bitfield || bf_bit_pos + bw > unit_bits || bf_unit_size != field_size {
+                        // Start a new storage unit
+                        if in_bitfield {
+                            offset = bf_unit_offset + bf_unit_size;
+                        }
+                        offset = align_up(offset, field_align);
+                        bf_unit_offset = offset;
+                        bf_unit_size = field_size;
+                        bf_bit_pos = 0;
+                        in_bitfield = true;
+                    }
+
+                    field_layouts.push(StructFieldLayout {
+                        name: field.name.clone(),
+                        offset: bf_unit_offset,
+                        ty: field.ty.clone(),
+                        bit_offset: Some(bf_bit_pos),
+                        bit_width: Some(bw),
+                    });
+
+                    bf_bit_pos += bw;
                 }
-
-                field_layouts.push(StructFieldLayout {
-                    name: field.name.clone(),
-                    offset: bf_unit_offset,
-                    ty: field.ty.clone(),
-                    bit_offset: Some(bf_bit_pos),
-                    bit_width: Some(bw),
-                });
-
-                bf_bit_pos += bw;
             } else {
                 // Regular (non-bitfield) field
                 if in_bitfield {
-                    offset = bf_unit_offset + bf_unit_size;
+                    if is_packed_1 {
+                        // For pack(1), advance past all bits used
+                        let total_bits = (bf_unit_offset * 8) as u32 + bf_bit_pos;
+                        offset = (total_bits as usize + 7) / 8; // round up to next byte
+                    } else {
+                        offset = bf_unit_offset + bf_unit_size;
+                    }
                     in_bitfield = false;
                 }
 
@@ -178,7 +222,12 @@ impl StructLayout {
 
         // Account for trailing bitfield
         if in_bitfield {
-            offset = bf_unit_offset + bf_unit_size;
+            if is_packed_1 {
+                let total_bits = (bf_unit_offset * 8) as u32 + bf_bit_pos;
+                offset = (total_bits as usize + 7) / 8;
+            } else {
+                offset = bf_unit_offset + bf_unit_size;
+            }
         }
 
         // Pad total size to struct alignment

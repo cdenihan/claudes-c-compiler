@@ -1208,14 +1208,14 @@ impl Lowerer {
             CType::Struct(st) => {
                 // Return as struct tag reference if possible
                 if let Some(name) = &st.name {
-                    TypeSpecifier::Struct(Some(name.clone()), None, false)
+                    TypeSpecifier::Struct(Some(name.clone()), None, false, None)
                 } else {
                     TypeSpecifier::Int // anonymous struct fallback
                 }
             }
             CType::Union(st) => {
                 if let Some(name) = &st.name {
-                    TypeSpecifier::Union(Some(name.clone()), None, false)
+                    TypeSpecifier::Union(Some(name.clone()), None, false, None)
                 } else {
                     TypeSpecifier::Int // anonymous union fallback
                 }
@@ -1426,7 +1426,7 @@ impl Lowerer {
             TypeSpecifier::ComplexFloat | TypeSpecifier::ComplexDouble | TypeSpecifier::ComplexLongDouble => IrType::Ptr,
             TypeSpecifier::Pointer(_) => IrType::Ptr,
             TypeSpecifier::Array(_, _) => IrType::Ptr,
-            TypeSpecifier::Struct(_, _, _) | TypeSpecifier::Union(_, _, _) => IrType::Ptr,
+            TypeSpecifier::Struct(_, _, _, _) | TypeSpecifier::Union(_, _, _, _) => IrType::Ptr,
             TypeSpecifier::Enum(_, _) => IrType::I32,
             TypeSpecifier::TypedefName(_) => IrType::I64, // fallback for unresolved typedef
             TypeSpecifier::Signed => IrType::I32,
@@ -1504,16 +1504,17 @@ impl Lowerer {
                     .map(|n| elem_size * n as usize)
                     .unwrap_or(elem_size)
             }
-            TypeSpecifier::Struct(_, Some(fields), is_packed) => {
-                let max_field_align = if *is_packed { Some(1) } else { None };
+            TypeSpecifier::Struct(_, Some(fields), is_packed, pragma_pack) => {
+                let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
                 self.compute_struct_union_layout_packed(fields, false, max_field_align).size
             }
-            TypeSpecifier::Union(_, Some(fields), _) => {
-                self.compute_struct_union_layout(fields, true).size
+            TypeSpecifier::Union(_, Some(fields), is_packed, pragma_pack) => {
+                let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
+                self.compute_struct_union_layout_packed(fields, true, max_field_align).size
             }
-            TypeSpecifier::Struct(Some(tag), None, _) =>
+            TypeSpecifier::Struct(Some(tag), None, _, _) =>
                 self.get_struct_union_layout_by_tag("struct", tag).map(|l| l.size).unwrap_or(8),
-            TypeSpecifier::Union(Some(tag), None, _) =>
+            TypeSpecifier::Union(Some(tag), None, _, _) =>
                 self.get_struct_union_layout_by_tag("union", tag).map(|l| l.size).unwrap_or(8),
             _ => 8,
         }
@@ -1528,35 +1529,17 @@ impl Lowerer {
         }
         match ts {
             TypeSpecifier::Array(elem, _) => self.alignof_type(elem),
-            TypeSpecifier::Struct(_, Some(fields), is_packed) => {
-                let natural = fields.iter()
-                    .map(|f| {
-                        if f.derived.is_empty() {
-                            self.alignof_type(&f.type_spec)
-                        } else {
-                            // Function pointer fields are pointer-sized
-                            8
-                        }
-                    })
-                    .max()
-                    .unwrap_or(1);
-                if *is_packed { natural.min(1) } else { natural }
+            TypeSpecifier::Struct(_, Some(fields), is_packed, pragma_pack) => {
+                let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
+                self.compute_struct_union_layout_packed(fields, false, max_field_align).align
             }
-            TypeSpecifier::Union(_, Some(fields), _) => {
-                fields.iter()
-                    .map(|f| {
-                        if f.derived.is_empty() {
-                            self.alignof_type(&f.type_spec)
-                        } else {
-                            8
-                        }
-                    })
-                    .max()
-                    .unwrap_or(1)
+            TypeSpecifier::Union(_, Some(fields), is_packed, pragma_pack) => {
+                let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
+                self.compute_struct_union_layout_packed(fields, true, max_field_align).align
             }
-            TypeSpecifier::Struct(Some(tag), None, _) =>
+            TypeSpecifier::Struct(Some(tag), None, _, _) =>
                 self.get_struct_union_layout_by_tag("struct", tag).map(|l| l.align).unwrap_or(8),
-            TypeSpecifier::Union(Some(tag), None, _) =>
+            TypeSpecifier::Union(Some(tag), None, _, _) =>
                 self.get_struct_union_layout_by_tag("union", tag).map(|l| l.align).unwrap_or(8),
             _ => 8,
         }
@@ -2125,11 +2108,11 @@ impl Lowerer {
                 });
                 CType::Array(Box::new(elem_ctype), size)
             }
-            TypeSpecifier::Struct(name, fields, is_packed) => {
-                self.struct_or_union_to_ctype(name, fields, false, *is_packed)
+            TypeSpecifier::Struct(name, fields, is_packed, pragma_pack) => {
+                self.struct_or_union_to_ctype(name, fields, false, *is_packed, *pragma_pack)
             }
-            TypeSpecifier::Union(name, fields, is_packed) => {
-                self.struct_or_union_to_ctype(name, fields, true, *is_packed)
+            TypeSpecifier::Union(name, fields, is_packed, pragma_pack) => {
+                self.struct_or_union_to_ctype(name, fields, true, *is_packed, *pragma_pack)
             }
             TypeSpecifier::Enum(_, _) => CType::Int, // enums are int-sized
             TypeSpecifier::TypedefName(_) => CType::Int, // TODO: resolve typedef
@@ -2147,18 +2130,21 @@ impl Lowerer {
     /// Convert a struct or union TypeSpecifier to CType.
     /// `is_union` selects between struct and union semantics.
     /// `is_packed` indicates __attribute__((packed)).
+    /// `pragma_pack` is the #pragma pack(N) alignment, if any.
     fn struct_or_union_to_ctype(
         &self,
         name: &Option<String>,
         fields: &Option<Vec<StructFieldDecl>>,
         is_union: bool,
         is_packed: bool,
+        pragma_pack: Option<usize>,
     ) -> CType {
         let make = |st: crate::common::types::StructType| -> CType {
             if is_union { CType::Union(st) } else { CType::Struct(st) }
         };
         let prefix = if is_union { "union" } else { "struct" };
-        let max_field_align = if is_packed { Some(1) } else { None };
+        // __attribute__((packed)) forces alignment 1; #pragma pack(N) caps to N.
+        let max_field_align = if is_packed { Some(1) } else { pragma_pack };
 
         if let Some(fs) = fields {
             let struct_fields: Vec<StructField> = fs.iter().map(|f| {

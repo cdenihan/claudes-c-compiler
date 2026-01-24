@@ -9,18 +9,19 @@ impl Lowerer {
     /// nested struct/union types defined in the fields.
     pub(super) fn register_struct_type(&mut self, ts: &TypeSpecifier) {
         match ts {
-            TypeSpecifier::Struct(tag, Some(fields), is_packed) => {
+            TypeSpecifier::Struct(tag, Some(fields), is_packed, pragma_pack) => {
                 // Recursively register nested struct/union types in fields
                 self.register_nested_struct_types(fields);
-                let max_field_align = if *is_packed { Some(1) } else { None };
+                let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
                 let layout = self.compute_struct_union_layout_packed(fields, false, max_field_align);
                 let key = self.struct_layout_key(tag, false);
                 self.struct_layouts.insert(key, layout);
             }
-            TypeSpecifier::Union(tag, Some(fields), _) => {
+            TypeSpecifier::Union(tag, Some(fields), is_packed, pragma_pack) => {
                 // Recursively register nested struct/union types in fields
                 self.register_nested_struct_types(fields);
-                let layout = self.compute_struct_union_layout(fields, true);
+                let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
+                let layout = self.compute_struct_union_layout_packed(fields, true, max_field_align);
                 let key = self.struct_layout_key(tag, true);
                 self.struct_layouts.insert(key, layout);
             }
@@ -41,11 +42,11 @@ impl Lowerer {
     /// Walk a TypeSpecifier and register any struct/union definitions found within it.
     fn register_nested_in_type_spec(&mut self, ts: &TypeSpecifier) {
         match ts {
-            TypeSpecifier::Struct(tag, Some(_fields), _) if tag.is_some() => {
+            TypeSpecifier::Struct(tag, Some(_fields), _, _) if tag.is_some() => {
                 // This is a named struct definition inside a field - register it
                 self.register_struct_type(ts);
             }
-            TypeSpecifier::Union(tag, Some(_fields), _) if tag.is_some() => {
+            TypeSpecifier::Union(tag, Some(_fields), _, _) if tag.is_some() => {
                 // This is a named union definition inside a field - register it
                 self.register_struct_type(ts);
             }
@@ -76,17 +77,18 @@ impl Lowerer {
     pub(super) fn get_struct_layout_for_type(&self, ts: &TypeSpecifier) -> Option<StructLayout> {
         let ts = self.resolve_type_spec(ts);
         match ts {
-            TypeSpecifier::Struct(_, Some(fields), is_packed) => {
-                let max_field_align = if *is_packed { Some(1) } else { None };
+            TypeSpecifier::Struct(_, Some(fields), is_packed, pragma_pack) => {
+                let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
                 Some(self.compute_struct_union_layout_packed(&fields, false, max_field_align))
             }
-            TypeSpecifier::Struct(Some(tag), None, _) => {
+            TypeSpecifier::Struct(Some(tag), None, _, _) => {
                 self.struct_layouts.get(&format!("struct.{}", tag)).cloned()
             }
-            TypeSpecifier::Union(_, Some(fields), _) => {
-                Some(self.compute_struct_union_layout(&fields, true))
+            TypeSpecifier::Union(_, Some(fields), is_packed, pragma_pack) => {
+                let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
+                Some(self.compute_struct_union_layout_packed(&fields, true, max_field_align))
             }
-            TypeSpecifier::Union(Some(tag), None, _) => {
+            TypeSpecifier::Union(Some(tag), None, _, _) => {
                 self.struct_layouts.get(&format!("union.{}", tag)).cloned()
             }
             _ => None,

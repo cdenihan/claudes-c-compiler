@@ -83,6 +83,13 @@ pub enum TokenKind {
     /// __imag__ - extract imaginary part of complex number (GCC extension)
     ImagPart,
 
+    /// #pragma pack directive, emitted by preprocessor as synthetic token.
+    /// Variants: Set(N), Push(N), Pop, Reset (pack())
+    PragmaPackSet(usize),
+    PragmaPackPush(usize),
+    PragmaPackPop,
+    PragmaPackReset,
+
     // Punctuation
     LParen,     // (
     RParen,     // )

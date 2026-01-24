@@ -573,10 +573,43 @@ impl Lexer {
         let text = std::str::from_utf8(&self.input[start..self.pos]).unwrap_or("");
         let span = Span::new(start as u32, self.pos as u32, self.file_id);
 
+        // Check for synthetic pragma pack directives emitted by preprocessor
+        if let Some(pack_tok) = Self::try_pragma_pack_token(text) {
+            return Token::new(pack_tok, span);
+        }
+
         if let Some(kw) = TokenKind::from_keyword(text) {
             Token::new(kw, span)
         } else {
             Token::new(TokenKind::Identifier(text.to_string()), span)
+        }
+    }
+
+    /// Recognize synthetic pragma pack identifiers emitted by the preprocessor.
+    /// Format: __ccc_pack_set_N, __ccc_pack_push_N, __ccc_pack_pop, __ccc_pack_reset
+    fn try_pragma_pack_token(text: &str) -> Option<TokenKind> {
+        if let Some(rest) = text.strip_prefix("__ccc_pack_") {
+            if rest == "pop" {
+                Some(TokenKind::PragmaPackPop)
+            } else if rest == "reset" {
+                Some(TokenKind::PragmaPackReset)
+            } else if let Some(n_str) = rest.strip_prefix("set_") {
+                if let Ok(n) = n_str.parse::<usize>() {
+                    Some(TokenKind::PragmaPackSet(n))
+                } else {
+                    None
+                }
+            } else if let Some(n_str) = rest.strip_prefix("push_") {
+                if let Ok(n) = n_str.parse::<usize>() {
+                    Some(TokenKind::PragmaPackPush(n))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
         }
     }
 

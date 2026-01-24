@@ -489,22 +489,34 @@ impl SemanticAnalyzer {
                 let size = size_expr.as_ref().and_then(|e| self.eval_const_expr(e).map(|v| v as usize));
                 CType::Array(Box::new(elem_type), size)
             }
-            TypeSpecifier::Struct(name, fields, is_packed) => {
+            TypeSpecifier::Struct(name, fields, is_packed, pragma_pack_align) => {
                 let struct_fields = fields.as_ref().map(|f| self.convert_struct_fields(f)).unwrap_or_default();
+                // __attribute__((packed)) forces alignment 1; #pragma pack(N) caps to N.
+                // packed takes priority as it's most restrictive.
+                let effective_align = if *is_packed {
+                    Some(1)
+                } else {
+                    *pragma_pack_align
+                };
                 CType::Struct(crate::common::types::StructType {
                     name: name.clone(),
                     fields: struct_fields,
                     is_packed: *is_packed,
-                    max_field_align: if *is_packed { Some(1) } else { None },
+                    max_field_align: effective_align,
                 })
             }
-            TypeSpecifier::Union(name, fields, is_packed) => {
+            TypeSpecifier::Union(name, fields, is_packed, pragma_pack_align) => {
                 let union_fields = fields.as_ref().map(|f| self.convert_struct_fields(f)).unwrap_or_default();
+                let effective_align = if *is_packed {
+                    Some(1)
+                } else {
+                    *pragma_pack_align
+                };
                 CType::Union(crate::common::types::StructType {
                     name: name.clone(),
                     fields: union_fields,
                     is_packed: *is_packed,
-                    max_field_align: if *is_packed { Some(1) } else { None },
+                    max_field_align: effective_align,
                 })
             }
             TypeSpecifier::Enum(name, variants) => {

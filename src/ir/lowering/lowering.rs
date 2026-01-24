@@ -486,7 +486,7 @@ impl Lowerer {
         // Detect struct/complex returns > 8 bytes that need sret (hidden pointer) convention
         if ptr_count == 0 {
             let resolved = self.resolve_type_spec(ret_type_spec).clone();
-            if matches!(resolved, TypeSpecifier::Struct(_, _, _) | TypeSpecifier::Union(_, _, _)) {
+            if matches!(resolved, TypeSpecifier::Struct(_, _, _, _) | TypeSpecifier::Union(_, _, _, _)) {
                 let size = self.sizeof_type(ret_type_spec);
                 if size > 8 {
                     self.func_meta.sret_functions.insert(name.to_string(), size);
@@ -650,7 +650,7 @@ impl Lowerer {
             if !param.name.is_empty() {
                 let is_struct_param = if let Some(orig_param) = func.params.get(orig_idx) {
                     let resolved = self.resolve_type_spec(&orig_param.type_spec);
-                    matches!(resolved, TypeSpecifier::Struct(_, _, _) | TypeSpecifier::Union(_, _, _))
+                    matches!(resolved, TypeSpecifier::Struct(_, _, _, _) | TypeSpecifier::Union(_, _, _, _))
                 } else {
                     false
                 };
@@ -1260,7 +1260,7 @@ impl Lowerer {
                 }
             }
             // Recurse into struct/union fields to find enum definitions within them
-            TypeSpecifier::Struct(_, Some(fields), _) | TypeSpecifier::Union(_, Some(fields), _) => {
+            TypeSpecifier::Struct(_, Some(fields), _, _) | TypeSpecifier::Union(_, Some(fields), _, _) => {
                 for field in fields {
                     self.collect_enum_constants(&field.type_spec);
                 }

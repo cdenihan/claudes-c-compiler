@@ -783,7 +783,9 @@ impl Preprocessor {
             "ifdef" => self.handle_ifdef(rest, false),
             "ifndef" => self.handle_ifdef(rest, true),
             "if" => self.handle_if(rest),
-            "pragma" => self.handle_pragma(rest),
+            "pragma" => {
+                return self.handle_pragma(rest);
+            }
             "error" => {
                 // Expand macros in error message
                 let expanded = self.macros.expand_line(rest);
@@ -1212,15 +1214,70 @@ impl Preprocessor {
         self.conditionals.handle_elif(condition);
     }
 
-    fn handle_pragma(&mut self, rest: &str) {
+    fn handle_pragma(&mut self, rest: &str) -> Option<String> {
         let rest = rest.trim();
         if rest == "once" {
             // Mark the current file as "include once"
             if let Some(current_file) = self.include_stack.last() {
                 self.pragma_once_files.insert(current_file.clone());
             }
+            return None;
         }
+
+        // Handle #pragma pack directives
+        if let Some(pack_content) = rest.strip_prefix("pack") {
+            return self.handle_pragma_pack(pack_content.trim());
+        }
+
         // Other pragmas (GCC, diagnostic, etc.) are silently ignored
+        None
+    }
+
+    /// Handle #pragma pack directives and emit synthetic tokens for the parser.
+    /// Supported forms:
+    ///   #pragma pack(N)        - set alignment to N
+    ///   #pragma pack()         - reset to default alignment
+    ///   #pragma pack(push, N)  - push current and set to N
+    ///   #pragma pack(push)     - push current (no change)
+    ///   #pragma pack(pop)      - restore previous alignment
+    fn handle_pragma_pack(&mut self, content: &str) -> Option<String> {
+        let content = content.trim();
+        // Must start with '('
+        if !content.starts_with('(') {
+            return None;
+        }
+        let inner = content.trim_start_matches('(').trim_end_matches(')').trim();
+
+        if inner.is_empty() {
+            // #pragma pack() - reset
+            return Some("__ccc_pack_reset ;\n".to_string());
+        }
+
+        // Check for push/pop
+        if inner == "pop" {
+            return Some("__ccc_pack_pop ;\n".to_string());
+        }
+
+        if let Some(rest) = inner.strip_prefix("push") {
+            let rest = rest.trim().trim_start_matches(',').trim();
+            if rest.is_empty() {
+                // #pragma pack(push) - push current alignment, don't change
+                // Emit push with 0 as sentinel meaning "push current, no change"
+                return Some("__ccc_pack_push_0 ;\n".to_string());
+            }
+            // #pragma pack(push, N)
+            if let Ok(n) = rest.parse::<usize>() {
+                return Some(format!("__ccc_pack_push_{} ;\n", n));
+            }
+            return None;
+        }
+
+        // #pragma pack(N) - set alignment
+        if let Ok(n) = inner.parse::<usize>() {
+            return Some(format!("__ccc_pack_set_{} ;\n", n));
+        }
+
+        None
     }
 
     /// Replace remaining identifiers (not keywords) with 0 in a #if expression.

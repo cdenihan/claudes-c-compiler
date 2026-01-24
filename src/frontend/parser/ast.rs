@@ -128,10 +128,10 @@ pub enum TypeSpecifier {
     ComplexFloat,
     ComplexDouble,
     ComplexLongDouble,
-    /// Struct: (name, fields, is_packed)
-    Struct(Option<String>, Option<Vec<StructFieldDecl>>, bool),
-    /// Union: (name, fields, is_packed)
-    Union(Option<String>, Option<Vec<StructFieldDecl>>, bool),
+    /// Struct: (name, fields, is_packed, max_field_align from #pragma pack)
+    Struct(Option<String>, Option<Vec<StructFieldDecl>>, bool, Option<usize>),
+    /// Union: (name, fields, is_packed, max_field_align from #pragma pack)
+    Union(Option<String>, Option<Vec<StructFieldDecl>>, bool, Option<usize>),
     Enum(Option<String>, Option<Vec<EnumVariant>>),
     TypedefName(String),
     Pointer(Box<TypeSpecifier>),
