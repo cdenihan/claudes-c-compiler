@@ -295,6 +295,15 @@ impl Lowerer {
             BuiltinIntrinsic::VaStart | BuiltinIntrinsic::VaEnd | BuiltinIntrinsic::VaCopy => {
                 unreachable!("va builtins handled earlier by name match")
             }
+            // __builtin_constant_p(expr) -> 1 if expr is a compile-time constant, 0 otherwise
+            BuiltinIntrinsic::ConstantP => {
+                let result = if let Some(arg) = args.first() {
+                    if self.eval_const_expr(arg).is_some() { 1i64 } else { 0i64 }
+                } else {
+                    0i64
+                };
+                Some(Operand::Const(IrConst::I64(result)))
+            }
             // Nop intrinsic - just evaluate args for side effects and return 0
             BuiltinIntrinsic::Nop => {
                 for arg in args {

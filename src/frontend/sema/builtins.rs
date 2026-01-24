@@ -100,7 +100,7 @@ static BUILTIN_MAP: LazyLock<HashMap<&'static str, BuiltinInfo>> = LazyLock::new
     m.insert("__builtin_assume_aligned", BuiltinInfo::identity());
 
     // Type queries (compile-time constants)
-    m.insert("__builtin_constant_p", BuiltinInfo::constant_i64(0)); // conservative: always 0
+    m.insert("__builtin_constant_p", BuiltinInfo::intrinsic(BuiltinIntrinsic::ConstantP));
     // Note: __builtin_types_compatible_p is handled as a special AST node (BuiltinTypesCompatibleP),
     // parsed directly in the parser and evaluated at compile-time in the lowerer.
 
@@ -329,6 +329,8 @@ pub enum BuiltinIntrinsic {
     VaEnd,
     /// __builtin_va_copy(dest, src) -> copy va_list (lowered specially in IR)
     VaCopy,
+    /// __builtin_constant_p(expr) -> 1 if expr is a compile-time constant, 0 otherwise
+    ConstantP,
     /// No-op builtin (evaluates args, returns 0)
     Nop,
     /// __builtin_add_overflow(a, b, result_ptr) -> bool (1 if overflow)
