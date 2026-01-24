@@ -693,6 +693,13 @@ impl Lowerer {
             // Comparison/logical: result is int
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le
             | BinOp::Gt | BinOp::Ge | BinOp::LogicalAnd | BinOp::LogicalOr => 4,
+            // Pointer subtraction: result is ptrdiff_t (8 bytes on 64-bit)
+            BinOp::Sub if self.sizeof_operand_is_pointer_like(lhs)
+                && self.sizeof_operand_is_pointer_like(rhs) => 8,
+            // Pointer arithmetic (ptr + int, int + ptr, ptr - int): result is pointer
+            BinOp::Add | BinOp::Sub
+                if self.sizeof_operand_is_pointer_like(lhs)
+                || self.sizeof_operand_is_pointer_like(rhs) => 8,
             // Shift operators: result type is promoted left operand
             BinOp::Shl | BinOp::Shr => {
                 self.sizeof_expr(lhs).max(4) // integer promotion of left operand only
@@ -704,6 +711,19 @@ impl Lowerer {
                 ls.max(rs).max(4) // integer promotion
             }
         }
+    }
+
+    /// Check if an expression is pointer-like for sizeof computation.
+    /// Arrays decay to pointers in expression context, so both pointers and arrays
+    /// produce pointer-typed results in arithmetic.
+    fn sizeof_operand_is_pointer_like(&self, expr: &Expr) -> bool {
+        if self.expr_is_array_name(expr) {
+            return true;
+        }
+        if let Some(ctype) = self.get_expr_ctype(expr) {
+            return matches!(ctype, CType::Pointer(_) | CType::Array(_, _));
+        }
+        false
     }
 
     /// Compute sizeof for an expression operand (sizeof expr).

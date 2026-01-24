@@ -1,7 +1,7 @@
 use crate::frontend::parser::ast::*;
 use crate::ir::ir::*;
 use crate::common::types::{IrType, CType, StructLayout};
-use super::lowering::{Lowerer, LocalInfo, GlobalInfo, DeclAnalysis, SwitchFrame, FuncSig, resolve_typedef_derived};
+use super::lowering::{Lowerer, LocalInfo, GlobalInfo, DeclAnalysis, SwitchFrame, FuncSig, FunctionTypedefInfo, resolve_typedef_derived};
 
 impl Lowerer {
     pub(super) fn lower_compound_stmt(&mut self, compound: &CompoundStmt) {
@@ -63,6 +63,32 @@ impl Lowerer {
                 if !declarator.name.is_empty() {
                     let resolved_type = resolve_typedef_derived(&decl.type_spec, &declarator.derived);
                     self.types.typedefs.insert(declarator.name.clone(), resolved_type);
+
+                    // Track function pointer typedefs for correct CType resolution
+                    let has_fptr_derived = declarator.derived.iter().any(|d|
+                        matches!(d, DerivedDeclarator::FunctionPointer(_, _)));
+                    if has_fptr_derived {
+                        if let Some(DerivedDeclarator::FunctionPointer(params, variadic)) =
+                            declarator.derived.iter().find(|d| matches!(d, DerivedDeclarator::FunctionPointer(_, _)))
+                        {
+                            let mut return_type = decl.type_spec.clone();
+                            for d in &declarator.derived {
+                                match d {
+                                    DerivedDeclarator::Pointer => {
+                                        return_type = TypeSpecifier::Pointer(Box::new(return_type));
+                                    }
+                                    DerivedDeclarator::FunctionPointer(_, _) => break,
+                                    _ => break,
+                                }
+                            }
+                            self.types.func_ptr_typedefs.insert(declarator.name.clone());
+                            self.types.func_ptr_typedef_info.insert(declarator.name.clone(), FunctionTypedefInfo {
+                                return_type,
+                                params: params.clone(),
+                                variadic: *variadic,
+                            });
+                        }
+                    }
                 }
             }
             return;
@@ -294,7 +320,9 @@ impl Lowerer {
     ) {
         use crate::common::types::InitFieldResolution;
         let mut current_field_idx = 0usize;
-        for item in items {
+        let mut item_idx = 0usize;
+        while item_idx < items.len() {
+            let item = &items[item_idx];
             let desig_name = match item.designators.first() {
                 Some(Designator::Field(ref name)) => Some(name.as_str()),
                 _ => None,
@@ -313,7 +341,7 @@ impl Lowerer {
                     let sub_layout = match &anon_field.ty {
                         CType::Struct(st) => StructLayout::for_struct(&st.fields),
                         CType::Union(st) => StructLayout::for_union(&st.fields),
-                        _ => { current_field_idx = *anon_field_idx + 1; continue; }
+                        _ => { current_field_idx = *anon_field_idx + 1; item_idx += 1; continue; }
                     };
                     // Create a synthetic item with the inner designator
                     let sub_item = InitializerItem {
@@ -323,6 +351,7 @@ impl Lowerer {
                     let sub_base = self.emit_gep_offset(base, anon_offset, IrType::Ptr);
                     self.lower_local_struct_init(&[sub_item], sub_base, &sub_layout);
                     current_field_idx = *anon_field_idx + 1;
+                    item_idx += 1;
                     continue;
                 }
             };
@@ -349,6 +378,7 @@ impl Lowerer {
                     }
                 }
                 current_field_idx = field_idx + 1;
+                item_idx += 1;
                 continue;
             }
 
@@ -385,17 +415,36 @@ impl Lowerer {
                                     self.emit_store_at_offset(base, field_offset + i, val, IrType::I8);
                                 }
                             } else {
-                                // Non-string expr initializing char array - shouldn't normally happen,
-                                // but fall through to generic handling
                                 let val = self.lower_and_cast_init_expr(e, field_ty);
                                 let field_addr = self.emit_gep_offset(base, field_offset, field_ty);
                                 self.emit(Instruction::Store { val, ptr: field_addr, ty: field_ty });
                             }
                         } else {
-                            // Non-char array field with expression initializer
-                            let val = self.lower_and_cast_init_expr(e, field_ty);
-                            let field_addr = self.emit_gep_offset(base, field_offset, field_ty);
-                            self.emit(Instruction::Store { val, ptr: field_addr, ty: field_ty });
+                            // Non-char array field with flat expression initializer:
+                            // consume up to arr_size items from the init list to fill array elements
+                            let elem_ir_ty = IrType::from_ctype(elem_ty);
+                            let elem_size = elem_ir_ty.size().max(1);
+                            let val = self.lower_and_cast_init_expr(e, elem_ir_ty);
+                            let field_addr = self.emit_gep_offset(base, field_offset, elem_ir_ty);
+                            self.emit(Instruction::Store { val, ptr: field_addr, ty: elem_ir_ty });
+                            // Consume additional items for remaining array elements
+                            let mut arr_idx = 1usize;
+                            while arr_idx < arr_size && item_idx + 1 < items.len() {
+                                item_idx += 1;
+                                let next_item = &items[item_idx];
+                                // Stop if we hit a designator (it targets a different field)
+                                if !next_item.designators.is_empty() {
+                                    item_idx -= 1; // put it back
+                                    break;
+                                }
+                                if let Initializer::Expr(next_e) = &next_item.init {
+                                    let next_val = self.lower_and_cast_init_expr(next_e, elem_ir_ty);
+                                    let offset = field_offset + arr_idx * elem_size;
+                                    let elem_addr = self.emit_gep_offset(base, offset, elem_ir_ty);
+                                    self.emit(Instruction::Store { val: next_val, ptr: elem_addr, ty: elem_ir_ty });
+                                }
+                                arr_idx += 1;
+                            }
                         }
                     } else {
                         let val = self.lower_and_cast_init_expr(e, field_ty);
@@ -413,6 +462,7 @@ impl Lowerer {
                 }
             }
             current_field_idx = field_idx + 1;
+            item_idx += 1;
         }
     }
 

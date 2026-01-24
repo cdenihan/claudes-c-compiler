@@ -375,13 +375,18 @@ impl Lowerer {
                     ret_ty
                 }
             }
-            Expr::Deref(_, _) | _ => {
+            _ => {
                 let n = arg_vals.len();
                 let sas = struct_arg_sizes;
+                // Evaluate the callee expression. For Expr::Deref cases, lower_deref
+                // correctly handles function pointer dereference as a no-op (in C,
+                // *f where f is a function pointer yields a function designator that
+                // decays back to the same pointer), while real pointer-to-function-pointer
+                // dereferences emit the necessary Load instruction.
                 let func_ptr = self.lower_expr(func);
                 self.emit(Instruction::CallIndirect {
                     dest: Some(dest), func_ptr, args: arg_vals, arg_types,
-                    return_type: indirect_ret_ty, is_variadic: false, num_fixed_args: n,
+                    return_type: indirect_ret_ty, is_variadic, num_fixed_args,
                     struct_arg_sizes: sas,
                 });
                 indirect_ret_ty

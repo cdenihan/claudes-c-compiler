@@ -790,8 +790,103 @@ impl Lowerer {
         }
     }
 
+    /// Build the CType for a function parameter, correctly handling function
+    /// pointer parameters (both explicit syntax and typedef'd).
+    ///
+    /// For explicit function pointer params like `void (*callback)(int, int)`,
+    /// the parser sets `fptr_params` to Some(...) and we build
+    /// CType::Pointer(CType::Function(...)).
+    ///
+    /// For typedef'd function pointer params like `lua_Alloc f`, the parser
+    /// doesn't set `fptr_params` (the function pointer nature is hidden in the
+    /// typedef). We detect this by checking if the resolved type spec has
+    /// DerivedDeclarator::FunctionPointer info stored in function_typedefs or
+    /// by checking the original typedef declaration.
+    pub(super) fn param_ctype(&self, param: &crate::frontend::parser::ast::ParamDecl) -> CType {
+        // Case 1: explicit function pointer syntax - fptr_params is set
+        if let Some(ref fptr_params) = param.fptr_params {
+            let return_ctype = self.type_spec_to_ctype(&param.type_spec);
+            // Peel the outer Pointer wrapper from the return type
+            // (type_spec for `int (*f)(...)` is Pointer(Int), the actual return type is Int)
+            let actual_return = match return_ctype {
+                CType::Pointer(inner) => *inner,
+                other => other,
+            };
+            let param_types: Vec<(CType, Option<String>)> = fptr_params.iter()
+                .map(|p| (self.type_spec_to_ctype(&p.type_spec), p.name.clone()))
+                .collect();
+            let func_type = CType::Function(Box::new(crate::common::types::FunctionType {
+                return_type: actual_return,
+                params: param_types,
+                variadic: false,
+            }));
+            return CType::Pointer(Box::new(func_type));
+        }
+
+        // Case 2: typedef'd function pointer (e.g., lua_Alloc f)
+        // Check if the parameter's type resolves to a typedef that was
+        // declared as a function pointer typedef
+        if let TypeSpecifier::TypedefName(tname) = &param.type_spec {
+            if self.is_typedef_function_pointer(tname) {
+                // Build the full function pointer CType from the typedef info
+                if let Some(fptr_ctype) = self.build_function_pointer_ctype_from_typedef(tname) {
+                    return fptr_ctype;
+                }
+            }
+        }
+
+        // Default: use the standard type_spec_to_ctype
+        self.type_spec_to_ctype(&param.type_spec)
+    }
+
+    /// Check if a typedef name refers to a function pointer type.
+    /// This handles typedefs like `typedef void *(*lua_Alloc)(void *, ...)`.
+    fn is_typedef_function_pointer(&self, tname: &str) -> bool {
+        // Check if the typedef's resolved type is a Pointer AND the original
+        // typedef had a FunctionPointer derived declarator.
+        // We track this via function_typedefs which stores function type info
+        // for both bare function typedefs and function pointer typedefs.
+        //
+        // However, function_typedefs only stores bare function typedefs
+        // (typedef int func_t(int)), not function pointer typedefs.
+        // For function pointer typedefs, we check the resolved typedef: if it's
+        // a Pointer type and the original declaration context implies function pointer.
+        //
+        // Heuristic: if the typedef resolves to Pointer(X) and there's also a
+        // function_typedefs entry, it was a function pointer typedef. But this
+        // isn't reliable. Instead, track function pointer typedefs explicitly.
+        self.types.func_ptr_typedefs.contains(tname)
+    }
+
+    /// Build a CType::Pointer(CType::Function(...)) from a function pointer typedef.
+    fn build_function_pointer_ctype_from_typedef(&self, tname: &str) -> Option<CType> {
+        // Look up the stored function pointer typedef info
+        if let Some(fti) = self.types.func_ptr_typedef_info.get(tname) {
+            let return_ctype = self.type_spec_to_ctype(&fti.return_type);
+            let param_types: Vec<(CType, Option<String>)> = fti.params.iter()
+                .map(|p| (self.type_spec_to_ctype(&p.type_spec), p.name.clone()))
+                .collect();
+            let func_type = CType::Function(Box::new(crate::common::types::FunctionType {
+                return_type: return_ctype,
+                params: param_types,
+                variadic: fti.variadic,
+            }));
+            return Some(CType::Pointer(Box::new(func_type)));
+        }
+        None
+    }
+
     /// Convert a TypeSpecifier to CType (for struct layout computation).
     pub(super) fn type_spec_to_ctype(&self, ts: &TypeSpecifier) -> CType {
+        // Before resolving, check if this is a function pointer typedef.
+        // resolve_type_spec loses function type info for function pointer typedefs
+        // (e.g., lua_Alloc resolves to Pointer(Void) instead of Pointer(Function(...))).
+        // We intercept here to produce the correct CType.
+        if let TypeSpecifier::TypedefName(tname) = ts {
+            if let Some(fptr_ctype) = self.build_function_pointer_ctype_from_typedef(tname) {
+                return fptr_ctype;
+            }
+        }
         let ts = self.resolve_type_spec(ts);
         match ts {
             TypeSpecifier::Void => CType::Void,
@@ -954,8 +1049,9 @@ impl Lowerer {
     /// - `int (*fp)(int)`: [Pointer, FunctionPointer([int])] -> Pointer(Function(Int->Int))
     /// - `int (*fp[3])(int)`: [Array(3), Pointer, FunctionPointer([int])] -> Array(Pointer(Function(Int->Int)), 3)
     pub(super) fn build_full_ctype(&self, type_spec: &TypeSpecifier, derived: &[DerivedDeclarator]) -> CType {
-        let resolved = self.resolve_type_spec(type_spec);
-        let base = self.type_spec_to_ctype(resolved);
+        // Use type_spec_to_ctype on the ORIGINAL type spec (not resolved) so that
+        // function pointer typedefs are correctly detected and expanded.
+        let base = self.type_spec_to_ctype(type_spec);
 
         // Process derived declarators. The list is ordered outer-to-inner:
         // outermost wrapping (e.g. Array) first, innermost (closest to base type, e.g.

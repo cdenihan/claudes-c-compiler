@@ -497,8 +497,13 @@ pub(super) struct TypeContext {
     pub enum_constants: HashMap<String, i64>,
     /// Typedef mappings
     pub typedefs: HashMap<String, TypeSpecifier>,
-    /// Function typedef info
+    /// Function typedef info (bare function typedefs like `typedef int func_t(int)`)
     pub function_typedefs: HashMap<String, FunctionTypedefInfo>,
+    /// Set of typedef names that are function pointer types
+    /// (e.g., `typedef void *(*lua_Alloc)(void *, ...)`)
+    pub func_ptr_typedefs: HashSet<String>,
+    /// Function pointer typedef info (return type, params, variadic)
+    pub func_ptr_typedef_info: HashMap<String, FunctionTypedefInfo>,
     /// Return CType for known functions
     pub func_return_ctypes: HashMap<String, CType>,
     /// Cache for CType of named struct/union types
@@ -515,6 +520,8 @@ impl TypeContext {
             enum_constants: HashMap::new(),
             typedefs: HashMap::new(),
             function_typedefs: HashMap::new(),
+            func_ptr_typedefs: HashSet::new(),
+            func_ptr_typedef_info: HashMap::new(),
             func_return_ctypes: HashMap::new(),
             ctype_cache: std::cell::RefCell::new(HashMap::new()),
             scope_stack: Vec::new(),
@@ -788,6 +795,35 @@ impl Lowerer {
                                         params: params.clone(),
                                         variadic: *variadic,
                                     });
+                                }
+                            }
+
+                            // Track function pointer typedefs (e.g., typedef void *(*lua_Alloc)(void *, ...))
+                            // These have a FunctionPointer derived declarator
+                            if has_fptr_derived {
+                                if let Some(fptr_derived) = declarator.derived.iter().find(|d|
+                                    matches!(d, DerivedDeclarator::FunctionPointer(_, _)))
+                                {
+                                    if let DerivedDeclarator::FunctionPointer(params, variadic) = fptr_derived {
+                                        // Build the return type from the base type spec + any
+                                        // pointer deriveds before the FunctionPointer
+                                        let mut return_type = decl.type_spec.clone();
+                                        for d in &declarator.derived {
+                                            match d {
+                                                DerivedDeclarator::Pointer => {
+                                                    return_type = TypeSpecifier::Pointer(Box::new(return_type));
+                                                }
+                                                DerivedDeclarator::FunctionPointer(_, _) => break,
+                                                _ => break,
+                                            }
+                                        }
+                                        self.types.func_ptr_typedefs.insert(declarator.name.clone());
+                                        self.types.func_ptr_typedef_info.insert(declarator.name.clone(), FunctionTypedefInfo {
+                                            return_type,
+                                            params: params.clone(),
+                                            variadic: *variadic,
+                                        });
+                                    }
                                 }
                             }
 
@@ -1457,7 +1493,7 @@ impl Lowerer {
                         func.params.get(orig_idx).and_then(|p| self.get_struct_layout_for_pointer_param(&p.type_spec))
                     } else { None };
 
-                    let c_type = func.params.get(orig_idx).map(|p| self.type_spec_to_ctype(&p.type_spec));
+                    let c_type = func.params.get(orig_idx).map(|p| self.param_ctype(p));
                     let is_bool = func.params.get(orig_idx).map_or(false, |p| {
                         matches!(self.resolve_type_spec(&p.type_spec), TypeSpecifier::Bool)
                     });

@@ -880,6 +880,41 @@ impl Lowerer {
         self.lower_expr(inner)
     }
 
+    /// Check if dereferencing the given expression is a no-op because the
+    /// expression is a function pointer (or function designator). In C:
+    /// - *f where f is a function pointer → function designator → decays back
+    /// - *add where add is a function name → function designator → decays back
+    /// - *(s->fnptr) where fnptr is a function pointer member → same no-op
+    /// - **f, ***f etc. are also no-ops (recursive application)
+    fn is_function_pointer_deref(&self, inner: &Expr) -> bool {
+        // Check CType-based detection (works for typedef'd function pointers
+        // where param_ctype correctly sets CType::Pointer(CType::Function(...)),
+        // and also for struct member function pointers via get_expr_ctype)
+        if let Some(inner_ct) = self.get_expr_ctype(inner) {
+            match &inner_ct {
+                CType::Pointer(pointee) if matches!(pointee.as_ref(), CType::Function(_)) => {
+                    return true;
+                }
+                CType::Function(_) => {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        // Check for known function names (e.g., *add where add is a function)
+        match inner {
+            Expr::Identifier(name, _) => {
+                if self.known_functions.contains(name.as_str()) {
+                    return true;
+                }
+                false
+            }
+            // For nested derefs: *(*f) where *f is also a no-op → check recursively
+            Expr::Deref(deeper_inner, _) => self.is_function_pointer_deref(deeper_inner),
+            _ => false,
+        }
+    }
+
     fn lower_deref(&mut self, inner: &Expr) -> Operand {
         let pointee_is_aggregate = |ct: &CType| -> bool {
             if let CType::Pointer(ref pointee) = ct {
@@ -887,6 +922,15 @@ impl Lowerer {
                     || pointee.is_complex()
             } else { false }
         };
+        // In C, dereferencing a function pointer yields a function designator which
+        // immediately decays back to a function pointer. So *f, **f, ***f etc. are
+        // all equivalent when f is a function pointer. No Load should be emitted.
+        // This also applies to direct function names: (*add)(x, y) is valid C
+        // because the function name decays to a pointer, and dereferencing that
+        // gives back the function designator.
+        if self.is_function_pointer_deref(inner) {
+            return self.lower_expr(inner);
+        }
         // Check if dereferencing yields an aggregate (array/struct/union/complex).
         // In that case, the result is an address (no Load needed).
         if self.get_expr_ctype(inner).map_or(false, |ct| pointee_is_aggregate(&ct)) {
