@@ -332,22 +332,12 @@ impl Lowerer {
                                     self.emit(Instruction::Store { val, ptr: alloca, ty: comp_ty });
                                 }
                             } else {
-                                // Zero-init real part
-                                let zero = match comp_ty {
-                                    IrType::F32 => Operand::Const(IrConst::F32(0.0)),
-                                    _ => Operand::Const(IrConst::F64(0.0)),
-                                };
+                                let zero = Self::complex_zero(comp_ty);
                                 self.emit(Instruction::Store { val: zero, ptr: alloca, ty: comp_ty });
                             }
                             // Store imag part (second item) at offset
                             let comp_size = Self::complex_component_size(&complex_ctype);
-                            let imag_ptr = self.fresh_value();
-                            self.emit(Instruction::GetElementPtr {
-                                dest: imag_ptr,
-                                base: alloca,
-                                offset: Operand::Const(IrConst::I64(comp_size as i64)),
-                                ty: IrType::I8,
-                            });
+                            let imag_ptr = self.emit_gep_offset(alloca, comp_size, IrType::I8);
                             if let Some(item) = items.get(1) {
                                 if let Initializer::Expr(expr) = &item.init {
                                     let val = self.lower_expr(expr);
@@ -356,11 +346,7 @@ impl Lowerer {
                                     self.emit(Instruction::Store { val, ptr: imag_ptr, ty: comp_ty });
                                 }
                             } else {
-                                // Zero-init imag part if not provided
-                                let zero = match comp_ty {
-                                    IrType::F32 => Operand::Const(IrConst::F32(0.0)),
-                                    _ => Operand::Const(IrConst::F64(0.0)),
-                                };
+                                let zero = Self::complex_zero(comp_ty);
                                 self.emit(Instruction::Store { val: zero, ptr: imag_ptr, ty: comp_ty });
                             }
                         } else if da.is_struct {
@@ -437,13 +423,7 @@ impl Lowerer {
                                                     match &sub_items[sub_idx].init {
                                                         Initializer::List(inner) => {
                                                             // Braced struct init: {a, b}
-                                                            let elem_base = self.fresh_value();
-                                                            self.emit(Instruction::GetElementPtr {
-                                                                dest: elem_base,
-                                                                base: alloca,
-                                                                offset: Operand::Const(IrConst::I64(row_offset as i64)),
-                                                                ty: IrType::I8,
-                                                            });
+                                                            let elem_base = self.emit_gep_offset(alloca, row_offset, IrType::I8);
                                                             self.lower_local_struct_init(inner, elem_base, s_layout);
                                                             sub_idx += 1;
                                                             row_elem += 1;
@@ -459,13 +439,7 @@ impl Lowerer {
                                                 flat_struct_idx += row_size;
                                             } else {
                                                 // 1D: Initialize struct fields from sub-list
-                                                let elem_base = self.fresh_value();
-                                                self.emit(Instruction::GetElementPtr {
-                                                    dest: elem_base,
-                                                    base: alloca,
-                                                    offset: Operand::Const(IrConst::I64(base_byte_offset as i64)),
-                                                    ty: IrType::I8,
-                                                });
+                                                let elem_base = self.emit_gep_offset(alloca, base_byte_offset, IrType::I8);
                                                 self.lower_local_struct_init(sub_items, elem_base, s_layout);
                                                 flat_struct_idx += 1;
                                             }
@@ -477,14 +451,7 @@ impl Lowerer {
                                                 if let Some(field) = s_layout.fields.iter().find(|f| &f.name == fname) {
                                                     let field_ty = IrType::from_ctype(&field.ty);
                                                     let val = self.lower_and_cast_init_expr(e, field_ty);
-                                                    let field_addr = self.fresh_value();
-                                                    self.emit(Instruction::GetElementPtr {
-                                                        dest: field_addr,
-                                                        base: alloca,
-                                                        offset: Operand::Const(IrConst::I64(base_byte_offset as i64 + field.offset as i64)),
-                                                        ty: field_ty,
-                                                    });
-                                                    self.emit(Instruction::Store { val, ptr: field_addr, ty: field_ty });
+                                                    self.emit_store_at_offset(alloca, base_byte_offset + field.offset, val, field_ty);
                                                 }
                                                 item_idx += 1;
                                             } else {
@@ -531,19 +498,8 @@ impl Lowerer {
                                             let converted = self.real_to_complex(val, &expr_ctype, cplx_ctype);
                                             self.operand_to_value(converted)
                                         };
-                                        // Compute target address for this element
-                                        let elem_addr = self.fresh_value();
-                                        self.emit(Instruction::GetElementPtr {
-                                            dest: elem_addr,
-                                            base: alloca,
-                                            offset: Operand::Const(IrConst::I64((current_idx * da.elem_size) as i64)),
-                                            ty: IrType::I8,
-                                        });
-                                        self.emit(Instruction::Memcpy {
-                                            dest: elem_addr,
-                                            src,
-                                            size: da.elem_size,
-                                        });
+                                        // Memcpy to target element slot
+                                        self.emit_memcpy_at_offset(alloca, current_idx * da.elem_size, src, da.elem_size);
                                     }
                                     current_idx += 1;
                                 }
@@ -601,18 +557,7 @@ impl Lowerer {
                                             // pointer to the target array slot.
                                             let val = self.lower_expr(e);
                                             let src = self.operand_to_value(val);
-                                            let dest = self.fresh_value();
-                                            self.emit(Instruction::GetElementPtr {
-                                                dest,
-                                                base: alloca,
-                                                offset: Operand::Const(IrConst::I64((current_idx * da.elem_size) as i64)),
-                                                ty: IrType::I8,
-                                            });
-                                            self.emit(Instruction::Memcpy {
-                                                dest,
-                                                src,
-                                                size: da.elem_size,
-                                            });
+                                            self.emit_memcpy_at_offset(alloca, current_idx * da.elem_size, src, da.elem_size);
                                         } else {
                                             let val = self.lower_expr(e);
                                             let expr_ty = self.get_expr_type(e);
@@ -720,13 +665,7 @@ impl Lowerer {
             if field.ty.is_complex() {
                 let complex_ctype = field.ty.clone();
                 let complex_size = complex_ctype.size();
-                let dest_addr = self.fresh_value();
-                self.emit(Instruction::GetElementPtr {
-                    dest: dest_addr,
-                    base,
-                    offset: Operand::Const(IrConst::I64(field_offset as i64)),
-                    ty: IrType::Ptr,
-                });
+                let dest_addr = self.emit_gep_offset(base, field_offset, IrType::Ptr);
                 match &item.init {
                     Initializer::Expr(e) => {
                         let expr_ctype = self.expr_ctype(e);
@@ -760,19 +699,10 @@ impl Lowerer {
                                 self.emit(Instruction::Store { val, ptr: dest_addr, ty: comp_ty });
                             }
                         } else {
-                            let zero = match comp_ty {
-                                IrType::F32 => Operand::Const(IrConst::F32(0.0)),
-                                _ => Operand::Const(IrConst::F64(0.0)),
-                            };
+                            let zero = Self::complex_zero(comp_ty);
                             self.emit(Instruction::Store { val: zero, ptr: dest_addr, ty: comp_ty });
                         }
-                        let imag_ptr = self.fresh_value();
-                        self.emit(Instruction::GetElementPtr {
-                            dest: imag_ptr,
-                            base: dest_addr,
-                            offset: Operand::Const(IrConst::I64(comp_size as i64)),
-                            ty: IrType::I8,
-                        });
+                        let imag_ptr = self.emit_gep_offset(dest_addr, comp_size, IrType::I8);
                         if let Some(item) = sub_items.get(1) {
                             if let Initializer::Expr(e) = &item.init {
                                 let val = self.lower_expr(e);
@@ -781,10 +711,7 @@ impl Lowerer {
                                 self.emit(Instruction::Store { val, ptr: imag_ptr, ty: comp_ty });
                             }
                         } else {
-                            let zero = match comp_ty {
-                                IrType::F32 => Operand::Const(IrConst::F32(0.0)),
-                                _ => Operand::Const(IrConst::F64(0.0)),
-                            };
+                            let zero = Self::complex_zero(comp_ty);
                             self.emit(Instruction::Store { val: zero, ptr: imag_ptr, ty: comp_ty });
                         }
                     }
@@ -798,28 +725,15 @@ impl Lowerer {
             match &item.init {
                 Initializer::Expr(e) => {
                     let val = self.lower_and_cast_init_expr(e, field_ty);
-                    let field_addr = self.fresh_value();
-                    self.emit(Instruction::GetElementPtr {
-                        dest: field_addr,
-                        base,
-                        offset: Operand::Const(IrConst::I64(field_offset as i64)),
-                        ty: field_ty,
-                    });
+                    let field_addr = self.emit_gep_offset(base, field_offset, field_ty);
                     if let (Some(bit_offset), Some(bit_width)) = (field.bit_offset, field.bit_width) {
-                        // Bitfield: read-modify-write
                         self.store_bitfield(field_addr, field_ty, bit_offset, bit_width, val);
                     } else {
                         self.emit(Instruction::Store { val, ptr: field_addr, ty: field_ty });
                     }
                 }
                 Initializer::List(sub_items) => {
-                    let field_addr = self.fresh_value();
-                    self.emit(Instruction::GetElementPtr {
-                        dest: field_addr,
-                        base,
-                        offset: Operand::Const(IrConst::I64(field_offset as i64)),
-                        ty: field_ty,
-                    });
+                    let field_addr = self.emit_gep_offset(base, field_offset, field_ty);
                     self.lower_struct_field_init_list(sub_items, field_addr, &field.ty);
                 }
             }
@@ -858,14 +772,7 @@ impl Lowerer {
                     }
                     if let Initializer::Expr(e) = &item.init {
                         let val = self.lower_and_cast_init_expr(e, elem_ir_ty);
-                        let elem_addr = self.fresh_value();
-                        self.emit(Instruction::GetElementPtr {
-                            dest: elem_addr,
-                            base,
-                            offset: Operand::Const(IrConst::I64((ai * elem_size) as i64)),
-                            ty: elem_ir_ty,
-                        });
-                        self.emit(Instruction::Store { val, ptr: elem_addr, ty: elem_ir_ty });
+                        self.emit_store_at_offset(base, ai * elem_size, val, elem_ir_ty);
                     }
                     ai += 1;
                 }
@@ -1692,17 +1599,7 @@ impl Lowerer {
                                                 self.emit_string_to_alloca(base_alloca, s, inner_offset);
                                             }
                                         } else {
-                                            let expr_ty = self.get_expr_type(e);
-                                            let val = self.lower_expr(e);
-                                            let val = self.emit_implicit_cast(val, expr_ty, inner_ir_ty);
-                                            let addr = self.fresh_value();
-                                            self.emit(Instruction::GetElementPtr {
-                                                dest: addr,
-                                                base: base_alloca,
-                                                offset: Operand::Const(IrConst::I64(inner_offset as i64)),
-                                                ty: inner_ir_ty,
-                                            });
-                                            self.emit(Instruction::Store { val, ptr: addr, ty: inner_ir_ty });
+                                            self.emit_init_expr_to_offset(e, base_alloca, inner_offset, inner_ir_ty);
                                         }
                                     }
                                 }
@@ -1715,30 +1612,10 @@ impl Lowerer {
                                         self.emit_string_to_alloca(base_alloca, s, elem_offset);
                                     }
                                 } else {
-                                    let expr_ty = self.get_expr_type(e);
-                                    let val = self.lower_expr(e);
-                                    let val = self.emit_implicit_cast(val, expr_ty, elem_ir_ty);
-                                    let addr = self.fresh_value();
-                                    self.emit(Instruction::GetElementPtr {
-                                        dest: addr,
-                                        base: base_alloca,
-                                        offset: Operand::Const(IrConst::I64(elem_offset as i64)),
-                                        ty: elem_ir_ty,
-                                    });
-                                    self.emit(Instruction::Store { val, ptr: addr, ty: elem_ir_ty });
+                                    self.emit_init_expr_to_offset(e, base_alloca, elem_offset, elem_ir_ty);
                                 }
                             } else {
-                                let expr_ty = self.get_expr_type(e);
-                                let val = self.lower_expr(e);
-                                let val = self.emit_implicit_cast(val, expr_ty, elem_ir_ty);
-                                let addr = self.fresh_value();
-                                self.emit(Instruction::GetElementPtr {
-                                    dest: addr,
-                                    base: base_alloca,
-                                    offset: Operand::Const(IrConst::I64(elem_offset as i64)),
-                                    ty: elem_ir_ty,
-                                });
-                                self.emit(Instruction::Store { val, ptr: addr, ty: elem_ir_ty });
+                                self.emit_init_expr_to_offset(e, base_alloca, elem_offset, elem_ir_ty);
                             }
                         } else if let Initializer::List(sub_items) = &item.init {
                             // Handle list init for array element (e.g., .a[1] = {1,2,3})
@@ -1750,18 +1627,8 @@ impl Lowerer {
                                     for sub_item in sub_items.iter() {
                                         if si >= *inner_size { break; }
                                         if let Initializer::Expr(e) = &sub_item.init {
-                                            let expr_ty = self.get_expr_type(e);
-                                            let val = self.lower_expr(e);
-                                            let val = self.emit_implicit_cast(val, expr_ty, inner_ir_ty);
                                             let inner_offset = elem_offset + si * inner_elem_size;
-                                            let addr = self.fresh_value();
-                                            self.emit(Instruction::GetElementPtr {
-                                                dest: addr,
-                                                base: base_alloca,
-                                                offset: Operand::Const(IrConst::I64(inner_offset as i64)),
-                                                ty: inner_ir_ty,
-                                            });
-                                            self.emit(Instruction::Store { val, ptr: addr, ty: inner_ir_ty });
+                                            self.emit_init_expr_to_offset(e, base_alloca, inner_offset, inner_ir_ty);
                                         }
                                         si += 1;
                                     }
@@ -1786,18 +1653,8 @@ impl Lowerer {
                             break;
                         }
                         if let Initializer::Expr(e) = &next_item.init {
-                            let expr_ty = self.get_expr_type(e);
-                            let val = self.lower_expr(e);
-                            let val = self.emit_implicit_cast(val, expr_ty, elem_ir_ty);
                             let elem_offset = field_offset + ai * elem_size;
-                            let addr = self.fresh_value();
-                            self.emit(Instruction::GetElementPtr {
-                                dest: addr,
-                                base: base_alloca,
-                                offset: Operand::Const(IrConst::I64(elem_offset as i64)),
-                                ty: elem_ir_ty,
-                            });
-                            self.emit(Instruction::Store { val, ptr: addr, ty: elem_ir_ty });
+                            self.emit_init_expr_to_offset(e, base_alloca, elem_offset, elem_ir_ty);
                         } else {
                             // Sub-list initializer - stop flat continuation
                             break;
@@ -1830,18 +1687,7 @@ impl Lowerer {
                                 // Struct copy in init list: { 2, b } where b is a struct variable
                                 // Emit memcpy from source struct to the target field offset
                                 let src_addr = self.get_struct_base_addr(expr);
-                                let dest_addr = self.fresh_value();
-                                self.emit(Instruction::GetElementPtr {
-                                    dest: dest_addr,
-                                    base: base_alloca,
-                                    offset: Operand::Const(IrConst::I64(field_offset as i64)),
-                                    ty: IrType::Ptr,
-                                });
-                                self.emit(Instruction::Memcpy {
-                                    dest: dest_addr,
-                                    src: src_addr,
-                                    size: sub_layout.size,
-                                });
+                                self.emit_memcpy_at_offset(base_alloca, field_offset, src_addr, sub_layout.size);
                                 item_idx += 1;
                             } else {
                                 // Flat init: { 10, 20, 30 } - consume items for inner struct fields
@@ -1865,18 +1711,7 @@ impl Lowerer {
                             if self.struct_value_size(expr).is_some() {
                                 // Union copy in init list
                                 let src_addr = self.get_struct_base_addr(expr);
-                                let dest_addr = self.fresh_value();
-                                self.emit(Instruction::GetElementPtr {
-                                    dest: dest_addr,
-                                    base: base_alloca,
-                                    offset: Operand::Const(IrConst::I64(field_offset as i64)),
-                                    ty: IrType::Ptr,
-                                });
-                                self.emit(Instruction::Memcpy {
-                                    dest: dest_addr,
-                                    src: src_addr,
-                                    size: sub_layout.size,
-                                });
+                                self.emit_memcpy_at_offset(base_alloca, field_offset, src_addr, sub_layout.size);
                                 item_idx += 1;
                             } else {
                                 let consumed = self.emit_struct_init(&items[item_idx..], base_alloca, &sub_layout, field_offset);
@@ -1918,18 +1753,7 @@ impl Lowerer {
                                         Initializer::Expr(e) => {
                                             if self.struct_value_size(e).is_some() {
                                                 let src_addr = self.get_struct_base_addr(e);
-                                                let dest_addr = self.fresh_value();
-                                                self.emit(Instruction::GetElementPtr {
-                                                    dest: dest_addr,
-                                                    base: base_alloca,
-                                                    offset: Operand::Const(IrConst::I64(elem_offset as i64)),
-                                                    ty: IrType::Ptr,
-                                                });
-                                                self.emit(Instruction::Memcpy {
-                                                    dest: dest_addr,
-                                                    src: src_addr,
-                                                    size: sub_layout.size,
-                                                });
+                                                self.emit_memcpy_at_offset(base_alloca, elem_offset, src_addr, sub_layout.size);
                                                 si += 1;
                                                 ai += 1;
                                             } else {
@@ -1954,18 +1778,8 @@ impl Lowerer {
                                     if ai >= *arr_size { break; }
                                     let elem_offset = field_offset + ai * elem_size;
                                     if let Initializer::Expr(e) = &sub_item.init {
-                                        let expr_ty = self.get_expr_type(e);
-                                        let val = self.lower_expr(e);
                                         let elem_ir_ty = IrType::from_ctype(elem_ty);
-                                        let val = self.emit_implicit_cast(val, expr_ty, elem_ir_ty);
-                                        let addr = self.fresh_value();
-                                        self.emit(Instruction::GetElementPtr {
-                                            dest: addr,
-                                            base: base_alloca,
-                                            offset: Operand::Const(IrConst::I64(elem_offset as i64)),
-                                            ty: elem_ir_ty,
-                                        });
-                                        self.emit(Instruction::Store { val, ptr: addr, ty: elem_ir_ty });
+                                        self.emit_init_expr_to_offset(e, base_alloca, elem_offset, elem_ir_ty);
                                     } else if let Initializer::List(inner_items) = &sub_item.init {
                                         // Handle braced sub-init for array elements (e.g., int arr[2][3] = {{1,2,3},{4,5,6}})
                                         if let CType::Array(inner_elem_ty, Some(inner_size)) = elem_ty.as_ref() {
@@ -1974,18 +1788,8 @@ impl Lowerer {
                                             for (ii, inner_item) in inner_items.iter().enumerate() {
                                                 if ii >= *inner_size { break; }
                                                 if let Initializer::Expr(e) = &inner_item.init {
-                                                    let expr_ty = self.get_expr_type(e);
-                                                    let val = self.lower_expr(e);
-                                                    let val = self.emit_implicit_cast(val, expr_ty, inner_elem_ir_ty);
                                                     let inner_offset = elem_offset + ii * inner_elem_size;
-                                                    let addr = self.fresh_value();
-                                                    self.emit(Instruction::GetElementPtr {
-                                                        dest: addr,
-                                                        base: base_alloca,
-                                                        offset: Operand::Const(IrConst::I64(inner_offset as i64)),
-                                                        ty: inner_elem_ir_ty,
-                                                    });
-                                                    self.emit(Instruction::Store { val, ptr: addr, ty: inner_elem_ir_ty });
+                                                    self.emit_init_expr_to_offset(e, base_alloca, inner_offset, inner_elem_ir_ty);
                                                 }
                                             }
                                         }
@@ -2031,18 +1835,8 @@ impl Lowerer {
                                     // Stop if we hit a designator (which targets a different field/index)
                                     if !cur_item.designators.is_empty() && consumed > 0 { break; }
                                     if let Initializer::Expr(expr) = &cur_item.init {
-                                        let expr_ty = self.get_expr_type(expr);
-                                        let val = self.lower_expr(expr);
-                                        let val = self.emit_implicit_cast(val, expr_ty, elem_ir_ty);
                                         let elem_offset = field_offset + ai * elem_size;
-                                        let addr = self.fresh_value();
-                                        self.emit(Instruction::GetElementPtr {
-                                            dest: addr,
-                                            base: base_alloca,
-                                            offset: Operand::Const(IrConst::I64(elem_offset as i64)),
-                                            ty: elem_ir_ty,
-                                        });
-                                        self.emit(Instruction::Store { val, ptr: addr, ty: elem_ir_ty });
+                                        self.emit_init_expr_to_offset(expr, base_alloca, elem_offset, elem_ir_ty);
                                         consumed += 1;
                                         ai += 1;
                                     } else {
@@ -2059,13 +1853,7 @@ impl Lowerer {
                 CType::ComplexFloat | CType::ComplexDouble | CType::ComplexLongDouble => {
                     let complex_ctype = field.ty.clone();
                     let complex_size = complex_ctype.size();
-                    let dest_addr = self.fresh_value();
-                    self.emit(Instruction::GetElementPtr {
-                        dest: dest_addr,
-                        base: base_alloca,
-                        offset: Operand::Const(IrConst::I64(field_offset as i64)),
-                        ty: IrType::Ptr,
-                    });
+                    let dest_addr = self.emit_gep_offset(base_alloca, field_offset, IrType::Ptr);
                     match &item.init {
                         Initializer::Expr(e) => {
                             let expr_ctype = self.expr_ctype(e);
@@ -2103,20 +1891,11 @@ impl Lowerer {
                                     self.emit(Instruction::Store { val, ptr: dest_addr, ty: comp_ty });
                                 }
                             } else {
-                                let zero = match comp_ty {
-                                    IrType::F32 => Operand::Const(IrConst::F32(0.0)),
-                                    _ => Operand::Const(IrConst::F64(0.0)),
-                                };
+                                let zero = Self::complex_zero(comp_ty);
                                 self.emit(Instruction::Store { val: zero, ptr: dest_addr, ty: comp_ty });
                             }
                             // Store imag part
-                            let imag_ptr = self.fresh_value();
-                            self.emit(Instruction::GetElementPtr {
-                                dest: imag_ptr,
-                                base: dest_addr,
-                                offset: Operand::Const(IrConst::I64(comp_size as i64)),
-                                ty: IrType::I8,
-                            });
+                            let imag_ptr = self.emit_gep_offset(dest_addr, comp_size, IrType::I8);
                             if let Some(item) = sub_items.get(1) {
                                 if let Initializer::Expr(e) = &item.init {
                                     let val = self.lower_expr(e);
@@ -2125,10 +1904,7 @@ impl Lowerer {
                                     self.emit(Instruction::Store { val, ptr: imag_ptr, ty: comp_ty });
                                 }
                             } else {
-                                let zero = match comp_ty {
-                                    IrType::F32 => Operand::Const(IrConst::F32(0.0)),
-                                    _ => Operand::Const(IrConst::F64(0.0)),
-                                };
+                                let zero = Self::complex_zero(comp_ty);
                                 self.emit(Instruction::Store { val: zero, ptr: imag_ptr, ty: comp_ty });
                             }
                         }
@@ -2159,13 +1935,7 @@ impl Lowerer {
                     };
                     // Implicit cast for type mismatches (e.g., int literal to float field)
                     let val = self.emit_implicit_cast(val, expr_ty, field_ty);
-                    let addr = self.fresh_value();
-                    self.emit(Instruction::GetElementPtr {
-                        dest: addr,
-                        base: base_alloca,
-                        offset: Operand::Const(IrConst::I64(field_offset as i64)),
-                        ty: field_ty,
-                    });
+                    let addr = self.emit_gep_offset(base_alloca, field_offset, field_ty);
                     // Bitfield fields need read-modify-write instead of plain store
                     if let (Some(bit_offset), Some(bit_width)) = (field.bit_offset, field.bit_width) {
                         self.store_bitfield(addr, field_ty, bit_offset, bit_width, val);

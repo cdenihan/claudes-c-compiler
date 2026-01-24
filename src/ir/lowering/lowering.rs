@@ -575,6 +575,44 @@ impl Lowerer {
         dest
     }
 
+    /// Emit a GEP + Store: store `val` at `base + byte_offset` with the given type.
+    pub(super) fn emit_store_at_offset(&mut self, base: Value, byte_offset: usize, val: Operand, ty: IrType) {
+        let addr = self.fresh_value();
+        self.emit(Instruction::GetElementPtr {
+            dest: addr,
+            base,
+            offset: Operand::Const(IrConst::I64(byte_offset as i64)),
+            ty,
+        });
+        self.emit(Instruction::Store { val, ptr: addr, ty });
+    }
+
+    /// Lower an expression, cast to target type, then store at base + byte_offset.
+    pub(super) fn emit_init_expr_to_offset(&mut self, e: &Expr, base: Value, byte_offset: usize, target_ty: IrType) {
+        let expr_ty = self.get_expr_type(e);
+        let val = self.lower_expr(e);
+        let val = self.emit_implicit_cast(val, expr_ty, target_ty);
+        self.emit_store_at_offset(base, byte_offset, val, target_ty);
+    }
+
+    /// Emit a GEP to compute base + byte_offset and return the address Value.
+    pub(super) fn emit_gep_offset(&mut self, base: Value, byte_offset: usize, ty: IrType) -> Value {
+        let addr = self.fresh_value();
+        self.emit(Instruction::GetElementPtr {
+            dest: addr,
+            base,
+            offset: Operand::Const(IrConst::I64(byte_offset as i64)),
+            ty,
+        });
+        addr
+    }
+
+    /// Emit memcpy from src to base + byte_offset.
+    pub(super) fn emit_memcpy_at_offset(&mut self, base: Value, byte_offset: usize, src: Value, size: usize) {
+        let dest = self.emit_gep_offset(base, byte_offset, IrType::Ptr);
+        self.emit(Instruction::Memcpy { dest, src, size });
+    }
+
     pub(super) fn terminate(&mut self, term: Terminator) {
         let block = BasicBlock {
             label: self.current_label.clone(),

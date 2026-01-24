@@ -35,6 +35,14 @@ impl Lowerer {
         }
     }
 
+    /// Get the zero constant for a complex component type.
+    pub(super) fn complex_zero(comp_ty: IrType) -> Operand {
+        match comp_ty {
+            IrType::F32 => Operand::Const(IrConst::F32(0.0)),
+            _ => Operand::Const(IrConst::F64(0.0)),
+        }
+    }
+
     /// Allocate stack space for a complex value and return the alloca pointer.
     pub(super) fn alloca_complex(&mut self, ctype: &CType) -> Value {
         let size = ctype.size();
