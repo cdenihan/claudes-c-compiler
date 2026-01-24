@@ -751,6 +751,18 @@ impl Lowerer {
 
         // Lower arguments with implicit casts
         let (mut arg_vals, mut arg_types) = self.lower_call_arguments(func, args);
+
+        // Decompose complex double/float arguments into (real, imag) pairs for ABI compliance.
+        // Per SysV ABI: _Complex double -> 2 F64 in XMM registers
+        // _Complex float -> 2 F32 (packed in one XMM, but passed as separate F32 values)
+        // _Complex long double -> memory (keep as pointer, handled via sret/stack)
+        let param_ctypes_for_decompose = if let Expr::Identifier(name, _) = func {
+            self.func_meta.param_ctypes.get(name).cloned()
+        } else {
+            None
+        };
+        self.decompose_complex_call_args(&mut arg_vals, &mut arg_types, &param_ctypes_for_decompose, args);
+
         let dest = self.fresh_value();
 
         // For sret calls, allocate space and prepend hidden pointer argument
@@ -765,14 +777,22 @@ impl Lowerer {
             None
         };
 
-        // Determine variadic status and number of fixed (named) args
+        // Determine variadic status and number of fixed (named) args.
+        // After complex decomposition, each complex float/double param becomes 2 args,
+        // so num_fixed_args must reflect the expanded count.
         let (call_variadic, num_fixed_args) = if let Expr::Identifier(name, _) = func {
             let variadic = self.is_function_variadic(name);
             let n_fixed = if variadic {
-                // Number of declared parameters in the prototype
-                self.func_meta.param_types.get(name)
-                    .map(|p| p.len())
-                    .unwrap_or(arg_vals.len()) // fallback: treat all as fixed
+                // Count decomposed fixed params: complex float/double -> 2, others -> 1
+                if let Some(pctypes) = self.func_meta.param_ctypes.get(name) {
+                    pctypes.iter().map(|ct| {
+                        if matches!(ct, CType::ComplexDouble) { 2 } else { 1 }
+                    }).sum()
+                } else {
+                    self.func_meta.param_types.get(name)
+                        .map(|p| p.len())
+                        .unwrap_or(arg_vals.len())
+                }
             } else {
                 arg_vals.len()
             };
@@ -789,15 +809,38 @@ impl Lowerer {
             return Operand::Value(alloca);
         }
 
-        // For non-sret complex float returns: the packed {real, imag} data is in rax (I64).
-        // Store it into a temporary alloca so consumers can treat it as a pointer to complex data.
+        // For complex returns (non-sret), the return value(s) need to be stored
+        // into a complex alloca so consumers can treat it as a pointer to complex data.
         if sret_size.is_none() {
             if let Expr::Identifier(name, _) = func {
                 if let Some(ret_ct) = self.func_return_ctypes.get(name).cloned() {
                     if ret_ct == CType::ComplexFloat {
+                        // _Complex float: packed {real, imag} in a single I64 register
                         let alloca = self.fresh_value();
                         self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: 8 });
                         self.emit(Instruction::Store { val: Operand::Value(dest), ptr: alloca, ty: IrType::I64 });
+                        return Operand::Value(alloca);
+                    } else if ret_ct == CType::ComplexDouble {
+                        // _Complex double: real in xmm0 (dest), imag in xmm1 (dest2)
+                        // The call returns real part in dest (F64).
+                        // We need to get the second return value (imag) from the call.
+                        // Use a ReturnImag instruction to capture the second FP return value.
+                        let imag_val = self.fresh_value();
+                        self.emit(Instruction::GetReturnF64Second { dest: imag_val });
+                        let alloca = self.fresh_value();
+                        self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: 16 });
+                        // Store real part at offset 0
+                        self.emit(Instruction::Store { val: Operand::Value(dest), ptr: alloca, ty: IrType::F64 });
+                        // Store imag part at offset 8
+                        let imag_ptr = self.fresh_value();
+                        self.emit(Instruction::BinOp {
+                            dest: imag_ptr,
+                            op: IrBinOp::Add,
+                            lhs: Operand::Value(alloca),
+                            rhs: Operand::Const(IrConst::I64(8)),
+                            ty: IrType::I64,
+                        });
+                        self.emit(Instruction::Store { val: Operand::Value(imag_val), ptr: imag_ptr, ty: IrType::F64 });
                         return Operand::Value(alloca);
                     }
                 }

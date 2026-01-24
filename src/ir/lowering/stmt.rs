@@ -961,50 +961,53 @@ impl Lowerer {
                             return Operand::Value(dest);
                         }
                     }
-                    // For non-sret complex returns (e.g., _Complex float), handle
-                    // implicit type conversion when expression type differs from return type.
+                    // For non-sret complex returns, handle type conversion and register-based return.
                     let expr_ct = self.expr_ctype(e);
                     let ret_ct = self.func_return_ctypes.get(&self.current_function_name.clone()).cloned();
                     if expr_ct.is_complex() {
                         if let Some(ref rct) = ret_ct {
-                            if rct.is_complex() && expr_ct != *rct {
+                            // Determine the source pointer for the complex value
+                            let val = self.lower_expr(e);
+                            let src_ptr = if rct.is_complex() && expr_ct != *rct {
                                 // Complex-to-complex conversion (different precision)
-                                let val = self.lower_expr(e);
                                 let ptr = self.operand_to_value(val);
                                 let converted = self.complex_to_complex(ptr, &expr_ct, rct);
-                                // For non-sret complex float, pack into I64 for return
-                                if *rct == CType::ComplexFloat && !self.func_meta.sret_functions.contains_key(&self.current_function_name) {
-                                    let conv_ptr = self.operand_to_value(converted);
-                                    let packed = self.fresh_value();
-                                    self.emit(Instruction::Load { dest: packed, ptr: conv_ptr, ty: IrType::I64 });
-                                    return Operand::Value(packed);
-                                }
-                                return converted;
+                                self.operand_to_value(converted)
+                            } else {
+                                self.operand_to_value(val)
+                            };
+
+                            // _Complex double: return real in xmm0 (as F64), imag in xmm1
+                            if *rct == CType::ComplexDouble && !self.func_meta.sret_functions.contains_key(&self.current_function_name) {
+                                let real = self.load_complex_real(src_ptr, rct);
+                                let imag = self.load_complex_imag(src_ptr, rct);
+                                // Set xmm1 to imag part before return
+                                self.emit(Instruction::SetReturnF64Second { src: imag });
+                                // Return real part (goes into xmm0)
+                                return real;
                             }
-                            // Same complex type, non-sret: pack into I64 for register return
+
+                            // _Complex float: pack into I64 for register return
                             if *rct == CType::ComplexFloat && !self.func_meta.sret_functions.contains_key(&self.current_function_name) {
-                                let val = self.lower_expr(e);
-                                let ptr = self.operand_to_value(val);
                                 let packed = self.fresh_value();
-                                self.emit(Instruction::Load { dest: packed, ptr, ty: IrType::I64 });
+                                self.emit(Instruction::Load { dest: packed, ptr: src_ptr, ty: IrType::I64 });
                                 return Operand::Value(packed);
                             }
                         }
                         // Complex expression returned from non-complex function:
                         // extract real part and convert to return type
                         let ret_ty = self.current_return_type;
-                        if ret_ty != IrType::Ptr {
-                            let val = self.lower_expr(e);
-                            let ptr = self.operand_to_value(val);
+                        if ret_ty != IrType::Ptr && ret_ty != IrType::F64 {
+                            let val2 = self.lower_expr(e);
+                            let ptr = self.operand_to_value(val2);
                             let real_part = self.load_complex_real(ptr, &expr_ct);
                             let from_ty = Self::complex_component_ir_type(&expr_ct);
-                            let val = self.emit_implicit_cast(real_part, from_ty, ret_ty);
-                            return if self.current_return_is_bool { self.emit_bool_normalize(val) } else { val };
+                            let val2 = self.emit_implicit_cast(real_part, from_ty, ret_ty);
+                            return if self.current_return_is_bool { self.emit_bool_normalize(val2) } else { val2 };
                         }
                     }
                     // Non-complex expression returned from a complex-returning function:
-                    // convert scalar to complex (real=scalar, imag=0).
-                    // Use scalar_to_complex for accurate IR-type-based conversion.
+                    // convert scalar to complex and handle appropriately
                     {
                         let ret_ct = self.func_return_ctypes.get(&self.current_function_name.clone()).cloned();
                         if let Some(ref rct) = ret_ct {
@@ -1013,6 +1016,16 @@ impl Lowerer {
                                 let src_ir_ty = self.get_expr_type(e);
                                 let rct_clone = rct.clone();
                                 let complex_val = self.scalar_to_complex(val, src_ir_ty, &rct_clone);
+
+                                // _Complex double: decompose into two FP return registers
+                                if rct_clone == CType::ComplexDouble && !self.func_meta.sret_functions.contains_key(&self.current_function_name) {
+                                    let src_ptr = self.operand_to_value(complex_val);
+                                    let real = self.load_complex_real(src_ptr, &rct_clone);
+                                    let imag = self.load_complex_imag(src_ptr, &rct_clone);
+                                    self.emit(Instruction::SetReturnF64Second { src: imag });
+                                    return real;
+                                }
+
                                 // For sret returns, copy to the hidden pointer
                                 if let Some(sret_alloca) = self.current_sret_ptr {
                                     let src_addr = self.operand_to_value(complex_val);

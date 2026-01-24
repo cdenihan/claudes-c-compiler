@@ -1413,6 +1413,28 @@ impl Lowerer {
         self.func_meta.param_types.insert("scalbnf".to_string(), vec![F32, I32]);
         self.func_meta.return_types.insert("scalbn".to_string(), F64);
         self.func_meta.param_types.insert("scalbn".to_string(), vec![F64, I32]);
+        // Complex math functions: register return types and param_ctypes.
+        // param_types left at original form (Ptr for complex) since arg-casting
+        // uses them pre-decomposition. param_ctypes enables decomposition.
+        self.func_meta.return_types.insert("cabs".to_string(), F64);
+        self.func_meta.param_ctypes.insert("cabs".to_string(), vec![CType::ComplexDouble]);
+        self.func_meta.return_types.insert("cabsf".to_string(), F32);
+        self.func_meta.param_ctypes.insert("cabsf".to_string(), vec![CType::ComplexFloat]);
+        self.func_meta.return_types.insert("cabsl".to_string(), F64);
+        self.func_meta.return_types.insert("carg".to_string(), F64);
+        self.func_meta.param_ctypes.insert("carg".to_string(), vec![CType::ComplexDouble]);
+        self.func_meta.return_types.insert("cargf".to_string(), F32);
+        self.func_meta.param_ctypes.insert("cargf".to_string(), vec![CType::ComplexFloat]);
+        self.func_meta.return_types.insert("creal".to_string(), F64);
+        self.func_meta.param_ctypes.insert("creal".to_string(), vec![CType::ComplexDouble]);
+        self.func_meta.return_types.insert("cimag".to_string(), F64);
+        self.func_meta.param_ctypes.insert("cimag".to_string(), vec![CType::ComplexDouble]);
+        self.func_meta.return_types.insert("crealf".to_string(), F32);
+        self.func_meta.param_ctypes.insert("crealf".to_string(), vec![CType::ComplexFloat]);
+        self.func_meta.return_types.insert("cimagf".to_string(), F32);
+        self.func_meta.param_ctypes.insert("cimagf".to_string(), vec![CType::ComplexFloat]);
+        self.func_meta.return_types.insert("conj".to_string(), F64);
+        self.func_meta.return_types.insert("conjf".to_string(), F32);
     }
 
     pub(super) fn type_spec_to_ir(&self, ts: &TypeSpecifier) -> IrType {

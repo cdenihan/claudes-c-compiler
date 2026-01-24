@@ -190,6 +190,14 @@ pub trait ArchCodegen {
     /// Emit a label address load (GCC &&label extension for computed goto).
     fn emit_label_addr(&mut self, dest: &Value, label: &str);
 
+    /// Emit code to capture the second F64 return value after a function call.
+    /// On x86-64: read xmm1 into dest. On ARM64: read d1. On RISC-V: read fa1.
+    fn emit_get_return_f64_second(&mut self, dest: &Value);
+
+    /// Emit code to set the second F64 return value before a return.
+    /// On x86-64: write xmm1. On ARM64: write d1. On RISC-V: write fa1.
+    fn emit_set_return_f64_second(&mut self, src: &Operand);
+
     /// Emit an indirect branch (computed goto: goto *addr).
     fn emit_indirect_branch(&mut self, target: &Operand);
 
@@ -340,6 +348,12 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction) {
         }
         Instruction::LabelAddr { dest, label } => {
             cg.emit_label_addr(dest, label);
+        }
+        Instruction::GetReturnF64Second { dest } => {
+            cg.emit_get_return_f64_second(dest);
+        }
+        Instruction::SetReturnF64Second { src } => {
+            cg.emit_set_return_f64_second(src);
         }
         Instruction::InlineAsm { template, outputs, inputs, clobbers, operand_types } => {
             cg.emit_inline_asm(template, outputs, inputs, clobbers, operand_types);

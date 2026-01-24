@@ -866,6 +866,14 @@ impl Lowerer {
         if ptr_count > 0 {
             ret_ty = IrType::Ptr;
         }
+        // _Complex double returns real part in xmm0 (F64), imag in xmm1.
+        // Override the Ptr IR type to F64 so the backend uses FP return register.
+        if ptr_count == 0 {
+            let resolved = self.resolve_type_spec(ret_type_spec).clone();
+            if matches!(resolved, TypeSpecifier::ComplexDouble) {
+                ret_ty = IrType::F64;
+            }
+        }
         self.func_meta.return_types.insert(name.to_string(), ret_ty);
 
         // Track CType for pointer-returning functions
@@ -901,7 +909,9 @@ impl Lowerer {
                     self.func_meta.sret_functions.insert(name.to_string(), size);
                 }
             }
-            if matches!(resolved, TypeSpecifier::ComplexDouble | TypeSpecifier::ComplexLongDouble) {
+            // _Complex long double uses sret (too large for registers).
+            // _Complex double returns via xmm0+xmm1 (two FP registers), not sret.
+            if matches!(resolved, TypeSpecifier::ComplexLongDouble) {
                 let size = self.sizeof_type(ret_type_spec);
                 self.func_meta.sret_functions.insert(name.to_string(), size);
             }
@@ -1054,8 +1064,7 @@ impl Lowerer {
         self.push_scope();
         self.current_function_name = func.name.clone();
 
-        let return_type = self.type_spec_to_ir(&func.return_type);
-        self.current_return_type = return_type;
+        let mut return_type = self.type_spec_to_ir(&func.return_type);
         self.current_return_is_bool = matches!(self.resolve_type_spec(&func.return_type), TypeSpecifier::Bool);
 
         // Record return CType for complex-returning functions
@@ -1067,20 +1076,51 @@ impl Lowerer {
         // Check if this function uses sret (returns struct > 8 bytes via hidden pointer)
         let uses_sret = self.func_meta.sret_functions.contains_key(&func.name);
 
+        // _Complex double returns via xmm0+xmm1, not sret. Override return type to F64.
+        if !uses_sret {
+            let resolved_ret = self.resolve_type_spec(&func.return_type).clone();
+            if matches!(resolved_ret, TypeSpecifier::ComplexDouble) {
+                return_type = IrType::F64;
+            }
+        }
+        self.current_return_type = return_type;
+
         let mut params: Vec<IrParam> = Vec::new();
         // If sret, prepend hidden pointer parameter
         if uses_sret {
             params.push(IrParam { name: "__sret_ptr".to_string(), ty: IrType::Ptr });
         }
-        // For K&R functions, float params are promoted to double (default argument promotion)
-        params.extend(func.params.iter().map(|p| {
-            let ty = self.type_spec_to_ir(&p.type_spec);
-            let ty = if func.is_kr && ty == IrType::F32 { IrType::F64 } else { ty };
-            IrParam {
-                name: p.name.clone().unwrap_or_default(),
-                ty,
+        // Build IR params, decomposing complex double/float into two FP params for ABI compliance.
+        // ir_param_to_orig[ir_idx] = original func.params index
+        // complex_decomposed: set of original indices that were decomposed
+        let mut ir_param_to_orig: Vec<Option<usize>> = Vec::new();
+        let mut complex_decomposed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        if uses_sret {
+            ir_param_to_orig.push(None); // sret param has no original
+        }
+        for (orig_idx, p) in func.params.iter().enumerate() {
+            let resolved = self.resolve_type_spec(&p.type_spec).clone();
+            let is_complex_decomposed = matches!(resolved, TypeSpecifier::ComplexDouble);
+            if is_complex_decomposed {
+                let ct = self.type_spec_to_ctype(&resolved);
+                let comp_ty = Self::complex_component_ir_type(&ct);
+                let name = p.name.clone().unwrap_or_default();
+                // Two params: real and imag parts
+                params.push(IrParam { name: format!("{}_real", name), ty: comp_ty });
+                ir_param_to_orig.push(Some(orig_idx));
+                params.push(IrParam { name: format!("{}_imag", name), ty: comp_ty });
+                ir_param_to_orig.push(Some(orig_idx));
+                complex_decomposed.insert(orig_idx);
+            } else {
+                let ty = self.type_spec_to_ir(&p.type_spec);
+                let ty = if func.is_kr && ty == IrType::F32 { IrType::F64 } else { ty };
+                params.push(IrParam {
+                    name: p.name.clone().unwrap_or_default(),
+                    ty,
+                });
+                ir_param_to_orig.push(Some(orig_idx));
             }
-        }));
+        }
 
         // Start entry block
         self.start_block("entry".to_string());
@@ -1104,8 +1144,17 @@ impl Lowerer {
         }
         let mut struct_params: Vec<StructParamInfo> = Vec::new();
 
-        // sret_offset: maps IR param index to func.params index (skip hidden sret param)
-        let sret_offset: usize = if uses_sret { 1 } else { 0 };
+        // Track decomposed complex param allocas for Phase 3 reconstruction
+        struct ComplexDecompInfo {
+            real_alloca: Value,
+            imag_alloca: Value,
+            orig_name: String,
+            c_type: CType,
+        }
+        let mut complex_decomp_params: Vec<ComplexDecompInfo> = Vec::new();
+        // Map: orig_idx -> (real_alloca, imag_alloca) built during Phase 1
+        let mut decomp_real_allocas: std::collections::HashMap<usize, Value> = std::collections::HashMap::new();
+        let mut decomp_imag_allocas: std::collections::HashMap<usize, Value> = std::collections::HashMap::new();
 
         for (i, param) in params.iter().enumerate() {
             // For sret, index 0 is the hidden sret pointer param
@@ -1117,7 +1166,34 @@ impl Lowerer {
                 continue;
             }
 
-            let orig_idx = i - sret_offset;  // index into func.params
+            let orig_idx = match ir_param_to_orig.get(i) {
+                Some(Some(idx)) => *idx,
+                _ => continue, // shouldn't happen
+            };
+
+            // Check if this IR param is part of a decomposed complex param
+            let is_decomposed = complex_decomposed.contains(&orig_idx);
+
+            if is_decomposed {
+                // This is a decomposed complex FP param (real or imag part).
+                // Emit a simple FP alloca for it - don't register as local yet.
+                let alloca = self.fresh_value();
+                let ty = param.ty; // F32 or F64
+                self.emit(Instruction::Alloca {
+                    dest: alloca,
+                    ty,
+                    size: ty.size(),
+                });
+
+                // Determine if this is the real or imag part based on the param name suffix
+                let is_real = param.name.ends_with("_real");
+                if is_real {
+                    decomp_real_allocas.insert(orig_idx, alloca);
+                } else {
+                    decomp_imag_allocas.insert(orig_idx, alloca);
+                }
+                continue;
+            }
 
             if !param.name.is_empty() {
                 let is_struct_param = if let Some(orig_param) = func.params.get(orig_idx) {
@@ -1242,6 +1318,20 @@ impl Lowerer {
             }
         }
 
+        // Collect decomposed complex param info for Phase 3
+        for &orig_idx in &complex_decomposed {
+            if let (Some(&real_alloca), Some(&imag_alloca)) = (decomp_real_allocas.get(&orig_idx), decomp_imag_allocas.get(&orig_idx)) {
+                let orig_name = func.params[orig_idx].name.clone().unwrap_or_default();
+                let ct = self.type_spec_to_ctype(&func.params[orig_idx].type_spec);
+                complex_decomp_params.push(ComplexDecompInfo {
+                    real_alloca,
+                    imag_alloca,
+                    orig_name,
+                    c_type: ct,
+                });
+            }
+        }
+
         // Phase 2: For struct params, emit the struct-sized alloca + memcpy
         for sp in struct_params {
             let struct_alloca = self.fresh_value();
@@ -1280,6 +1370,79 @@ impl Lowerer {
                 },
                 alloca: struct_alloca,
                 alloc_size: sp.struct_size,
+                is_bool: false,
+                static_global_name: None,
+                vla_strides: vec![],
+                vla_size: None,
+            });
+        }
+
+        // Phase 3: For decomposed complex params, create a complex alloca and store
+        // the real/imag FP values (loaded from their Phase 1 allocas) into it.
+        for cdp in complex_decomp_params {
+            let comp_ty = Self::complex_component_ir_type(&cdp.c_type);
+            let comp_size = Self::complex_component_size(&cdp.c_type);
+            let complex_size = cdp.c_type.size();
+
+            // Allocate complex-sized stack slot
+            let complex_alloca = self.fresh_value();
+            self.emit(Instruction::Alloca {
+                dest: complex_alloca,
+                ty: IrType::Ptr,
+                size: complex_size,
+            });
+
+            // Load real part from its param alloca
+            let real_val = self.fresh_value();
+            self.emit(Instruction::Load {
+                dest: real_val,
+                ptr: cdp.real_alloca,
+                ty: comp_ty,
+            });
+
+            // Store real part into complex alloca at offset 0
+            self.emit(Instruction::Store {
+                val: Operand::Value(real_val),
+                ptr: complex_alloca,
+                ty: comp_ty,
+            });
+
+            // Load imag part from its param alloca
+            let imag_val = self.fresh_value();
+            self.emit(Instruction::Load {
+                dest: imag_val,
+                ptr: cdp.imag_alloca,
+                ty: comp_ty,
+            });
+
+            // Store imag part into complex alloca at offset comp_size
+            let imag_ptr = self.fresh_value();
+            self.emit(Instruction::GetElementPtr {
+                dest: imag_ptr,
+                base: complex_alloca,
+                offset: Operand::Const(IrConst::I64(comp_size as i64)),
+                ty: IrType::I8,
+            });
+            self.emit(Instruction::Store {
+                val: Operand::Value(imag_val),
+                ptr: imag_ptr,
+                ty: comp_ty,
+            });
+
+            // Register the complex alloca as the local variable
+            self.locals.insert(cdp.orig_name, LocalInfo {
+                var: VarInfo {
+                    ty: IrType::Ptr,
+                    elem_size: 0,
+                    is_array: false,
+                    pointee_type: None,
+                    struct_layout: None,
+                    is_struct: true,
+                    array_dim_strides: vec![],
+                    c_type: Some(cdp.c_type),
+                },
+                alloca: complex_alloca,
+                alloc_size: complex_size,
                 is_bool: false,
                 static_global_name: None,
                 vla_strides: vec![],

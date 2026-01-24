@@ -1240,6 +1240,34 @@ impl ArchCodegen for RiscvCodegen {
         self.store_t0_to(dest);
     }
 
+    fn emit_get_return_f64_second(&mut self, dest: &Value) {
+        // After a function call, the second F64 return value is in fa1.
+        // Store it to the dest stack slot.
+        if let Some(slot) = self.state.get_slot(dest.0) {
+            self.state.emit(&format!("    fsd fa1, {}(s0)", slot.0));
+        }
+    }
+
+    fn emit_set_return_f64_second(&mut self, src: &Operand) {
+        // Load src into fa1 for the second return value.
+        match src {
+            Operand::Value(v) => {
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    self.state.emit(&format!("    fld fa1, {}(s0)", slot.0));
+                }
+            }
+            Operand::Const(IrConst::F64(f)) => {
+                let bits = f.to_bits() as i64;
+                self.state.emit(&format!("    li t0, {}", bits));
+                self.state.emit("    fmv.d.x fa1, t0");
+            }
+            _ => {
+                self.operand_to_t0(src);
+                self.state.emit("    fmv.d.x fa1, t0");
+            }
+        }
+    }
+
     fn emit_indirect_branch(&mut self, target: &Operand) {
         // Computed goto: goto *target
         self.operand_to_t0(target);

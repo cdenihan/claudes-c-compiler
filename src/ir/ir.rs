@@ -199,6 +199,16 @@ pub enum Instruction {
     /// Get the address of a label (GCC computed goto extension: &&label)
     LabelAddr { dest: Value, label: String },
 
+    /// Get the second F64 return value from a function call (for _Complex double returns).
+    /// On x86-64: reads xmm1, on ARM64: reads d1, on RISC-V: reads fa1.
+    /// Must appear immediately after a Call/CallIndirect instruction.
+    GetReturnF64Second { dest: Value },
+
+    /// Set the second F64 return value before a return (for _Complex double returns).
+    /// On x86-64: writes xmm1, on ARM64: writes d1, on RISC-V: writes fa1.
+    /// Must appear immediately before a Return terminator.
+    SetReturnF64Second { src: Operand },
+
     /// Inline assembly statement
     InlineAsm {
         /// Assembly template string (with \n\t separators)
@@ -728,7 +738,8 @@ impl Instruction {
             | Instruction::AtomicCmpxchg { dest, .. }
             | Instruction::AtomicLoad { dest, .. }
             | Instruction::Phi { dest, .. }
-            | Instruction::LabelAddr { dest, .. } => Some(*dest),
+            | Instruction::LabelAddr { dest, .. }
+            | Instruction::GetReturnF64Second { dest } => Some(*dest),
             Instruction::Call { dest, .. }
             | Instruction::CallIndirect { dest, .. } => *dest,
             Instruction::Store { .. }
@@ -738,6 +749,7 @@ impl Instruction {
             | Instruction::VaCopy { .. }
             | Instruction::AtomicStore { .. }
             | Instruction::Fence { .. }
+            | Instruction::SetReturnF64Second { .. }
             | Instruction::InlineAsm { .. } => None,
         }
     }

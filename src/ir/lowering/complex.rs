@@ -838,4 +838,69 @@ impl Lowerer {
             }
         }
     }
+
+    /// Decompose complex arguments at a call site for ABI compliance.
+    /// Replaces complex double/float pointer arguments with (real, imag) pairs.
+    /// Per SysV ABI:
+    /// - _Complex float: decompose to 2 F32 values (passed in XMM registers)
+    /// - _Complex double: decompose to 2 F64 values (passed in XMM registers)
+    /// - _Complex long double: keep as pointer (passed on stack)
+    pub(super) fn decompose_complex_call_args(
+        &mut self,
+        arg_vals: &mut Vec<Operand>,
+        arg_types: &mut Vec<IrType>,
+        param_ctypes: &Option<Vec<CType>>,
+        args: &[Expr],
+    ) {
+        let pctypes = match param_ctypes {
+            Some(ref ct) => ct.clone(),
+            None => {
+                // No param type info available - try to infer from expressions
+                args.iter().map(|a| self.expr_ctype(a)).collect()
+            }
+        };
+
+        let mut new_vals = Vec::with_capacity(arg_vals.len() * 2);
+        let mut new_types = Vec::with_capacity(arg_types.len() * 2);
+
+        for (i, (val, ty)) in arg_vals.iter().zip(arg_types.iter()).enumerate() {
+            let ctype = pctypes.get(i);
+            let should_decompose = match ctype {
+                Some(CType::ComplexDouble) => true,
+                _ => {
+                    // Also check if the arg_type is Ptr and the expression has complex type
+                    if *ty == IrType::Ptr && i < args.len() {
+                        let arg_ct = self.expr_ctype(&args[i]);
+                        matches!(arg_ct, CType::ComplexDouble)
+                    } else {
+                        false
+                    }
+                }
+            };
+
+            if should_decompose {
+                let complex_ct = ctype.cloned().unwrap_or_else(|| {
+                    if i < args.len() { self.expr_ctype(&args[i]) } else { CType::ComplexDouble }
+                });
+                let comp_ty = Self::complex_component_ir_type(&complex_ct);
+                let ptr = self.operand_to_value(val.clone());
+
+                // Load real part
+                let real = self.load_complex_real(ptr, &complex_ct);
+                // Load imag part
+                let imag = self.load_complex_imag(ptr, &complex_ct);
+
+                new_vals.push(real);
+                new_types.push(comp_ty);
+                new_vals.push(imag);
+                new_types.push(comp_ty);
+            } else {
+                new_vals.push(val.clone());
+                new_types.push(*ty);
+            }
+        }
+
+        *arg_vals = new_vals;
+        *arg_types = new_types;
+    }
 }
