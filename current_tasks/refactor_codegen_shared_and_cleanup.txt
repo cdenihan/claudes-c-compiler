@@ -1,0 +1,12 @@
+Refactor codegen_shared.rs internal structure and clean up resolved tracking files
+
+1. Extract repeated 3-way alloca address resolution pattern (duplicated in emit_store, emit_load,
+   emit_memcpy, emit_gep) into a shared SlotAddr enum + resolve_slot_addr helper
+2. Fix emit_dyn_alloca redundant branch (emit_mov_sp_to_acc called unconditionally in both arms)
+3. Fix inline asm duplicated tied-operand resolution (two separate loops doing the same thing)
+4. Extract copy_operand_metadata helper for operand field copying in emit_inline_asm_common
+5. Remove duplicate num_plus computation
+6. Clean up resolved ideas files (fix_postgres_bootstrap_segfault, fix_postgres_zic_segfault)
+7. Clean up completed task files (fix_struct_pass_by_value_abi)
+
+Does NOT touch the ArchCodegen trait interface or any backend files - purely internal cleanup.

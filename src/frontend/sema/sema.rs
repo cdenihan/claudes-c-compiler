@@ -460,6 +460,8 @@ impl SemanticAnalyzer {
             | Expr::CharLiteral(_, _) => {}
             // Label address (&&label) - just a compile-time address
             Expr::LabelAddr(_, _) => {}
+            // __builtin_types_compatible_p(type1, type2) - compile-time constant
+            Expr::BuiltinTypesCompatibleP(_, _, _) => {}
         }
     }
 

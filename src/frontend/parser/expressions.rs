@@ -514,15 +514,16 @@ impl Parser {
                 Expr::VaArg(Box::new(ap_expr), type_spec, span)
             }
             TokenKind::BuiltinTypesCompatibleP => {
-                // __builtin_types_compatible_p(type1, type2) - always returns 0 (conservative)
+                // __builtin_types_compatible_p(type1, type2)
+                // Compile-time: 1 if types are compatible (ignoring qualifiers), 0 otherwise.
                 let span = self.peek_span();
                 self.advance();
                 self.expect(&TokenKind::LParen);
-                self.parse_va_arg_type();
+                let type1 = self.parse_va_arg_type();
                 self.expect(&TokenKind::Comma);
-                self.parse_va_arg_type();
+                let type2 = self.parse_va_arg_type();
                 self.expect(&TokenKind::RParen);
-                Expr::IntLiteral(0, span)
+                Expr::BuiltinTypesCompatibleP(type1, type2, span)
             }
             TokenKind::Typeof => {
                 let span = self.peek_span();

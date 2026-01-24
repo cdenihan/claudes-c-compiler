@@ -167,6 +167,10 @@ impl Lowerer {
             Expr::AddressOf(inner, _) => {
                 self.eval_offsetof_pattern(inner)
             }
+            Expr::BuiltinTypesCompatibleP(ref type1, ref type2, _) => {
+                let result = self.eval_types_compatible(type1, type2);
+                Some(IrConst::I64(result as i64))
+            }
             _ => None,
         }
     }

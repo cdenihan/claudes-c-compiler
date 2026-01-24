@@ -101,7 +101,8 @@ static BUILTIN_MAP: LazyLock<HashMap<&'static str, BuiltinInfo>> = LazyLock::new
 
     // Type queries (compile-time constants)
     m.insert("__builtin_constant_p", BuiltinInfo::constant_i64(0)); // conservative: always 0
-    m.insert("__builtin_types_compatible_p", BuiltinInfo::constant_i64(0));
+    // Note: __builtin_types_compatible_p is handled as a special AST node (BuiltinTypesCompatibleP),
+    // parsed directly in the parser and evaluated at compile-time in the lowerer.
 
     // Floating-point comparison builtins
     m.insert("__builtin_isgreater", BuiltinInfo::intrinsic(BuiltinIntrinsic::FpCompare));

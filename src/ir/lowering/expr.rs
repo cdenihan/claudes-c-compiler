@@ -97,6 +97,10 @@ impl Lowerer {
                 self.emit(Instruction::LabelAddr { dest, label: scoped_label });
                 Operand::Value(dest)
             }
+            Expr::BuiltinTypesCompatibleP(ref type1, ref type2, _) => {
+                let result = self.eval_types_compatible(type1, type2);
+                Operand::Const(IrConst::I64(result as i64))
+            }
         }
     }
 

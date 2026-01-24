@@ -284,6 +284,9 @@ pub enum Expr {
     GenericSelection(Box<Expr>, Vec<GenericAssociation>, Span),
     /// GCC extension: &&label (address of label, for computed goto)
     LabelAddr(String, Span),
+    /// GCC extension: __builtin_types_compatible_p(type1, type2)
+    /// Compile-time constant: 1 if the two types are compatible, 0 otherwise.
+    BuiltinTypesCompatibleP(TypeSpecifier, TypeSpecifier, Span),
 }
 
 /// A _Generic association: either a type-expression pair, or a default expression.
@@ -370,7 +373,8 @@ impl Expr {
             | Expr::Cast(_, _, s) | Expr::CompoundLiteral(_, _, s) | Expr::StmtExpr(_, s)
             | Expr::Sizeof(_, s) | Expr::VaArg(_, _, s) | Expr::Alignof(_, s) | Expr::Comma(_, _, s)
             | Expr::AddressOf(_, s) | Expr::Deref(_, s)
-            | Expr::GenericSelection(_, _, s) | Expr::LabelAddr(_, s) => *s,
+            | Expr::GenericSelection(_, _, s) | Expr::LabelAddr(_, s)
+            | Expr::BuiltinTypesCompatibleP(_, _, s) => *s,
         }
     }
 }

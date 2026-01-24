@@ -58,6 +58,46 @@ impl Lowerer {
         }
     }
 
+    /// Evaluate __builtin_types_compatible_p(type1, type2).
+    /// Returns 1 if the unqualified types are compatible (same type after resolving
+    /// typedefs and typeof), 0 otherwise. Follows GCC semantics: ignores top-level
+    /// qualifiers, resolves typedefs, but considers signed/unsigned as distinct.
+    pub(super) fn eval_types_compatible(&self, type1: &TypeSpecifier, type2: &TypeSpecifier) -> i32 {
+        let ctype1 = self.type_spec_to_ctype(type1);
+        let ctype2 = self.type_spec_to_ctype(type2);
+        // Strip top-level qualifiers (CType doesn't carry qualifiers, so this is already done).
+        // Compare the resolved CTypes. GCC considers enum types as their underlying int type,
+        // and considers long/int as distinct even if same size on the platform.
+        if Self::ctypes_compatible(&ctype1, &ctype2) { 1 } else { 0 }
+    }
+
+    /// Check if two CTypes are compatible for __builtin_types_compatible_p purposes.
+    /// This is structural equality with special handling for:
+    /// - Arrays: compatible if element types match (ignore size for unsized arrays)
+    /// - Pointers: compatible if pointee types are compatible
+    /// - Enums: treated as compatible with int
+    fn ctypes_compatible(a: &CType, b: &CType) -> bool {
+        // Normalize enum to int for compatibility purposes
+        let a_norm = match a { CType::Enum(_) => &CType::Int, other => other };
+        let b_norm = match b { CType::Enum(_) => &CType::Int, other => other };
+
+        match (a_norm, b_norm) {
+            // Pointers: pointee types must be compatible
+            (CType::Pointer(p1), CType::Pointer(p2)) => Self::ctypes_compatible(p1, p2),
+            // Arrays: element types must be compatible, sizes must match (or both unsized)
+            (CType::Array(e1, s1), CType::Array(e2, s2)) => {
+                Self::ctypes_compatible(e1, e2) && s1 == s2
+            }
+            // Structs/Unions: use derived PartialEq (compares name + fields)
+            (CType::Struct(s1), CType::Struct(s2)) => s1 == s2,
+            (CType::Union(u1), CType::Union(u2)) => u1 == u2,
+            // Function types
+            (CType::Function(f1), CType::Function(f2)) => f1 == f2,
+            // All other types (scalars, void, bool, etc.): direct enum equality
+            _ => a_norm == b_norm,
+        }
+    }
+
     /// Convert a CType back to a TypeSpecifier (for typeof resolution).
     fn ctype_to_type_spec(ctype: &CType) -> TypeSpecifier {
         match ctype {
