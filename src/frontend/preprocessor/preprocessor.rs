@@ -529,7 +529,7 @@ impl Preprocessor {
 
             if needs_more {
                 // Was accumulating for unbalanced parens
-                if !Self::has_unbalanced_parens(pending_line) || *pending_newlines > 20 {
+                if !Self::has_unbalanced_parens(pending_line) || *pending_newlines > 200 {
                     let expanded = self.macros.expand_line(pending_line);
                     output.push_str(&expanded);
                     output.push('\n');
@@ -542,7 +542,7 @@ impl Preprocessor {
             } else {
                 // Was accumulating for trailing function-like macro name.
                 // Now we have the next line joined. Check if parens are balanced.
-                if Self::has_unbalanced_parens(pending_line) && *pending_newlines <= 20 {
+                if Self::has_unbalanced_parens(pending_line) && *pending_newlines <= 200 {
                     // The joined text has unbalanced parens (macro args span more lines)
                     // Keep accumulating.
                 } else {
