@@ -124,6 +124,8 @@ pub enum TypeSpecifier {
     UnsignedInt,
     UnsignedLong,
     UnsignedLongLong,
+    Int128,
+    UnsignedInt128,
     Bool,
     ComplexFloat,
     ComplexDouble,

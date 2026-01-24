@@ -258,6 +258,8 @@ pub enum IrConst {
     I16(i16),
     I32(i32),
     I64(i64),
+    /// 128-bit integer constant (signed or unsigned, stored as i128).
+    I128(i128),
     F32(f32),
     F64(f64),
     /// Long double: stored as f64 value, emitted as x87 80-bit extended precision (16 bytes with padding).
@@ -391,7 +393,7 @@ impl IrConst {
     /// Returns true if this constant is zero (integer or float).
     pub fn is_zero(&self) -> bool {
         match self {
-            IrConst::I8(0) | IrConst::I16(0) | IrConst::I32(0) | IrConst::I64(0) => true,
+            IrConst::I8(0) | IrConst::I16(0) | IrConst::I32(0) | IrConst::I64(0) | IrConst::I128(0) => true,
             IrConst::F32(v) => *v == 0.0,
             IrConst::F64(v) => *v == 0.0,
             IrConst::LongDouble(v) => *v == 0.0,
@@ -402,7 +404,7 @@ impl IrConst {
 
     /// Returns true if this constant is one (integer only).
     pub fn is_one(&self) -> bool {
-        matches!(self, IrConst::I8(1) | IrConst::I16(1) | IrConst::I32(1) | IrConst::I64(1))
+        matches!(self, IrConst::I8(1) | IrConst::I16(1) | IrConst::I32(1) | IrConst::I64(1) | IrConst::I128(1))
     }
 
     /// Returns true if this constant is nonzero (for truthiness checks in const eval).
@@ -417,6 +419,7 @@ impl IrConst {
             IrConst::I16(v) => ConstHashKey::I16(*v),
             IrConst::I32(v) => ConstHashKey::I32(*v),
             IrConst::I64(v) => ConstHashKey::I64(*v),
+            IrConst::I128(v) => ConstHashKey::I64(*v as i64), // hash key truncates to i64
             IrConst::F32(v) => ConstHashKey::F32(v.to_bits()),
             IrConst::F64(v) => ConstHashKey::F64(v.to_bits()),
             IrConst::LongDouble(v) => ConstHashKey::F64(v.to_bits()),
@@ -431,6 +434,7 @@ impl IrConst {
             IrConst::I16(v) => Some(*v as f64),
             IrConst::I32(v) => Some(*v as f64),
             IrConst::I64(v) => Some(*v as f64),
+            IrConst::I128(v) => Some(*v as f64),
             IrConst::F32(v) => Some(*v as f64),
             IrConst::F64(v) => Some(*v),
             IrConst::LongDouble(v) => Some(*v),
@@ -449,6 +453,7 @@ impl IrConst {
             IrType::I16 | IrType::U16 => IrConst::I16(fv as i16),
             IrType::I32 | IrType::U32 => IrConst::I32(fv as i32),
             IrType::I64 | IrType::U64 | IrType::Ptr => IrConst::I64(fv as i64),
+            IrType::I128 | IrType::U128 => IrConst::I128(fv as i128),
             _ => return None,
         })
     }
@@ -460,6 +465,7 @@ impl IrConst {
             IrConst::I16(v) => Some(*v as i64),
             IrConst::I32(v) => Some(*v as i64),
             IrConst::I64(v) => Some(*v),
+            IrConst::I128(v) => Some(*v as i64),
             IrConst::Zero => Some(0),
             IrConst::F32(_) | IrConst::F64(_) | IrConst::LongDouble(_) => None,
         }
@@ -472,6 +478,7 @@ impl IrConst {
             IrConst::I16(v) => Some(*v as u64),
             IrConst::I32(v) => Some(*v as u64),
             IrConst::I64(v) => Some(*v as u64),
+            IrConst::I128(v) => Some(*v as u64),
             IrConst::Zero => Some(0),
             IrConst::F32(_) | IrConst::F64(_) | IrConst::LongDouble(_) => None,
         }
@@ -506,6 +513,10 @@ impl IrConst {
                 let bytes = f64_to_f128_bytes(*v);
                 out.extend_from_slice(&bytes);
             }
+            IrConst::I128(v) => {
+                let le_bytes = v.to_le_bytes();
+                out.extend_from_slice(&le_bytes[..size.min(16)]);
+            }
             _ => {
                 let le_bytes = self.to_i64().unwrap_or(0).to_le_bytes();
                 if size <= 8 {
@@ -525,6 +536,7 @@ impl IrConst {
             IrType::I8 | IrType::U8 => IrConst::I8(val as i8),
             IrType::I16 | IrType::U16 => IrConst::I16(val as i16),
             IrType::I32 | IrType::U32 => IrConst::I32(val as i32),
+            IrType::I128 | IrType::U128 => IrConst::I128(val as i128),
             IrType::F32 => IrConst::F32(val as f32),
             IrType::F64 => IrConst::F64(val as f64),
             _ => IrConst::I64(val),
@@ -539,6 +551,7 @@ impl IrConst {
             (IrConst::I16(_), IrType::I16 | IrType::U16) => return self.clone(),
             (IrConst::I32(_), IrType::I32 | IrType::U32) => return self.clone(),
             (IrConst::I64(_), IrType::I64 | IrType::U64 | IrType::Ptr) => return self.clone(),
+            (IrConst::I128(_), IrType::I128 | IrType::U128) => return self.clone(),
             (IrConst::F32(_), IrType::F32) => return self.clone(),
             (IrConst::F64(_), IrType::F64) => return self.clone(),
             // LongDouble stays as LongDouble when target is F64 or F128
@@ -721,6 +734,33 @@ impl Instruction {
     /// Get the destination value defined by this instruction, if any.
     /// Instructions like Store, Memcpy, VaStart, VaEnd, VaCopy, AtomicStore,
     /// Fence, and InlineAsm produce no value.
+    /// Returns the result IR type of this instruction, if any.
+    /// Used to determine stack slot sizes for 128-bit values.
+    pub fn result_type(&self) -> Option<IrType> {
+        match self {
+            Instruction::Load { ty, .. } => Some(*ty),
+            Instruction::BinOp { ty, .. } => Some(*ty),
+            Instruction::UnaryOp { ty, .. } => Some(*ty),
+            Instruction::Cmp { .. } => Some(IrType::I8), // comparisons produce i8
+            Instruction::Cast { to_ty, .. } => Some(*to_ty),
+            Instruction::Call { return_type, .. }
+            | Instruction::CallIndirect { return_type, .. } => Some(*return_type),
+            Instruction::VaArg { result_ty, .. } => Some(*result_ty),
+            Instruction::AtomicRmw { ty, .. } => Some(*ty),
+            Instruction::AtomicCmpxchg { ty, returns_bool, .. } => {
+                if *returns_bool { Some(IrType::I8) } else { Some(*ty) }
+            }
+            Instruction::AtomicLoad { ty, .. } => Some(*ty),
+            // Alloca, GEP, GlobalAddr, Copy, DynAlloca, LabelAddr produce pointers or copy types
+            Instruction::Alloca { .. } | Instruction::DynAlloca { .. }
+            | Instruction::GetElementPtr { .. } | Instruction::GlobalAddr { .. }
+            | Instruction::LabelAddr { .. } => Some(IrType::Ptr),
+            Instruction::Copy { .. } => None, // unknown without tracking
+            Instruction::Phi { ty, .. } => Some(*ty),
+            _ => None,
+        }
+    }
+
     pub fn dest(&self) -> Option<Value> {
         match self {
             Instruction::Alloca { dest, .. }

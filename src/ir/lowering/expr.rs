@@ -364,15 +364,24 @@ impl Lowerer {
         } else if is_shift {
             // For shifts: result type is the promoted left operand type
             let promoted_lhs = Self::integer_promote(lhs_ty);
-            (IrType::I64, promoted_lhs.is_unsigned(), promoted_lhs)
+            let shift_op_ty = if promoted_lhs == IrType::I128 || promoted_lhs == IrType::U128 {
+                promoted_lhs
+            } else {
+                IrType::I64
+            };
+            (shift_op_ty, promoted_lhs.is_unsigned(), promoted_lhs)
         } else {
             let ct = Self::common_type(lhs_ty, rhs_ty);
-            (IrType::I64, ct.is_unsigned(), ct)
+            // Use I128/U128 as op_ty when operands are 128-bit
+            let ot = if ct == IrType::I128 || ct == IrType::U128 { ct } else { IrType::I64 };
+            (ot, ct.is_unsigned(), ct)
         };
 
         // For shifts, promote operands independently (not to common type)
         let (lhs_val, rhs_val) = if is_shift {
-            let lhs_val = self.lower_expr_with_type(lhs, IrType::I64);
+            let shift_lhs_ty = if op_ty == IrType::I128 || op_ty == IrType::U128 { op_ty } else { IrType::I64 };
+            let lhs_val = self.lower_expr_with_type(lhs, shift_lhs_ty);
+            // Shift amount is always I64 regardless of operand type
             let rhs_val = self.lower_expr_with_type(rhs, IrType::I64);
             (lhs_val, rhs_val)
         } else {
@@ -2943,6 +2952,11 @@ impl Lowerer {
 
     /// Determine common type for usual arithmetic conversions.
     pub(super) fn common_type(a: IrType, b: IrType) -> IrType {
+        // 128-bit integers have highest rank among integer types
+        if a == IrType::I128 || a == IrType::U128 || b == IrType::I128 || b == IrType::U128 {
+            if a == IrType::U128 || b == IrType::U128 { return IrType::U128; }
+            return IrType::I128;
+        }
         if a == IrType::F128 || b == IrType::F128 { return IrType::F128; }
         if a == IrType::F64 || b == IrType::F64 { return IrType::F64; }
         if a == IrType::F32 || b == IrType::F32 { return IrType::F32; }

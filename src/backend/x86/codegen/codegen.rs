@@ -76,6 +76,15 @@ impl X86Codegen {
                             self.state.emit(&format!("    movabsq ${}, %rax", bits as i64));
                         }
                     }
+                    IrConst::I128(v) => {
+                        // Truncate to low 64 bits for rax-only path
+                        let low = *v as i64;
+                        if low >= i32::MIN as i64 && low <= i32::MAX as i64 {
+                            self.state.emit(&format!("    movq ${}, %rax", low));
+                        } else {
+                            self.state.emit(&format!("    movabsq ${}, %rax", low));
+                        }
+                    }
                     IrConst::Zero => self.state.emit("    xorq %rax, %rax"),
                 }
             }
@@ -97,6 +106,76 @@ impl X86Codegen {
     fn store_rax_to(&mut self, dest: &Value) {
         if let Some(slot) = self.state.get_slot(dest.0) {
             self.state.emit(&format!("    movq %rax, {}(%rbp)", slot.0));
+        }
+    }
+
+    // --- 128-bit integer helpers ---
+    // Convention: 128-bit values use %rax (low 64 bits) and %rdx (high 64 bits).
+    // Stack slots for 128-bit values are 16 bytes: slot(%rbp) = low, slot+8(%rbp) = high.
+
+    /// Check if a type is 128-bit.
+    fn is_i128_type(ty: IrType) -> bool {
+        matches!(ty, IrType::I128 | IrType::U128)
+    }
+
+    /// Load a 128-bit operand into %rax (low) and %rdx (high).
+    fn operand_to_rax_rdx(&mut self, op: &Operand) {
+        match op {
+            Operand::Const(c) => {
+                match c {
+                    IrConst::I128(v) => {
+                        let low = *v as u64 as i64;
+                        let high = (*v >> 64) as u64 as i64;
+                        if low == 0 {
+                            self.state.emit("    xorq %rax, %rax");
+                        } else if low >= i32::MIN as i64 && low <= i32::MAX as i64 {
+                            self.state.emit(&format!("    movq ${}, %rax", low));
+                        } else {
+                            self.state.emit(&format!("    movabsq ${}, %rax", low));
+                        }
+                        if high == 0 {
+                            self.state.emit("    xorq %rdx, %rdx");
+                        } else if high >= i32::MIN as i64 && high <= i32::MAX as i64 {
+                            self.state.emit(&format!("    movq ${}, %rdx", high));
+                        } else {
+                            self.state.emit(&format!("    movabsq ${}, %rdx", high));
+                        }
+                    }
+                    IrConst::Zero => {
+                        self.state.emit("    xorq %rax, %rax");
+                        self.state.emit("    xorq %rdx, %rdx");
+                    }
+                    _ => {
+                        // Smaller constant: load into rax, zero/sign-extend to rdx
+                        self.operand_to_rax(op);
+                        self.state.emit("    xorq %rdx, %rdx");
+                    }
+                }
+            }
+            Operand::Value(v) => {
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    if self.state.is_alloca(v.0) {
+                        // Alloca: load the address (not a 128-bit value itself)
+                        self.state.emit(&format!("    leaq {}(%rbp), %rax", slot.0));
+                        self.state.emit("    xorq %rdx, %rdx");
+                    } else {
+                        // 128-bit value in 16-byte stack slot
+                        self.state.emit(&format!("    movq {}(%rbp), %rax", slot.0));
+                        self.state.emit(&format!("    movq {}(%rbp), %rdx", slot.0 + 8));
+                    }
+                } else {
+                    self.state.emit("    xorq %rax, %rax");
+                    self.state.emit("    xorq %rdx, %rdx");
+                }
+            }
+        }
+    }
+
+    /// Store %rax:%rdx (128-bit) to a value's 16-byte stack slot.
+    fn store_rax_rdx_to(&mut self, dest: &Value) {
+        if let Some(slot) = self.state.get_slot(dest.0) {
+            self.state.emit(&format!("    movq %rax, {}(%rbp)", slot.0));
+            self.state.emit(&format!("    movq %rdx, {}(%rbp)", slot.0 + 8));
         }
     }
 
@@ -359,6 +438,147 @@ impl X86Codegen {
         self.state.emit(&format!("    jne {}", loop_label));
         // rax = old value on success
     }
+
+    /// Emit 128-bit binary operation.
+    /// Convention: lhs in %rax:%rdx (low:high), rhs pushed onto stack.
+    /// Result in %rax:%rdx, then stored to 16-byte dest slot.
+    fn emit_binop_i128(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
+        let _is_unsigned = ty.is_unsigned();
+        match op {
+            IrBinOp::Add => {
+                self.operand_to_rax_rdx(lhs);
+                self.state.emit("    pushq %rdx");
+                self.state.emit("    pushq %rax");
+                self.operand_to_rax_rdx(rhs);
+                self.state.emit("    movq %rax, %rcx");
+                self.state.emit("    movq %rdx, %rsi");
+                self.state.emit("    popq %rax");
+                self.state.emit("    popq %rdx");
+                self.state.emit("    addq %rcx, %rax");
+                self.state.emit("    adcq %rsi, %rdx");
+            }
+            IrBinOp::Sub => {
+                self.operand_to_rax_rdx(lhs);
+                self.state.emit("    pushq %rdx");
+                self.state.emit("    pushq %rax");
+                self.operand_to_rax_rdx(rhs);
+                self.state.emit("    movq %rax, %rcx");
+                self.state.emit("    movq %rdx, %rsi");
+                self.state.emit("    popq %rax");
+                self.state.emit("    popq %rdx");
+                self.state.emit("    subq %rcx, %rax");
+                self.state.emit("    sbbq %rsi, %rdx");
+            }
+            IrBinOp::Mul => {
+                self.operand_to_rax_rdx(lhs);
+                self.state.emit("    pushq %rdx");  // a_hi
+                self.state.emit("    pushq %rax");  // a_lo
+                self.operand_to_rax_rdx(rhs);
+                self.state.emit("    movq %rax, %rcx");   // rcx = b_lo
+                self.state.emit("    movq %rdx, %rsi");   // rsi = b_hi
+                self.state.emit("    popq %rax");          // rax = a_lo
+                self.state.emit("    popq %rdi");          // rdi = a_hi
+                self.state.emit("    movq %rdi, %r8");
+                self.state.emit("    imulq %rcx, %r8");    // r8 = a_hi * b_lo
+                self.state.emit("    movq %rax, %r9");
+                self.state.emit("    imulq %rsi, %r9");    // r9 = a_lo * b_hi
+                self.state.emit("    mulq %rcx");          // rdx:rax = a_lo * b_lo
+                self.state.emit("    addq %r8, %rdx");
+                self.state.emit("    addq %r9, %rdx");
+            }
+            IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem => {
+                let func_name = match op {
+                    IrBinOp::SDiv => "__divti3",
+                    IrBinOp::UDiv => "__udivti3",
+                    IrBinOp::SRem => "__modti3",
+                    IrBinOp::URem => "__umodti3",
+                    _ => unreachable!(),
+                };
+                self.operand_to_rax_rdx(rhs);
+                self.state.emit("    pushq %rdx");
+                self.state.emit("    pushq %rax");
+                self.operand_to_rax_rdx(lhs);
+                self.state.emit("    movq %rax, %rdi");
+                self.state.emit("    movq %rdx, %rsi");
+                self.state.emit("    popq %rdx");
+                self.state.emit("    popq %rcx");
+                self.state.emit(&format!("    call {}@PLT", func_name));
+            }
+            IrBinOp::And => {
+                self.operand_to_rax_rdx(lhs);
+                self.state.emit("    pushq %rdx");
+                self.state.emit("    pushq %rax");
+                self.operand_to_rax_rdx(rhs);
+                self.state.emit("    movq %rax, %rcx");
+                self.state.emit("    movq %rdx, %rsi");
+                self.state.emit("    popq %rax");
+                self.state.emit("    popq %rdx");
+                self.state.emit("    andq %rcx, %rax");
+                self.state.emit("    andq %rsi, %rdx");
+            }
+            IrBinOp::Or => {
+                self.operand_to_rax_rdx(lhs);
+                self.state.emit("    pushq %rdx");
+                self.state.emit("    pushq %rax");
+                self.operand_to_rax_rdx(rhs);
+                self.state.emit("    movq %rax, %rcx");
+                self.state.emit("    movq %rdx, %rsi");
+                self.state.emit("    popq %rax");
+                self.state.emit("    popq %rdx");
+                self.state.emit("    orq %rcx, %rax");
+                self.state.emit("    orq %rsi, %rdx");
+            }
+            IrBinOp::Xor => {
+                self.operand_to_rax_rdx(lhs);
+                self.state.emit("    pushq %rdx");
+                self.state.emit("    pushq %rax");
+                self.operand_to_rax_rdx(rhs);
+                self.state.emit("    movq %rax, %rcx");
+                self.state.emit("    movq %rdx, %rsi");
+                self.state.emit("    popq %rax");
+                self.state.emit("    popq %rdx");
+                self.state.emit("    xorq %rcx, %rax");
+                self.state.emit("    xorq %rsi, %rdx");
+            }
+            IrBinOp::Shl => {
+                self.operand_to_rax_rdx(rhs);
+                self.state.emit("    movq %rax, %rcx");
+                self.operand_to_rax_rdx(lhs);
+                self.state.emit("    shldq %cl, %rax, %rdx");
+                self.state.emit("    shlq %cl, %rax");
+                self.state.emit("    testb $64, %cl");
+                self.state.emit("    je 1f");
+                self.state.emit("    movq %rax, %rdx");
+                self.state.emit("    xorq %rax, %rax");
+                self.state.emit("1:");
+            }
+            IrBinOp::LShr => {
+                self.operand_to_rax_rdx(rhs);
+                self.state.emit("    movq %rax, %rcx");
+                self.operand_to_rax_rdx(lhs);
+                self.state.emit("    shrdq %cl, %rdx, %rax");
+                self.state.emit("    shrq %cl, %rdx");
+                self.state.emit("    testb $64, %cl");
+                self.state.emit("    je 1f");
+                self.state.emit("    movq %rdx, %rax");
+                self.state.emit("    xorq %rdx, %rdx");
+                self.state.emit("1:");
+            }
+            IrBinOp::AShr => {
+                self.operand_to_rax_rdx(rhs);
+                self.state.emit("    movq %rax, %rcx");
+                self.operand_to_rax_rdx(lhs);
+                self.state.emit("    shrdq %cl, %rdx, %rax");
+                self.state.emit("    sarq %cl, %rdx");
+                self.state.emit("    testb $64, %cl");
+                self.state.emit("    je 1f");
+                self.state.emit("    movq %rdx, %rax");
+                self.state.emit("    sarq $63, %rdx");
+                self.state.emit("1:");
+            }
+        }
+        self.store_rax_rdx_to(dest);
+    }
 }
 
 const X86_ARG_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
@@ -448,10 +668,14 @@ impl ArchCodegen for X86Codegen {
         let mut stack_param_offset: i64 = 16;
         for (_i, param) in func.params.iter().enumerate() {
             let is_long_double = param.ty.is_long_double();
+            let is_i128 = Self::is_i128_type(param.ty);
             let is_float = param.ty.is_float() && !is_long_double;
             // F128 (long double) is always passed on the stack on x86-64 (X87 class)
+            // I128 needs 2 consecutive int regs
             let is_stack_passed = if is_long_double {
                 true
+            } else if is_i128 {
+                int_reg_idx + 1 >= 6 // needs 2 consecutive regs
             } else if is_float {
                 float_reg_idx >= 8
             } else {
@@ -460,8 +684,13 @@ impl ArchCodegen for X86Codegen {
 
             if param.name.is_empty() {
                 if is_long_double {
-                    // F128 takes 16 bytes on stack
                     stack_param_offset += 16;
+                } else if is_i128 {
+                    if is_stack_passed {
+                        stack_param_offset += 16;
+                    } else {
+                        int_reg_idx += 2;
+                    }
                 } else if is_stack_passed {
                     stack_param_offset += 8;
                 } else if is_float {
@@ -471,11 +700,10 @@ impl ArchCodegen for X86Codegen {
                 }
                 continue;
             }
-            if let Some((dest, ty)) = find_param_alloca(func, _i) {
+            if let Some((dest, _ty)) = find_param_alloca(func, _i) {
                 if let Some(slot) = self.state.get_slot(dest.0) {
                     if is_long_double {
                         // F128 (long double) on x86-64: passed on stack as 16-byte x87 extended.
-                        // Load the x87 80-bit extended precision value and convert to f64 bit pattern.
                         self.state.emit(&format!("    fldt {}(%rbp)", stack_param_offset));
                         self.state.emit("    subq $8, %rsp");
                         self.state.emit("    fstpl (%rsp)");
@@ -483,17 +711,27 @@ impl ArchCodegen for X86Codegen {
                         self.state.emit("    addq $8, %rsp");
                         self.state.emit(&format!("    movq %rax, {}(%rbp)", slot.0));
                         stack_param_offset += 16;
-                    } else if is_stack_passed {
-                        // Stack-passed parameter: copy from positive rbp offset to local slot
+                    } else if is_i128 && !is_stack_passed {
+                        // 128-bit integer: arrives in 2 consecutive int regs
+                        // reg[idx] = low half, reg[idx+1] = high half
+                        self.state.emit(&format!("    movq %{}, {}(%rbp)", X86_ARG_REGS[int_reg_idx], slot.0));
+                        self.state.emit(&format!("    movq %{}, {}(%rbp)", X86_ARG_REGS[int_reg_idx + 1], slot.0 + 8));
+                        int_reg_idx += 2;
+                    } else if is_i128 && is_stack_passed {
+                        // 128-bit integer on stack: 16 bytes
                         self.state.emit(&format!("    movq {}(%rbp), %rax", stack_param_offset));
-                        let store_instr = Self::mov_store_for_type(ty);
-                        let reg = Self::reg_for_type("rax", ty);
+                        self.state.emit(&format!("    movq %rax, {}(%rbp)", slot.0));
+                        self.state.emit(&format!("    movq {}(%rbp), %rax", stack_param_offset + 8));
+                        self.state.emit(&format!("    movq %rax, {}(%rbp)", slot.0 + 8));
+                        stack_param_offset += 16;
+                    } else if is_stack_passed {
+                        self.state.emit(&format!("    movq {}(%rbp), %rax", stack_param_offset));
+                        let store_instr = Self::mov_store_for_type(_ty);
+                        let reg = Self::reg_for_type("rax", _ty);
                         self.state.emit(&format!("    {} %{}, {}(%rbp)", store_instr, reg, slot.0));
                         stack_param_offset += 8;
                     } else if is_float {
-                        // Float params arrive in xmm0-xmm7 per SysV ABI
-                        if ty == IrType::F32 {
-                            // Store F32: movd to eax (zero-extends to rax), then movq to slot
+                        if _ty == IrType::F32 {
                             self.state.emit(&format!("    movd %{}, %eax", xmm_regs[float_reg_idx]));
                             self.state.emit(&format!("    movq %rax, {}(%rbp)", slot.0));
                         } else {
@@ -502,8 +740,8 @@ impl ArchCodegen for X86Codegen {
                         }
                         float_reg_idx += 1;
                     } else {
-                        let store_instr = Self::mov_store_for_type(ty);
-                        let reg = Self::reg_for_type(X86_ARG_REGS[int_reg_idx], ty);
+                        let store_instr = Self::mov_store_for_type(_ty);
+                        let reg = Self::reg_for_type(X86_ARG_REGS[int_reg_idx], _ty);
                         self.state.emit(&format!("    {} %{}, {}(%rbp)", store_instr, reg, slot.0));
                         int_reg_idx += 1;
                     }
@@ -511,6 +749,12 @@ impl ArchCodegen for X86Codegen {
             } else {
                 if is_long_double {
                     stack_param_offset += 16;
+                } else if is_i128 {
+                    if is_stack_passed {
+                        stack_param_offset += 16;
+                    } else {
+                        int_reg_idx += 2;
+                    }
                 } else if is_stack_passed {
                     stack_param_offset += 8;
                 } else if is_float {
@@ -531,6 +775,24 @@ impl ArchCodegen for X86Codegen {
     }
 
     fn emit_store(&mut self, val: &Operand, ptr: &Value, ty: IrType) {
+        if Self::is_i128_type(ty) {
+            // 128-bit store: load value into rax:rdx, then store both halves
+            self.operand_to_rax_rdx(val);
+            if let Some(slot) = self.state.get_slot(ptr.0) {
+                if self.state.is_alloca(ptr.0) {
+                    self.state.emit(&format!("    movq %rax, {}(%rbp)", slot.0));
+                    self.state.emit(&format!("    movq %rdx, {}(%rbp)", slot.0 + 8));
+                } else {
+                    // ptr is indirect: save rax:rdx, load ptr, then store
+                    self.state.emit("    movq %rax, %rsi");  // low half
+                    self.state.emit("    movq %rdx, %rdi");  // high half
+                    self.state.emit(&format!("    movq {}(%rbp), %rcx", slot.0));
+                    self.state.emit("    movq %rsi, (%rcx)");
+                    self.state.emit("    movq %rdi, 8(%rcx)");
+                }
+            }
+            return;
+        }
         self.operand_to_rax(val);
         if let Some(slot) = self.state.get_slot(ptr.0) {
             if self.state.is_alloca(ptr.0) {
@@ -548,6 +810,21 @@ impl ArchCodegen for X86Codegen {
     }
 
     fn emit_load(&mut self, dest: &Value, ptr: &Value, ty: IrType) {
+        if Self::is_i128_type(ty) {
+            // 128-bit load: load both halves into rax:rdx
+            if let Some(slot) = self.state.get_slot(ptr.0) {
+                if self.state.is_alloca(ptr.0) {
+                    self.state.emit(&format!("    movq {}(%rbp), %rax", slot.0));
+                    self.state.emit(&format!("    movq {}(%rbp), %rdx", slot.0 + 8));
+                } else {
+                    self.state.emit(&format!("    movq {}(%rbp), %rcx", slot.0));
+                    self.state.emit("    movq (%rcx), %rax");
+                    self.state.emit("    movq 8(%rcx), %rdx");
+                }
+                self.store_rax_rdx_to(dest);
+            }
+            return;
+        }
         if let Some(slot) = self.state.get_slot(ptr.0) {
             let load_instr = Self::mov_load_for_type(ty);
             let dest_reg = Self::load_dest_reg(ty);
@@ -562,6 +839,10 @@ impl ArchCodegen for X86Codegen {
     }
 
     fn emit_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
+        if Self::is_i128_type(ty) {
+            self.emit_binop_i128(dest, op, lhs, rhs, ty);
+            return;
+        }
         if ty.is_float() {
             let float_op = classify_float_binop(op)
                 .unwrap_or_else(|| panic!("unsupported float binop: {:?} on type {:?}", op, ty));
@@ -679,6 +960,26 @@ impl ArchCodegen for X86Codegen {
     }
 
     fn emit_unaryop(&mut self, dest: &Value, op: IrUnaryOp, src: &Operand, ty: IrType) {
+        if Self::is_i128_type(ty) {
+            self.operand_to_rax_rdx(src);
+            match op {
+                IrUnaryOp::Neg => {
+                    // 128-bit negate: not both halves, then add 1
+                    self.state.emit("    notq %rax");
+                    self.state.emit("    notq %rdx");
+                    self.state.emit("    addq $1, %rax");
+                    self.state.emit("    adcq $0, %rdx");
+                }
+                IrUnaryOp::Not => {
+                    // 128-bit bitwise NOT: not both halves
+                    self.state.emit("    notq %rax");
+                    self.state.emit("    notq %rdx");
+                }
+                _ => {} // Clz/Ctz/Bswap/Popcount not expected for 128-bit
+            }
+            self.store_rax_rdx_to(dest);
+            return;
+        }
         self.operand_to_rax(src);
         if ty.is_float() {
             match op {
@@ -744,6 +1045,63 @@ impl ArchCodegen for X86Codegen {
     }
 
     fn emit_cmp(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
+        if Self::is_i128_type(ty) {
+            // 128-bit comparison: compare high halves first, then low
+            // lhs in rax:rdx, rhs in rcx:rsi
+            self.operand_to_rax_rdx(lhs);
+            self.state.emit("    pushq %rdx");  // lhs high
+            self.state.emit("    pushq %rax");  // lhs low
+            self.operand_to_rax_rdx(rhs);
+            self.state.emit("    movq %rax, %rcx");  // rhs low
+            self.state.emit("    movq %rdx, %rsi");  // rhs high
+            self.state.emit("    popq %rax");         // lhs low
+            self.state.emit("    popq %rdx");         // lhs high
+            // For eq/ne: both halves must match
+            // For ordered: compare high first, if equal compare low
+            match op {
+                IrCmpOp::Eq => {
+                    self.state.emit("    xorq %rcx, %rax");   // low diff
+                    self.state.emit("    xorq %rsi, %rdx");   // high diff
+                    self.state.emit("    orq %rdx, %rax");    // combine
+                    self.state.emit("    sete %al");
+                    self.state.emit("    movzbq %al, %rax");
+                }
+                IrCmpOp::Ne => {
+                    self.state.emit("    xorq %rcx, %rax");
+                    self.state.emit("    xorq %rsi, %rdx");
+                    self.state.emit("    orq %rdx, %rax");
+                    self.state.emit("    setne %al");
+                    self.state.emit("    movzbq %al, %rax");
+                }
+                _ => {
+                    // Ordered comparison: cmp high, branch if not equal, else cmp low
+                    self.state.emit("    cmpq %rsi, %rdx");   // cmp lhs_hi, rhs_hi
+                    let set_hi = match op {
+                        IrCmpOp::Slt | IrCmpOp::Sle => "setl",
+                        IrCmpOp::Sgt | IrCmpOp::Sge => "setg",
+                        IrCmpOp::Ult | IrCmpOp::Ule => "setb",
+                        IrCmpOp::Ugt | IrCmpOp::Uge => "seta",
+                        _ => unreachable!(),
+                    };
+                    self.state.emit(&format!("    {} %r8b", set_hi));  // result if high differs
+                    self.state.emit("    jne 1f");
+                    // High halves equal: compare low halves (always unsigned for low)
+                    self.state.emit("    cmpq %rcx, %rax");
+                    let set_lo = match op {
+                        IrCmpOp::Slt | IrCmpOp::Ult => "setb",
+                        IrCmpOp::Sle | IrCmpOp::Ule => "setbe",
+                        IrCmpOp::Sgt | IrCmpOp::Ugt => "seta",
+                        IrCmpOp::Sge | IrCmpOp::Uge => "setae",
+                        _ => unreachable!(),
+                    };
+                    self.state.emit(&format!("    {} %r8b", set_lo));
+                    self.state.emit("1:");
+                    self.state.emit("    movzbq %r8b, %rax");
+                }
+            }
+            self.store_rax_to(dest);
+            return;
+        }
         if ty.is_float() {
             // Float comparison using SSE
             let (mov_to_xmm0, mov_to_xmm1) = if ty == IrType::F32 {
@@ -805,17 +1163,27 @@ impl ArchCodegen for X86Codegen {
     fn emit_call(&mut self, args: &[Operand], arg_types: &[IrType], direct_name: Option<&str>,
                  func_ptr: Option<&Operand>, dest: Option<Value>, return_type: IrType,
                  _is_variadic: bool, _num_fixed_args: usize) {
-        // Classify args: float args go in xmm regs, others in int regs
-        let mut stack_args: Vec<&Operand> = Vec::new();
+        // Classify args: float args go in xmm regs, others in int regs.
+        // 128-bit integer args consume 2 consecutive int register slots.
+        let mut stack_args: Vec<(&Operand, usize)> = Vec::new(); // (arg, arg_index)
         let mut int_idx = 0usize;
         let mut float_idx = 0usize;
-        let mut arg_assignments: Vec<(&Operand, bool, usize)> = Vec::new(); // (arg, is_float, reg_idx)
+        // (arg, is_float, is_i128, reg_idx): reg_idx is the FIRST of 2 regs for i128
+        let mut arg_assignments: Vec<(&Operand, bool, bool, usize)> = Vec::new();
 
-        // Track which stack args are F128 (long double, 16-byte x87 extended)
-        let mut stack_arg_is_f128: Vec<bool> = Vec::new();
+        // Track which stack args are F128 (long double) or I128 (16-byte int)
+        #[derive(Clone, Copy, PartialEq)]
+        enum StackArgKind { Normal, F128, I128 }
+        let mut stack_arg_kinds: Vec<StackArgKind> = Vec::new();
+
         for (i, arg) in args.iter().enumerate() {
             let is_long_double = if i < arg_types.len() {
                 arg_types[i].is_long_double()
+            } else {
+                false
+            };
+            let is_i128 = if i < arg_types.len() {
+                Self::is_i128_type(arg_types[i])
             } else {
                 false
             };
@@ -825,26 +1193,34 @@ impl ArchCodegen for X86Codegen {
                 matches!(arg, Operand::Const(IrConst::F32(_) | IrConst::F64(_)))
             };
             if is_long_double {
-                // F128 (long double): always goes on the stack as 16-byte x87 extended precision
-                stack_args.push(arg);
-                stack_arg_is_f128.push(true);
+                stack_args.push((arg, i));
+                stack_arg_kinds.push(StackArgKind::F128);
+            } else if is_i128 {
+                // 128-bit int: needs 2 consecutive int regs
+                if int_idx + 1 < 6 {
+                    arg_assignments.push((arg, false, true, int_idx));
+                    int_idx += 2;
+                } else {
+                    // Spill to stack as 16 bytes
+                    stack_args.push((arg, i));
+                    stack_arg_kinds.push(StackArgKind::I128);
+                }
             } else if is_float_arg && float_idx < 8 {
-                arg_assignments.push((arg, true, float_idx));
+                arg_assignments.push((arg, true, false, float_idx));
                 float_idx += 1;
             } else if !is_float_arg && int_idx < 6 {
-                arg_assignments.push((arg, false, int_idx));
+                arg_assignments.push((arg, false, false, int_idx));
                 int_idx += 1;
             } else {
-                stack_args.push(arg);
-                stack_arg_is_f128.push(false);
+                stack_args.push((arg, i));
+                stack_arg_kinds.push(StackArgKind::Normal);
             }
         }
 
         // Ensure 16-byte stack alignment before call when pushing stack args.
-        // F128 args take 16 bytes (already aligned), non-F128 args take 8 bytes.
         let mut total_stack_bytes: usize = 0;
         for (si, _) in stack_args.iter().enumerate() {
-            if si < stack_arg_is_f128.len() && stack_arg_is_f128[si] {
+            if si < stack_arg_kinds.len() && (stack_arg_kinds[si] == StackArgKind::F128 || stack_arg_kinds[si] == StackArgKind::I128) {
                 total_stack_bytes += 16;
             } else {
                 total_stack_bytes += 8;
@@ -856,14 +1232,13 @@ impl ArchCodegen for X86Codegen {
         }
 
         // Push stack args in reverse order.
-        // F128 (long double) args are pushed as 16 bytes in x87 80-bit extended format.
         let n_stack = stack_args.len();
         for ri in 0..n_stack {
             let si = n_stack - 1 - ri; // reverse index
-            let is_f128 = si < stack_arg_is_f128.len() && stack_arg_is_f128[si];
-            if is_f128 {
+            let kind = if si < stack_arg_kinds.len() { stack_arg_kinds[si] } else { StackArgKind::Normal };
+            if kind == StackArgKind::F128 {
                 // Push 16 bytes of x87 extended precision format
-                match stack_args[si] {
+                match stack_args[si].0 {
                     Operand::Const(ref c) => {
                         let f64_val = match c {
                             IrConst::LongDouble(v) => *v,
@@ -871,19 +1246,13 @@ impl ArchCodegen for X86Codegen {
                             _ => c.to_f64().unwrap_or(0.0),
                         };
                         let x87_bytes = crate::ir::ir::f64_to_x87_bytes(f64_val);
-                        // x87 format: 10 bytes of data, padded to 16 with 6 zero bytes
-                        // Push hi 8 bytes first (padding + top 2 bytes of x87), then lo 8 bytes
                         let lo = u64::from_le_bytes(x87_bytes[0..8].try_into().unwrap());
                         let hi_2bytes = u16::from_le_bytes(x87_bytes[8..10].try_into().unwrap());
-                        // Push 8 bytes: 6 bytes padding (zeros) + 2 bytes (exp+sign)
                         self.state.emit(&format!("    pushq ${}", hi_2bytes as i64));
-                        // Push 8 bytes: mantissa
                         self.state.emit(&format!("    movabsq ${}, %rax", lo as i64));
                         self.state.emit("    pushq %rax");
                     }
                     Operand::Value(ref v) => {
-                        // Variable: f64 value in slot, convert to x87 80-bit at runtime.
-                        // Load f64 into xmm0, store to temp, use fld/fstp to convert.
                         if let Some(slot) = self.state.get_slot(v.0) {
                             if self.state.is_alloca(v.0) {
                                 self.state.emit(&format!("    leaq {}(%rbp), %rax", slot.0));
@@ -893,31 +1262,40 @@ impl ArchCodegen for X86Codegen {
                         } else {
                             self.state.emit("    xorq %rax, %rax");
                         }
-                        // rax has f64 bit pattern; use x87 to convert f64 -> 80-bit extended
-                        // Store f64 to temp memory, load with fldl, allocate 16 bytes, store with fstpt
-                        self.state.emit("    subq $16, %rsp");    // allocate 16 bytes for result
-                        self.state.emit("    pushq %rax");        // store f64 at [rsp] (temp)
-                        self.state.emit("    fldl (%rsp)");       // load f64 onto x87 stack
-                        self.state.emit("    addq $8, %rsp");     // pop temp f64
-                        self.state.emit("    fstpt (%rsp)");      // store 80-bit to [rsp] (16 bytes allocated)
-                        // 10 bytes written at [rsp], 6 bytes of padding at [rsp+10..rsp+15] are whatever
-                        // That's fine per ABI: only 10 bytes are significant
+                        self.state.emit("    subq $16, %rsp");
+                        self.state.emit("    pushq %rax");
+                        self.state.emit("    fldl (%rsp)");
+                        self.state.emit("    addq $8, %rsp");
+                        self.state.emit("    fstpt (%rsp)");
                     }
                 }
+            } else if kind == StackArgKind::I128 {
+                // Push 128-bit integer: high 8 bytes first, then low 8 bytes
+                self.operand_to_rax_rdx(stack_args[si].0);
+                self.state.emit("    pushq %rdx");  // high half first (higher address)
+                self.state.emit("    pushq %rax");  // low half second (lower address)
             } else {
-                self.operand_to_rax(stack_args[si]);
+                self.operand_to_rax(stack_args[si].0);
                 self.state.emit("    pushq %rax");
             }
         }
 
-        // Load register args
+        // Load register args. For 128-bit args, load into two consecutive int regs.
         let xmm_regs = ["xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"];
-        for (arg, is_float, idx) in &arg_assignments {
-            self.operand_to_rax(arg);
-            if *is_float {
-                self.state.emit(&format!("    movq %rax, %{}", xmm_regs[*idx]));
-            } else {
+        for (arg, is_float, is_i128, idx) in &arg_assignments {
+            if *is_i128 {
+                // Load 128-bit arg into consecutive register pair
+                self.operand_to_rax_rdx(arg);
+                // low half -> reg[idx], high half -> reg[idx+1]
                 self.state.emit(&format!("    movq %rax, %{}", X86_ARG_REGS[*idx]));
+                self.state.emit(&format!("    movq %rdx, %{}", X86_ARG_REGS[*idx + 1]));
+            } else {
+                self.operand_to_rax(arg);
+                if *is_float {
+                    self.state.emit(&format!("    movq %rax, %{}", xmm_regs[*idx]));
+                } else {
+                    self.state.emit(&format!("    movq %rax, %{}", X86_ARG_REGS[*idx]));
+                }
             }
         }
 
@@ -944,9 +1322,12 @@ impl ArchCodegen for X86Codegen {
         }
 
         if let Some(dest) = dest {
-            if return_type == IrType::F32 {
-                // F32 return value is in xmm0 (low 32 bits)
+            if Self::is_i128_type(return_type) {
+                // 128-bit return: rax = low, rdx = high
+                self.store_rax_rdx_to(&dest);
+            } else if return_type == IrType::F32 {
                 self.state.emit("    movd %xmm0, %eax");
+                self.store_rax_to(&dest);
             } else if return_type == IrType::F128 {
                 // F128 (long double) return value is in x87 st(0) per SysV ABI.
                 // Convert from 80-bit extended to f64 bit pattern in rax.
@@ -954,11 +1335,14 @@ impl ArchCodegen for X86Codegen {
                 self.state.emit("    fstpl (%rsp)");
                 self.state.emit("    movq (%rsp), %rax");
                 self.state.emit("    addq $8, %rsp");
+                self.store_rax_to(&dest);
             } else if return_type == IrType::F64 {
                 // F64 return value is in xmm0 (full 64 bits)
                 self.state.emit("    movq %xmm0, %rax");
+                self.store_rax_to(&dest);
+            } else {
+                self.store_rax_to(&dest);
             }
-            self.store_rax_to(&dest);
         }
     }
 
@@ -984,6 +1368,40 @@ impl ArchCodegen for X86Codegen {
     }
 
     fn emit_cast(&mut self, dest: &Value, src: &Operand, from_ty: IrType, to_ty: IrType) {
+        if Self::is_i128_type(to_ty) && !Self::is_i128_type(from_ty) {
+            // Widening to 128-bit: load src into rax, extend to rax:rdx
+            self.operand_to_rax(src);
+            // First apply standard widening to 64-bit if needed
+            if from_ty.size() < 8 {
+                self.emit_cast_instrs(from_ty, if from_ty.is_signed() { IrType::I64 } else { IrType::U64 });
+            }
+            // Now extend 64-bit rax to 128-bit rax:rdx
+            if from_ty.is_signed() {
+                // Sign-extend: rdx = rax >> 63 (arithmetic)
+                self.state.emit("    cqto");  // sign-extend rax into rdx:rax
+            } else {
+                // Zero-extend: rdx = 0
+                self.state.emit("    xorq %rdx, %rdx");
+            }
+            self.store_rax_rdx_to(dest);
+            return;
+        }
+        if Self::is_i128_type(from_ty) && !Self::is_i128_type(to_ty) {
+            // Narrowing from 128-bit: load into rax:rdx, just use rax (low 64 bits)
+            self.operand_to_rax_rdx(src);
+            // rax already has the low 64 bits; apply standard narrowing if needed
+            if to_ty.size() < 8 {
+                self.emit_cast_instrs(IrType::I64, to_ty);
+            }
+            self.store_rax_to(dest);
+            return;
+        }
+        if Self::is_i128_type(from_ty) && Self::is_i128_type(to_ty) {
+            // I128 <-> U128: noop (same representation)
+            self.operand_to_rax_rdx(src);
+            self.store_rax_rdx_to(dest);
+            return;
+        }
         self.operand_to_rax(src);
         self.emit_cast_instrs(from_ty, to_ty);
         self.store_rax_to(dest);
@@ -1195,18 +1613,23 @@ impl ArchCodegen for X86Codegen {
 
     fn emit_return(&mut self, val: Option<&Operand>, _frame_size: i64) {
         if let Some(val) = val {
-            self.operand_to_rax(val);
-            if self.current_return_type == IrType::F32 {
-                self.state.emit("    movd %eax, %xmm0");
-            } else if self.current_return_type == IrType::F128 {
-                // F128 (long double) must be returned in x87 st(0) per SysV ABI.
-                // rax has f64 bit pattern; push to stack, load with fldl.
-                self.state.emit("    pushq %rax");
-                self.state.emit("    fldl (%rsp)");
-                self.state.emit("    addq $8, %rsp");
-            } else if self.current_return_type == IrType::F64 {
-                // F64 return value goes in xmm0
-                self.state.emit("    movq %rax, %xmm0");
+            if Self::is_i128_type(self.current_return_type) {
+                // 128-bit return: rax = low, rdx = high
+                self.operand_to_rax_rdx(val);
+            } else {
+                self.operand_to_rax(val);
+                if self.current_return_type == IrType::F32 {
+                    self.state.emit("    movd %eax, %xmm0");
+                } else if self.current_return_type == IrType::F128 {
+                    // F128 (long double) must be returned in x87 st(0) per SysV ABI.
+                    // rax has f64 bit pattern; push to stack, load with fldl.
+                    self.state.emit("    pushq %rax");
+                    self.state.emit("    fldl (%rsp)");
+                    self.state.emit("    addq $8, %rsp");
+                } else if self.current_return_type == IrType::F64 {
+                    // F64 return value goes in xmm0
+                    self.state.emit("    movq %rax, %xmm0");
+                }
             }
         }
         self.emit_epilogue(0); // frame_size not needed for x86 epilogue
@@ -1627,6 +2050,12 @@ impl ArchCodegen for X86Codegen {
                 }
             }
         }
+    }
+
+    fn emit_copy_i128(&mut self, dest: &Value, src: &Operand) {
+        // 128-bit copy: load src into rax:rdx, store to dest
+        self.operand_to_rax_rdx(src);
+        self.store_rax_rdx_to(dest);
     }
 }
 

@@ -349,6 +349,13 @@ pub fn emit_const_data(out: &mut AsmOutput, c: &IrConst, ty: IrType, ptr_dir: Pt
             out.emit(&format!("    {} {}", ptr_dir.as_str(), v.to_bits()));
             out.emit(&format!("    {} 0", ptr_dir.as_str()));
         }
+        IrConst::I128(v) => {
+            // Emit as two 64-bit values (little-endian: low quad first)
+            let lo = *v as u64;
+            let hi = (*v >> 64) as u64;
+            out.emit(&format!("    {} {}", ptr_dir.as_str(), lo as i64));
+            out.emit(&format!("    {} {}", ptr_dir.as_str(), hi as i64));
+        }
         IrConst::Zero => {
             let size = ty.size();
             out.emit(&format!("    .zero {}", if size == 0 { 4 } else { size }));

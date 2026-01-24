@@ -71,8 +71,15 @@ impl Parser {
         // Handle post-type storage class specifiers (C allows "struct S typedef name;")
         self.consume_post_type_qualifiers();
 
-        let (name, derived) = self.parse_declarator();
-        self.skip_asm_and_attributes();
+        let (name, derived, decl_mode_ti) = self.parse_declarator_with_attrs();
+        let mode_ti = decl_mode_ti || self.skip_asm_and_attributes();
+
+        // Apply __attribute__((mode(TI))): transform type to 128-bit
+        let type_spec = if mode_ti {
+            Self::apply_mode_ti(type_spec)
+        } else {
+            type_spec
+        };
 
         // Determine if this is a function definition
         let is_funcdef = !derived.is_empty()
@@ -343,9 +350,10 @@ impl Parser {
             return Some(Declaration { type_spec, declarators, is_static, is_extern, is_typedef: self.parsing_typedef, is_const: self.parsing_const, span: start });
         }
 
+        let mut mode_ti = false;
         loop {
-            let (name, derived) = self.parse_declarator();
-            self.skip_asm_and_attributes();
+            let (name, derived, decl_mode_ti) = self.parse_declarator_with_attrs();
+            mode_ti = decl_mode_ti || self.skip_asm_and_attributes() || mode_ti;
             let init = if self.consume_if(&TokenKind::Assign) {
                 Some(self.parse_initializer())
             } else {
@@ -362,6 +370,13 @@ impl Parser {
                 break;
             }
         }
+
+        // Apply __attribute__((mode(TI))): transform type to 128-bit
+        let type_spec = if mode_ti {
+            Self::apply_mode_ti(type_spec)
+        } else {
+            type_spec
+        };
 
         // Register typedef names or shadow them for variable declarations
         let is_typedef = self.parsing_typedef;
@@ -474,6 +489,18 @@ impl Parser {
                 }
             }
             self.parsing_typedef = false;
+        }
+    }
+
+    /// Apply __attribute__((mode(TI))) to a type specifier: promotes to 128-bit integer.
+    fn apply_mode_ti(ts: TypeSpecifier) -> TypeSpecifier {
+        match ts {
+            TypeSpecifier::Int | TypeSpecifier::Long | TypeSpecifier::LongLong
+            | TypeSpecifier::Signed => TypeSpecifier::Int128,
+            TypeSpecifier::UnsignedInt | TypeSpecifier::UnsignedLong
+            | TypeSpecifier::UnsignedLongLong | TypeSpecifier::Unsigned => TypeSpecifier::UnsignedInt128,
+            // If already 128-bit or unknown, leave as is
+            other => other,
         }
     }
 }

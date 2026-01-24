@@ -227,6 +227,7 @@ impl ArmCodegen {
                     IrConst::F32(v) => self.emit_load_imm64("x0", v.to_bits() as i64),
                     IrConst::F64(v) => self.emit_load_imm64("x0", v.to_bits() as i64),
                     IrConst::LongDouble(v) => self.emit_load_imm64("x0", v.to_bits() as i64),
+                    IrConst::I128(v) => self.emit_load_imm64("x0", *v as i64), // truncate to 64-bit
                     IrConst::Zero => self.state.emit("    mov x0, #0"),
                 }
             }
@@ -1779,6 +1780,12 @@ impl ArchCodegen for ArmCodegen {
             }
         }
     }
+
+    fn emit_copy_i128(&mut self, dest: &Value, src: &Operand) {
+        // 128-bit copy on AArch64: not fully supported yet, fall back to 8-byte copy
+        self.emit_load_operand(src);
+        self.emit_store_result(dest);
+    }
 }
 
 impl ArmCodegen {
@@ -1884,6 +1891,7 @@ impl ArmCodegen {
             _ => reg.to_string(),
         }
     }
+
 }
 
 impl ArmCodegen {

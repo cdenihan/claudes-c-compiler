@@ -144,6 +144,7 @@ impl RiscvCodegen {
                         let bits = v.to_bits();
                         self.state.emit(&format!("    li t0, {}", bits as i64));
                     }
+                    IrConst::I128(v) => self.state.emit(&format!("    li t0, {}", *v as i64)), // truncate
                     IrConst::Zero => self.state.emit("    li t0, 0"),
                 }
             }
@@ -1709,6 +1710,12 @@ impl ArchCodegen for RiscvCodegen {
                 }
             }
         }
+    }
+
+    fn emit_copy_i128(&mut self, dest: &Value, src: &Operand) {
+        // 128-bit copy on RISC-V: not fully supported yet, fall back to 8-byte copy
+        self.emit_load_operand(src);
+        self.emit_store_result(dest);
     }
 }
 

@@ -15,6 +15,8 @@ pub enum CType {
     ULong,
     LongLong,
     ULongLong,
+    Int128,
+    UInt128,
     Float,
     Double,
     LongDouble,
@@ -539,6 +541,7 @@ impl CType {
             CType::Int | CType::UInt => 4,
             CType::Long | CType::ULong => 8,
             CType::LongLong | CType::ULongLong => 8,
+            CType::Int128 | CType::UInt128 => 16,
             CType::Float => 4,
             CType::Double => 8,
             CType::LongDouble => 16,
@@ -564,6 +567,7 @@ impl CType {
             CType::Int | CType::UInt => 4,
             CType::Long | CType::ULong => 8,
             CType::LongLong | CType::ULongLong => 8,
+            CType::Int128 | CType::UInt128 => 16,
             CType::Float => 4,
             CType::Double => 8,
             CType::LongDouble => 16,
@@ -582,11 +586,12 @@ impl CType {
     pub fn is_integer(&self) -> bool {
         matches!(self, CType::Bool | CType::Char | CType::UChar | CType::Short | CType::UShort |
                        CType::Int | CType::UInt | CType::Long | CType::ULong |
-                       CType::LongLong | CType::ULongLong | CType::Enum(_))
+                       CType::LongLong | CType::ULongLong |
+                       CType::Int128 | CType::UInt128 | CType::Enum(_))
     }
 
     pub fn is_signed(&self) -> bool {
-        matches!(self, CType::Char | CType::Short | CType::Int | CType::Long | CType::LongLong)
+        matches!(self, CType::Char | CType::Short | CType::Int | CType::Long | CType::LongLong | CType::Int128)
     }
 
     /// Whether this is a complex type (_Complex float/double/long double).
@@ -635,10 +640,12 @@ pub enum IrType {
     I16,
     I32,
     I64,
+    I128,
     U8,
     U16,
     U32,
     U64,
+    U128,
     F32,
     F64,
     /// 128-bit floating point (long double on AArch64/RISC-V, 80-bit extended on x86-64).
@@ -656,6 +663,7 @@ impl IrType {
             IrType::I16 | IrType::U16 => 2,
             IrType::I32 | IrType::U32 => 4,
             IrType::I64 | IrType::U64 | IrType::Ptr => 8,
+            IrType::I128 | IrType::U128 => 16,
             IrType::F32 => 4,
             IrType::F64 => 8,
             IrType::F128 => 16,
@@ -673,12 +681,12 @@ impl IrType {
 
     /// Whether this is an unsigned integer type.
     pub fn is_unsigned(&self) -> bool {
-        matches!(self, IrType::U8 | IrType::U16 | IrType::U32 | IrType::U64)
+        matches!(self, IrType::U8 | IrType::U16 | IrType::U32 | IrType::U64 | IrType::U128)
     }
 
     /// Whether this is a signed integer type.
     pub fn is_signed(&self) -> bool {
-        matches!(self, IrType::I8 | IrType::I16 | IrType::I32 | IrType::I64)
+        matches!(self, IrType::I8 | IrType::I16 | IrType::I32 | IrType::I64 | IrType::I128)
     }
 
     /// Whether this is any integer type (signed or unsigned).
@@ -706,6 +714,7 @@ impl IrType {
             IrType::I16 => IrType::U16,
             IrType::I32 => IrType::U32,
             IrType::I64 => IrType::U64,
+            IrType::I128 => IrType::U128,
             other => *other,
         }
     }
@@ -717,6 +726,7 @@ impl IrType {
             IrType::U16 => IrType::I16,
             IrType::U32 => IrType::I32,
             IrType::U64 => IrType::I64,
+            IrType::U128 => IrType::I128,
             other => *other,
         }
     }
@@ -734,13 +744,15 @@ impl IrType {
             CType::UInt => IrType::U32,
             CType::Long | CType::LongLong => IrType::I64,
             CType::ULong | CType::ULongLong => IrType::U64,
+            CType::Int128 => IrType::I128,
+            CType::UInt128 => IrType::U128,
             CType::Float => IrType::F32,
             CType::Double => IrType::F64,
             CType::LongDouble => IrType::F128,
             // Complex types are handled as aggregate (pointer to stack slot)
             CType::ComplexFloat | CType::ComplexDouble | CType::ComplexLongDouble => IrType::Ptr,
             CType::Pointer(_) | CType::Array(_, _) | CType::Function(_) => IrType::Ptr,
-            CType::Struct(_) | CType::Union(_) => IrType::Ptr, // TODO: handle aggregates properly
+            CType::Struct(_) | CType::Union(_) => IrType::Ptr,
         }
     }
 }

@@ -29,6 +29,8 @@ pub struct CodegenState {
     pub alloca_values: HashSet<u32>,
     /// Type associated with each alloca (for type-aware loads/stores).
     pub alloca_types: HashMap<u32, IrType>,
+    /// Values that are 128-bit integers (need 16-byte copy).
+    pub i128_values: HashSet<u32>,
     /// Counter for generating unique labels (e.g., memcpy loops).
     label_counter: u32,
 }
@@ -41,6 +43,7 @@ impl CodegenState {
             value_locations: HashMap::new(),
             alloca_values: HashSet::new(),
             alloca_types: HashMap::new(),
+            i128_values: HashSet::new(),
             label_counter: 0,
         }
     }
@@ -66,6 +69,7 @@ impl CodegenState {
         self.value_locations.clear();
         self.alloca_values.clear();
         self.alloca_types.clear();
+        self.i128_values.clear();
     }
 
     pub fn is_alloca(&self, v: u32) -> bool {
@@ -74,6 +78,10 @@ impl CodegenState {
 
     pub fn get_slot(&self, v: u32) -> Option<StackSlot> {
         self.value_locations.get(&v).copied()
+    }
+
+    pub fn is_i128_value(&self, v: u32) -> bool {
+        self.i128_values.contains(&v)
     }
 }
 
@@ -209,6 +217,9 @@ pub trait ArchCodegen {
     /// align the result, and store the pointer in dest.
     fn emit_dyn_alloca(&mut self, dest: &Value, size: &Operand, align: usize);
 
+    /// Emit a 128-bit value copy (src -> dest, both 16-byte stack slots).
+    fn emit_copy_i128(&mut self, dest: &Value, src: &Operand);
+
     /// Frame size including alignment and saved registers.
     fn aligned_frame_size(&self, raw_space: i64) -> i64;
 }
@@ -302,8 +313,20 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction) {
             cg.emit_global_addr(dest, name);
         }
         Instruction::Copy { dest, src } => {
-            cg.emit_load_operand(src);
-            cg.emit_store_result(dest);
+            // Check if this is a 128-bit value copy
+            let is_i128_copy = match src {
+                Operand::Value(v) => cg.state_ref().is_i128_value(v.0),
+                Operand::Const(IrConst::I128(_)) => true,
+                _ => false,
+            };
+            if is_i128_copy {
+                // Mark dest as i128 too so subsequent copies from it are also 128-bit
+                cg.state().i128_values.insert(dest.0);
+                cg.emit_copy_i128(dest, src);
+            } else {
+                cg.emit_load_operand(src);
+                cg.emit_store_result(dest);
+            }
         }
         Instruction::Cast { dest, src, from_ty, to_ty } => {
             cg.emit_cast(dest, src, *from_ty, *to_ty);
@@ -408,8 +431,14 @@ pub fn calculate_stack_space_common(
                 state.alloca_types.insert(dest.0, *ty);
                 space = new_space;
             } else if let Some(dest) = inst.dest() {
-                let (slot, new_space) = assign_slot(space, 8);
+                // Use 16-byte slots for I128/U128 result types, 8 bytes for everything else
+                let is_i128 = matches!(inst.result_type(), Some(IrType::I128) | Some(IrType::U128));
+                let slot_size = if is_i128 { 16 } else { 8 };
+                let (slot, new_space) = assign_slot(space, slot_size);
                 state.value_locations.insert(dest.0, StackSlot(slot));
+                if is_i128 {
+                    state.i128_values.insert(dest.0);
+                }
                 space = new_space;
             }
         }

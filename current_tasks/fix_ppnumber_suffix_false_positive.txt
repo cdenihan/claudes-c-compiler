@@ -1,0 +1,16 @@
+Task: Fix pp-number suffix false positive in preprocessor macro expansion
+Status: In progress
+
+The preprocessor incorrectly classifies macro invocations like `source+D2U(shift)` as
+pp-number suffixes when an identifier ending in a hex digit (e.g., 'source' ends with
+'rce' where 'c' is hex and 'e' is exponent letter) is followed by +/- and a macro name.
+
+The is_ppnumber_suffix check was only looking one character back from the 'e' to see if
+it was a hex digit, but this misidentifies identifiers like "source" as pp-numbers.
+
+Fix: Walk backwards through the entire token to verify it actually starts with a digit
+(the defining characteristic of a pp-number). Also adds _Pragma support and fixes
+non-static inline function emission for external linkage.
+
+This fix is critical for jq's decNumber library (D2U macro) and potentially other
+real-world code using patterns like `var_ending_in_e+MACRO(args)`.

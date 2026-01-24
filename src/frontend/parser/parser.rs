@@ -186,7 +186,7 @@ impl Parser {
             TokenKind::Typeof | TokenKind::Attribute | TokenKind::Extension |
             TokenKind::Noreturn | TokenKind::Restrict | TokenKind::Complex |
             TokenKind::Atomic | TokenKind::Auto | TokenKind::Alignas |
-            TokenKind::Builtin => true,
+            TokenKind::Builtin | TokenKind::Int128 | TokenKind::UInt128 => true,
             TokenKind::Identifier(name) => self.typedefs.contains(name) && !self.shadowed_typedefs.contains(name),
             _ => false,
         }
@@ -254,9 +254,10 @@ impl Parser {
 
     /// Parse __attribute__((...)) and __extension__, returning struct attribute flags.
     /// Returns (is_packed, aligned_value).
-    pub(super) fn parse_gcc_attributes(&mut self) -> (bool, Option<usize>) {
+    pub(super) fn parse_gcc_attributes(&mut self) -> (bool, Option<usize>, bool) {
         let mut is_packed = false;
         let mut _aligned = None;
+        let mut has_mode_ti = false;
         loop {
             match self.peek() {
                 TokenKind::Extension => { self.advance(); }
@@ -303,6 +304,25 @@ impl Parser {
                                             }
                                         }
                                     }
+                                    TokenKind::Identifier(name) if name == "mode" || name == "__mode__" => {
+                                        self.advance();
+                                        if matches!(self.peek(), TokenKind::LParen) {
+                                            self.advance(); // consume (
+                                            // Check for TI mode (128-bit integer)
+                                            if let TokenKind::Identifier(mode_name) = self.peek() {
+                                                if mode_name == "TI" || mode_name == "__TI__" {
+                                                    has_mode_ti = true;
+                                                }
+                                            }
+                                            // Skip to closing paren
+                                            while !matches!(self.peek(), TokenKind::RParen | TokenKind::Eof) {
+                                                self.advance();
+                                            }
+                                            if matches!(self.peek(), TokenKind::RParen) {
+                                                self.advance();
+                                            }
+                                        }
+                                    }
                                     TokenKind::Identifier(_) => {
                                         self.advance();
                                         if matches!(self.peek(), TokenKind::LParen) {
@@ -338,11 +358,13 @@ impl Parser {
                 _ => break,
             }
         }
-        (is_packed, _aligned)
+        (is_packed, _aligned, has_mode_ti)
     }
 
     /// Skip __asm__("..."), __attribute__(...), and __extension__ after declarators.
-    pub(super) fn skip_asm_and_attributes(&mut self) {
+    /// Returns true if __attribute__((mode(TI))) was found (128-bit integer mode).
+    pub(super) fn skip_asm_and_attributes(&mut self) -> bool {
+        let mut has_mode_ti = false;
         loop {
             match self.peek() {
                 TokenKind::Asm => {
@@ -353,10 +375,8 @@ impl Parser {
                     }
                 }
                 TokenKind::Attribute => {
-                    self.advance();
-                    if matches!(self.peek(), TokenKind::LParen) {
-                        self.skip_balanced_parens();
-                    }
+                    let (_, _, mode_ti) = self.parse_gcc_attributes();
+                    has_mode_ti = has_mode_ti || mode_ti;
                 }
                 TokenKind::Extension => {
                     self.advance();
@@ -364,6 +384,7 @@ impl Parser {
                 _ => break,
             }
         }
+        has_mode_ti
     }
 
     // === Pragma pack handling ===

@@ -78,6 +78,10 @@ pub enum TokenKind {
     Builtin,         // __builtin_va_list (used as type name)
     BuiltinVaArg,    // __builtin_va_arg(expr, type) - special syntax
     BuiltinTypesCompatibleP, // __builtin_types_compatible_p(type, type) - special syntax
+    /// __int128 / __int128_t type keyword (GCC extension, signed)
+    Int128,
+    /// __uint128_t type keyword (GCC extension, unsigned)
+    UInt128,
     /// __real__ - extract real part of complex number (GCC extension)
     RealPart,
     /// __imag__ - extract imaginary part of complex number (GCC extension)
@@ -224,6 +228,8 @@ impl TokenKind {
             "__builtin_va_list" => Some(TokenKind::Builtin),
             "__builtin_va_arg" => Some(TokenKind::BuiltinVaArg),
             "__builtin_types_compatible_p" => Some(TokenKind::BuiltinTypesCompatibleP),
+            "__int128" | "__int128_t" => Some(TokenKind::Int128),
+            "__uint128_t" => Some(TokenKind::UInt128),
             "__real__" | "__real" => Some(TokenKind::RealPart),
             "__imag__" | "__imag" => Some(TokenKind::ImagPart),
             // __builtin_va_start, __builtin_va_end, __builtin_va_copy remain as

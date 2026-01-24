@@ -35,6 +35,7 @@ impl Parser {
         let mut has_union = false;
         let mut has_enum = false;
         let mut has_typeof = false;
+        let mut has_mode_ti = false;
         let mut typedef_name: Option<String> = None;
         let mut any_base_specifier = false;
 
@@ -76,8 +77,8 @@ impl Parser {
                 }
                 // GNU extensions
                 TokenKind::Attribute => {
-                    self.advance();
-                    self.skip_balanced_parens();
+                    let (_, _, mode_ti) = self.parse_gcc_attributes();
+                    has_mode_ti = has_mode_ti || mode_ti;
                 }
                 TokenKind::Extension => {
                     self.advance();
@@ -133,6 +134,21 @@ impl Parser {
                 TokenKind::Unsigned => {
                     self.advance(); has_unsigned = true; any_base_specifier = true;
                 }
+                // __int128 can combine with signed/unsigned
+                TokenKind::Int128 => {
+                    self.advance(); any_base_specifier = true;
+                    // __int128 already implies signed unless unsigned is present
+                    if has_unsigned {
+                        return Some(TypeSpecifier::UnsignedInt128);
+                    } else {
+                        return Some(TypeSpecifier::Int128);
+                    }
+                }
+                // __uint128_t is always unsigned
+                TokenKind::UInt128 => {
+                    self.advance(); any_base_specifier = true;
+                    return Some(TypeSpecifier::UnsignedInt128);
+                }
                 TokenKind::Struct => {
                     self.advance(); has_struct = true; any_base_specifier = true;
                     break;
@@ -178,7 +194,7 @@ impl Parser {
         self.collect_trailing_specifiers(
             &mut has_char, &mut has_short, &mut has_int, &mut long_count,
             &mut has_signed, &mut has_unsigned, &mut has_float, &mut has_double,
-            &mut has_complex,
+            &mut has_complex, &mut has_mode_ti,
         );
 
         if !any_base_specifier {
@@ -195,6 +211,19 @@ impl Parser {
         // Handle trailing _Complex, qualifiers, and storage classes after the base type
         let base = self.consume_trailing_qualifiers(base);
 
+        // Apply __attribute__((mode(TI))): transform type to 128-bit
+        let base = if has_mode_ti {
+            match base {
+                TypeSpecifier::Int | TypeSpecifier::Long | TypeSpecifier::LongLong
+                | TypeSpecifier::Signed => TypeSpecifier::Int128,
+                TypeSpecifier::UnsignedInt | TypeSpecifier::UnsignedLong
+                | TypeSpecifier::UnsignedLongLong | TypeSpecifier::Unsigned => TypeSpecifier::UnsignedInt128,
+                other => other,
+            }
+        } else {
+            base
+        };
+
         Some(base)
     }
 
@@ -206,6 +235,7 @@ impl Parser {
         has_char: &mut bool, has_short: &mut bool, has_int: &mut bool,
         long_count: &mut u32, has_signed: &mut bool, has_unsigned: &mut bool,
         has_float: &mut bool, has_double: &mut bool, has_complex: &mut bool,
+        has_mode_ti: &mut bool,
     ) {
         if *has_char || *has_short || *has_int || *long_count > 0 {
             loop {
@@ -222,7 +252,10 @@ impl Parser {
                     TokenKind::Extern => { self.advance(); self.parsing_extern = true; }
                     TokenKind::Register | TokenKind::Noreturn => { self.advance(); }
                     TokenKind::Inline => { self.advance(); self.parsing_inline = true; }
-                    TokenKind::Attribute => { self.advance(); self.skip_balanced_parens(); }
+                    TokenKind::Attribute => {
+                        let (_, _, mode_ti) = self.parse_gcc_attributes();
+                        *has_mode_ti = *has_mode_ti || mode_ti;
+                    }
                     TokenKind::Extension => { self.advance(); }
                     _ => break,
                 }
@@ -303,21 +336,21 @@ impl Parser {
 
     /// Parse a struct or union definition/reference.
     fn parse_struct_or_union(&mut self, is_struct: bool) -> TypeSpecifier {
-        let (mut is_packed, _aligned) = self.parse_gcc_attributes();
+        let (mut is_packed, _aligned, _) = self.parse_gcc_attributes();
         let name = if let TokenKind::Identifier(n) = self.peek().clone() {
             self.advance();
             Some(n)
         } else {
             None
         };
-        let (packed2, _) = self.parse_gcc_attributes();
+        let (packed2, _, _) = self.parse_gcc_attributes();
         is_packed = is_packed || packed2;
         let fields = if matches!(self.peek(), TokenKind::LBrace) {
             Some(self.parse_struct_fields())
         } else {
             None
         };
-        let (packed3, _) = self.parse_gcc_attributes();
+        let (packed3, _, _) = self.parse_gcc_attributes();
         is_packed = is_packed || packed3;
         // Apply current #pragma pack alignment to struct definition
         let max_field_align = self.pragma_pack_align;
