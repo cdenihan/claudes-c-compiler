@@ -1,0 +1,9 @@
+Fix statement expression (GCC extension) returning wrong type for float/double values.
+
+get_expr_type() did not handle StmtExpr or CompoundLiteral, falling through to
+the catch-all IrType::I64. This caused float/double values from statement
+expressions to be spuriously cast from I64->F64 (reinterpreting the float bit
+pattern as an integer), producing garbage results. Affects the common MAX/MIN
+macro pattern using typeof + statement expressions.
+
+Status: IN PROGRESS
