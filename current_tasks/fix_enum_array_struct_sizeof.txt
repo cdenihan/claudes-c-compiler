@@ -1,0 +1,11 @@
+Fix: enum-constant array sizes in struct layout computation
+
+Bug: When a struct field is another struct containing an array sized by an enum
+constant (e.g., `void *arr[ENUM_COUNT]`), the outer struct's sizeof is wrong.
+The enum constants were collected in Pass 2 but struct layouts were computed in
+Pass 0, so enum-constant array sizes resolved to None (incomplete = 8 bytes).
+
+Fix: Move collect_all_enum_constants() to run before Pass 0 struct registration.
+
+This caused a Lua segfault regression (sizeof(LG) was 1424 instead of 1624,
+causing heap corruption in lua_newstate).
