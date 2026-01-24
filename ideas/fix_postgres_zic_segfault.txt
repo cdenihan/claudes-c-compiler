@@ -1,0 +1,20 @@
+Fix PostgreSQL zic (timezone compiler) segfault
+
+After fixing the BSS struct pointer size bug and -rdynamic flag forwarding,
+PostgreSQL initdb completes successfully. However, `make check` fails because
+the `zic` binary (timezone info compiler, src/timezone/zic.c) segfaults
+during `make install` (temp-install step before running pg_regress).
+
+The zic binary crashes even on `--version`, so this is likely a codegen bug
+in how zic.c is compiled, not a data-dependent issue.
+
+To investigate:
+1. Try mixed compilation: build zic.o with gcc, rest with ccc
+2. If that fixes it, bisect which source file(s) in src/timezone/ are
+   miscompiled
+3. Create minimal reproducer from the problematic code pattern
+4. Fix the underlying codegen bug
+
+This is the last blocker for postgres `make check` (pg_regress regression
+tests). Once zic works, the temp-install will succeed and regression tests
+can run.
