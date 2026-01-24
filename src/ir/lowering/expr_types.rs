@@ -777,8 +777,16 @@ impl Lowerer {
                 }
             }
 
-            // Compound literal: size of the type
-            Expr::CompoundLiteral(ts, _, _) => self.sizeof_type(ts),
+            // Compound literal: size of the type (handle incomplete array types)
+            Expr::CompoundLiteral(ts, ref init, _) => {
+                let resolved = self.resolve_type_spec(ts);
+                match (resolved, init.as_ref()) {
+                    (TypeSpecifier::Array(ref elem, None), Initializer::List(items)) => {
+                        self.sizeof_type(elem) * items.len()
+                    }
+                    _ => self.sizeof_type(ts),
+                }
+            }
 
             // Default
             _ => 4,
@@ -788,7 +796,8 @@ impl Lowerer {
     /// Get the element size for a compound literal type.
     /// For arrays, returns the element size; for scalars/structs, returns the full size.
     pub(super) fn compound_literal_elem_size(&self, ts: &TypeSpecifier) -> usize {
-        match ts {
+        let resolved = self.resolve_type_spec(ts);
+        match resolved {
             TypeSpecifier::Array(elem, _) => self.sizeof_type(elem),
             _ => self.sizeof_type(ts),
         }
@@ -978,7 +987,7 @@ impl Lowerer {
                 }
                 None
             }
-            Expr::VaArg(_, type_spec, _) => {
+            Expr::VaArg(_, type_spec, _) | Expr::CompoundLiteral(type_spec, _, _) => {
                 let resolved = self.resolve_type_spec(type_spec);
                 Some(self.type_spec_to_ctype(resolved))
             }

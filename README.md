@@ -127,6 +127,12 @@ A C compiler written from scratch in Rust, targeting x86-64, AArch64, and RISC-V
   the operation. Also fixed switch statement controlling expression promotion. Fixed binary op
   type inference (`get_expr_type`) to return `common_type` instead of falling through. Fixed
   constant folding for `Neg`/`BitNot` on `I8`/`I16` to produce `I32` results.
+- **Compound literal postfix ops and typedef array fixes**: Compound literals now support postfix
+  operators (subscript, member access, `++`/`--`) — `(int[]){1,2,3}[1]` and `(struct S){x,y}.field`
+  now parse and compile correctly. Fixed typedef'd array compound literals (`typedef int a[];
+  (a){1,2,3}`) to return array address instead of loading first element. Fixed `sizeof` on
+  compound literals with incomplete array types to compute size from initializer list length.
+  Added `CompoundLiteral` to `get_expr_ctype` so subscript element sizes are computed correctly.
 - **GCC atomic builtins**: Full implementation of `__atomic_*` (C11-style) and `__sync_*` (legacy)
   builtin families across all three backends. Includes `__atomic_fetch_add/sub/and/or/xor`,
   `__atomic_add/sub/and/or/xor_fetch`, `__atomic_compare_exchange_n`, `__atomic_exchange_n`,

@@ -157,7 +157,8 @@ impl Parser {
                         // Check for compound literal: (type){...}
                         if matches!(self.peek(), TokenKind::LBrace) {
                             let init = self.parse_initializer();
-                            return Expr::CompoundLiteral(result_type, Box::new(init), span);
+                            let lit = Expr::CompoundLiteral(result_type, Box::new(init), span);
+                            return self.parse_postfix_ops(lit);
                         }
                         let expr = self.parse_cast_expr();
                         return Expr::Cast(result_type, Box::new(expr), span);
@@ -297,8 +298,12 @@ impl Parser {
     }
 
     fn parse_postfix_expr(&mut self) -> Expr {
-        let mut expr = self.parse_primary_expr();
+        let expr = self.parse_primary_expr();
+        self.parse_postfix_ops(expr)
+    }
 
+    /// Parse postfix operators ([], ., ->, ++, --, function call) applied to an initial expression.
+    fn parse_postfix_ops(&mut self, mut expr: Expr) -> Expr {
         loop {
             match self.peek() {
                 TokenKind::LParen => {

@@ -2240,7 +2240,8 @@ impl Lowerer {
         let struct_layout = self.get_struct_layout_for_type(type_spec);
         // For scalar compound literals (not struct/array), return the loaded value.
         // Struct and array compound literals return the alloca address (they are lvalues).
-        let is_scalar = struct_layout.is_none() && !matches!(type_spec, TypeSpecifier::Array(..));
+        let resolved = self.resolve_type_spec(type_spec);
+        let is_scalar = struct_layout.is_none() && !matches!(resolved, TypeSpecifier::Array(..));
         if is_scalar {
             let loaded = self.fresh_value();
             self.emit(Instruction::Load { dest: loaded, ptr: alloca, ty });

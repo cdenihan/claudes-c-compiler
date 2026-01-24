@@ -1,0 +1,25 @@
+Implement 128-bit integer codegen for ARM (AArch64) and RISC-V backends
+
+Currently both ARM and RISC-V backends silently truncate all I128/U128 values
+to 64 bits. The x86 backend has full support using rax:rdx register pairs.
+
+Plan:
+- ARM: Use x0:x1 register pair (x0=low, x1=high) for 128-bit values
+  - Override emit_copy_i128 for full 16-byte copies
+  - Add 128-bit load/store using ldp/stp instructions
+  - Add 128-bit arithmetic (add/adc, sub/sbc, mul cross-products)
+  - Add 128-bit bitwise ops (and, or, xor on both halves)
+  - Add 128-bit shifts with conditional moves
+  - Add 128-bit comparisons
+  - Add 128-bit unary ops (neg, not)
+  - Add 128-bit casts (widening/narrowing)
+  - Add 128-bit function arg/return support per AAPCS64
+  - Call __divti3/__udivti3/__modti3/__umodti3 for div/mod
+
+- RISC-V: Use t0:t1 register pair (t0=low, t1=high) for 128-bit values
+  - Same set of operations as ARM but with RISC-V instructions
+  - Use add/sltu for carry-based addition
+  - Use sub/sltu for borrow-based subtraction
+  - Call compiler-rt helpers for div/mod
+
+- Add regression tests for 128-bit operations across all backends
