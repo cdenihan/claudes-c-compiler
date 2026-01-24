@@ -1,0 +1,14 @@
+Fix va_arg on va_list passed as function parameter (ARM/x86-64 broken)
+
+On AArch64 and x86-64, va_list is an array type (char[32] / char[24]).
+When passed as a function parameter, it decays to a pointer. The va_arg
+lowering used lower_address_of which returned the address of the local slot
+holding the pointer (pointer-to-pointer), instead of the pointer value itself
+(pointer-to-struct). This caused va_arg to read from garbage stack memory.
+
+Fix: use lower_expr for x86-64/AArch64 (handles both local array decay and
+parameter pointer load correctly), keep lower_address_of for RISC-V where
+va_list is a scalar void* that needs its address for read-modify-write.
+
+This fixes Lua ARM tests (print(1+2) was outputting garbage pointer values)
+and all programs using va_list parameter passing (e.g. vfprintf wrappers).
