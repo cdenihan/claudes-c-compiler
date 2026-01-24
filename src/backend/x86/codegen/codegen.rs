@@ -1311,8 +1311,17 @@ impl ArchCodegen for X86Codegen {
                 // Load 128-bit arg into consecutive register pair
                 self.operand_to_rax_rdx(arg);
                 // low half -> reg[idx], high half -> reg[idx+1]
-                self.state.emit(&format!("    movq %rax, %{}", X86_ARG_REGS[*idx]));
-                self.state.emit(&format!("    movq %rdx, %{}", X86_ARG_REGS[*idx + 1]));
+                // Must avoid clobbering: if target low reg is rdx, move high first
+                let lo_reg = X86_ARG_REGS[*idx];
+                let hi_reg = X86_ARG_REGS[*idx + 1];
+                if lo_reg == "rdx" {
+                    // rdx holds the high half; move it to hi_reg before overwriting rdx
+                    self.state.emit(&format!("    movq %rdx, %{}", hi_reg));
+                    self.state.emit(&format!("    movq %rax, %{}", lo_reg));
+                } else {
+                    self.state.emit(&format!("    movq %rax, %{}", lo_reg));
+                    self.state.emit(&format!("    movq %rdx, %{}", hi_reg));
+                }
             } else {
                 self.operand_to_rax(arg);
                 if *is_float {
