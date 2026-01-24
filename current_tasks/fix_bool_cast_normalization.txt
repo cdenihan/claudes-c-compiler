@@ -1,0 +1,3 @@
+Fix _Bool cast normalization: explicit casts like (_Bool)expr must produce 0 or 1,
+not truncate to the low byte. Currently lower_cast emits a plain IntNarrow for Bool targets,
+but C requires (expr != 0) ? 1 : 0 semantics. This affects all three backends.
