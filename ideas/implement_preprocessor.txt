@@ -1,6 +1,5 @@
 Remaining preprocessor work:
 - Complete variadic macro support (named variadic params, ##__VA_ARGS__ GNU extension)
-- #line directive support for source mapping
 - _Pragma operator
 - Handle __has_attribute properly (return correct values for common attributes)
   Currently we define it as a macro returning 0, but GCC supports many attributes

@@ -39,6 +39,9 @@ pub struct Preprocessor {
     /// Stack for #pragma push_macro / pop_macro.
     /// Maps macro name -> stack of saved definitions (None = was undefined).
     macro_save_stack: HashMap<String, Vec<Option<MacroDef>>>,
+    /// Line offset set by #line directive: effective_line = line_offset + (source_line - line_offset_base)
+    /// When None, no #line has been issued and __LINE__ uses the source line directly.
+    line_override: Option<(usize, usize)>, // (target_line, source_line_at_directive)
 }
 
 impl Preprocessor {
@@ -56,6 +59,7 @@ impl Preprocessor {
             resolve_includes: true,
             pending_injections: Vec::new(),
             macro_save_stack: HashMap::new(),
+            line_override: None,
         };
         pp.define_predefined_macros();
         define_builtin_macros(&mut pp.macros);
@@ -431,9 +435,14 @@ impl Preprocessor {
         let source = Self::strip_block_comments(&source);
         let mut output = String::with_capacity(source.len());
 
-        // For included files, save and reset the conditional stack
+        // For included files, save and reset the conditional stack and line override
         let saved_conditionals = if is_include {
             Some(std::mem::replace(&mut self.conditionals, ConditionalStack::new()))
+        } else {
+            None
+        };
+        let saved_line_override = if is_include {
+            self.line_override.take()
         } else {
             None
         };
@@ -445,13 +454,20 @@ impl Preprocessor {
         for (line_num, line) in source.lines().enumerate() {
             let trimmed = line.trim();
 
-            // Update __LINE__
+            // Update __LINE__, accounting for any #line directive override
+            let effective_line = if let Some((target_line, source_line_at_directive)) = self.line_override {
+                // After #line N, __LINE__ = N + (current_source_line - source_line_of_directive)
+                let offset = line_num.saturating_sub(source_line_at_directive);
+                target_line + offset
+            } else {
+                line_num + 1
+            };
             self.macros.define(MacroDef {
                 name: "__LINE__".to_string(),
                 is_function_like: false,
                 params: Vec::new(),
                 is_variadic: false,
-                body: (line_num + 1).to_string(),
+                body: effective_line.to_string(),
                 is_predefined: true,
             });
 
@@ -530,9 +546,12 @@ impl Preprocessor {
             output.push('\n');
         }
 
-        // Restore conditional stack for included files
+        // Restore conditional stack and line override for included files
         if let Some(saved) = saved_conditionals {
             self.conditionals = saved;
+        }
+        if is_include {
+            self.line_override = saved_line_override;
         }
 
         output
@@ -857,7 +876,7 @@ impl Preprocessor {
 
     /// Process a preprocessor directive line.
     /// Returns Some(content) if an #include was processed and should be inserted.
-    fn process_directive(&mut self, line: &str, _line_num: usize) -> Option<String> {
+    fn process_directive(&mut self, line: &str, line_num: usize) -> Option<String> {
         // Strip leading # and whitespace
         let after_hash = line.trim_start_matches('#').trim();
 
@@ -934,13 +953,19 @@ impl Preprocessor {
                 eprintln!("warning: #warning {}", rest);
             }
             "line" => {
-                // TODO: handle #line directives for source mapping
+                self.handle_line_directive(rest, line_num);
             }
             "" => {
                 // Empty # directive (null directive), valid in C
             }
             _ => {
-                // Unknown directive, ignore silently
+                // Handle GNU linemarker: # <digit-sequence> ["filename" [flags]]
+                // This is equivalent to #line <digit-sequence> ["filename"]
+                if keyword.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+                    let line_rest = format!("{} {}", keyword, rest);
+                    self.handle_line_directive(&line_rest, line_num);
+                }
+                // Otherwise unknown directive, ignore silently
             }
         }
 
@@ -984,6 +1009,40 @@ impl Preprocessor {
         let final_expr = self.replace_remaining_idents_with_zero(&expanded);
         let condition = evaluate_condition(&final_expr, &self.macros);
         self.conditionals.handle_elif(condition);
+    }
+
+    fn handle_line_directive(&mut self, rest: &str, source_line_num: usize) {
+        // #line digit-sequence ["filename"]
+        // The argument undergoes macro expansion first
+        let expanded = self.macros.expand_line(rest);
+        let expanded = expanded.trim();
+
+        // Parse the line number (first token)
+        let mut parts = expanded.split_whitespace();
+        if let Some(line_str) = parts.next() {
+            if let Ok(target_line) = line_str.parse::<usize>() {
+                // source_line_num is 1-based (the line where #line appears)
+                // The line AFTER #line should be target_line, so we record:
+                // (target_line, source_line_num_0based_of_directive)
+                // source_line_num is already 1-based from process_directive caller
+                self.line_override = Some((target_line, source_line_num));
+
+                // If there's a filename argument, update __FILE__
+                if let Some(filename_str) = parts.next() {
+                    let filename = filename_str.trim_matches('"');
+                    if !filename.is_empty() {
+                        self.macros.define(MacroDef {
+                            name: "__FILE__".to_string(),
+                            is_function_like: false,
+                            params: Vec::new(),
+                            is_variadic: false,
+                            body: format!("\"{}\"", filename),
+                            is_predefined: true,
+                        });
+                    }
+                }
+            }
+        }
     }
 
     fn handle_pragma(&mut self, rest: &str) -> Option<String> {

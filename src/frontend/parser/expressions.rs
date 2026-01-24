@@ -263,17 +263,14 @@ impl Parser {
                 // _Alignof(type) - always requires parenthesized type
                 self.expect(&TokenKind::LParen);
                 if let Some(ts) = self.parse_type_specifier() {
-                    let mut result_type = ts;
-                    while self.consume_if(&TokenKind::Star) {
-                        result_type = TypeSpecifier::Pointer(Box::new(result_type));
-                        self.skip_cv_qualifiers();
-                    }
+                    let result_type = self.parse_abstract_declarator_suffix(ts);
                     self.expect(&TokenKind::RParen);
                     Expr::Alignof(result_type, span)
                 } else {
                     // Fallback: treat as sizeof-like with expression
                     let expr = self.parse_assignment_expr();
                     self.expect(&TokenKind::RParen);
+                    let _ = expr; // suppress unused warning
                     Expr::IntLiteral(8, span)
                 }
             }

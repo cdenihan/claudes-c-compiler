@@ -1,0 +1,20 @@
+Fix packed bitfield load/store for fields that span storage unit boundaries.
+
+Problem:
+When #pragma pack(1) or __attribute__((packed)) is used, bitfield layout allows fields
+to cross byte boundaries. For example, a struct with:
+  unsigned char mb:8;
+  unsigned char m0:4;
+  unsigned char m1:8;  // starts at bit 12, spans bytes 1-2
+  unsigned char m2:4;
+
+Field m1 has storage_offset=1, bit_offset=4, bit_width=8, storage_type=I8.
+But bit_offset + bit_width = 12 > 8 (storage type bits), so the field
+spans beyond the single byte that store_bitfield/extract_bitfield loads.
+
+Fix:
+1. In the layout computation (types.rs), when a packed bitfield's bit_offset + bit_width
+   exceeds the storage type's bit width, widen the storage type to cover all needed bits.
+2. Update store_bitfield and extract_bitfield to handle the widened storage type correctly.
+
+This fixes ~17 pragma-pack test failures (68% fail rate → should become near 0%).
