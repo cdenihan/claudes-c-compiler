@@ -1,0 +1,10 @@
+Fix typedef pointer array global initialization
+
+When a global array uses a typedef'd pointer type (e.g. `typedef const struct Foo *FooPtr;
+static const FooPtr arr[] = { NULL, &foo1, &foo2 };`), the address-of initializers
+are silently dropped, resulting in all-NULL arrays. This directly causes the
+PostgreSQL initdb "unrecognized lock method: 1" crash because the LockMethods[]
+array (typed via LockMethod typedef) is not initialized.
+
+The bug is in the global init lowering path where typedef pointer types are not
+properly recognized as needing relocation entries for address-of expressions.
