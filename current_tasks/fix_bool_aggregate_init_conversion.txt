@@ -1,6 +1,6 @@
 Task: Fix _Bool conversion in aggregate initializers (struct/array init)
 
-Status: IN PROGRESS
+Status: COMPLETED
 
 Problem:
 When initializing _Bool fields in structs or _Bool array elements,
