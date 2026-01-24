@@ -1,0 +1,14 @@
+Task: Fix pp-number suffix not skipped in #if condition macro expansion
+Status: In progress
+
+The expand_condition_macros() function in conditionals.rs does not skip pp-number
+tokens when expanding macros. When a macro like `#define u 1` is defined and
+an expression like `#if 1u == 1` is evaluated, the `u` suffix in `1u` is
+incorrectly treated as a macro identifier and expanded to `1`, resulting in
+`11 == 1` (false) instead of `1u == 1` (true).
+
+The fix is to add pp-number skipping logic (similar to what expand_text in
+macro_defs.rs already has) to expand_condition_macros, so that digit-starting
+tokens consume their alphanumeric suffixes without attempting macro expansion.
+
+This affects at least compiler_suite_0125_0029 and potentially other tests.
