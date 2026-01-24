@@ -600,10 +600,20 @@ impl Lowerer {
             return result;
         }
 
-        let rhs_val = self.lower_expr(rhs);
+        // When assigning a complex RHS to a non-complex LHS, extract the real part first
+        let rhs_ct = self.expr_ctype(rhs);
         let lhs_ty = self.get_expr_type(lhs);
-        let rhs_ty = self.get_expr_type(rhs);
-        let rhs_val = self.emit_implicit_cast(rhs_val, rhs_ty, lhs_ty);
+        let rhs_val = if rhs_ct.is_complex() && !lhs_ct.is_complex() {
+            let complex_val = self.lower_expr(rhs);
+            let ptr = self.operand_to_value(complex_val);
+            let real_part = self.load_complex_real(ptr, &rhs_ct);
+            let from_ty = Self::complex_component_ir_type(&rhs_ct);
+            self.emit_implicit_cast(real_part, from_ty, lhs_ty)
+        } else {
+            let rhs_val = self.lower_expr(rhs);
+            let rhs_ty = self.get_expr_type(rhs);
+            self.emit_implicit_cast(rhs_val, rhs_ty, lhs_ty)
+        };
 
         // _Bool variables clamp any value to 0 or 1
         let rhs_val = if self.is_bool_lvalue(lhs) {
@@ -1940,6 +1950,13 @@ impl Lowerer {
             None
         };
 
+        // Get parameter CTypes for complex argument conversion
+        let param_ctypes: Option<Vec<CType>> = if let Expr::Identifier(name, _) = func {
+            self.func_meta.param_ctypes.get(name).cloned()
+        } else {
+            None
+        };
+
         // Get _Bool parameter flags for normalization
         let param_bool_flags: Option<Vec<bool>> = if let Expr::Identifier(name, _) = func {
             self.func_meta.param_bool_flags.get(name).cloned()
@@ -1958,6 +1975,21 @@ impl Lowerer {
         let arg_vals: Vec<Operand> = args.iter().enumerate().map(|(i, a)| {
             let mut val = self.lower_expr(a);
             let arg_ty = self.get_expr_type(a);
+
+            // Convert complex arguments to the declared parameter complex type if they differ.
+            // E.g., passing _Complex float to a parameter of _Complex double.
+            if let Some(ref pctypes) = param_ctypes {
+                if i < pctypes.len() && pctypes[i].is_complex() {
+                    let arg_ct = self.expr_ctype(a);
+                    if arg_ct.is_complex() && arg_ct != pctypes[i] {
+                        let ptr = self.operand_to_value(val);
+                        val = self.complex_to_complex(ptr, &arg_ct, &pctypes[i]);
+                    } else if !arg_ct.is_complex() {
+                        // Real-to-complex: e.g., passing int to _Complex double param
+                        val = self.real_to_complex(val, &arg_ct, &pctypes[i]);
+                    }
+                }
+            }
 
             // When a struct-returning function call's result is passed directly as
             // an argument to another function, the caller passes the raw packed data
@@ -2958,6 +2990,45 @@ impl Lowerer {
             });
 
             return Operand::Value(lhs_ptr);
+        }
+
+        // When LHS is non-complex but RHS is complex, extract real part from RHS
+        // and perform scalar compound assignment. E.g.: short x -= complex_y;
+        let rhs_ct = self.expr_ctype(rhs);
+        if !lhs_ct.is_complex() && rhs_ct.is_complex() {
+            // Extract real part from RHS
+            let rhs_val = self.lower_expr(rhs);
+            let rhs_ptr = self.operand_to_value(rhs_val);
+            let real_part = self.load_complex_real(rhs_ptr, &rhs_ct);
+            let real_ty = Self::complex_component_ir_type(&rhs_ct);
+
+            let ty = self.get_expr_type(lhs);
+            // Promote real part to the common type for the operation
+            let common_ty = if ty.is_float() || real_ty.is_float() {
+                if ty == IrType::F128 || real_ty == IrType::F128 { IrType::F128 }
+                else if ty == IrType::F64 || real_ty == IrType::F64 { IrType::F64 }
+                else { IrType::F32 }
+            } else {
+                IrType::I64
+            };
+            let op_ty = if common_ty.is_float() { common_ty } else { IrType::I64 };
+
+            // Convert real part to operation type
+            let rhs_promoted = self.emit_implicit_cast(real_part, real_ty, op_ty);
+
+            if let Some(lv) = self.lower_lvalue(lhs) {
+                let loaded = self.load_lvalue_typed(&lv, ty);
+                let loaded_promoted = self.emit_implicit_cast(loaded, ty, op_ty);
+                let is_unsigned = self.infer_expr_type(lhs).is_unsigned();
+                let ir_op = Self::compound_assign_to_ir(op, is_unsigned);
+                let result = self.fresh_value();
+                self.emit(Instruction::BinOp { dest: result, op: ir_op, ty: op_ty, lhs: loaded_promoted, rhs: rhs_promoted });
+                // Convert result back to LHS type
+                let result_cast = self.emit_implicit_cast(Operand::Value(result), op_ty, ty);
+                self.store_lvalue_typed(&lv, result_cast.clone(), ty);
+                return result_cast;
+            }
+            return Operand::Const(IrConst::I64(0));
         }
 
         // Check for bitfield compound assignment

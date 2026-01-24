@@ -160,6 +160,8 @@ pub(super) struct FunctionMeta {
     pub return_types: HashMap<String, IrType>,
     /// Function name -> parameter types mapping for inserting implicit argument casts.
     pub param_types: HashMap<String, Vec<IrType>>,
+    /// Function name -> parameter CType mapping for complex type argument conversions.
+    pub param_ctypes: HashMap<String, Vec<CType>>,
     /// Function name -> flags indicating which parameters are _Bool (need normalization to 0/1).
     pub param_bool_flags: HashMap<String, Vec<bool>>,
     /// Function name -> is_variadic flag for calling convention handling.
@@ -464,10 +466,15 @@ impl Lowerer {
         let param_bool_flags: Vec<bool> = params.iter().map(|p| {
             matches!(self.resolve_type_spec(&p.type_spec), TypeSpecifier::Bool)
         }).collect();
+        // Collect parameter CTypes for complex argument conversion
+        let param_ctypes: Vec<CType> = params.iter().map(|p| {
+            self.type_spec_to_ctype(&self.resolve_type_spec(&p.type_spec).clone())
+        }).collect();
 
         if !variadic || !param_tys.is_empty() {
             self.func_meta.param_types.insert(name.to_string(), param_tys);
             self.func_meta.param_bool_flags.insert(name.to_string(), param_bool_flags);
+            self.func_meta.param_ctypes.insert(name.to_string(), param_ctypes);
         }
         if variadic {
             self.func_meta.variadic.insert(name.to_string());

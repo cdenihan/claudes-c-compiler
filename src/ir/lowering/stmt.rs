@@ -515,11 +515,22 @@ impl Lowerer {
                                     }
                                 }
                             }
-                            let val = self.lower_expr(expr);
-                            // Insert implicit cast for type mismatches
-                            // (e.g., float f = 'a', int x = 3.14, char c = 99.0)
-                            let expr_ty = self.get_expr_type(expr);
-                            let val = self.emit_implicit_cast(val, expr_ty, var_ty);
+                            // Check if RHS is complex but LHS is non-complex:
+                            // extract real part first, then convert to target type.
+                            let rhs_ctype = self.expr_ctype(expr);
+                            let val = if rhs_ctype.is_complex() && !is_complex {
+                                let complex_val = self.lower_expr(expr);
+                                let ptr = self.operand_to_value(complex_val);
+                                let real_part = self.load_complex_real(ptr, &rhs_ctype);
+                                let from_ty = Self::complex_component_ir_type(&rhs_ctype);
+                                self.emit_implicit_cast(real_part, from_ty, var_ty)
+                            } else {
+                                let val = self.lower_expr(expr);
+                                // Insert implicit cast for type mismatches
+                                // (e.g., float f = 'a', int x = 3.14, char c = 99.0)
+                                let expr_ty = self.get_expr_type(expr);
+                                self.emit_implicit_cast(val, expr_ty, var_ty)
+                            };
                             // _Bool variables clamp any value to 0 or 1
                             let val = if is_bool { self.emit_bool_normalize(val) } else { val };
                             self.emit(Instruction::Store { val, ptr: alloca, ty: var_ty });
@@ -1006,10 +1017,22 @@ impl Lowerer {
                         }
                         // For complex returns with sret, copy complex data to sret pointer
                         let expr_ct = self.expr_ctype(e);
+                        let ret_ct = self.func_return_ctypes.get(&self.current_function_name.clone()).cloned();
                         if expr_ct.is_complex() {
-                            let complex_size = expr_ct.size();
                             let val = self.lower_expr(e);
-                            let src_addr = self.operand_to_value(val);
+                            let src_addr = if let Some(ref rct) = ret_ct {
+                                if rct.is_complex() && expr_ct != *rct {
+                                    // Convert complex expression to function return type
+                                    let ptr = self.operand_to_value(val);
+                                    let converted = self.complex_to_complex(ptr, &expr_ct, rct);
+                                    self.operand_to_value(converted)
+                                } else {
+                                    self.operand_to_value(val)
+                                }
+                            } else {
+                                self.operand_to_value(val)
+                            };
+                            let complex_size = ret_ct.as_ref().unwrap_or(&expr_ct).size();
                             let sret_ptr = self.fresh_value();
                             self.emit(Instruction::Load { dest: sret_ptr, ptr: sret_alloca, ty: IrType::Ptr });
                             self.emit(Instruction::Memcpy { dest: sret_ptr, src: src_addr, size: complex_size });
@@ -1025,6 +1048,32 @@ impl Lowerer {
                             let dest = self.fresh_value();
                             self.emit(Instruction::Load { dest, ptr: addr, ty: IrType::I64 });
                             return Operand::Value(dest);
+                        }
+                    }
+                    // For non-sret complex returns (e.g., _Complex float), handle
+                    // implicit type conversion when expression type differs from return type.
+                    let expr_ct = self.expr_ctype(e);
+                    let ret_ct = self.func_return_ctypes.get(&self.current_function_name.clone()).cloned();
+                    if expr_ct.is_complex() {
+                        if let Some(ref rct) = ret_ct {
+                            if rct.is_complex() && expr_ct != *rct {
+                                // Complex-to-complex conversion (different precision)
+                                let val = self.lower_expr(e);
+                                let ptr = self.operand_to_value(val);
+                                let converted = self.complex_to_complex(ptr, &expr_ct, rct);
+                                return converted;
+                            }
+                        }
+                        // Complex expression returned from non-complex function:
+                        // extract real part and convert to return type
+                        let ret_ty = self.current_return_type;
+                        if ret_ty != IrType::Ptr {
+                            let val = self.lower_expr(e);
+                            let ptr = self.operand_to_value(val);
+                            let real_part = self.load_complex_real(ptr, &expr_ct);
+                            let from_ty = Self::complex_component_ir_type(&expr_ct);
+                            let val = self.emit_implicit_cast(real_part, from_ty, ret_ty);
+                            return if self.current_return_is_bool { self.emit_bool_normalize(val) } else { val };
                         }
                     }
                     let val = self.lower_expr(e);
