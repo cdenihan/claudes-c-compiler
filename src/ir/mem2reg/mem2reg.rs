@@ -180,8 +180,12 @@ fn find_promotable_allocas(func: &IrFunction) -> Vec<AllocaInfo> {
 fn instruction_used_values(inst: &Instruction) -> Vec<u32> {
     let mut used = Vec::new();
     match inst {
-        // Load and Store ptr uses are handled by the caller
-        Instruction::Load { .. } | Instruction::Store { .. } | Instruction::Alloca { .. } => {}
+        // Load ptr and Store ptr uses are handled by the caller.
+        // Store val must still be tracked for disqualification.
+        Instruction::Load { .. } | Instruction::Alloca { .. } => {}
+        Instruction::Store { val, .. } => {
+            add_operand_values(val, &mut used);
+        }
         Instruction::DynAlloca { size, .. } => {
             add_operand_values(size, &mut used);
         }
