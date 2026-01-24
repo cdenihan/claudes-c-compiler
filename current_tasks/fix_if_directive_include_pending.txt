@@ -1,0 +1,29 @@
+Task: Fix #if directives not processed during multi-line accumulation in included files
+
+Problem:
+When processing included files, the preprocessor skips #if/#endif directives
+if there's a pending multi-line accumulation (unbalanced parentheses from a
+previous line). This causes #if conditions to leak through as literal text
+in the preprocessed output, resulting in parse errors.
+
+Example from libjpeg-turbo's turbojpeg-mp.c (included via #include):
+  if (
+  #if ULLONG_MAX > SIZE_MAX
+      (unsigned long long)pitch > (unsigned long long)((size_t)-1) ||
+  #endif
+      malloc(...) == NULL)
+
+The "if (" on one line creates unbalanced parens, then "#if ULLONG_MAX > SIZE_MAX"
+on the next line is not recognized as a directive (treated as regular text), so
+it survives into preprocessed output as "#if (9223372036854775807LL ...) > ...".
+
+Fix:
+Conditional directives (#if, #ifdef, #ifndef, #elif, #else, #endif) are now
+always processed regardless of pending multi-line accumulation state. When a
+conditional directive is encountered during accumulation in an included file,
+the pending line is flushed first before processing the directive.
+
+Real-world impact: Fixes libjpeg-turbo build (turbojpeg-mp.c included via
+#include "turbojpeg-mp.c" pattern). libjpeg-turbo now passes all tests.
+
+Status: Completed
