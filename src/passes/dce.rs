@@ -313,6 +313,7 @@ mod tests {
                     return_type: IrType::I32,
                     is_variadic: true,
                     num_fixed_args: 0,
+                    struct_arg_sizes: vec![],
                 },
             ],
             terminator: Terminator::Return(None),

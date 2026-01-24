@@ -145,6 +145,7 @@ impl Lowerer {
                         is_variadic: false,
                         sret_size: None,
                         two_reg_ret_size: None,
+                        param_struct_sizes: Vec::new(),
                     });
                     break;
                 }
@@ -519,6 +520,7 @@ impl Lowerer {
         flat_index: &mut usize,
     ) {
         let elem_size = *array_dim_strides.last().unwrap_or(&1);
+        let base_type_size = base_ty.size().max(1);
         let sub_elem_count = if array_dim_strides.len() > 1 && elem_size > 0 {
             array_dim_strides[0] / elem_size
         } else {
@@ -526,6 +528,61 @@ impl Lowerer {
         };
 
         for item in items {
+            // Check for multi-dimensional index designators: [i][j]...
+            let index_designators: Vec<usize> = item.designators.iter().filter_map(|d| {
+                if let Designator::Index(ref idx_expr) = d {
+                    self.eval_const_expr_for_designator(idx_expr)
+                } else {
+                    None
+                }
+            }).collect();
+
+            if !index_designators.is_empty() {
+                // Compute flat scalar index from multi-dimensional indices
+                let mut target_flat = 0usize;
+                for (i, &idx) in index_designators.iter().enumerate() {
+                    let elems_per_entry = if i < array_dim_strides.len() && base_type_size > 0 {
+                        array_dim_strides[i] / base_type_size
+                    } else {
+                        1
+                    };
+                    target_flat += idx * elems_per_entry;
+                }
+
+                match &item.init {
+                    Initializer::List(sub_items) => {
+                        // Set flat_index to designated position and recurse
+                        *flat_index = target_flat;
+                        let remaining_dims = array_dim_strides.len().saturating_sub(index_designators.len());
+                        let sub_strides = &array_dim_strides[array_dim_strides.len() - remaining_dims..];
+                        if remaining_dims > 0 {
+                            self.lower_array_init_recursive(sub_items, alloca, base_ty, sub_strides, flat_index);
+                        } else {
+                            for sub_item in sub_items {
+                                if let Initializer::Expr(e) = &sub_item.init {
+                                    let val = self.lower_and_cast_init_expr(e, base_ty);
+                                    self.emit_array_element_store(alloca, val, *flat_index * elem_size, base_ty);
+                                    *flat_index += 1;
+                                }
+                            }
+                        }
+                    }
+                    Initializer::Expr(e) => {
+                        if base_ty == IrType::I8 || base_ty == IrType::U8 {
+                            if let Expr::StringLiteral(s, _) = e {
+                                self.emit_string_to_alloca(alloca, s, target_flat * elem_size);
+                                *flat_index = target_flat + sub_elem_count;
+                                continue;
+                            }
+                        }
+                        let val = self.lower_and_cast_init_expr(e, base_ty);
+                        self.emit_array_element_store(alloca, val, target_flat * elem_size, base_ty);
+                        *flat_index = target_flat + 1;
+                    }
+                }
+                continue;
+            }
+
             let start_index = *flat_index;
             match &item.init {
                 Initializer::List(sub_items) => {
@@ -556,11 +613,6 @@ impl Lowerer {
                     if base_ty == IrType::I8 || base_ty == IrType::U8 {
                         if let Expr::StringLiteral(s, _) = e {
                             self.emit_string_to_alloca(alloca, s, *flat_index * elem_size);
-                            // String literal fills the innermost char sub-array.
-                            // For multi-dim arrays like char[2][3][1][1][3], a string fills
-                            // the innermost [1][1][3] sub-array (3 chars), not the full
-                            // first-dim sub-array [3][1][1][3] (9 chars).
-                            // Use strides[len-2] if available (second-to-last stride = innermost sub-array size).
                             let string_stride = if array_dim_strides.len() >= 2 {
                                 array_dim_strides[array_dim_strides.len() - 2]
                             } else {

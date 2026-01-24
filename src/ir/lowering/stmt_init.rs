@@ -112,6 +112,7 @@ impl Lowerer {
                 is_variadic: variadic,
                 sret_size: None,
                 two_reg_ret_size: None,
+                param_struct_sizes: Vec::new(),
             }
         } else {
             FuncSig {
@@ -123,6 +124,7 @@ impl Lowerer {
                 is_variadic: variadic,
                 sret_size: None,
                 two_reg_ret_size: None,
+                param_struct_sizes: Vec::new(),
             }
         };
         self.func_meta.sigs.insert(name.to_string(), sig);

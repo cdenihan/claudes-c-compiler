@@ -1674,7 +1674,7 @@ impl ArchCodegen for RiscvCodegen {
 
     fn emit_call(&mut self, args: &[Operand], arg_types: &[IrType], direct_name: Option<&str>,
                  func_ptr: Option<&Operand>, dest: Option<Value>, return_type: IrType,
-                 is_variadic: bool, _num_fixed_args: usize) {
+                 is_variadic: bool, _num_fixed_args: usize, struct_arg_sizes: &[Option<usize>]) {
         let float_arg_regs = ["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"];
 
         // Phase 1: Classify all args into register assignments or stack overflow.

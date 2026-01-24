@@ -950,12 +950,22 @@ impl ArchCodegen for X86Codegen {
             let is_long_double = param.ty.is_long_double();
             let is_i128 = Self::is_i128_type(param.ty);
             let is_float = param.ty.is_float() && !is_long_double;
-            // F128 (long double) is always passed on the stack on x86-64 (X87 class)
-            // I128 needs 2 consecutive int regs
-            let is_stack_passed = if is_long_double {
+            // Check for struct-by-value parameter
+            let struct_size = param.struct_size;
+            let is_small_struct = struct_size.map_or(false, |s| s <= 16);
+            let is_large_struct = struct_size.map_or(false, |s| s > 16);
+            let struct_regs_needed = struct_size.map_or(0, |s| if s <= 8 { 1 } else if s <= 16 { 2 } else { 0 });
+
+            // Determine if this param overflows to the stack
+            // Large structs (> 16 bytes) are always MEMORY class (always stack-passed).
+            let is_stack_passed = if is_large_struct {
+                true
+            } else if is_small_struct {
+                int_reg_idx + struct_regs_needed > 6
+            } else if is_long_double {
                 true
             } else if is_i128 {
-                int_reg_idx + 1 >= 6 // needs 2 consecutive regs
+                int_reg_idx + 1 >= 6
             } else if is_float {
                 float_reg_idx >= 8
             } else {
@@ -963,14 +973,21 @@ impl ArchCodegen for X86Codegen {
             };
 
             if param.name.is_empty() {
-                if is_long_double {
+                // Unnamed param - just advance register/stack counters
+                if is_large_struct {
+                    // MEMORY class: always on stack, raw data
+                    let size = struct_size.unwrap();
+                    stack_param_offset += (((size + 7) / 8) as i64) * 8;
+                } else if is_small_struct {
+                    if is_stack_passed {
+                        stack_param_offset += ((struct_size.unwrap() as i64 + 7) / 8) * 8;
+                    } else {
+                        int_reg_idx += struct_regs_needed;
+                    }
+                } else if is_long_double {
                     stack_param_offset += 16;
                 } else if is_i128 {
-                    if is_stack_passed {
-                        stack_param_offset += 16;
-                    } else {
-                        int_reg_idx += 2;
-                    }
+                    if is_stack_passed { stack_param_offset += 16; } else { int_reg_idx += 2; }
                 } else if is_stack_passed {
                     stack_param_offset += 8;
                 } else if is_float {
@@ -982,8 +999,40 @@ impl ArchCodegen for X86Codegen {
             }
             if let Some((dest, _ty)) = find_param_alloca(func, _i) {
                 if let Some(slot) = self.state.get_slot(dest.0) {
-                    if is_long_double {
-                        // F128 (long double) on x86-64: passed on stack as 16-byte x87 extended.
+                    if is_small_struct && !is_stack_passed {
+                        // Small struct by value: data arrives in 1-2 GP registers
+                        let size = struct_size.unwrap();
+                        // Store first register (up to 8 bytes) into alloca
+                        self.state.emit(&format!("    movq %{}, {}(%rbp)", X86_ARG_REGS[int_reg_idx], slot.0));
+                        if size > 8 {
+                            // Store second register
+                            self.state.emit(&format!("    movq %{}, {}(%rbp)", X86_ARG_REGS[int_reg_idx + 1], slot.0 + 8));
+                        }
+                        int_reg_idx += struct_regs_needed;
+                    } else if is_small_struct && is_stack_passed {
+                        // Small struct on stack: copy from stack to alloca
+                        let size = struct_size.unwrap();
+                        let n_qwords = (size + 7) / 8;
+                        for qi in 0..n_qwords {
+                            let src_off = stack_param_offset + (qi as i64 * 8);
+                            let dst_off = slot.0 + (qi as i64 * 8);
+                            self.state.emit(&format!("    movq {}(%rbp), %rax", src_off));
+                            self.state.emit(&format!("    movq %rax, {}(%rbp)", dst_off));
+                        }
+                        stack_param_offset += (n_qwords as i64) * 8;
+                    } else if is_large_struct {
+                        // Large struct (MEMORY class): raw data is on the stack.
+                        // Copy the struct data from the stack into the alloca.
+                        let size = struct_size.unwrap();
+                        let n_qwords = (size + 7) / 8;
+                        for qi in 0..n_qwords {
+                            let src_off = stack_param_offset + (qi as i64 * 8);
+                            let dst_off = slot.0 + (qi as i64 * 8);
+                            self.state.emit(&format!("    movq {}(%rbp), %rax", src_off));
+                            self.state.emit(&format!("    movq %rax, {}(%rbp)", dst_off));
+                        }
+                        stack_param_offset += (n_qwords as i64) * 8;
+                    } else if is_long_double {
                         self.state.emit(&format!("    fldt {}(%rbp)", stack_param_offset));
                         self.state.emit("    subq $8, %rsp");
                         self.state.emit("    fstpl (%rsp)");
@@ -992,13 +1041,10 @@ impl ArchCodegen for X86Codegen {
                         self.state.emit(&format!("    movq %rax, {}(%rbp)", slot.0));
                         stack_param_offset += 16;
                     } else if is_i128 && !is_stack_passed {
-                        // 128-bit integer: arrives in 2 consecutive int regs
-                        // reg[idx] = low half, reg[idx+1] = high half
                         self.state.emit(&format!("    movq %{}, {}(%rbp)", X86_ARG_REGS[int_reg_idx], slot.0));
                         self.state.emit(&format!("    movq %{}, {}(%rbp)", X86_ARG_REGS[int_reg_idx + 1], slot.0 + 8));
                         int_reg_idx += 2;
                     } else if is_i128 && is_stack_passed {
-                        // 128-bit integer on stack: 16 bytes
                         self.state.emit(&format!("    movq {}(%rbp), %rax", stack_param_offset));
                         self.state.emit(&format!("    movq %rax, {}(%rbp)", slot.0));
                         self.state.emit(&format!("    movq {}(%rbp), %rax", stack_param_offset + 8));
@@ -1027,14 +1073,21 @@ impl ArchCodegen for X86Codegen {
                     }
                 }
             } else {
-                if is_long_double {
+                // No alloca found - just advance counters
+                if is_large_struct {
+                    // MEMORY class: always on stack, raw data
+                    let size = struct_size.unwrap();
+                    stack_param_offset += (((size + 7) / 8) as i64) * 8;
+                } else if is_small_struct {
+                    if is_stack_passed {
+                        stack_param_offset += ((struct_size.unwrap() as i64 + 7) / 8) * 8;
+                    } else {
+                        int_reg_idx += struct_regs_needed;
+                    }
+                } else if is_long_double {
                     stack_param_offset += 16;
                 } else if is_i128 {
-                    if is_stack_passed {
-                        stack_param_offset += 16;
-                    } else {
-                        int_reg_idx += 2;
-                    }
+                    if is_stack_passed { stack_param_offset += 16; } else { int_reg_idx += 2; }
                 } else if is_stack_passed {
                     stack_param_offset += 8;
                 } else if is_float {
@@ -1599,21 +1652,29 @@ impl ArchCodegen for X86Codegen {
 
     fn emit_call(&mut self, args: &[Operand], arg_types: &[IrType], direct_name: Option<&str>,
                  func_ptr: Option<&Operand>, dest: Option<Value>, return_type: IrType,
-                 _is_variadic: bool, _num_fixed_args: usize) {
-        // Classify args: float args go in xmm regs, others in int regs.
-        // 128-bit integer args consume 2 consecutive int register slots.
+                 _is_variadic: bool, _num_fixed_args: usize, struct_arg_sizes: &[Option<usize>]) {
+        // Classify args per x86-64 SysV ABI:
+        // - Small structs (size <= 16, INTEGER class) -> pass by value in 1-2 GP registers
+        // - Large structs (size > 16, MEMORY class) -> pass on the stack (NOT by pointer)
+        // - Float args -> FP/SSE registers
+        // - Integer/pointer args -> GP registers
+        // - Long double, i128 -> stack or GP register pairs
         let mut stack_args: Vec<(&Operand, usize)> = Vec::new(); // (arg, arg_index)
         let mut int_idx = 0usize;
         let mut float_idx = 0usize;
-        // (arg, is_float, is_i128, reg_idx): reg_idx is the FIRST of 2 regs for i128
-        let mut arg_assignments: Vec<(&Operand, bool, bool, usize)> = Vec::new();
 
-        // Track which stack args are F128 (long double) or I128 (16-byte int)
         #[derive(Clone, Copy, PartialEq)]
-        enum StackArgKind { Normal, F128, I128 }
+        enum ArgKind { Normal, Float, I128, StructByVal { size: usize } }
+        // (arg, kind, reg_idx): reg_idx is the FIRST register for this arg
+        let mut arg_assignments: Vec<(&Operand, ArgKind, usize)> = Vec::new();
+
+        // Track which stack args are F128 (long double) or I128 (16-byte int) or struct
+        #[derive(Clone, Copy, PartialEq)]
+        enum StackArgKind { Normal, F128, I128, StructByVal { size: usize } }
         let mut stack_arg_kinds: Vec<StackArgKind> = Vec::new();
 
         for (i, arg) in args.iter().enumerate() {
+            let struct_size = struct_arg_sizes.get(i).copied().flatten();
             let is_long_double = if i < arg_types.len() {
                 arg_types[i].is_long_double()
             } else {
@@ -1629,13 +1690,32 @@ impl ArchCodegen for X86Codegen {
             } else {
                 matches!(arg, Operand::Const(IrConst::F32(_) | IrConst::F64(_)))
             };
-            if is_long_double {
+
+            if let Some(size) = struct_size {
+                if size <= 16 {
+                    // Small struct: pass by value in 1-2 GP registers (INTEGER class)
+                    let regs_needed = if size <= 8 { 1 } else { 2 };
+                    if int_idx + regs_needed <= 6 {
+                        arg_assignments.push((arg, ArgKind::StructByVal { size }, int_idx));
+                        int_idx += regs_needed;
+                    } else {
+                        // Overflow to stack
+                        stack_args.push((arg, i));
+                        stack_arg_kinds.push(StackArgKind::StructByVal { size });
+                    }
+                } else {
+                    // Large struct (> 16 bytes, MEMORY class): pass on the stack.
+                    // Does NOT consume GP registers.
+                    stack_args.push((arg, i));
+                    stack_arg_kinds.push(StackArgKind::StructByVal { size });
+                }
+            } else if is_long_double {
                 stack_args.push((arg, i));
                 stack_arg_kinds.push(StackArgKind::F128);
             } else if is_i128 {
                 // 128-bit int: needs 2 consecutive int regs
                 if int_idx + 1 < 6 {
-                    arg_assignments.push((arg, false, true, int_idx));
+                    arg_assignments.push((arg, ArgKind::I128, int_idx));
                     int_idx += 2;
                 } else {
                     // Spill to stack as 16 bytes
@@ -1643,10 +1723,10 @@ impl ArchCodegen for X86Codegen {
                     stack_arg_kinds.push(StackArgKind::I128);
                 }
             } else if is_float_arg && float_idx < 8 {
-                arg_assignments.push((arg, true, false, float_idx));
+                arg_assignments.push((arg, ArgKind::Float, float_idx));
                 float_idx += 1;
             } else if !is_float_arg && int_idx < 6 {
-                arg_assignments.push((arg, false, false, int_idx));
+                arg_assignments.push((arg, ArgKind::Normal, int_idx));
                 int_idx += 1;
             } else {
                 stack_args.push((arg, i));
@@ -1657,13 +1737,17 @@ impl ArchCodegen for X86Codegen {
         // Ensure 16-byte stack alignment before call when pushing stack args.
         let mut total_stack_bytes: usize = 0;
         for (si, _) in stack_args.iter().enumerate() {
-            if si < stack_arg_kinds.len() && (stack_arg_kinds[si] == StackArgKind::F128 || stack_arg_kinds[si] == StackArgKind::I128) {
-                total_stack_bytes += 16;
-            } else {
-                total_stack_bytes += 8;
+            let kind = if si < stack_arg_kinds.len() { stack_arg_kinds[si] } else { StackArgKind::Normal };
+            match kind {
+                StackArgKind::F128 | StackArgKind::I128 => total_stack_bytes += 16,
+                StackArgKind::StructByVal { size } => {
+                    total_stack_bytes += ((size + 7) / 8) * 8; // round up to 8-byte units
+                }
+                StackArgKind::Normal => total_stack_bytes += 8,
             }
         }
-        let need_align_pad = total_stack_bytes % 16 != 0;
+        let call_stack_bytes = total_stack_bytes;
+        let need_align_pad = call_stack_bytes % 16 != 0;
         if need_align_pad {
             self.state.emit("    subq $8, %rsp");
         }
@@ -1673,73 +1757,109 @@ impl ArchCodegen for X86Codegen {
         for ri in 0..n_stack {
             let si = n_stack - 1 - ri; // reverse index
             let kind = if si < stack_arg_kinds.len() { stack_arg_kinds[si] } else { StackArgKind::Normal };
-            if kind == StackArgKind::F128 {
-                // Push 16 bytes of x87 extended precision format
-                match stack_args[si].0 {
-                    Operand::Const(ref c) => {
-                        let f64_val = match c {
-                            IrConst::LongDouble(v) => *v,
-                            IrConst::F64(v) => *v,
-                            _ => c.to_f64().unwrap_or(0.0),
-                        };
-                        let x87_bytes = crate::ir::ir::f64_to_x87_bytes(f64_val);
-                        let lo = u64::from_le_bytes(x87_bytes[0..8].try_into().unwrap());
-                        let hi_2bytes = u16::from_le_bytes(x87_bytes[8..10].try_into().unwrap());
-                        self.state.emit(&format!("    pushq ${}", hi_2bytes as i64));
-                        self.state.emit(&format!("    movabsq ${}, %rax", lo as i64));
-                        self.state.emit("    pushq %rax");
-                    }
-                    Operand::Value(ref v) => {
-                        if let Some(slot) = self.state.get_slot(v.0) {
-                            if self.state.is_alloca(v.0) {
-                                self.state.emit(&format!("    leaq {}(%rbp), %rax", slot.0));
-                            } else {
-                                self.state.emit(&format!("    movq {}(%rbp), %rax", slot.0));
-                            }
-                        } else {
-                            self.state.emit("    xorq %rax, %rax");
+            match kind {
+                StackArgKind::F128 => {
+                    // Push 16 bytes of x87 extended precision format
+                    match stack_args[si].0 {
+                        Operand::Const(ref c) => {
+                            let f64_val = match c {
+                                IrConst::LongDouble(v) => *v,
+                                IrConst::F64(v) => *v,
+                                _ => c.to_f64().unwrap_or(0.0),
+                            };
+                            let x87_bytes = crate::ir::ir::f64_to_x87_bytes(f64_val);
+                            let lo = u64::from_le_bytes(x87_bytes[0..8].try_into().unwrap());
+                            let hi_2bytes = u16::from_le_bytes(x87_bytes[8..10].try_into().unwrap());
+                            self.state.emit(&format!("    pushq ${}", hi_2bytes as i64));
+                            self.state.emit(&format!("    movabsq ${}, %rax", lo as i64));
+                            self.state.emit("    pushq %rax");
                         }
-                        self.state.emit("    subq $16, %rsp");
-                        self.state.emit("    pushq %rax");
-                        self.state.emit("    fldl (%rsp)");
-                        self.state.emit("    addq $8, %rsp");
-                        self.state.emit("    fstpt (%rsp)");
+                        Operand::Value(ref v) => {
+                            if let Some(slot) = self.state.get_slot(v.0) {
+                                if self.state.is_alloca(v.0) {
+                                    self.state.emit(&format!("    leaq {}(%rbp), %rax", slot.0));
+                                } else {
+                                    self.state.emit(&format!("    movq {}(%rbp), %rax", slot.0));
+                                }
+                            } else {
+                                self.state.emit("    xorq %rax, %rax");
+                            }
+                            self.state.emit("    subq $16, %rsp");
+                            self.state.emit("    pushq %rax");
+                            self.state.emit("    fldl (%rsp)");
+                            self.state.emit("    addq $8, %rsp");
+                            self.state.emit("    fstpt (%rsp)");
+                        }
                     }
                 }
-            } else if kind == StackArgKind::I128 {
-                // Push 128-bit integer: high 8 bytes first, then low 8 bytes
-                self.operand_to_rax_rdx(stack_args[si].0);
-                self.state.emit("    pushq %rdx");  // high half first (higher address)
-                self.state.emit("    pushq %rax");  // low half second (lower address)
-            } else {
-                self.operand_to_rax(stack_args[si].0);
-                self.state.emit("    pushq %rax");
+                StackArgKind::I128 => {
+                    // Push 128-bit integer: high 8 bytes first, then low 8 bytes
+                    self.operand_to_rax_rdx(stack_args[si].0);
+                    self.state.emit("    pushq %rdx");
+                    self.state.emit("    pushq %rax");
+                }
+                StackArgKind::StructByVal { size } => {
+                    // Push struct data from memory onto the stack.
+                    // The operand is the address of the struct.
+                    self.operand_to_rax(stack_args[si].0);
+                    // Push in reverse 8-byte chunks
+                    let n_qwords = (size + 7) / 8;
+                    for qi in (0..n_qwords).rev() {
+                        let offset = qi * 8;
+                        if offset + 8 <= size {
+                            self.state.emit(&format!("    pushq {}(%rax)", offset));
+                        } else {
+                            // Partial last qword - load and push
+                            self.state.emit(&format!("    movq {}(%rax), %rcx", offset));
+                            self.state.emit("    pushq %rcx");
+                        }
+                    }
+                }
+                StackArgKind::Normal => {
+                    self.operand_to_rax(stack_args[si].0);
+                    self.state.emit("    pushq %rax");
+                }
             }
         }
 
-        // Load register args. For 128-bit args, load into two consecutive int regs.
+        // Load register args.
         let xmm_regs = ["xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"];
-        for (arg, is_float, is_i128, idx) in &arg_assignments {
-            if *is_i128 {
-                // Load 128-bit arg into consecutive register pair
-                self.operand_to_rax_rdx(arg);
-                // low half -> reg[idx], high half -> reg[idx+1]
-                // Must avoid clobbering: if target low reg is rdx, move high first
-                let lo_reg = X86_ARG_REGS[*idx];
-                let hi_reg = X86_ARG_REGS[*idx + 1];
-                if lo_reg == "rdx" {
-                    // rdx holds the high half; move it to hi_reg before overwriting rdx
-                    self.state.emit(&format!("    movq %rdx, %{}", hi_reg));
-                    self.state.emit(&format!("    movq %rax, %{}", lo_reg));
-                } else {
-                    self.state.emit(&format!("    movq %rax, %{}", lo_reg));
-                    self.state.emit(&format!("    movq %rdx, %{}", hi_reg));
+        for (_ai, (arg, kind, idx)) in arg_assignments.iter().enumerate() {
+            match kind {
+                ArgKind::I128 => {
+                    // Load 128-bit arg into consecutive register pair
+                    self.operand_to_rax_rdx(arg);
+                    let lo_reg = X86_ARG_REGS[*idx];
+                    let hi_reg = X86_ARG_REGS[*idx + 1];
+                    if lo_reg == "rdx" {
+                        self.state.emit(&format!("    movq %rdx, %{}", hi_reg));
+                        self.state.emit(&format!("    movq %rax, %{}", lo_reg));
+                    } else {
+                        self.state.emit(&format!("    movq %rax, %{}", lo_reg));
+                        self.state.emit(&format!("    movq %rdx, %{}", hi_reg));
+                    }
                 }
-            } else {
-                self.operand_to_rax(arg);
-                if *is_float {
+                ArgKind::StructByVal { size } => {
+                    // Load struct data from memory into 1-2 GP registers.
+                    // The operand is a pointer (alloca address) to the struct data.
+                    self.operand_to_rax(arg);
+                    // rax now holds the address of the struct
+                    // Load first 8 bytes (or less) into first register
+                    let lo_reg = X86_ARG_REGS[*idx];
+                    self.state.emit(&format!("    movq (%rax), %{}", lo_reg));
+                    if *size > 8 {
+                        // Load second chunk into next register
+                        let hi_reg = X86_ARG_REGS[*idx + 1];
+                        // Always load full 8 bytes - the callee only looks at what it needs
+                        self.state.emit(&format!("    movq 8(%rax), %{}", hi_reg));
+                    }
+                }
+                ArgKind::Float => {
+                    self.operand_to_rax(arg);
                     self.state.emit(&format!("    movq %rax, %{}", xmm_regs[*idx]));
-                } else {
+                }
+                ArgKind::Normal => {
+                    self.operand_to_rax(arg);
                     self.state.emit(&format!("    movq %rax, %{}", X86_ARG_REGS[*idx]));
                 }
             }
@@ -1766,9 +1886,9 @@ impl ArchCodegen for X86Codegen {
             self.state.emit("    call *%r10");
         }
 
-        if total_stack_bytes > 0 || need_align_pad {
-            let cleanup = total_stack_bytes + if need_align_pad { 8 } else { 0 };
-            self.state.emit(&format!("    addq ${}, %rsp", cleanup));
+        let total_cleanup = call_stack_bytes + if need_align_pad { 8 } else { 0 };
+        if total_cleanup > 0 {
+            self.state.emit(&format!("    addq ${}, %rsp", total_cleanup));
         }
 
         if let Some(dest) = dest {

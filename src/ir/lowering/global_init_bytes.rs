@@ -937,15 +937,83 @@ impl Lowerer {
         while item_idx < items.len() {
             let item = &items[item_idx];
 
-            // Check for index designator (may jump backwards for out-of-order designated inits)
-            let has_index_designator = if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
-                if let Some(idx) = self.eval_const_expr(idx_expr).and_then(|c| c.to_usize()) {
-                    current_idx = idx;
+            // Check for multi-dimensional index designators: [i][j]...
+            // Collect all Index designators to compute the correct element index at this level
+            let index_designators: Vec<usize> = item.designators.iter().filter_map(|d| {
+                if let Designator::Index(ref idx_expr) = d {
+                    self.eval_const_expr(idx_expr).and_then(|c| c.to_usize())
+                } else {
+                    None
                 }
-                true
-            } else {
-                false
-            };
+            }).collect();
+
+            let has_index_designator = !index_designators.is_empty();
+            if has_index_designator {
+                // For multi-dim designators like [i][j], the first index selects at this level,
+                // and remaining indices drill into sub-dimensions.
+                current_idx = index_designators[0];
+
+                // If there are extra index designators beyond the first, we need to compute
+                // a byte offset within this_stride and recurse or write directly.
+                if index_designators.len() > 1 && remaining_strides.len() > 0 {
+                    let elem_offset = base_offset + current_idx * this_stride;
+                    // Compute sub-offset from remaining designators
+                    let mut sub_byte_offset = 0usize;
+                    let mut sub_strides = remaining_strides;
+                    for &idx in &index_designators[1..] {
+                        let sub_stride = if !sub_strides.is_empty() { sub_strides[0] } else { struct_size };
+                        sub_byte_offset += idx * sub_stride;
+                        if sub_strides.len() > 1 {
+                            sub_strides = &sub_strides[1..];
+                        } else {
+                            sub_strides = &remaining_strides[0..0]; // empty
+                        }
+                    }
+
+                    // Handle field designator for [i][j].field = val
+                    let field_designator_name = item.designators.iter().find_map(|d| {
+                        if let Designator::Field(ref name) = d { Some(name.clone()) } else { None }
+                    });
+
+                    match &item.init {
+                        Initializer::Expr(expr) => {
+                            if let Some(ref fname) = field_designator_name {
+                                if let Some(val) = self.eval_const_expr(expr) {
+                                    if let Some(field) = layout.fields.iter().find(|f| &f.name == fname) {
+                                        let field_ir_ty = IrType::from_ctype(&field.ty);
+                                        let write_offset = elem_offset + sub_byte_offset + field.offset;
+                                        if write_offset + field_ir_ty.size() <= bytes.len() {
+                                            self.write_const_to_bytes(bytes, write_offset, &val, field_ir_ty);
+                                        }
+                                    }
+                                }
+                            } else {
+                                // Scalar value at the computed sub-position
+                                if let Some(val) = self.eval_const_expr(expr) {
+                                    let write_offset = elem_offset + sub_byte_offset;
+                                    // Write struct fields sequentially from this position
+                                    self.fill_struct_global_bytes(std::slice::from_ref(item), layout, bytes, write_offset);
+                                }
+                            }
+                        }
+                        Initializer::List(sub_items) => {
+                            let write_offset = elem_offset + sub_byte_offset;
+                            if !sub_strides.is_empty() && sub_strides[0] > struct_size {
+                                self.fill_multidim_struct_array_bytes(
+                                    sub_items, layout, struct_size, sub_strides,
+                                    bytes, write_offset, sub_strides[0],
+                                );
+                            } else {
+                                self.fill_struct_global_bytes(sub_items, layout, bytes, write_offset);
+                            }
+                        }
+                    }
+                    item_idx += 1;
+                    current_idx += 1;
+                    continue;
+                }
+            }
+
             if current_idx >= num_elems {
                 // Only skip items without a designator that would reset the index;
                 // designated items explicitly set current_idx above

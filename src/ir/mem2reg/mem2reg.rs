@@ -858,7 +858,7 @@ mod tests {
         let mut func = IrFunction::new(
             "f".to_string(),
             IrType::I32,
-            vec![IrParam { name: "cond".to_string(), ty: IrType::I32 }],
+            vec![IrParam { name: "cond".to_string(), ty: IrType::I32, struct_size: None }],
             false,
         );
 
@@ -960,6 +960,7 @@ mod tests {
                     return_type: IrType::Void,
                     is_variadic: false,
                     num_fixed_args: 1,
+                    struct_arg_sizes: vec![None],
                 },
                 Instruction::Load { dest: Value(1), ptr: Value(0), ty: IrType::I32 },
             ],

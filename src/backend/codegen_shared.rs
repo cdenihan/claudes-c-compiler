@@ -305,9 +305,10 @@ pub trait ArchCodegen {
     /// `is_variadic` indicates the called function uses variadic arguments (affects calling convention).
     /// `num_fixed_args` is the number of named (non-variadic) parameters. For variadic calls on
     /// AArch64, arguments beyond this index must be passed in GP registers even if they are floats.
+    /// `struct_arg_sizes` indicates which args are struct/union by-value: Some(size) for struct args, None otherwise.
     fn emit_call(&mut self, args: &[Operand], arg_types: &[IrType], direct_name: Option<&str>,
                  func_ptr: Option<&Operand>, dest: Option<Value>, return_type: IrType,
-                 is_variadic: bool, num_fixed_args: usize);
+                 is_variadic: bool, num_fixed_args: usize, struct_arg_sizes: &[Option<usize>]);
 
     /// Emit a global address load.
     fn emit_global_addr(&mut self, dest: &Value, name: &str);
@@ -856,11 +857,11 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction) {
         Instruction::Cmp { dest, op, lhs, rhs, ty } => {
             cg.emit_cmp(dest, *op, lhs, rhs, *ty);
         }
-        Instruction::Call { dest, func, args, arg_types, return_type, is_variadic, num_fixed_args } => {
-            cg.emit_call(args, arg_types, Some(func), None, *dest, *return_type, *is_variadic, *num_fixed_args);
+        Instruction::Call { dest, func, args, arg_types, return_type, is_variadic, num_fixed_args, struct_arg_sizes } => {
+            cg.emit_call(args, arg_types, Some(func), None, *dest, *return_type, *is_variadic, *num_fixed_args, struct_arg_sizes);
         }
-        Instruction::CallIndirect { dest, func_ptr, args, arg_types, return_type, is_variadic, num_fixed_args } => {
-            cg.emit_call(args, arg_types, None, Some(func_ptr), *dest, *return_type, *is_variadic, *num_fixed_args);
+        Instruction::CallIndirect { dest, func_ptr, args, arg_types, return_type, is_variadic, num_fixed_args, struct_arg_sizes } => {
+            cg.emit_call(args, arg_types, None, Some(func_ptr), *dest, *return_type, *is_variadic, *num_fixed_args, struct_arg_sizes);
         }
         Instruction::GlobalAddr { dest, name } => {
             cg.emit_global_addr(dest, name);

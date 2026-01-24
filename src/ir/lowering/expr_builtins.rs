@@ -140,9 +140,11 @@ impl Lowerer {
                 let return_type = Self::builtin_return_type(name)
                     .or_else(|| libc_sig.map(|s| s.return_type))
                     .unwrap_or(IrType::I64);
+                let struct_arg_sizes = vec![None; arg_vals.len()];
                 self.emit(Instruction::Call {
                     dest: Some(dest), func: libc_name.clone(),
                     args: arg_vals, arg_types, return_type, is_variadic: variadic, num_fixed_args: n_fixed,
+                    struct_arg_sizes,
                 });
                 Some(Operand::Value(dest))
             }

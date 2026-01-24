@@ -720,8 +720,25 @@ impl Lowerer {
     ) {
         let base_type_size = base_ty.size().max(1);
         if array_dim_strides.len() <= 1 {
+            // 1D array: support designated initializers [idx] = val
+            let total_elems = if !array_dim_strides.is_empty() && base_type_size > 0 {
+                array_dim_strides[0] / base_type_size
+            } else {
+                0
+            };
+            let mut current_idx = 0usize;
             for item in items {
+                if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
+                    if let Some(idx) = self.eval_const_expr(idx_expr).and_then(|c| c.to_usize()) {
+                        current_idx = idx;
+                    }
+                }
+                // Pad values up to current_idx if needed
+                while values.len() <= current_idx {
+                    values.push(self.zero_const(base_ty));
+                }
                 self.flatten_global_init_item(&item.init, base_ty, values);
+                current_idx = values.len();
             }
             return;
         }
@@ -731,13 +748,98 @@ impl Lowerer {
         } else {
             1
         };
+        // Total number of scalar elements this level covers
+        let total_scalar_elems = sub_elem_count * (if array_dim_strides[0] > 0 {
+            // number of sub-arrays at the parent level is determined by caller
+            // Here we just process items sequentially or by designator
+            0 // placeholder, we use values.len() tracking instead
+        } else { 0 });
+        let _ = total_scalar_elems;
+        let mut current_outer_idx = 0usize;
         for item in items {
+            // Check for multi-dimensional designators: [i][j]...
+            let index_designators: Vec<usize> = item.designators.iter().filter_map(|d| {
+                if let Designator::Index(ref idx_expr) = d {
+                    self.eval_const_expr(idx_expr).and_then(|c| c.to_usize())
+                } else {
+                    None
+                }
+            }).collect();
+
+            if !index_designators.is_empty() {
+                // Compute flat scalar index from multi-dimensional indices and strides
+                let flat_idx = self.compute_flat_index_from_designators(
+                    &index_designators, array_dim_strides, base_type_size
+                );
+                // Pad values up to flat_idx if needed
+                while values.len() <= flat_idx {
+                    values.push(self.zero_const(base_ty));
+                }
+                match &item.init {
+                    Initializer::List(sub_items) => {
+                        // Braced sub-list at a designated position: recurse
+                        // Figure out which dimension level the remaining designators cover
+                        let remaining_dims = array_dim_strides.len().saturating_sub(index_designators.len());
+                        let sub_strides = &array_dim_strides[array_dim_strides.len() - remaining_dims..];
+                        let start_len = values.len();
+                        // Set values length to flat_idx so recursion appends from there
+                        values.truncate(flat_idx);
+                        while values.len() < flat_idx {
+                            values.push(self.zero_const(base_ty));
+                        }
+                        if sub_strides.is_empty() || remaining_dims == 0 {
+                            self.flatten_global_init_item(&item.init, base_ty, values);
+                        } else {
+                            self.flatten_global_array_init(sub_items, sub_strides, base_ty, values);
+                        }
+                        // Don't pad here - designated init doesn't imply sub-array boundary
+                    }
+                    Initializer::Expr(expr) => {
+                        if let Expr::StringLiteral(s, _) = expr {
+                            // String at designated position
+                            values.truncate(flat_idx);
+                            while values.len() < flat_idx {
+                                values.push(self.zero_const(base_ty));
+                            }
+                            let string_sub_count = if index_designators.len() < array_dim_strides.len() {
+                                let remaining = &array_dim_strides[index_designators.len()..];
+                                if !remaining.is_empty() && base_type_size > 0 {
+                                    remaining[0] / base_type_size
+                                } else {
+                                    sub_elem_count
+                                }
+                            } else {
+                                1
+                            };
+                            self.inline_string_to_values(s, string_sub_count, base_ty, values);
+                        } else {
+                            // Scalar at designated flat position
+                            if let Some(val) = self.eval_const_expr(expr) {
+                                let expr_ty = self.get_expr_type(expr);
+                                values[flat_idx] = self.coerce_const_to_type_with_src(val, base_ty, expr_ty);
+                            }
+                        }
+                    }
+                }
+                // Update current_outer_idx based on the first designator
+                current_outer_idx = index_designators[0] + 1;
+                continue;
+            }
+
+            // No designator: sequential processing
+            // Pad values up to current_outer_idx * sub_elem_count
+            let target_start = current_outer_idx * sub_elem_count;
+            while values.len() < target_start {
+                values.push(self.zero_const(base_ty));
+            }
+
             match &item.init {
                 Initializer::List(sub_items) => {
                     // Check for braced string literal initializing a char sub-array: { "abc" }
                     if sub_items.len() == 1 {
                         if let Initializer::Expr(Expr::StringLiteral(s, _)) = &sub_items[0].init {
                             self.inline_string_to_values(s, sub_elem_count, base_ty, values);
+                            current_outer_idx += 1;
                             continue;
                         }
                     }
@@ -760,7 +862,29 @@ impl Lowerer {
                     }
                 }
             }
+            current_outer_idx += 1;
         }
+    }
+
+    /// Compute a flat scalar index from multi-dimensional designator indices and array strides.
+    /// For example, for `int grid[3][3]` with strides `[12, 4]` and designator `[1][2]`:
+    /// flat_idx = 1 * (12/4) + 2 = 5
+    fn compute_flat_index_from_designators(
+        &self,
+        indices: &[usize],
+        array_dim_strides: &[usize],
+        base_type_size: usize,
+    ) -> usize {
+        let mut flat_idx = 0usize;
+        for (i, &idx) in indices.iter().enumerate() {
+            let elems_per_entry = if i < array_dim_strides.len() && base_type_size > 0 {
+                array_dim_strides[i] / base_type_size
+            } else {
+                1
+            };
+            flat_idx += idx * elems_per_entry;
+        }
+        flat_idx
     }
 
     /// Check if an initializer item contains an address expression or string literal,

@@ -263,6 +263,7 @@ impl Lowerer {
             is_variadic: false,
             sret_size: None,
             two_reg_ret_size: None,
+            param_struct_sizes: Vec::new(),
         });
     }
 

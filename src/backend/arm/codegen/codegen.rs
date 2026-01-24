@@ -1585,7 +1585,7 @@ impl ArchCodegen for ArmCodegen {
 
     fn emit_call(&mut self, args: &[Operand], arg_types: &[IrType], direct_name: Option<&str>,
                  func_ptr: Option<&Operand>, dest: Option<Value>, return_type: IrType,
-                 is_variadic: bool, num_fixed_args: usize) {
+                 is_variadic: bool, num_fixed_args: usize, struct_arg_sizes: &[Option<usize>]) {
         // For indirect calls, spill the function pointer to a dedicated stack slot.
         // We cannot use x17 to hold it across argument setup because x17 is used as
         // a scratch register by emit_load_from_sp/emit_store_to_sp/emit_add_sp_offset

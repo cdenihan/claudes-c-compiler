@@ -230,6 +230,9 @@ pub(super) struct FuncSig {
     pub sret_size: Option<usize>,
     /// If the function returns a struct of 9-16 bytes via two registers, the struct size.
     pub two_reg_ret_size: Option<usize>,
+    /// Per-parameter struct sizes for by-value struct passing ABI.
+    /// Each entry is Some(size) if that parameter is a struct/union, None otherwise.
+    pub param_struct_sizes: Vec<Option<usize>>,
 }
 
 /// Metadata about known functions (signatures, variadic status, ABI handling).
@@ -871,6 +874,16 @@ impl Lowerer {
             self.type_spec_to_ctype(&self.resolve_type_spec(&p.type_spec).clone())
         }).collect();
 
+        // Collect per-parameter struct sizes for by-value struct passing ABI
+        let param_struct_sizes: Vec<Option<usize>> = params.iter().map(|p| {
+            let resolved = self.resolve_type_spec(&p.type_spec);
+            if matches!(resolved, TypeSpecifier::Struct(..) | TypeSpecifier::Union(..)) {
+                Some(self.sizeof_type(&p.type_spec))
+            } else {
+                None
+            }
+        }).collect();
+
         let sig = if !variadic || !param_tys.is_empty() {
             FuncSig {
                 return_type: ret_ty,
@@ -881,6 +894,7 @@ impl Lowerer {
                 is_variadic: variadic,
                 sret_size,
                 two_reg_ret_size,
+                param_struct_sizes,
             }
         } else {
             FuncSig {
@@ -892,6 +906,7 @@ impl Lowerer {
                 is_variadic: variadic,
                 sret_size,
                 two_reg_ret_size,
+                param_struct_sizes: Vec::new(),
             }
         };
         self.func_meta.sigs.insert(name.to_string(), sig);
@@ -1073,7 +1088,7 @@ impl Lowerer {
         let mut params: Vec<IrParam> = Vec::new();
         // If sret, prepend hidden pointer parameter
         if uses_sret {
-            params.push(IrParam { name: "__sret_ptr".to_string(), ty: IrType::Ptr });
+            params.push(IrParam { name: "__sret_ptr".to_string(), ty: IrType::Ptr, struct_size: None });
         }
         // Build IR params, decomposing complex double/float into two FP params for ABI compliance.
         // ir_param_to_orig[ir_idx] = original func.params index
@@ -1100,23 +1115,30 @@ impl Lowerer {
                 let comp_ty = Self::complex_component_ir_type(&ct);
                 let name = p.name.clone().unwrap_or_default();
                 // Two params: real and imag parts
-                params.push(IrParam { name: format!("{}_real", name), ty: comp_ty });
+                params.push(IrParam { name: format!("{}_real", name), ty: comp_ty, struct_size: None });
                 ir_param_to_orig.push(Some(orig_idx));
-                params.push(IrParam { name: format!("{}_imag", name), ty: comp_ty });
+                params.push(IrParam { name: format!("{}_imag", name), ty: comp_ty, struct_size: None });
                 ir_param_to_orig.push(Some(orig_idx));
                 complex_decomposed.insert(orig_idx);
             } else if is_complex_float {
                 // _Complex float: packed two F32 in one XMM register as F64 (x86-64 only)
                 let name = p.name.clone().unwrap_or_default();
-                params.push(IrParam { name: format!("{}_packed", name), ty: IrType::F64 });
+                params.push(IrParam { name: format!("{}_packed", name), ty: IrType::F64, struct_size: None });
                 ir_param_to_orig.push(Some(orig_idx));
                 complex_float_params.insert(orig_idx);
             } else {
                 let ty = self.type_spec_to_ir(&p.type_spec);
                 let ty = if func.is_kr && ty == IrType::F32 { IrType::F64 } else { ty };
+                // Check if this is a struct/union parameter for by-value passing
+                let struct_size = if matches!(resolved, TypeSpecifier::Struct(..) | TypeSpecifier::Union(..)) {
+                    Some(self.sizeof_type(&p.type_spec))
+                } else {
+                    None
+                };
                 params.push(IrParam {
                     name: p.name.clone().unwrap_or_default(),
                     ty,
+                    struct_size,
                 });
                 ir_param_to_orig.push(Some(orig_idx));
             }
@@ -1352,6 +1374,7 @@ impl Lowerer {
                                     is_variadic: false,
                                     sret_size: None,
                                     two_reg_ret_size: None,
+                                    param_struct_sizes: Vec::new(),
                                 });
                             }
                         }
@@ -1374,32 +1397,14 @@ impl Lowerer {
             }
         }
 
-        // Phase 2: For struct params, emit the struct-sized alloca + memcpy
+        // Phase 2: For struct params, set up local variable.
+        // Both small structs (<= 16 bytes, passed in registers) and large structs
+        // (> 16 bytes, MEMORY class, passed on stack) have their data stored directly
+        // into the Phase 1 alloca by emit_store_params. No extra alloca or copy needed.
         for sp in struct_params {
-            let struct_alloca = self.fresh_value();
-            self.emit(Instruction::Alloca {
-                dest: struct_alloca,
-                ty: IrType::Ptr,
-                size: sp.struct_size,
-                align: 0,
-            });
+            let struct_alloca = sp.ptr_alloca;
 
-            // Load the incoming pointer from the ptr_alloca (stored by emit_store_params)
-            let src_ptr = self.fresh_value();
-            self.emit(Instruction::Load {
-                dest: src_ptr,
-                ptr: sp.ptr_alloca,
-                ty: IrType::Ptr,
-            });
-
-            // Copy struct data from the caller's struct to our local alloca
-            self.emit(Instruction::Memcpy {
-                dest: struct_alloca,
-                src: src_ptr,
-                size: sp.struct_size,
-            });
-
-            // Register the struct/complex alloca as the local variable
+            // Register the struct alloca as the local variable
             self.insert_local_scoped(sp.param_name, LocalInfo {
                 var: VarInfo {
                     ty: IrType::Ptr,

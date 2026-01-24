@@ -72,6 +72,8 @@ pub struct IrFunction {
 pub struct IrParam {
     pub name: String,
     pub ty: IrType,
+    /// If this param is a struct/union passed by value, its byte size. None for non-struct params.
+    pub struct_size: Option<usize>,
 }
 
 /// A basic block in the CFG.
@@ -116,10 +118,12 @@ pub enum Instruction {
     /// `num_fixed_args` is the number of named (non-variadic) parameters in the callee's prototype.
     /// For non-variadic calls, this equals args.len(). For variadic calls, args beyond num_fixed_args
     /// are variadic and may need different calling convention handling (e.g., floats in GP regs on AArch64).
-    Call { dest: Option<Value>, func: String, args: Vec<Operand>, arg_types: Vec<IrType>, return_type: IrType, is_variadic: bool, num_fixed_args: usize },
+    /// `struct_arg_sizes` indicates which args are struct/union by-value: Some(size) for struct args, None otherwise.
+    Call { dest: Option<Value>, func: String, args: Vec<Operand>, arg_types: Vec<IrType>, return_type: IrType, is_variadic: bool, num_fixed_args: usize, struct_arg_sizes: Vec<Option<usize>> },
 
     /// Indirect function call through a pointer: %dest = call_indirect ptr(args...)
-    CallIndirect { dest: Option<Value>, func_ptr: Operand, args: Vec<Operand>, arg_types: Vec<IrType>, return_type: IrType, is_variadic: bool, num_fixed_args: usize },
+    /// `struct_arg_sizes` indicates which args are struct/union by-value: Some(size) for struct args, None otherwise.
+    CallIndirect { dest: Option<Value>, func_ptr: Operand, args: Vec<Operand>, arg_types: Vec<IrType>, return_type: IrType, is_variadic: bool, num_fixed_args: usize, struct_arg_sizes: Vec<Option<usize>> },
 
     /// Get element pointer (for arrays/structs)
     GetElementPtr { dest: Value, base: Value, offset: Operand, ty: IrType },

@@ -65,7 +65,7 @@ impl Lowerer {
         };
 
         // Lower arguments with implicit casts
-        let (mut arg_vals, mut arg_types) = self.lower_call_arguments(func, args);
+        let (mut arg_vals, mut arg_types, mut struct_arg_sizes) = self.lower_call_arguments(func, args);
 
         // Decompose complex double/float arguments into (real, imag) pairs for ABI compliance
         let param_ctypes_for_decompose = if let Expr::Identifier(name, _) = func {
@@ -83,6 +83,7 @@ impl Lowerer {
             self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size, align: 0 });
             arg_vals.insert(0, Operand::Value(alloca));
             arg_types.insert(0, IrType::Ptr);
+            struct_arg_sizes.insert(0, None); // sret pointer is not a struct arg
             Some(alloca)
         } else {
             None
@@ -114,7 +115,7 @@ impl Lowerer {
         };
 
         // Dispatch: direct call, function pointer call, or indirect call
-        let call_ret_ty = self.emit_call_instruction(func, dest, arg_vals, arg_types, call_variadic, num_fixed_args, two_reg_size, sret_size);
+        let call_ret_ty = self.emit_call_instruction(func, dest, arg_vals, arg_types, struct_arg_sizes, call_variadic, num_fixed_args, two_reg_size, sret_size);
 
         // For sret calls, the struct data is now in the alloca - return its address
         if let Some(alloca) = sret_alloca {
@@ -213,7 +214,9 @@ impl Lowerer {
 
     /// Lower function call arguments, applying implicit casts for parameter types
     /// and default argument promotions for variadic args.
-    pub(super) fn lower_call_arguments(&mut self, func: &Expr, args: &[Expr]) -> (Vec<Operand>, Vec<IrType>) {
+    /// Returns (arg_vals, arg_types, struct_arg_sizes) where struct_arg_sizes[i] is
+    /// Some(size) if the ith argument is a struct/union passed by value.
+    pub(super) fn lower_call_arguments(&mut self, func: &Expr, args: &[Expr]) -> (Vec<Operand>, Vec<IrType>, Vec<Option<usize>>) {
         let func_name = if let Expr::Identifier(name, _) = func { Some(name.as_str()) } else { None };
         let sig = func_name.and_then(|name|
             self.func_meta.sigs.get(name)
@@ -304,7 +307,27 @@ impl Lowerer {
             val
         }).collect();
 
-        (arg_vals, arg_types)
+        // Build struct_arg_sizes: for each arg, check if it's a struct/union by value
+        let func_name = if let Expr::Identifier(name, _) = func { Some(name.as_str()) } else { None };
+        let struct_arg_sizes: Vec<Option<usize>> = if let Some(ref sizes) = func_name.and_then(|n| self.func_meta.sigs.get(n).map(|s| s.param_struct_sizes.clone())) {
+            // Use pre-registered struct sizes from function metadata
+            args.iter().enumerate().map(|(i, _)| {
+                sizes.get(i).copied().flatten()
+            }).collect()
+        } else {
+            // Infer from argument expressions
+            args.iter().map(|a| {
+                let ctype = self.get_expr_ctype(a);
+                match ctype {
+                    Some(CType::Struct(_)) | Some(CType::Union(_)) => {
+                        self.struct_value_size(a)
+                    }
+                    _ => None,
+                }
+            }).collect()
+        };
+
+        (arg_vals, arg_types, struct_arg_sizes)
     }
 
     /// Emit the actual call instruction (direct, indirect via fptr, or general indirect).
@@ -315,6 +338,7 @@ impl Lowerer {
         dest: Value,
         arg_vals: Vec<Operand>,
         arg_types: Vec<IrType>,
+        struct_arg_sizes: Vec<Option<usize>>,
         is_variadic: bool,
         num_fixed_args: usize,
         two_reg_size: Option<usize>,
@@ -333,6 +357,7 @@ impl Lowerer {
                     self.emit(Instruction::CallIndirect {
                         dest: Some(dest), func_ptr: Operand::Value(func_ptr),
                         args: arg_vals, arg_types, return_type: indirect_ret_ty, is_variadic, num_fixed_args,
+                        struct_arg_sizes,
                     });
                     indirect_ret_ty
                 } else {
@@ -345,25 +370,30 @@ impl Lowerer {
                     self.emit(Instruction::Call {
                         dest: Some(dest), func: name.clone(),
                         args: arg_vals, arg_types, return_type: ret_ty, is_variadic, num_fixed_args,
+                        struct_arg_sizes,
                     });
                     ret_ty
                 }
             }
             Expr::Deref(inner, _) => {
                 let n = arg_vals.len();
+                let sas = struct_arg_sizes;
                 let func_ptr = self.lower_expr(inner);
                 self.emit(Instruction::CallIndirect {
                     dest: Some(dest), func_ptr, args: arg_vals, arg_types,
                     return_type: indirect_ret_ty, is_variadic: false, num_fixed_args: n,
+                    struct_arg_sizes: sas,
                 });
                 indirect_ret_ty
             }
             _ => {
                 let n = arg_vals.len();
+                let sas = struct_arg_sizes;
                 let func_ptr = self.lower_expr(func);
                 self.emit(Instruction::CallIndirect {
                     dest: Some(dest), func_ptr, args: arg_vals, arg_types,
                     return_type: indirect_ret_ty, is_variadic: false, num_fixed_args: n,
+                    struct_arg_sizes: sas,
                 });
                 indirect_ret_ty
             }
