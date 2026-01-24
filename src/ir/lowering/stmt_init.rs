@@ -157,6 +157,13 @@ impl Lowerer {
         match expr {
             Expr::StringLiteral(s, _) | Expr::WideStringLiteral(s, _) => {
                 self.emit_string_to_alloca(alloca, s, 0);
+                // Zero-fill remaining bytes if string is shorter than array
+                let str_len = s.chars().count() + 1; // +1 for null terminator
+                let arr_size = da.alloc_size;
+                for i in str_len..arr_size {
+                    let val = Operand::Const(IrConst::I8(0));
+                    self.emit_store_at_offset(alloca, i, val, IrType::I8);
+                }
             }
             _ => {
                 let val = self.lower_expr(expr);

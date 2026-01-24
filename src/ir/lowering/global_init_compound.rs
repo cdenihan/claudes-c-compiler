@@ -80,9 +80,13 @@ impl Lowerer {
             // Check if this is a flat init filling an array field.
             // A string literal initializing a char array is NOT flat init - it's a single
             // complete initializer for the entire array (e.g., char c[10] = "hello").
+            // However, for pointer arrays (e.g., char *s[2] = {"abc", "def"}), each
+            // string literal IS a flat-init element (it initializes one pointer).
             let is_string_literal = matches!(&item.init, Initializer::Expr(Expr::StringLiteral(..)));
-            if let CType::Array(_, Some(arr_size)) = field_ty {
-                if matches!(&item.init, Initializer::Expr(_)) && !is_string_literal {
+            if let CType::Array(elem_ty, Some(arr_size)) = field_ty {
+                let is_char_array = matches!(elem_ty.as_ref(), CType::Char | CType::UChar);
+                let skip_flat = is_string_literal && is_char_array;
+                if matches!(&item.init, Initializer::Expr(_)) && !skip_flat {
                     // Flat init: consume up to arr_size items for this array field
                     let mut consumed = 0;
                     while consumed < *arr_size && (item_idx + consumed) < items.len() {
