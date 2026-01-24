@@ -902,6 +902,45 @@ impl ArchCodegen for ArmCodegen {
         self.state.emit("    mvn x1, x1");
     }
 
+    fn emit_sign_extend_acc_high(&mut self) {
+        self.state.emit("    asr x1, x0, #63");
+    }
+
+    fn emit_zero_acc_high(&mut self) {
+        self.state.emit("    mov x1, #0");
+    }
+
+    fn current_return_type(&self) -> IrType {
+        self.current_return_type
+    }
+
+    fn emit_return_i128_to_regs(&mut self) {
+        // x0:x1 already hold the i128 return value per AAPCS64 — noop
+    }
+
+    fn emit_return_f128_to_reg(&mut self) {
+        // F128 return: convert f64 bit pattern in x0 to f128 in q0 via __extenddftf2.
+        self.state.emit("    fmov d0, x0");
+        self.state.emit("    bl __extenddftf2");
+    }
+
+    fn emit_return_f32_to_reg(&mut self) {
+        self.state.emit("    fmov s0, w0");
+    }
+
+    fn emit_return_f64_to_reg(&mut self) {
+        self.state.emit("    fmov d0, x0");
+    }
+
+    fn emit_return_int_to_reg(&mut self) {
+        // x0 already holds the return value per AAPCS64 — noop
+    }
+
+    fn emit_epilogue_and_ret(&mut self, frame_size: i64) {
+        self.emit_epilogue_arm(frame_size);
+        self.state.emit("    ret");
+    }
+
     fn store_instr_for_type(&self, ty: IrType) -> &'static str {
         Self::str_for_type(ty)
     }
@@ -1853,46 +1892,7 @@ impl ArchCodegen for ArmCodegen {
         }
     }
 
-    /// Override emit_cast to handle 128-bit widening/narrowing.
-    fn emit_cast(&mut self, dest: &Value, src: &Operand, from_ty: IrType, to_ty: IrType) {
-        if is_i128_type(to_ty) && !is_i128_type(from_ty) {
-            // Widening to 128-bit
-            self.operand_to_x0(src);
-            // First widen to 64-bit if needed
-            if from_ty.size() < 8 {
-                self.emit_cast_instrs(from_ty, if from_ty.is_signed() { IrType::I64 } else { IrType::U64 });
-            }
-            if from_ty.is_signed() {
-                // Sign-extend: x1 = x0 >> 63 (arithmetic)
-                self.state.emit("    asr x1, x0, #63");
-            } else {
-                // Zero-extend
-                self.state.emit("    mov x1, #0");
-            }
-            self.store_x0_x1_to(dest);
-            return;
-        }
-        if is_i128_type(from_ty) && !is_i128_type(to_ty) {
-            // Narrowing from 128-bit: use low 64 bits
-            self.operand_to_x0_x1(src);
-            // x0 already has the low 64 bits
-            if to_ty.size() < 8 {
-                self.emit_cast_instrs(IrType::I64, to_ty);
-            }
-            self.store_x0_to(dest);
-            return;
-        }
-        if is_i128_type(from_ty) && is_i128_type(to_ty) {
-            // I128 <-> U128: same representation, just copy
-            self.operand_to_x0_x1(src);
-            self.store_x0_x1_to(dest);
-            return;
-        }
-        // Default path for non-128-bit casts
-        self.emit_load_operand(src);
-        self.emit_cast_instrs(from_ty, to_ty);
-        self.emit_store_result(dest);
-    }
+    // emit_cast: uses default implementation from ArchCodegen trait (handles i128 via primitives)
 
     fn emit_va_arg(&mut self, dest: &Value, va_list_ptr: &Value, result_ty: IrType) {
         // AArch64 AAPCS64 va_arg implementation.
@@ -2105,33 +2105,7 @@ impl ArchCodegen for ArmCodegen {
         self.state.emit("    stp x2, x3, [x0, #16]");
     }
 
-    fn emit_return(&mut self, val: Option<&Operand>, frame_size: i64) {
-        if let Some(val) = val {
-            if is_i128_type(self.current_return_type) {
-                // 128-bit return: x0 = low, x1 = high per AAPCS64
-                self.operand_to_x0_x1(val);
-                self.emit_epilogue_arm(frame_size);
-                self.state.emit("    ret");
-                return;
-            }
-            self.operand_to_x0(val);
-            if self.current_return_type.is_long_double() {
-                // F128 return: convert f64 bit pattern in x0 to f128 in q0 via __extenddftf2.
-                // __extenddftf2 takes input in d0, returns f128 in q0.
-                self.state.emit("    fmov d0, x0");
-                self.state.emit("    bl __extenddftf2");
-                // Result now in q0, which is the AAPCS64 return register for f128
-            } else if self.current_return_type == IrType::F32 {
-                // F32 return: bit pattern in w0, move to s0 per AAPCS64
-                self.state.emit("    fmov s0, w0");
-            } else if self.current_return_type.is_float() {
-                // F64 return: bit pattern in x0, move to d0 per AAPCS64
-                self.state.emit("    fmov d0, x0");
-            }
-        }
-        self.emit_epilogue_arm(frame_size);
-        self.state.emit("    ret");
-    }
+    // emit_return: uses default implementation from ArchCodegen trait
 
     // emit_branch, emit_cond_branch, emit_unreachable, emit_indirect_branch:
     // use default implementations from ArchCodegen trait

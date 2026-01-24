@@ -1095,6 +1095,47 @@ impl ArchCodegen for X86Codegen {
         self.state.emit("    notq %rdx");
     }
 
+    fn emit_sign_extend_acc_high(&mut self) {
+        self.state.emit("    cqto"); // sign-extends rax into rdx
+    }
+
+    fn emit_zero_acc_high(&mut self) {
+        self.state.emit("    xorq %rdx, %rdx");
+    }
+
+    fn current_return_type(&self) -> IrType {
+        self.current_return_type
+    }
+
+    fn emit_return_i128_to_regs(&mut self) {
+        // rax:rdx already hold the i128 return value per SysV ABI — noop
+    }
+
+    fn emit_return_f128_to_reg(&mut self) {
+        // F128 (long double) must be returned in x87 st(0) per SysV ABI.
+        // rax has f64 bit pattern; push to stack, load with fldl.
+        self.state.emit("    pushq %rax");
+        self.state.emit("    fldl (%rsp)");
+        self.state.emit("    addq $8, %rsp");
+    }
+
+    fn emit_return_f32_to_reg(&mut self) {
+        self.state.emit("    movd %eax, %xmm0");
+    }
+
+    fn emit_return_f64_to_reg(&mut self) {
+        self.state.emit("    movq %rax, %xmm0");
+    }
+
+    fn emit_return_int_to_reg(&mut self) {
+        // rax already holds the return value per SysV ABI — noop
+    }
+
+    fn emit_epilogue_and_ret(&mut self, _frame_size: i64) {
+        self.emit_epilogue(0);
+        self.state.emit("    ret");
+    }
+
     fn store_instr_for_type(&self, ty: IrType) -> &'static str {
         Self::mov_store_for_type(ty)
     }
@@ -1770,42 +1811,7 @@ impl ArchCodegen for X86Codegen {
         self.emit_cast_instrs_x86(from_ty, to_ty);
     }
 
-    /// Override the default emit_cast to handle 128-bit widening/narrowing.
-    fn emit_cast(&mut self, dest: &Value, src: &Operand, from_ty: IrType, to_ty: IrType) {
-        if Self::is_i128_type(to_ty) && !Self::is_i128_type(from_ty) {
-            // Widening to 128-bit: load src into rax, extend to rax:rdx
-            self.operand_to_rax(src);
-            if from_ty.size() < 8 {
-                self.emit_cast_instrs_x86(from_ty, if from_ty.is_signed() { IrType::I64 } else { IrType::U64 });
-            }
-            if from_ty.is_signed() {
-                self.state.emit("    cqto");
-            } else {
-                self.state.emit("    xorq %rdx, %rdx");
-            }
-            self.store_rax_rdx_to(dest);
-            return;
-        }
-        if Self::is_i128_type(from_ty) && !Self::is_i128_type(to_ty) {
-            // Narrowing from 128-bit: load into rax:rdx, use rax (low 64 bits)
-            self.operand_to_rax_rdx(src);
-            if to_ty.size() < 8 {
-                self.emit_cast_instrs_x86(IrType::I64, to_ty);
-            }
-            self.store_rax_to(dest);
-            return;
-        }
-        if Self::is_i128_type(from_ty) && Self::is_i128_type(to_ty) {
-            // I128 <-> U128: noop (same representation)
-            self.operand_to_rax_rdx(src);
-            self.store_rax_rdx_to(dest);
-            return;
-        }
-        // Standard cast: use default load → cast_instrs → store pattern
-        self.operand_to_rax(src);
-        self.emit_cast_instrs_x86(from_ty, to_ty);
-        self.store_rax_to(dest);
-    }
+    // emit_cast: uses default implementation from ArchCodegen trait (handles i128 via primitives)
 
     fn emit_va_arg(&mut self, dest: &Value, va_list_ptr: &Value, result_ty: IrType) {
         // x86-64 System V ABI va_arg implementation.
@@ -1988,30 +1994,7 @@ impl ArchCodegen for X86Codegen {
         self.state.emit("    movq %rax, 16(%rdi)");
     }
 
-    fn emit_return(&mut self, val: Option<&Operand>, _frame_size: i64) {
-        if let Some(val) = val {
-            if Self::is_i128_type(self.current_return_type) {
-                // 128-bit return: rax = low, rdx = high
-                self.operand_to_rax_rdx(val);
-            } else {
-                self.operand_to_rax(val);
-                if self.current_return_type == IrType::F32 {
-                    self.state.emit("    movd %eax, %xmm0");
-                } else if self.current_return_type == IrType::F128 {
-                    // F128 (long double) must be returned in x87 st(0) per SysV ABI.
-                    // rax has f64 bit pattern; push to stack, load with fldl.
-                    self.state.emit("    pushq %rax");
-                    self.state.emit("    fldl (%rsp)");
-                    self.state.emit("    addq $8, %rsp");
-                } else if self.current_return_type == IrType::F64 {
-                    // F64 return value goes in xmm0
-                    self.state.emit("    movq %rax, %xmm0");
-                }
-            }
-        }
-        self.emit_epilogue(0); // frame_size not needed for x86 epilogue
-        self.state.emit("    ret");
-    }
+    // emit_return: uses default implementation from ArchCodegen trait
 
     // emit_branch, emit_cond_branch, emit_unreachable, emit_indirect_branch:
     // use default implementations from ArchCodegen trait

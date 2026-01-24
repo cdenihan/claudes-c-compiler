@@ -332,9 +332,40 @@ pub trait ArchCodegen {
     /// the conversion instructions.
     fn emit_cast_instrs(&mut self, from_ty: IrType, to_ty: IrType);
 
-    /// Emit a type cast. Default: load source → emit_cast_instrs → store result.
-    /// x86-64 overrides this to handle 128-bit widening/narrowing.
+    /// Emit a type cast. Handles i128 widening/narrowing/copy using accumulator
+    /// pair primitives, and delegates non-i128 casts to emit_cast_instrs.
     fn emit_cast(&mut self, dest: &Value, src: &Operand, from_ty: IrType, to_ty: IrType) {
+        if is_i128_type(to_ty) && !is_i128_type(from_ty) {
+            // Widening to 128-bit: load src, widen to 64-bit if needed, sign/zero extend high half
+            self.emit_load_operand(src);
+            if from_ty.size() < 8 {
+                let widen_to = if from_ty.is_signed() { IrType::I64 } else { IrType::U64 };
+                self.emit_cast_instrs(from_ty, widen_to);
+            }
+            if from_ty.is_signed() {
+                self.emit_sign_extend_acc_high();
+            } else {
+                self.emit_zero_acc_high();
+            }
+            self.emit_store_acc_pair(dest);
+            return;
+        }
+        if is_i128_type(from_ty) && !is_i128_type(to_ty) {
+            // Narrowing from 128-bit: load pair, use low half, truncate if needed
+            self.emit_load_acc_pair(src);
+            if to_ty.size() < 8 {
+                self.emit_cast_instrs(IrType::I64, to_ty);
+            }
+            self.emit_store_result(dest);
+            return;
+        }
+        if is_i128_type(from_ty) && is_i128_type(to_ty) {
+            // I128 <-> U128: same representation, just copy
+            self.emit_load_acc_pair(src);
+            self.emit_store_acc_pair(dest);
+            return;
+        }
+        // Standard non-i128 cast
         self.emit_load_operand(src);
         self.emit_cast_instrs(from_ty, to_ty);
         self.emit_store_result(dest);
@@ -401,8 +432,30 @@ pub trait ArchCodegen {
     /// Emit inline assembly.
     fn emit_inline_asm(&mut self, template: &str, outputs: &[(String, Value, Option<String>)], inputs: &[(String, Operand, Option<String>)], clobbers: &[String], operand_types: &[IrType]);
 
-    /// Emit a return terminator.
-    fn emit_return(&mut self, val: Option<&Operand>, frame_size: i64);
+    /// Emit a return terminator. Default handles i128 pair returns, f128/f32/f64
+    /// float-to-register moves, and integer returns using arch-specific primitives.
+    fn emit_return(&mut self, val: Option<&Operand>, frame_size: i64) {
+        if let Some(val) = val {
+            let ret_ty = self.current_return_type();
+            if is_i128_type(ret_ty) {
+                self.emit_load_acc_pair(val);
+                self.emit_return_i128_to_regs();
+                self.emit_epilogue_and_ret(frame_size);
+                return;
+            }
+            self.emit_load_operand(val);
+            if ret_ty.is_long_double() {
+                self.emit_return_f128_to_reg();
+            } else if ret_ty == IrType::F32 {
+                self.emit_return_f32_to_reg();
+            } else if ret_ty.is_float() {
+                self.emit_return_f64_to_reg();
+            } else {
+                self.emit_return_int_to_reg();
+            }
+        }
+        self.emit_epilogue_and_ret(frame_size);
+    }
 
     // ---- Architecture-specific instruction primitives ----
     // These small methods provide the building blocks for default implementations
@@ -411,6 +464,14 @@ pub trait ArchCodegen {
     // --- 128-bit (accumulator pair) primitives ---
     // Convention: each arch uses a register pair for 128-bit values:
     //   x86: rax:rdx, ARM: x0:x1, RISC-V: t0:t1
+
+    /// Sign-extend the accumulator into the high half of the accumulator pair.
+    /// x86: cqto (rax sign-extends into rdx), ARM: asr x1, x0, #63, RISC-V: srai t1, t0, 63
+    fn emit_sign_extend_acc_high(&mut self);
+
+    /// Zero the high half of the accumulator pair.
+    /// x86: xorq %rdx, %rdx, ARM: mov x1, #0, RISC-V: li t1, 0
+    fn emit_zero_acc_high(&mut self);
 
     /// Load an operand into the accumulator pair (rax:rdx / x0:x1 / t0:t1).
     fn emit_load_acc_pair(&mut self, op: &Operand);
@@ -438,6 +499,36 @@ pub trait ArchCodegen {
 
     /// Emit 128-bit bitwise NOT on the accumulator pair.
     fn emit_i128_not(&mut self);
+
+    // --- Return primitives ---
+    // Used by the default emit_return implementation.
+
+    /// Get the current function's return type (stored in backend struct).
+    fn current_return_type(&self) -> IrType;
+
+    /// Move the i128 accumulator pair into the ABI return registers.
+    /// x86: noop (rax:rdx already correct), ARM: noop (x0:x1), RISC-V: mv a0,t0 / mv a1,t1
+    fn emit_return_i128_to_regs(&mut self);
+
+    /// Move the accumulator (containing an f128/long double f64 bit pattern) into
+    /// the ABI f128 return register/format.
+    /// x86: push rax, fldl, pop. ARM: fmov d0,x0 + bl __extenddftf2. RISC-V: fmv.d.x fa0,t0 + call __extenddftf2
+    fn emit_return_f128_to_reg(&mut self);
+
+    /// Move the accumulator (containing an f32 bit pattern) into the ABI float return register.
+    /// x86: movd %eax,%xmm0. ARM: fmov s0,w0. RISC-V: fmv.w.x fa0,t0
+    fn emit_return_f32_to_reg(&mut self);
+
+    /// Move the accumulator (containing an f64 bit pattern) into the ABI float return register.
+    /// x86: movq %rax,%xmm0. ARM: fmov d0,x0. RISC-V: fmv.d.x fa0,t0
+    fn emit_return_f64_to_reg(&mut self);
+
+    /// Move the accumulator into the ABI integer return register (if not already there).
+    /// x86: noop (already rax). ARM: noop (already x0). RISC-V: mv a0,t0
+    fn emit_return_int_to_reg(&mut self);
+
+    /// Emit function epilogue and return instruction.
+    fn emit_epilogue_and_ret(&mut self, frame_size: i64);
 
     // --- Typed store/load primitives ---
     // Used by emit_store/emit_load defaults for non-i128 paths.
@@ -1072,6 +1163,124 @@ pub fn find_param_alloca(func: &IrFunction, param_idx: usize) -> Option<(Value, 
                 }
             })
     })
+}
+
+// ============================================================================
+// Shared call argument classification
+// ============================================================================
+
+/// Classification of a function call argument for register/stack assignment.
+/// All three backends use the same algorithmic structure to classify arguments;
+/// only the register counts and F128 handling differ. This shared classification
+/// eliminates the duplicated arg-walking logic from each backend's `emit_call`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallArgClass {
+    /// Integer/pointer argument in a GP register. `reg_idx` is the GP register index.
+    IntReg { reg_idx: usize },
+    /// Float argument in an FP register. `reg_idx` is the FP register index.
+    FloatReg { reg_idx: usize },
+    /// 128-bit integer in a GP register pair. `base_reg_idx` is the first register.
+    I128RegPair { base_reg_idx: usize },
+    /// F128 (long double) — handling is arch-specific (x87 on x86, Q-reg on ARM, GP pair on RISC-V).
+    /// `reg_or_stack` indicates whether it goes in registers or overflows to stack.
+    F128Reg { reg_idx: usize },
+    /// Argument overflows to the stack (normal 8-byte).
+    Stack,
+    /// F128 argument overflows to the stack (16-byte aligned).
+    F128Stack,
+    /// I128 argument overflows to the stack (16-byte aligned).
+    I128Stack,
+}
+
+/// ABI configuration for call argument classification.
+pub struct CallAbiConfig {
+    /// Maximum GP registers for arguments (x86: 6, ARM/RISC-V: 8).
+    pub max_int_regs: usize,
+    /// Maximum FP registers for arguments (all: 8).
+    pub max_float_regs: usize,
+    /// Whether i128 register pairs must be even-aligned (ARM/RISC-V: true, x86: false).
+    pub align_i128_pairs: bool,
+    /// Whether F128 uses FP registers (ARM: true) or always goes to stack/x87 (x86: true = stack).
+    /// On RISC-V, F128 goes in GP register pairs like i128.
+    pub f128_in_fp_regs: bool,
+    /// Whether F128 uses GP register pairs (RISC-V: true).
+    pub f128_in_gp_pairs: bool,
+    /// Whether variadic float args must go in GP registers instead of FP regs (RISC-V: true, x86: false, ARM: false).
+    pub variadic_floats_in_gp: bool,
+}
+
+/// Classify all arguments for a function call, returning a `CallArgClass` per argument.
+/// This captures the shared classification logic used identically by all three backends.
+pub fn classify_call_args(
+    args: &[Operand],
+    arg_types: &[IrType],
+    is_variadic: bool,
+    config: &CallAbiConfig,
+) -> Vec<CallArgClass> {
+    let mut result = Vec::with_capacity(args.len());
+    let mut int_idx = 0usize;
+    let mut float_idx = 0usize;
+
+    for (i, arg) in args.iter().enumerate() {
+        let arg_ty = if i < arg_types.len() { Some(arg_types[i]) } else { None };
+        let is_long_double = arg_ty.map(|t| t.is_long_double()).unwrap_or(false);
+        let is_i128 = arg_ty.map(|t| is_i128_type(t)).unwrap_or(false);
+        let is_float = if let Some(ty) = arg_ty {
+            ty.is_float()
+        } else {
+            matches!(arg, Operand::Const(IrConst::F32(_) | IrConst::F64(_)))
+        };
+        // Variadic floats go through GP registers on RISC-V
+        let force_gp = is_variadic && config.variadic_floats_in_gp && is_float && !is_long_double;
+
+        if is_i128 {
+            if config.align_i128_pairs && int_idx % 2 != 0 {
+                int_idx += 1;
+            }
+            if int_idx + 1 < config.max_int_regs {
+                result.push(CallArgClass::I128RegPair { base_reg_idx: int_idx });
+                int_idx += 2;
+            } else {
+                result.push(CallArgClass::I128Stack);
+                int_idx = config.max_int_regs;
+            }
+        } else if is_long_double {
+            if config.f128_in_fp_regs {
+                // ARM: F128 goes in Q registers (FP)
+                if float_idx < config.max_float_regs {
+                    result.push(CallArgClass::F128Reg { reg_idx: float_idx });
+                    float_idx += 1;
+                } else {
+                    result.push(CallArgClass::F128Stack);
+                }
+            } else if config.f128_in_gp_pairs {
+                // RISC-V: F128 goes in GP register pairs
+                if config.align_i128_pairs && int_idx % 2 != 0 {
+                    int_idx += 1;
+                }
+                if int_idx + 1 < config.max_int_regs {
+                    result.push(CallArgClass::F128Reg { reg_idx: int_idx });
+                    int_idx += 2;
+                } else {
+                    result.push(CallArgClass::F128Stack);
+                    int_idx = config.max_int_regs;
+                }
+            } else {
+                // x86: F128 always goes to stack (x87)
+                result.push(CallArgClass::F128Stack);
+            }
+        } else if is_float && !force_gp && float_idx < config.max_float_regs {
+            result.push(CallArgClass::FloatReg { reg_idx: float_idx });
+            float_idx += 1;
+        } else if int_idx < config.max_int_regs {
+            result.push(CallArgClass::IntReg { reg_idx: int_idx });
+            int_idx += 1;
+        } else {
+            result.push(CallArgClass::Stack);
+        }
+    }
+
+    result
 }
 
 // ============================================================================

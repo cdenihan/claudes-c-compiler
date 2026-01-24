@@ -943,6 +943,48 @@ impl ArchCodegen for RiscvCodegen {
         self.state.emit("    not t1, t1");
     }
 
+    fn emit_sign_extend_acc_high(&mut self) {
+        self.state.emit("    srai t1, t0, 63");
+    }
+
+    fn emit_zero_acc_high(&mut self) {
+        self.state.emit("    li t1, 0");
+    }
+
+    fn current_return_type(&self) -> IrType {
+        self.current_return_type
+    }
+
+    fn emit_return_i128_to_regs(&mut self) {
+        // i128 return: t0:t1 -> a0:a1 per RISC-V LP64D ABI
+        self.state.emit("    mv a0, t0");
+        self.state.emit("    mv a1, t1");
+    }
+
+    fn emit_return_f128_to_reg(&mut self) {
+        // F128 return: convert f64 bit pattern to f128 via __extenddftf2.
+        // Result goes in a0:a1 (GP register pair) per RISC-V LP64D ABI.
+        self.state.emit("    fmv.d.x fa0, t0");
+        self.state.emit("    call __extenddftf2");
+    }
+
+    fn emit_return_f32_to_reg(&mut self) {
+        self.state.emit("    fmv.w.x fa0, t0");
+    }
+
+    fn emit_return_f64_to_reg(&mut self) {
+        self.state.emit("    fmv.d.x fa0, t0");
+    }
+
+    fn emit_return_int_to_reg(&mut self) {
+        self.state.emit("    mv a0, t0");
+    }
+
+    fn emit_epilogue_and_ret(&mut self, frame_size: i64) {
+        self.emit_epilogue_riscv(frame_size);
+        self.state.emit("    ret");
+    }
+
     fn store_instr_for_type(&self, ty: IrType) -> &'static str {
         Self::store_for_type(ty)
     }
@@ -1721,45 +1763,7 @@ impl ArchCodegen for RiscvCodegen {
         }
     }
 
-    /// Override emit_cast to handle 128-bit widening/narrowing.
-    fn emit_cast(&mut self, dest: &Value, src: &Operand, from_ty: IrType, to_ty: IrType) {
-        if is_i128_type(to_ty) && !is_i128_type(from_ty) {
-            // Widening to 128-bit
-            self.operand_to_t0(src);
-            // First widen to 64-bit if needed
-            if from_ty.size() < 8 {
-                self.emit_cast_instrs(from_ty, if from_ty.is_signed() { IrType::I64 } else { IrType::U64 });
-            }
-            if from_ty.is_signed() {
-                // Sign-extend: t1 = t0 >> 63 (arithmetic)
-                self.state.emit("    srai t1, t0, 63");
-            } else {
-                self.state.emit("    li t1, 0");
-            }
-            self.store_t0_t1_to(dest);
-            return;
-        }
-        if is_i128_type(from_ty) && !is_i128_type(to_ty) {
-            // Narrowing from 128-bit: use low 64 bits
-            self.operand_to_t0_t1(src);
-            // t0 already has the low 64 bits
-            if to_ty.size() < 8 {
-                self.emit_cast_instrs(IrType::I64, to_ty);
-            }
-            self.store_t0_to(dest);
-            return;
-        }
-        if is_i128_type(from_ty) && is_i128_type(to_ty) {
-            // I128 <-> U128: same representation, just copy
-            self.operand_to_t0_t1(src);
-            self.store_t0_t1_to(dest);
-            return;
-        }
-        // Default path
-        self.emit_load_operand(src);
-        self.emit_cast_instrs(from_ty, to_ty);
-        self.emit_store_result(dest);
-    }
+    // emit_cast: uses default implementation from ArchCodegen trait (handles i128 via primitives)
 
     fn emit_va_arg(&mut self, dest: &Value, va_list_ptr: &Value, result_ty: IrType) {
         // RISC-V LP64D: va_list is just a void* (pointer to the next arg on stack).
@@ -1846,37 +1850,7 @@ impl ArchCodegen for RiscvCodegen {
         self.state.emit("    sd t2, 0(t0)");
     }
 
-    fn emit_return(&mut self, val: Option<&Operand>, frame_size: i64) {
-        if let Some(val) = val {
-            if is_i128_type(self.current_return_type) {
-                // 128-bit return: a0 = low, a1 = high per RISC-V LP64D ABI
-                self.operand_to_t0_t1(val);
-                self.state.emit("    mv a0, t0");
-                self.state.emit("    mv a1, t1");
-                self.emit_epilogue_riscv(frame_size);
-                self.state.emit("    ret");
-                return;
-            }
-            self.operand_to_t0(val);
-            if self.current_return_type.is_long_double() {
-                // F128 return: convert f64 bit pattern to f128 via __extenddftf2.
-                // Result goes in a0:a1 (GP register pair) per RISC-V LP64D ABI.
-                self.state.emit("    fmv.d.x fa0, t0");
-                self.state.emit("    call __extenddftf2");
-                // __extenddftf2 returns f128 in a0:a1 which is the correct return convention
-            } else if self.current_return_type == IrType::F32 {
-                // F32 return: bit pattern in t0, move to fa0 as single-precision
-                self.state.emit("    fmv.w.x fa0, t0");
-            } else if self.current_return_type.is_float() {
-                // F64 return: bit pattern in t0, move to fa0 as double-precision
-                self.state.emit("    fmv.d.x fa0, t0");
-            } else {
-                self.state.emit("    mv a0, t0");
-            }
-        }
-        self.emit_epilogue_riscv(frame_size);
-        self.state.emit("    ret");
-    }
+    // emit_return: uses default implementation from ArchCodegen trait
 
     // emit_branch, emit_cond_branch, emit_unreachable, emit_indirect_branch:
     // use default implementations from ArchCodegen trait

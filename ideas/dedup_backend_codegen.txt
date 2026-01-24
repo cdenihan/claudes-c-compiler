@@ -12,8 +12,9 @@ Completed items:
   emit_unreachable, emit_indirect_branch, emit_label_addr, emit_va_end, emit_copy_i128.
   Each backend provides small primitives (jump_mnemonic, trap_instruction,
   emit_branch_nonzero, emit_jump_indirect) and the defaults compose them.
-- emit_cast_instrs promoted to trait method; default emit_cast does load→cast→store.
-  x86-64 overrides emit_cast for 128-bit widening/narrowing. ARM and RISC-V use default.
+- emit_cast: Default implementation handles i128 widening/narrowing/copy via
+  emit_sign_extend_acc_high/emit_zero_acc_high primitives. All three backends
+  now use the shared default (no overrides needed).
 - emit_binop decomposed: default dispatches float→emit_float_binop, int→emit_int_binop.
   x86-64 overrides emit_binop for 128-bit integer arithmetic.
   Each backend provides arch-specific emit_float_binop and emit_int_binop.
@@ -33,9 +34,14 @@ Completed items:
 - emit_memcpy: Default loads addresses via emit_memcpy_load_dest/src_addr, then calls
   emit_memcpy_impl for the arch-specific copy loop.
 
+- emit_return: Default implementation dispatches i128/f128/f32/f64/int returns using
+  arch-specific primitives (emit_return_i128_to_regs, emit_return_f128_to_reg, etc.).
+  All three backends now use the shared default.
+- CallArgClass enum + classify_call_args(): Shared function call argument classification
+  with CallAbiConfig for arch-specific register counts and alignment rules.
+
 Remaining opportunities (diminishing returns):
 
-1. Parameter classification: emit_store_params and emit_call all independently classify
-   params as int-reg/float-reg/stack. A shared classify_params() helper could reduce this,
-   but the three ABIs differ significantly (x86-64 SysV, AAPCS64, RISC-V LP64D), so the
-   benefit is lower.
+1. Parameter classification: emit_store_params still independently classify params. The
+   shared classify_call_args() could be extended to cover this, but the store operations
+   are sufficiently arch-specific that the benefit is limited.
