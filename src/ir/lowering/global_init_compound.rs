@@ -310,12 +310,26 @@ impl Lowerer {
                 }
             }
             Initializer::List(nested_items) => {
-                // Check if this is an array of pointers
+                // Check if this is an array whose elements contain pointers
                 if let CType::Array(elem_ty, Some(arr_size)) = field_ty {
                     if Self::type_has_pointer_elements(elem_ty) {
-                        // Array of pointers: emit each element as a GlobalAddr or zero
-                        self.emit_compound_ptr_array_init(elements, nested_items, elem_ty, *arr_size);
-                        return;
+                        // Distinguish: direct pointer array vs struct-with-pointer-fields array
+                        if matches!(elem_ty.as_ref(), CType::Pointer(_) | CType::Function(_)) {
+                            // Array of direct pointers: emit each element as a GlobalAddr or zero
+                            self.emit_compound_ptr_array_init(elements, nested_items, elem_ty, *arr_size);
+                            return;
+                        }
+                        // Array of structs/unions containing pointer fields:
+                        // use the struct-array-with-ptrs path (byte buffer + ptr_ranges)
+                        if let Some(elem_layout) = self.get_struct_layout_for_ctype(elem_ty) {
+                            let nested = self.lower_struct_array_with_ptrs(nested_items, &elem_layout, *arr_size);
+                            if let GlobalInit::Compound(nested_elems) = nested {
+                                elements.extend(nested_elems);
+                            } else {
+                                push_zero_bytes(elements, field_size);
+                            }
+                            return;
+                        }
                     }
                 }
 
@@ -1262,12 +1276,65 @@ impl Lowerer {
             } else {
                 self.fill_struct_global_bytes(items, &sub_layout, bytes, offset);
             }
+        } else if let CType::Array(elem_ty, _) = field_ty {
+            // Array field: check if elements are structs/unions with pointer fields
+            if let Some(elem_layout) = self.get_struct_layout_for_ctype(elem_ty) {
+                if elem_layout.has_pointer_fields() {
+                    // Array of structs with pointer fields: handle each element
+                    let struct_size = elem_layout.size;
+                    for (ai, item) in items.iter().enumerate() {
+                        let elem_offset = offset + ai * struct_size;
+                        match &item.init {
+                            Initializer::List(sub_items) => {
+                                self.fill_nested_struct_with_ptrs(
+                                    sub_items, &elem_layout, elem_offset, bytes, ptr_ranges,
+                                );
+                            }
+                            Initializer::Expr(expr) => {
+                                // Single expression for first field of struct element
+                                if !elem_layout.fields.is_empty() {
+                                    let field = &elem_layout.fields[0];
+                                    let field_offset = elem_offset + field.offset;
+                                    self.write_expr_to_bytes_or_ptrs(
+                                        expr, &field.ty, field_offset,
+                                        field.bit_offset, field.bit_width,
+                                        bytes, ptr_ranges,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Array of structs without pointer fields: byte serialization
+                    let struct_size = elem_layout.size;
+                    for (ai, item) in items.iter().enumerate() {
+                        let elem_offset = offset + ai * struct_size;
+                        if let Initializer::List(ref sub_items) = item.init {
+                            self.fill_struct_global_bytes(sub_items, &elem_layout, bytes, elem_offset);
+                        }
+                    }
+                }
+            } else {
+                // Array of non-composite elements (scalars, pointers, etc.)
+                let elem_size = elem_ty.size();
+                let elem_ir_ty = IrType::from_ctype(elem_ty);
+                for (ai, item) in items.iter().enumerate() {
+                    let elem_offset = offset + ai * elem_size;
+                    if let Initializer::Expr(ref expr) = item.init {
+                        if Self::type_has_pointer_elements(elem_ty) {
+                            self.write_expr_to_bytes_or_ptrs(
+                                expr, elem_ty, elem_offset, None, None, bytes, ptr_ranges,
+                            );
+                        } else if let Some(val) = self.eval_const_expr(expr) {
+                            self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
+                        }
+                    }
+                }
+            }
         } else {
-            // Non-composite (e.g., array of scalars): write elements to byte buffer
-            let (elem_size, elem_ir_ty) = match field_ty {
-                CType::Array(inner, _) => (inner.size(), IrType::from_ctype(inner)),
-                other => (other.size(), IrType::from_ctype(other)),
-            };
+            // Non-composite, non-array field: write scalar value
+            let elem_ir_ty = IrType::from_ctype(field_ty);
+            let elem_size = elem_ir_ty.size().max(1);
             for (ai, item) in items.iter().enumerate() {
                 let elem_offset = offset + ai * elem_size;
                 if let Initializer::Expr(ref expr) = item.init {
