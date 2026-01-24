@@ -426,8 +426,14 @@ impl Lowerer {
         };
         if let Some(ctype) = self.resolve_field_ctype(base_expr, field_name, is_ptr) {
             match &ctype {
-                CType::Array(elem_ty, _) => return Some(self.resolve_ctype_size(elem_ty)),
-                CType::Pointer(pointee_ty) => return Some(self.resolve_ctype_size(pointee_ty)),
+                CType::Array(elem_ty, _) => {
+                    let sz = self.resolve_ctype_size(elem_ty);
+                    if sz > 0 { return Some(sz); }
+                }
+                CType::Pointer(pointee_ty) => {
+                    let sz = self.resolve_ctype_size(pointee_ty);
+                    if sz > 0 { return Some(sz); }
+                }
                 _ => {}
             }
         }

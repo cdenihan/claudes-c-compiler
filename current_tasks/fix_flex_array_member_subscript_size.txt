@@ -18,4 +18,8 @@ Minimal reproducer:
   Container* c = malloc(...);
   &c->elements[4]  // returns same address as &c->elements[0] (BUG)
 
-Status: IN PROGRESS
+Fix: In lvalue.rs get_member_array_elem_size(), changed elem_ty.size() and
+pointee_ty.size() to self.resolve_ctype_size() which properly looks up struct
+layouts for named struct types.
+
+Status: DONE
