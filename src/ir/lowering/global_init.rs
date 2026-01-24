@@ -208,7 +208,7 @@ impl Lowerer {
                     // But skip byte-serialization if any struct field is a pointer type
                     // (pointers need .quad directives for address relocations).
                     let has_ptr_fields = struct_layout.as_ref().map_or(false, |layout| {
-                        layout.fields.iter().any(|f| matches!(f.ty, CType::Pointer(_)))
+                        layout.fields.iter().any(|f| matches!(f.ty, CType::Pointer(_) | CType::Function(_)))
                     });
                     if let Some(ref layout) = struct_layout {
                         if has_ptr_fields {
@@ -1226,10 +1226,57 @@ impl Lowerer {
             if layout.is_union && !has_designator { break; }
         }
 
-        for fi in 0..layout.fields.len() {
+        let mut fi = 0;
+        while fi < layout.fields.len() {
             let field_offset = layout.fields[fi].offset;
             let field_size = layout.fields[fi].ty.size();
-            let field_is_pointer = matches!(layout.fields[fi].ty, CType::Pointer(_));
+            let field_is_pointer = matches!(layout.fields[fi].ty, CType::Pointer(_) | CType::Function(_));
+
+            // Check if this is a bitfield: if so, we need to pack all bitfields
+            // sharing the same storage unit into a single byte buffer.
+            if layout.fields[fi].bit_offset.is_some() {
+                let storage_unit_offset = field_offset;
+                let storage_unit_size = field_size; // All bitfields in this unit have the same type size
+
+                // Emit padding before this storage unit
+                if storage_unit_offset > current_offset {
+                    let pad = storage_unit_offset - current_offset;
+                    push_zero_bytes(&mut elements, pad);
+                    current_offset = storage_unit_offset;
+                }
+
+                // Allocate a byte buffer for the storage unit and pack all
+                // bitfield values into it using read-modify-write.
+                let mut unit_bytes = vec![0u8; storage_unit_size];
+
+                // Process all consecutive bitfield fields sharing this storage unit offset
+                while fi < layout.fields.len()
+                    && layout.fields[fi].offset == storage_unit_offset
+                    && layout.fields[fi].bit_offset.is_some()
+                {
+                    let bit_offset = layout.fields[fi].bit_offset.unwrap();
+                    let bit_width = layout.fields[fi].bit_width.unwrap();
+                    let field_ir_ty = IrType::from_ctype(&layout.fields[fi].ty);
+
+                    let inits = &field_inits[fi];
+                    let val = if !inits.is_empty() {
+                        self.eval_init_scalar(&inits[0].init)
+                    } else {
+                        IrConst::I32(0) // Zero-init for missing initializers
+                    };
+
+                    // Pack this bitfield value into the storage unit buffer
+                    self.write_bitfield_to_bytes(&mut unit_bytes, 0, &val, field_ir_ty, bit_offset, bit_width);
+                    fi += 1;
+                }
+
+                // Emit the packed storage unit as individual bytes
+                for &b in &unit_bytes {
+                    elements.push(GlobalInit::Scalar(IrConst::I8(b as i8)));
+                }
+                current_offset += storage_unit_size;
+                continue;
+            }
 
             // Emit padding before this field
             if field_offset > current_offset {
@@ -1268,6 +1315,7 @@ impl Lowerer {
                 self.emit_compound_flat_array_init(&mut elements, inits, &layout.fields[fi].ty, field_size);
             }
             current_offset += field_size;
+            fi += 1;
         }
 
         // Trailing padding
@@ -1845,7 +1893,7 @@ impl Lowerer {
                             let field = &layout.fields[field_idx];
                             let field_offset = base_offset + field.offset;
                             let field_ir_ty = IrType::from_ctype(&field.ty);
-                            let is_ptr_field = matches!(field.ty, CType::Pointer(_));
+                            let is_ptr_field = matches!(field.ty, CType::Pointer(_) | CType::Function(_));
 
                             if let Initializer::Expr(expr) = &sub_item.init {
                                 if is_ptr_field {
@@ -1873,10 +1921,16 @@ impl Lowerer {
                             let field = &layout.fields[0];
                             let field_offset = base_offset + field.offset;
                             let field_ir_ty = IrType::from_ctype(&field.ty);
-                            let is_ptr_field = matches!(field.ty, CType::Pointer(_));
+                            let is_ptr_field = matches!(field.ty, CType::Pointer(_) | CType::Function(_));
                             if is_ptr_field {
                                 if let Some(addr_init) = self.resolve_ptr_field_init(expr) {
                                     ptr_ranges.push((field_offset, addr_init));
+                                }
+                            } else if field.bit_offset.is_some() {
+                                if let Some(val) = self.eval_const_expr(expr) {
+                                    let bit_offset = field.bit_offset.unwrap();
+                                    let bit_width = field.bit_width.unwrap();
+                                    self.write_bitfield_to_bytes(&mut bytes, field_offset, &val, field_ir_ty, bit_offset, bit_width);
                                 }
                             } else if let Some(val) = self.eval_const_expr(expr) {
                                 self.write_const_to_bytes(&mut bytes, field_offset, &val, field_ir_ty);
