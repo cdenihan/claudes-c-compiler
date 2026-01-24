@@ -2409,8 +2409,17 @@ impl Lowerer {
         // type_spec_to_ir returns Ptr (array decays to pointer), but we need
         // the element type for correct storage/initialization.
         if is_array && base_ty == IrType::Ptr && !is_pointer {
-            if let TypeSpecifier::Array(ref elem, _) = self.resolve_type_spec(type_spec) {
-                base_ty = self.type_spec_to_ir(elem);
+            // Peel through nested Array layers resolving typedefs to find
+            // the true element type for multi-dimensional typedef'd arrays.
+            let mut resolved = self.resolve_type_spec(type_spec);
+            while let TypeSpecifier::Array(ref inner, _) = resolved {
+                let inner_resolved = self.resolve_type_spec(inner);
+                if matches!(inner_resolved, TypeSpecifier::Array(_, _)) {
+                    resolved = inner_resolved;
+                } else {
+                    base_ty = self.type_spec_to_ir(inner);
+                    break;
+                }
             }
         }
 

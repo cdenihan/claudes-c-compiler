@@ -271,8 +271,10 @@ impl Lowerer {
                         }
                     }
                 } else if let Some(val) = self.eval_const_expr(expr) {
-                    // Scalar constant - emit as bytes
-                    self.push_const_as_bytes(elements, &val, field_size);
+                    // Scalar constant - coerce to field type and emit as bytes
+                    let field_ir_ty = IrType::from_ctype(field_ty);
+                    let coerced = val.coerce_to(field_ir_ty);
+                    self.push_const_as_bytes(elements, &coerced, field_size);
                 } else if let Some(addr_init) = self.eval_global_addr_expr(expr) {
                     // Address expression - emit as relocation
                     elements.push(addr_init);
@@ -491,7 +493,9 @@ impl Lowerer {
                     }
                 } else {
                     if let Some(val) = self.eval_const_expr(expr) {
-                        self.push_const_as_bytes(elements, &val, elem_size);
+                        let elem_ir_ty = IrType::from_ctype(elem_ty);
+                        let coerced = val.coerce_to(elem_ir_ty);
+                        self.push_const_as_bytes(elements, &coerced, elem_size);
                     } else {
                         push_zero_bytes(elements, elem_size);
                     }

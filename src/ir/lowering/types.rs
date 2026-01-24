@@ -2086,13 +2086,14 @@ impl Lowerer {
     /// since that comes from the derived declarator).
     fn collect_type_array_dims(&self, ts: &TypeSpecifier) -> Vec<usize> {
         let mut dims = Vec::new();
-        let mut current = ts;
+        let mut current_owned = ts.clone();
         loop {
-            if let TypeSpecifier::Array(inner, Some(size_expr)) = current {
+            let resolved = self.resolve_type_spec(&current_owned);
+            if let TypeSpecifier::Array(inner, Some(size_expr)) = &resolved {
                 if let Some(n) = self.expr_as_array_size(size_expr) {
                     dims.push(n as usize);
                 }
-                current = inner.as_ref();
+                current_owned = inner.as_ref().clone();
             } else {
                 break;
             }

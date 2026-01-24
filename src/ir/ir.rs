@@ -510,13 +510,11 @@ impl IrConst {
                 out.extend_from_slice(&v.to_bits().to_le_bytes());
             }
             IrConst::LongDouble(v) => {
-                // Store as IEEE 754 binary128 (quad-precision) for AArch64/RISC-V,
-                // or x87 80-bit extended + padding for x86-64.
-                // We use quad-precision format which works correctly for ARM64/RISC-V.
-                // For x86-64, this also works because the x87 format is handled separately
-                // in the x86 backend's global data emission.
-                let bytes = f64_to_f128_bytes(*v);
-                out.extend_from_slice(&bytes);
+                // Store as f64 bits in low 8 bytes + 8 zero padding bytes.
+                // All backends (x86-64, AArch64, RISC-V) use this 16-byte layout
+                // for long double in global data emission.
+                out.extend_from_slice(&v.to_bits().to_le_bytes());
+                out.extend_from_slice(&[0u8; 8]);
             }
             IrConst::I128(v) => {
                 let le_bytes = v.to_le_bytes();
@@ -544,6 +542,7 @@ impl IrConst {
             IrType::I128 | IrType::U128 => IrConst::I128(val as i128),
             IrType::F32 => IrConst::F32(val as f32),
             IrType::F64 => IrConst::F64(val as f64),
+            IrType::F128 => IrConst::LongDouble(val as f64),
             _ => IrConst::I64(val),
         }
     }
@@ -573,6 +572,7 @@ impl IrConst {
                     return match target_ty {
                         IrType::F32 => IrConst::F32(uint_val as f32),
                         IrType::F64 => IrConst::F64(uint_val as f64),
+                        IrType::F128 => IrConst::LongDouble(uint_val as f64),
                         _ => IrConst::I64(int_val),
                     };
                 }
