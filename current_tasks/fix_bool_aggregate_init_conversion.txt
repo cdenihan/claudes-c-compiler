@@ -1,0 +1,25 @@
+Task: Fix _Bool conversion in aggregate initializers (struct/array init)
+
+Status: IN PROGRESS
+
+Problem:
+When initializing _Bool fields in structs or _Bool array elements,
+the compiler truncates values to U8 instead of applying the C standard
+_Bool conversion (any nonzero -> 1, zero -> 0).
+
+Example:
+  struct S { _Bool b; };
+  struct S s = { .b = -8 };  // should give s.b=1, but gives s.b=248
+
+Direct _Bool assignment works correctly (lower_scalar_init_expr has is_bool check),
+but aggregate initializers bypass this check.
+
+Affected paths:
+1. Local struct init (emit_struct_init in stmt.rs) - uses emit_implicit_cast
+2. Local array init (lower_1d_array_init in stmt_init.rs) - uses emit_implicit_cast
+3. Global struct init (global_init_bytes.rs, global_init_compound.rs) - uses coerce_to
+4. Global array init (global_init.rs) - uses coerce_const_to_type_with_src
+5. emit_init_expr_to_offset in lowering.rs
+
+Fix: Add _Bool normalization check at each of these sites, using CType::Bool
+to distinguish from plain U8.
