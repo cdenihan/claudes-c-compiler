@@ -13,6 +13,15 @@ use super::parser::Parser;
 
 impl Parser {
     pub(super) fn parse_external_decl(&mut self) -> Option<ExternalDecl> {
+        // Reset storage class and attribute flags before parsing
+        self.parsing_typedef = false;
+        self.parsing_static = false;
+        self.parsing_extern = false;
+        self.parsing_inline = false;
+        self.parsing_const = false;
+        self.parsing_constructor = false;
+        self.parsing_destructor = false;
+
         self.skip_gcc_extensions();
 
         // Handle #pragma pack directives (emitted as synthetic tokens by preprocessor)
@@ -44,15 +53,12 @@ impl Parser {
             return Some(ExternalDecl::Declaration(Declaration::empty()));
         }
 
-        // Reset storage class flags
-        self.parsing_typedef = false;
-        self.parsing_static = false;
-        self.parsing_extern = false;
-        self.parsing_inline = false;
-        self.parsing_const = false;
-
         let start = self.peek_span();
         let type_spec = self.parse_type_specifier()?;
+
+        // Capture constructor/destructor from type-level attributes
+        let type_level_ctor = self.parsing_constructor;
+        let type_level_dtor = self.parsing_destructor;
 
         // Bare type with no declarator (e.g., struct definition)
         if self.at_eof() || matches!(self.peek(), TokenKind::Semicolon) {
@@ -72,7 +78,11 @@ impl Parser {
         self.consume_post_type_qualifiers();
 
         let (name, derived, decl_mode_ti) = self.parse_declarator_with_attrs();
-        let mode_ti = decl_mode_ti || self.skip_asm_and_attributes();
+        let (post_ctor, post_dtor, post_mode_ti) = self.parse_asm_and_attributes();
+        let mode_ti = decl_mode_ti || post_mode_ti;
+        // Merge all sources of constructor/destructor: type-level attrs, declarator-level attrs, post-declarator attrs
+        let is_constructor = type_level_ctor || self.parsing_constructor || post_ctor;
+        let is_destructor = type_level_dtor || self.parsing_destructor || post_dtor;
 
         // Apply __attribute__((mode(TI))): transform type to 128-bit
         let type_spec = if mode_ti {
@@ -87,9 +97,9 @@ impl Parser {
             && (matches!(self.peek(), TokenKind::LBrace) || self.is_type_specifier());
 
         if is_funcdef {
-            self.parse_function_def(type_spec, name, derived, start)
+            self.parse_function_def(type_spec, name, derived, start, is_constructor, is_destructor)
         } else {
-            self.parse_declaration_rest(type_spec, name, derived, start)
+            self.parse_declaration_rest(type_spec, name, derived, start, is_constructor, is_destructor)
         }
     }
 
@@ -100,6 +110,8 @@ impl Parser {
         name: Option<String>,
         derived: Vec<DerivedDeclarator>,
         start: crate::common::source::Span,
+        is_constructor: bool,
+        is_destructor: bool,
     ) -> Option<ExternalDecl> {
         self.parsing_typedef = false; // function defs are never typedefs
         let (params, variadic) = if let Some(DerivedDeclarator::Function(p, v)) = derived.last() {
@@ -143,6 +155,8 @@ impl Parser {
             is_static,
             is_inline,
             is_kr: is_kr_style,
+            is_constructor,
+            is_destructor,
             span: start,
         }))
     }
@@ -278,6 +292,8 @@ impl Parser {
         name: Option<String>,
         derived: Vec<DerivedDeclarator>,
         start: crate::common::source::Span,
+        is_constructor: bool,
+        is_destructor: bool,
     ) -> Option<ExternalDecl> {
         let mut declarators = Vec::new();
         let init = if self.consume_if(&TokenKind::Assign) {
@@ -289,15 +305,23 @@ impl Parser {
             name: name.unwrap_or_default(),
             derived,
             init,
+            is_constructor,
+            is_destructor,
             span: start,
         });
 
-        self.skip_asm_and_attributes();
+        let (extra_ctor, extra_dtor, _) = self.parse_asm_and_attributes();
+        if extra_ctor {
+            declarators.last_mut().unwrap().is_constructor = true;
+        }
+        if extra_dtor {
+            declarators.last_mut().unwrap().is_destructor = true;
+        }
 
         // Parse additional declarators separated by commas
         while self.consume_if(&TokenKind::Comma) {
             let (dname, dderived) = self.parse_declarator();
-            self.skip_asm_and_attributes();
+            let (d_ctor, d_dtor, _) = self.parse_asm_and_attributes();
             let dinit = if self.consume_if(&TokenKind::Assign) {
                 Some(self.parse_initializer())
             } else {
@@ -307,6 +331,8 @@ impl Parser {
                 name: dname.unwrap_or_default(),
                 derived: dderived,
                 init: dinit,
+                is_constructor: d_ctor,
+                is_destructor: d_dtor,
                 span: start,
             });
             self.skip_asm_and_attributes();
@@ -363,6 +389,8 @@ impl Parser {
                 name: name.unwrap_or_default(),
                 derived,
                 init,
+                is_constructor: false,
+                is_destructor: false,
                 span: start,
             });
             self.skip_asm_and_attributes();

@@ -24,6 +24,8 @@ pub struct FunctionDef {
     pub is_static: bool,
     pub is_inline: bool,
     pub is_kr: bool,
+    pub is_constructor: bool,
+    pub is_destructor: bool,
     pub span: Span,
 }
 
@@ -71,6 +73,8 @@ pub struct InitDeclarator {
     pub name: String,
     pub derived: Vec<DerivedDeclarator>,
     pub init: Option<Initializer>,
+    pub is_constructor: bool,
+    pub is_destructor: bool,
     pub span: Span,
 }
 

@@ -238,6 +238,22 @@ pub fn generate_module(cg: &mut dyn ArchCodegen, module: &IrModule) -> String {
         }
     }
 
+    // Emit .init_array for constructor functions
+    for ctor in &module.constructors {
+        cg.state().emit("");
+        cg.state().emit(".section .init_array,\"aw\",@init_array");
+        cg.state().emit(".align 8");
+        cg.state().emit(&format!("{} {}", ptr_dir.as_str(), ctor));
+    }
+
+    // Emit .fini_array for destructor functions
+    for dtor in &module.destructors {
+        cg.state().emit("");
+        cg.state().emit(".section .fini_array,\"aw\",@fini_array");
+        cg.state().emit(".align 8");
+        cg.state().emit(&format!("{} {}", ptr_dir.as_str(), dtor));
+    }
+
     // Emit .note.GNU-stack section to indicate non-executable stack
     cg.state().emit("");
     cg.state().emit(".section .note.GNU-stack,\"\",@progbits");

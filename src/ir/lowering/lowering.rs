@@ -632,6 +632,34 @@ impl Lowerer {
         // Second pass: collect all enum constants from the entire AST
         self.collect_all_enum_constants(tu);
 
+        // Collect constructor/destructor attributes from function definitions and declarations
+        for decl in &tu.decls {
+            match decl {
+                ExternalDecl::FunctionDef(func) => {
+                    if func.is_constructor && !self.module.constructors.contains(&func.name) {
+                        self.module.constructors.push(func.name.clone());
+                    }
+                    if func.is_destructor && !self.module.destructors.contains(&func.name) {
+                        self.module.destructors.push(func.name.clone());
+                    }
+                }
+                ExternalDecl::Declaration(decl) => {
+                    for declarator in &decl.declarators {
+                        if declarator.is_constructor && !declarator.name.is_empty()
+                            && !self.module.constructors.contains(&declarator.name)
+                        {
+                            self.module.constructors.push(declarator.name.clone());
+                        }
+                        if declarator.is_destructor && !declarator.name.is_empty()
+                            && !self.module.destructors.contains(&declarator.name)
+                        {
+                            self.module.destructors.push(declarator.name.clone());
+                        }
+                    }
+                }
+            }
+        }
+
         // Pass 2.5: collect referenced static functions so we can skip unreferenced ones.
         // Static/inline functions from headers that are never called don't need to be lowered.
         let referenced_statics = self.collect_referenced_static_functions(tu);

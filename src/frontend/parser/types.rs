@@ -79,6 +79,7 @@ impl Parser {
                 TokenKind::Attribute => {
                     let (_, _, mode_ti) = self.parse_gcc_attributes();
                     has_mode_ti = has_mode_ti || mode_ti;
+                    // parse_gcc_attributes already sets self.parsing_constructor/destructor
                 }
                 TokenKind::Extension => {
                     self.advance();
@@ -255,6 +256,7 @@ impl Parser {
                     TokenKind::Attribute => {
                         let (_, _, mode_ti) = self.parse_gcc_attributes();
                         *has_mode_ti = *has_mode_ti || mode_ti;
+                        // parse_gcc_attributes already sets self.parsing_constructor/destructor
                     }
                     TokenKind::Extension => { self.advance(); }
                     _ => break,
@@ -435,7 +437,9 @@ impl Parser {
                 }
                 TokenKind::Attribute => {
                     self.advance();
-                    self.skip_balanced_parens();
+                    let (ctor, dtor) = self.parse_attribute_params();
+                    if ctor { self.parsing_constructor = true; }
+                    if dtor { self.parsing_destructor = true; }
                 }
                 TokenKind::Extension => {
                     self.advance();

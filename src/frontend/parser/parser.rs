@@ -31,6 +31,10 @@ pub struct Parser {
     pub(super) parsing_inline: bool,
     /// Set to true when parse_type_specifier encounters a `const` qualifier.
     pub(super) parsing_const: bool,
+    /// Set to true when parse_type_specifier encounters __attribute__((constructor)).
+    pub(super) parsing_constructor: bool,
+    /// Set to true when parse_type_specifier encounters __attribute__((destructor)).
+    pub(super) parsing_destructor: bool,
     /// Stack for #pragma pack alignment values.
     /// Current effective alignment is the last element (or None for default).
     pub(super) pragma_pack_stack: Vec<Option<usize>>,
@@ -50,6 +54,8 @@ impl Parser {
             parsing_extern: false,
             parsing_inline: false,
             parsing_const: false,
+            parsing_constructor: false,
+            parsing_destructor: false,
             pragma_pack_stack: Vec::new(),
             pragma_pack_align: None,
         }
@@ -270,6 +276,20 @@ impl Parser {
                             // Parse attribute list
                             loop {
                                 match self.peek() {
+                                    TokenKind::Identifier(name) if name == "constructor" || name == "__constructor__" => {
+                                        self.parsing_constructor = true;
+                                        self.advance();
+                                        if matches!(self.peek(), TokenKind::LParen) {
+                                            self.skip_balanced_parens();
+                                        }
+                                    }
+                                    TokenKind::Identifier(name) if name == "destructor" || name == "__destructor__" => {
+                                        self.parsing_destructor = true;
+                                        self.advance();
+                                        if matches!(self.peek(), TokenKind::LParen) {
+                                            self.skip_balanced_parens();
+                                        }
+                                    }
                                     TokenKind::Identifier(name) if name == "packed" || name == "__packed__" => {
                                         is_packed = true;
                                         self.advance();
@@ -364,6 +384,15 @@ impl Parser {
     /// Skip __asm__("..."), __attribute__(...), and __extension__ after declarators.
     /// Returns true if __attribute__((mode(TI))) was found (128-bit integer mode).
     pub(super) fn skip_asm_and_attributes(&mut self) -> bool {
+        let (_, _, mode_ti) = self.parse_asm_and_attributes();
+        mode_ti
+    }
+
+    /// Parse __asm__("..."), __attribute__(...), and __extension__ after declarators.
+    /// Returns (is_constructor, is_destructor, has_mode_ti).
+    pub(super) fn parse_asm_and_attributes(&mut self) -> (bool, bool, bool) {
+        let mut is_constructor = false;
+        let mut is_destructor = false;
         let mut has_mode_ti = false;
         loop {
             match self.peek() {
@@ -377,6 +406,8 @@ impl Parser {
                 TokenKind::Attribute => {
                     let (_, _, mode_ti) = self.parse_gcc_attributes();
                     has_mode_ti = has_mode_ti || mode_ti;
+                    if self.parsing_constructor { is_constructor = true; }
+                    if self.parsing_destructor { is_destructor = true; }
                 }
                 TokenKind::Extension => {
                     self.advance();
@@ -384,7 +415,66 @@ impl Parser {
                 _ => break,
             }
         }
-        has_mode_ti
+        (is_constructor, is_destructor, has_mode_ti)
+    }
+
+    /// Parse the ((...)) parameter list of __attribute__.
+    /// Called after the `__attribute__` token has been consumed.
+    /// Returns (is_constructor, is_destructor).
+    pub(super) fn parse_attribute_params(&mut self) -> (bool, bool) {
+        let mut is_constructor = false;
+        let mut is_destructor = false;
+        if matches!(self.peek(), TokenKind::LParen) {
+            self.advance(); // outer (
+            if matches!(self.peek(), TokenKind::LParen) {
+                self.advance(); // inner (
+                // Parse attribute list looking for constructor/destructor
+                loop {
+                    match self.peek() {
+                        TokenKind::Identifier(name) if name == "constructor" || name == "__constructor__" => {
+                            is_constructor = true;
+                            self.advance();
+                            if matches!(self.peek(), TokenKind::LParen) {
+                                self.skip_balanced_parens();
+                            }
+                        }
+                        TokenKind::Identifier(name) if name == "destructor" || name == "__destructor__" => {
+                            is_destructor = true;
+                            self.advance();
+                            if matches!(self.peek(), TokenKind::LParen) {
+                                self.skip_balanced_parens();
+                            }
+                        }
+                        TokenKind::Identifier(_) => {
+                            self.advance();
+                            if matches!(self.peek(), TokenKind::LParen) {
+                                self.skip_balanced_parens();
+                            }
+                        }
+                        TokenKind::Comma => { self.advance(); }
+                        TokenKind::RParen | TokenKind::Eof => break,
+                        _ => { self.advance(); }
+                    }
+                }
+                // Inner )
+                if matches!(self.peek(), TokenKind::RParen) {
+                    self.advance();
+                }
+                // Outer )
+                if matches!(self.peek(), TokenKind::RParen) {
+                    self.advance();
+                }
+            } else {
+                // Single-paren form, just skip
+                while !matches!(self.peek(), TokenKind::RParen | TokenKind::Eof) {
+                    self.advance();
+                }
+                if matches!(self.peek(), TokenKind::RParen) {
+                    self.advance();
+                }
+            }
+        }
+        (is_constructor, is_destructor)
     }
 
     // === Pragma pack handling ===

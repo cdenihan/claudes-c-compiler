@@ -8,6 +8,8 @@ pub struct IrModule {
     pub string_literals: Vec<(String, String)>, // (label, value)
     /// Wide string literals (L"..."): (label, chars as u32 values including null terminator)
     pub wide_string_literals: Vec<(String, Vec<u32>)>,
+    pub constructors: Vec<String>, // functions with __attribute__((constructor))
+    pub destructors: Vec<String>,  // functions with __attribute__((destructor))
 }
 
 /// A global variable.
@@ -807,6 +809,8 @@ impl IrModule {
             globals: Vec::new(),
             string_literals: Vec::new(),
             wide_string_literals: Vec::new(),
+            constructors: Vec::new(),
+            destructors: Vec::new(),
         }
     }
 
