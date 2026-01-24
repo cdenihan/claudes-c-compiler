@@ -57,14 +57,27 @@ impl Lowerer {
     /// Returns Some(operand) if this is an sret return, None otherwise.
     fn try_sret_return(&mut self, e: &Expr, sret_alloca: Value) -> Option<Operand> {
         // Large struct return (> 16 bytes)
-        if let Some(struct_size) = self.struct_value_size(e) {
-            if struct_size > 16 {
-                let src_addr = self.get_struct_base_addr(e);
-                let sret_ptr = self.fresh_value();
-                self.emit(Instruction::Load { dest: sret_ptr, ptr: sret_alloca, ty: IrType::Ptr });
-                self.emit(Instruction::Memcpy { dest: sret_ptr, src: src_addr, size: struct_size });
-                return Some(Operand::Value(sret_ptr));
+        // struct_value_size may return Some(0) for FunctionCall/Conditional expressions
+        // where CType::size() returns 0 for Struct/Union types. Fall back to the
+        // current function's sret_size from sig metadata.
+        let mut struct_size = self.struct_value_size(e).unwrap_or(0);
+        if struct_size == 0 {
+            if let Some(ctype) = self.get_expr_ctype(e) {
+                if matches!(ctype, CType::Struct(_) | CType::Union(_)) {
+                    let fname = self.func().name.clone();
+                    if let Some(size) = self.func_meta.sigs.get(fname.as_str())
+                        .and_then(|s| s.sret_size) {
+                        struct_size = size;
+                    }
+                }
             }
+        }
+        if struct_size > 16 {
+            let src_addr = self.get_struct_base_addr(e);
+            let sret_ptr = self.fresh_value();
+            self.emit(Instruction::Load { dest: sret_ptr, ptr: sret_alloca, ty: IrType::Ptr });
+            self.emit(Instruction::Memcpy { dest: sret_ptr, src: src_addr, size: struct_size });
+            return Some(Operand::Value(sret_ptr));
         }
 
         // Complex expression returned via sret
@@ -111,7 +124,22 @@ impl Lowerer {
 
     /// Try two-register struct return (9-16 bytes packed into I128).
     fn try_two_reg_struct_return(&mut self, e: &Expr) -> Option<Operand> {
-        let struct_size = self.struct_value_size(e)?;
+        // Get the struct size. struct_value_size may return Some(0) for expressions
+        // where CType::size() returns 0 (Struct/Union types without resolved size).
+        // In that case, fall back to the function's own two_reg_ret_size from sig
+        // metadata, since the return type size is reliably known.
+        let mut struct_size = self.struct_value_size(e).unwrap_or(0);
+        if struct_size == 0 {
+            if let Some(ctype) = self.get_expr_ctype(e) {
+                if matches!(ctype, CType::Struct(_) | CType::Union(_)) {
+                    let fname = self.func().name.clone();
+                    if let Some(size) = self.func_meta.sigs.get(fname.as_str())
+                        .and_then(|s| s.two_reg_ret_size) {
+                        struct_size = size;
+                    }
+                }
+            }
+        }
         if struct_size <= 8 || struct_size > 16 {
             return None;
         }
@@ -139,7 +167,10 @@ impl Lowerer {
     /// Try small struct return (<= 8 bytes loaded as I64).
     fn try_small_struct_return(&mut self, e: &Expr) -> Option<Operand> {
         let struct_size = self.struct_value_size(e)?;
-        if struct_size > 8 {
+        // struct_value_size returns Some(0) for FunctionCall/Conditional expressions
+        // where CType::size() returns 0 for Struct/Union types. Don't handle those here;
+        // they should be caught by try_sret_return or try_two_reg_struct_return fallbacks.
+        if struct_size == 0 || struct_size > 8 {
             return None;
         }
         let addr = self.get_struct_base_addr(e);
