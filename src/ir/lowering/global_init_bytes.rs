@@ -57,8 +57,28 @@ impl Lowerer {
                 _ => None,
             };
             let array_start_idx = self.extract_index_designator(item, designator_name.is_some());
-            let field_idx = match layout.resolve_init_field_idx(designator_name, current_field_idx) {
-                Some(idx) => idx,
+            let resolution = layout.resolve_init_field(designator_name, current_field_idx);
+            let field_idx = match &resolution {
+                Some(crate::common::types::InitFieldResolution::Direct(idx)) => *idx,
+                Some(crate::common::types::InitFieldResolution::AnonymousMember { anon_field_idx, inner_name }) => {
+                    // Designated init targets a field inside an anonymous member.
+                    // Drill into the anonymous member.
+                    let anon_field = &layout.fields[*anon_field_idx];
+                    let anon_offset = base_offset + anon_field.offset;
+                    let sub_layout = match &anon_field.ty {
+                        CType::Struct(st) => StructLayout::for_struct(&st.fields),
+                        CType::Union(st) => StructLayout::for_union(&st.fields),
+                        _ => { item_idx += 1; current_field_idx = *anon_field_idx + 1; continue; }
+                    };
+                    let sub_item = InitializerItem {
+                        designators: vec![Designator::Field(inner_name.clone())],
+                        init: item.init.clone(),
+                    };
+                    self.fill_struct_global_bytes(&[sub_item], &sub_layout, bytes, anon_offset);
+                    item_idx += 1;
+                    current_field_idx = *anon_field_idx + 1;
+                    continue;
+                }
                 None => {
                     if designator_name.is_some() { item_idx += 1; continue; }
                     break;
@@ -191,9 +211,22 @@ impl Lowerer {
             match desig {
                 Designator::Field(name) => {
                     let sub_layout = self.get_struct_layout_for_ctype(&current_ty)?;
-                    let fi = sub_layout.resolve_init_field_idx(Some(name.as_str()), 0)?;
-                    byte_offset += sub_layout.fields[fi].offset;
-                    current_ty = sub_layout.fields[fi].ty.clone();
+                    let resolution = sub_layout.resolve_init_field(Some(name.as_str()), 0)?;
+                    match resolution {
+                        crate::common::types::InitFieldResolution::Direct(fi) => {
+                            byte_offset += sub_layout.fields[fi].offset;
+                            current_ty = sub_layout.fields[fi].ty.clone();
+                        }
+                        crate::common::types::InitFieldResolution::AnonymousMember { anon_field_idx, inner_name } => {
+                            // Add anonymous member's offset, then resolve inner field
+                            let anon_field = &sub_layout.fields[anon_field_idx];
+                            byte_offset += anon_field.offset;
+                            let anon_layout = self.get_struct_layout_for_ctype(&anon_field.ty)?;
+                            let inner_fi = anon_layout.resolve_init_field_idx(Some(inner_name.as_str()), 0)?;
+                            byte_offset += anon_layout.fields[inner_fi].offset;
+                            current_ty = anon_layout.fields[inner_fi].ty.clone();
+                        }
+                    }
                 }
                 Designator::Index(idx_expr) => {
                     if let CType::Array(elem_ty, _) = &current_ty {

@@ -11,7 +11,7 @@
 
 use crate::frontend::parser::ast::*;
 use crate::ir::ir::*;
-use crate::common::types::{IrType, StructLayout, CType};
+use crate::common::types::{IrType, StructLayout, CType, InitFieldResolution};
 use super::lowering::Lowerer;
 use super::global_init_bytes::push_zero_bytes;
 
@@ -34,10 +34,42 @@ impl Lowerer {
         let mut field_inits: Vec<Vec<&InitializerItem>> = vec![Vec::new(); layout.fields.len()];
         let mut current_field_idx = 0usize;
 
+        // Collect items targeting anonymous members that need synthetic sub-inits.
+        // We store them separately to avoid borrow issues with field_inits.
+        let mut anon_synth_items: Vec<(usize, InitializerItem)> = Vec::new();
+
         let mut item_idx = 0;
         while item_idx < items.len() {
             let item = &items[item_idx];
-            let field_idx = self.resolve_struct_init_field_idx(item, layout, current_field_idx);
+
+            // Use resolve_init_field for anonymous member awareness
+            let designator_name = match item.designators.first() {
+                Some(Designator::Field(ref name)) => Some(name.as_str()),
+                _ => None,
+            };
+            let resolution = layout.resolve_init_field(designator_name, current_field_idx);
+
+            let field_idx = match &resolution {
+                Some(InitFieldResolution::Direct(idx)) => *idx,
+                Some(InitFieldResolution::AnonymousMember { anon_field_idx, inner_name }) => {
+                    // Designator targets a field inside an anonymous member.
+                    // Create a synthetic init item with the inner designator.
+                    let synth_item = InitializerItem {
+                        designators: vec![Designator::Field(inner_name.clone())],
+                        init: item.init.clone(),
+                    };
+                    anon_synth_items.push((*anon_field_idx, synth_item));
+                    current_field_idx = *anon_field_idx + 1;
+                    item_idx += 1;
+                    let has_designator = !item.designators.is_empty();
+                    if layout.is_union && !has_designator { break; }
+                    continue;
+                }
+                None => {
+                    item_idx += 1;
+                    continue;
+                }
+            };
             if field_idx >= layout.fields.len() {
                 item_idx += 1;
                 continue;
@@ -190,7 +222,29 @@ impl Lowerer {
             }
 
             let inits = &field_inits[fi];
-            if inits.is_empty() {
+            // Check if there are synthetic items for anonymous member designated init
+            let anon_items_for_fi: Vec<InitializerItem> = anon_synth_items.iter()
+                .filter(|(idx, _)| *idx == fi)
+                .map(|(_, item)| item.clone())
+                .collect();
+            let has_anon_items = !anon_items_for_fi.is_empty();
+
+            if inits.is_empty() && has_anon_items {
+                // Anonymous member with designated inits targeting its sub-fields.
+                // Recursively lower the anonymous struct/union with the synthetic items.
+                let anon_field_ty = &layout.fields[fi].ty;
+                let sub_layout = match anon_field_ty {
+                    CType::Struct(st) => StructLayout::for_struct(&st.fields),
+                    CType::Union(st) => StructLayout::for_union(&st.fields),
+                    _ => { push_zero_bytes(&mut elements, field_size); current_offset += field_size; fi += 1; continue; }
+                };
+                let sub_init = self.lower_struct_global_init_compound(&anon_items_for_fi, &sub_layout);
+                if let GlobalInit::Compound(sub_elems) = sub_init {
+                    elements.extend(sub_elems);
+                } else {
+                    push_zero_bytes(&mut elements, field_size);
+                }
+            } else if inits.is_empty() {
                 // No initializer for this field - zero fill
                 push_zero_bytes(&mut elements, field_size);
             } else if inits.len() == 1 {
@@ -703,7 +757,24 @@ impl Lowerer {
         ptr_ranges: &mut Vec<(usize, GlobalInit)>,
     ) {
         // Resolve which field this designator targets
-        let field_idx = self.resolve_struct_init_field_idx(item, layout, 0);
+        let resolution = self.resolve_struct_init_field(item, layout, 0);
+        let field_idx = match resolution {
+            Some(InitFieldResolution::Direct(idx)) => idx,
+            Some(InitFieldResolution::AnonymousMember { anon_field_idx, inner_name }) => {
+                // Drill into anonymous member
+                let anon_field = &layout.fields[anon_field_idx];
+                let anon_offset = base_offset + anon_field.offset;
+                if let Some(sub_layout) = self.get_struct_layout_for_ctype(&anon_field.ty) {
+                    let sub_item = InitializerItem {
+                        designators: vec![Designator::Field(inner_name)],
+                        init: item.init.clone(),
+                    };
+                    self.collect_ptr_ranges_from_nested_init(&sub_item, &sub_layout, anon_offset, ptr_ranges);
+                }
+                return;
+            }
+            None => return,
+        };
         if field_idx >= layout.fields.len() { return; }
 
         let field = &layout.fields[field_idx];
@@ -751,18 +822,38 @@ impl Lowerer {
     ) {
         let mut current_fi = 0usize;
         for si in items {
+            // Resolve field, handling anonymous members
+            let si_resolution = self.resolve_struct_init_field(si, layout, current_fi);
+            let si_fi = match si_resolution {
+                Some(InitFieldResolution::Direct(idx)) => idx,
+                Some(InitFieldResolution::AnonymousMember { anon_field_idx, inner_name }) => {
+                    // Drill into anonymous member to collect ptr ranges
+                    let anon_field = &layout.fields[anon_field_idx];
+                    let anon_offset = base_offset + anon_field.offset;
+                    if let Some(sub_layout) = self.get_struct_layout_for_ctype(&anon_field.ty) {
+                        let sub_item = InitializerItem {
+                            designators: vec![Designator::Field(inner_name)],
+                            init: si.init.clone(),
+                        };
+                        self.collect_ptr_ranges_from_struct_init_list(
+                            &[sub_item], &sub_layout, anon_offset, ptr_ranges);
+                    }
+                    current_fi = anon_field_idx + 1;
+                    continue;
+                }
+                None => { continue; }
+            };
+
             // Handle nested designators (e.g., .config.i = &server.field)
             // by following the designator chain to the actual target field
             let has_nested_desig = si.designators.len() > 1
                 && matches!(si.designators.first(), Some(Designator::Field(_)));
             if has_nested_desig {
                 self.collect_ptr_ranges_from_nested_init(si, layout, base_offset, ptr_ranges);
-                let si_fi = self.resolve_struct_init_field_idx(si, layout, current_fi);
                 current_fi = si_fi + 1;
                 continue;
             }
 
-            let si_fi = self.resolve_struct_init_field_idx(si, layout, current_fi);
             if si_fi >= layout.fields.len() { continue; }
             let si_field = &layout.fields[si_fi];
             let si_offset = base_offset + si_field.offset;
@@ -814,6 +905,20 @@ impl Lowerer {
         };
         layout.resolve_init_field_idx(designator_name, current_field_idx)
             .unwrap_or(current_field_idx)
+    }
+
+    /// Resolve struct field with full anonymous member info.
+    pub(super) fn resolve_struct_init_field(
+        &self,
+        item: &InitializerItem,
+        layout: &StructLayout,
+        current_field_idx: usize,
+    ) -> Option<InitFieldResolution> {
+        let designator_name = match item.designators.first() {
+            Some(Designator::Field(ref name)) => Some(name.as_str()),
+            _ => None,
+        };
+        layout.resolve_init_field(designator_name, current_field_idx)
     }
 
     /// Resolve a pointer field's initializer expression to a GlobalInit.
@@ -1345,13 +1450,37 @@ impl Lowerer {
     ) {
         let mut current_field_idx = 0usize;
         for inner_item in inner_items {
+            let desig_name = match inner_item.designators.first() {
+                Some(Designator::Field(ref name)) => Some(name.as_str()),
+                _ => None,
+            };
+            let resolution = sub_layout.resolve_init_field(desig_name, current_field_idx);
+            let field_idx = match &resolution {
+                Some(InitFieldResolution::Direct(idx)) => *idx,
+                Some(InitFieldResolution::AnonymousMember { anon_field_idx, inner_name }) => {
+                    // Drill into anonymous member
+                    let anon_field = &sub_layout.fields[*anon_field_idx];
+                    let anon_offset = base_offset + anon_field.offset;
+                    if let Some(anon_layout) = self.get_struct_layout_for_ctype(&anon_field.ty) {
+                        let sub_item = InitializerItem {
+                            designators: vec![Designator::Field(inner_name.clone())],
+                            init: inner_item.init.clone(),
+                        };
+                        self.fill_nested_struct_with_ptrs(
+                            &[sub_item], &anon_layout, anon_offset, bytes, ptr_ranges);
+                    }
+                    current_field_idx = *anon_field_idx + 1;
+                    continue;
+                }
+                None => break,
+            };
+
             // Handle multi-level designators within the nested struct (e.g., .config.i = &val)
             if inner_item.designators.len() > 1
                 && matches!(inner_item.designators.first(), Some(Designator::Field(_)))
             {
-                let first_fi = self.resolve_struct_init_field_idx(inner_item, sub_layout, current_field_idx);
-                if first_fi < sub_layout.fields.len() {
-                    let field = &sub_layout.fields[first_fi];
+                if field_idx < sub_layout.fields.len() {
+                    let field = &sub_layout.fields[field_idx];
                     let field_abs_offset = base_offset + field.offset;
 
                     if let Some(drill) = self.drill_designators(&inner_item.designators[1..], &field.ty) {
@@ -1363,19 +1492,11 @@ impl Lowerer {
                             );
                         }
                     }
-                    current_field_idx = first_fi + 1;
+                    current_field_idx = field_idx + 1;
                     continue;
                 }
             }
 
-            let desig_name = match inner_item.designators.first() {
-                Some(Designator::Field(ref name)) => Some(name.as_str()),
-                _ => None,
-            };
-            let field_idx = match sub_layout.resolve_init_field_idx(desig_name, current_field_idx) {
-                Some(idx) => idx,
-                None => break,
-            };
             let field = &sub_layout.fields[field_idx];
             let field_abs_offset = base_offset + field.offset;
 

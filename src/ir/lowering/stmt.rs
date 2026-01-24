@@ -291,15 +291,39 @@ impl Lowerer {
         base: Value,
         layout: &StructLayout,
     ) {
+        use crate::common::types::InitFieldResolution;
         let mut current_field_idx = 0usize;
         for item in items {
             let desig_name = match item.designators.first() {
                 Some(Designator::Field(ref name)) => Some(name.as_str()),
                 _ => None,
             };
-            let field_idx = match layout.resolve_init_field_idx(desig_name, current_field_idx) {
-                Some(idx) => idx,
+            let resolution = match layout.resolve_init_field(desig_name, current_field_idx) {
+                Some(r) => r,
                 None => break,
+            };
+
+            // Handle anonymous member: drill into the anonymous struct/union
+            let field_idx = match &resolution {
+                InitFieldResolution::Direct(idx) => *idx,
+                InitFieldResolution::AnonymousMember { anon_field_idx, inner_name } => {
+                    let anon_field = &layout.fields[*anon_field_idx].clone();
+                    let anon_offset = anon_field.offset;
+                    let sub_layout = match &anon_field.ty {
+                        CType::Struct(st) => StructLayout::for_struct(&st.fields),
+                        CType::Union(st) => StructLayout::for_union(&st.fields),
+                        _ => { current_field_idx = *anon_field_idx + 1; continue; }
+                    };
+                    // Create a synthetic item with the inner designator
+                    let sub_item = InitializerItem {
+                        designators: vec![Designator::Field(inner_name.clone())],
+                        init: item.init.clone(),
+                    };
+                    let sub_base = self.emit_gep_offset(base, anon_offset, IrType::Ptr);
+                    self.lower_local_struct_init(&[sub_item], sub_base, &sub_layout);
+                    current_field_idx = *anon_field_idx + 1;
+                    continue;
+                }
             };
 
             let field = &layout.fields[field_idx];
@@ -1027,8 +1051,28 @@ impl Lowerer {
                     _ => None,
                 }
             };
-            let field_idx = match layout.resolve_init_field_idx(desig_name, current_field_idx) {
-                Some(idx) => idx,
+            let resolution = layout.resolve_init_field(desig_name, current_field_idx);
+            let field_idx = match &resolution {
+                Some(crate::common::types::InitFieldResolution::Direct(idx)) => *idx,
+                Some(crate::common::types::InitFieldResolution::AnonymousMember { anon_field_idx, inner_name }) => {
+                    // Designator targets a field inside an anonymous struct/union member.
+                    // Drill into the anonymous member with the original designator.
+                    let anon_field = &layout.fields[*anon_field_idx].clone();
+                    let anon_offset = base_offset + anon_field.offset;
+                    let sub_layout = match &anon_field.ty {
+                        CType::Struct(st) => StructLayout::for_struct(&st.fields),
+                        CType::Union(st) => StructLayout::for_union(&st.fields),
+                        _ => { item_idx += 1; current_field_idx = *anon_field_idx + 1; continue; }
+                    };
+                    let sub_item = InitializerItem {
+                        designators: vec![Designator::Field(inner_name.clone())],
+                        init: item.init.clone(),
+                    };
+                    self.emit_struct_init(&[sub_item], base_alloca, &sub_layout, anon_offset);
+                    item_idx += 1;
+                    current_field_idx = *anon_field_idx + 1;
+                    continue;
+                }
                 None => break,
             };
             let field = &layout.fields[field_idx].clone();

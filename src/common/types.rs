@@ -219,6 +219,17 @@ pub struct StructLayout {
     pub is_union: bool,
 }
 
+/// Result of resolving a designated initializer field name.
+#[derive(Debug, Clone)]
+pub enum InitFieldResolution {
+    /// Found as a direct field at this index.
+    Direct(usize),
+    /// Found inside an anonymous struct/union member at the given index.
+    /// The String is the original designator name to use when drilling into
+    /// the anonymous member.
+    AnonymousMember { anon_field_idx: usize, inner_name: String },
+}
+
 /// Layout info for a single field.
 #[derive(Debug, Clone)]
 pub struct StructFieldLayout {
@@ -525,8 +536,43 @@ impl StructLayout {
     ///
     /// Returns the resolved field index, or `None` if no valid field found.
     pub fn resolve_init_field_idx(&self, designator_name: Option<&str>, current_idx: usize) -> Option<usize> {
+        match self.resolve_init_field(designator_name, current_idx) {
+            Some(InitFieldResolution::Direct(idx)) => Some(idx),
+            Some(InitFieldResolution::AnonymousMember { anon_field_idx, .. }) => Some(anon_field_idx),
+            None => None,
+        }
+    }
+
+    /// Resolve which field an initializer targets, with full info about anonymous members.
+    ///
+    /// When a designator name is found inside an anonymous struct/union member,
+    /// returns `AnonymousMember` with the anonymous field's index and the inner name,
+    /// allowing callers to drill into the anonymous member for proper initialization.
+    pub fn resolve_init_field(&self, designator_name: Option<&str>, current_idx: usize) -> Option<InitFieldResolution> {
         if let Some(name) = designator_name {
-            self.fields.iter().position(|f| f.name == name)
+            // First try direct field lookup
+            if let Some(idx) = self.fields.iter().position(|f| f.name == name) {
+                return Some(InitFieldResolution::Direct(idx));
+            }
+            // Search inside anonymous struct/union members
+            for (idx, f) in self.fields.iter().enumerate() {
+                // Anonymous members have empty name and no bit_width
+                if !f.name.is_empty() || f.bit_width.is_some() {
+                    continue;
+                }
+                match &f.ty {
+                    CType::Struct(st) | CType::Union(st) => {
+                        if Self::anon_member_contains_field(&st.fields, name) {
+                            return Some(InitFieldResolution::AnonymousMember {
+                                anon_field_idx: idx,
+                                inner_name: name.to_string(),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
         } else {
             // Positional init: skip unnamed bitfields (empty name + has bit_width).
             // Anonymous struct/union members (empty name, no bit_width) still participate.
@@ -537,11 +583,33 @@ impl StructLayout {
                     // Unnamed bitfield: skip it
                     idx += 1;
                 } else {
-                    return Some(idx);
+                    return Some(InitFieldResolution::Direct(idx));
                 }
             }
             None
         }
+    }
+
+    /// Check if an anonymous struct/union's fields contain a field with the given name,
+    /// including recursively through nested anonymous members.
+    fn anon_member_contains_field(fields: &[StructField], name: &str) -> bool {
+        for f in fields {
+            if f.name == name {
+                return true;
+            }
+            // Recurse into nested anonymous members
+            if f.name.is_empty() {
+                match &f.ty {
+                    CType::Struct(st) | CType::Union(st) => {
+                        if Self::anon_member_contains_field(&st.fields, name) {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        false
     }
 
     /// Look up a field by name, returning its offset and type.
