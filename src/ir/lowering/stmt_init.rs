@@ -101,8 +101,9 @@ impl Lowerer {
     }
 
     /// Register function metadata for a block-scope function declaration.
-    /// Simpler than the full `register_function_meta` since block-scope declarations
-    /// don't need sret/two-reg detection or complex return CType tracking.
+    /// Must compute the same ABI metadata as `register_function_meta` so that
+    /// member access on struct return values (e.g., `stfunc1().field`) works
+    /// correctly even when the function is only forward-declared at block scope.
     fn register_block_func_meta(
         &mut self,
         name: &str,
@@ -116,34 +117,105 @@ impl Lowerer {
         if ptr_count > 0 {
             ret_ty = IrType::Ptr;
         }
+
+        // Complex return types need special IR type overrides (same as register_function_meta)
+        if ptr_count == 0 {
+            let ret_ctype = self.type_spec_to_ctype(ret_type_spec);
+            if matches!(ret_ctype, CType::ComplexDouble) {
+                ret_ty = IrType::F64;
+            } else if matches!(ret_ctype, CType::ComplexFloat) {
+                if self.uses_packed_complex_float() {
+                    ret_ty = IrType::F64;
+                } else {
+                    ret_ty = IrType::F32;
+                }
+            }
+        }
+
+        // Track CType for pointer-returning and struct-returning functions.
+        // Without this, member access on a call result (e.g., `func().field`)
+        // cannot resolve the struct layout and falls back to offset 0.
+        let mut return_ctype = None;
+        if ret_ty == IrType::Ptr {
+            let base_ctype = self.type_spec_to_ctype(ret_type_spec);
+            let ret_ctype = if ptr_count > 0 {
+                let mut ct = base_ctype;
+                for _ in 0..ptr_count {
+                    ct = CType::Pointer(Box::new(ct));
+                }
+                ct
+            } else {
+                base_ctype
+            };
+            return_ctype = Some(ret_ctype);
+        }
+
+        // Record complex return types for expr_ctype resolution
+        if ptr_count == 0 {
+            let ret_ct = self.type_spec_to_ctype(ret_type_spec);
+            if ret_ct.is_complex() {
+                self.types.func_return_ctypes.insert(name.to_string(), ret_ct);
+            }
+        }
+
+        // Detect struct/complex returns that need special ABI handling
+        let mut sret_size = None;
+        let mut two_reg_ret_size = None;
+        if ptr_count == 0 {
+            let ret_ct = self.type_spec_to_ctype(ret_type_spec);
+            if matches!(ret_ct, CType::Struct(_) | CType::Union(_)) {
+                let size = self.sizeof_type(ret_type_spec);
+                if size > 16 {
+                    sret_size = Some(size);
+                } else if size > 8 {
+                    two_reg_ret_size = Some(size);
+                }
+            }
+            if matches!(ret_ct, CType::ComplexLongDouble) {
+                let size = self.sizeof_type(ret_type_spec);
+                sret_size = Some(size);
+            }
+        }
+
         let param_tys: Vec<IrType> = params.iter().map(|p| {
             self.type_spec_to_ir(&p.type_spec)
         }).collect();
         let param_bool_flags: Vec<bool> = params.iter().map(|p| {
             self.is_type_bool(&p.type_spec)
         }).collect();
+        let param_ctypes: Vec<CType> = params.iter().map(|p| {
+            self.type_spec_to_ctype(&p.type_spec)
+        }).collect();
+        let param_struct_sizes: Vec<Option<usize>> = params.iter().map(|p| {
+            if self.is_type_struct_or_union(&p.type_spec) {
+                Some(self.sizeof_type(&p.type_spec))
+            } else {
+                None
+            }
+        }).collect();
+
         let sig = if !variadic || !param_tys.is_empty() {
             FuncSig {
                 return_type: ret_ty,
-                return_ctype: None,
+                return_ctype,
                 param_types: param_tys,
-                param_ctypes: Vec::new(),
+                param_ctypes,
                 param_bool_flags,
                 is_variadic: variadic,
-                sret_size: None,
-                two_reg_ret_size: None,
-                param_struct_sizes: Vec::new(),
+                sret_size,
+                two_reg_ret_size,
+                param_struct_sizes,
             }
         } else {
             FuncSig {
                 return_type: ret_ty,
-                return_ctype: None,
+                return_ctype,
                 param_types: Vec::new(),
                 param_ctypes: Vec::new(),
                 param_bool_flags: Vec::new(),
                 is_variadic: variadic,
-                sret_size: None,
-                two_reg_ret_size: None,
+                sret_size,
+                two_reg_ret_size,
                 param_struct_sizes: Vec::new(),
             }
         };

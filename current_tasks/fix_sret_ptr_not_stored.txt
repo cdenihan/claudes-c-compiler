@@ -1,0 +1,21 @@
+Fix: sret (hidden return pointer) not stored to stack slot in emit_store_params
+
+Bug: When a function returns a struct > 16 bytes via hidden sret pointer (passed in
+%rdi on x86-64), emit_store_params skips storing the pointer to its alloca because
+the sret parameter has an empty name (param.name.is_empty() causes early continue).
+
+This means the sret pointer value in %rdi is lost, and when the function returns,
+it loads garbage from the uninitialized stack slot, leading to a segfault during
+the rep movsb that copies the return struct to the caller's buffer.
+
+Root cause: The unnamed-param skip logic (lines 869-892 in x86/codegen.rs) was
+designed for parameters that don't need storage, but the sret hidden pointer
+absolutely must be stored because the return sequence loads it back.
+
+Fix: Check if find_param_alloca returns a valid alloca for the unnamed param
+(the sret pointer) and store the register value to it.
+
+Impact: Fixes zic segfault which blocks postgres temp-install (make check),
+and any other function returning a struct > 16 bytes by value.
+
+Status: IN PROGRESS
