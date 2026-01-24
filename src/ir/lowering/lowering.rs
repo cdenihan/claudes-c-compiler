@@ -1324,14 +1324,23 @@ impl Lowerer {
     }
 
     /// Compute the IR return type for a function, applying ABI overrides.
+    /// Uses the already-registered function signature from register_function_meta
+    /// (which correctly applies complex/sret/two-reg ABI overrides).
     fn compute_function_return_type(&mut self, func: &FunctionDef) -> IrType {
-        let return_type = self.type_spec_to_ir(&func.return_type);
-
+        // Record complex return type for expr_ctype resolution
         let ret_ctype = self.type_spec_to_ctype(&func.return_type);
         if ret_ctype.is_complex() {
             self.types.func_return_ctypes.insert(func.name.clone(), ret_ctype.clone());
         }
-        return_type
+
+        // Use the return type from the already-registered signature, which has
+        // complex ABI overrides applied (e.g., ComplexDouble -> F64, ComplexFloat -> F64/F32).
+        if let Some(sig) = self.func_meta.sigs.get(&func.name) {
+            return sig.return_type;
+        }
+
+        // Fallback: compute directly (shouldn't normally be reached)
+        self.type_spec_to_ir(&func.return_type)
     }
 
     /// Build the IR parameter list for a function, handling ABI decomposition.
