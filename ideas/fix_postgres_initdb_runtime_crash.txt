@@ -1,0 +1,24 @@
+Fix postgres initdb runtime crash (MemoryContextAllocZero segfault)
+
+PostgreSQL now builds successfully with CCC (PIC/GOT codegen + SSE intrinsics),
+but initdb crashes during the bootstrap phase. The crash is in:
+
+#0  MemoryContextAllocZero()
+#1  CreateWaitEventSet()
+#2  InitializeLatchWaitSet()
+#3  InitStandaloneProcess()
+#4  BootstrapModeMain()
+#5  main()
+
+This is a runtime codegen bug - postgres compiles and links fine but the
+generated code crashes when MemoryContextAllocZero is called. Likely causes:
+- Incorrect struct layout/field access for MemoryContext (large struct hierarchy)
+- Miscompilation of function pointer calls (MemoryContext uses vtable-style dispatch)
+- Incorrect code for the memory context allocation fast path (inline functions)
+
+Debugging approach:
+1. Compile postgres with CCC debug info (-g)
+2. Use gdb to inspect MemoryContextAllocZero parameters at crash
+3. Try mixed compilation: compile most files with GCC, swap in CCC one at a time
+   to isolate which source file is miscompiled
+4. Check if MemoryContext struct layout matches between CCC and GCC

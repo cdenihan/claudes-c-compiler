@@ -33,6 +33,11 @@ pub struct CodegenState {
     pub i128_values: HashSet<u32>,
     /// Counter for generating unique labels (e.g., memcpy loops).
     label_counter: u32,
+    /// Whether position-independent code (PIC) generation is enabled.
+    pub pic_mode: bool,
+    /// Set of symbol names that are locally defined (not extern) and have internal
+    /// linkage (static) — these can use direct addressing even in PIC mode.
+    pub local_symbols: HashSet<String>,
 }
 
 impl CodegenState {
@@ -45,6 +50,8 @@ impl CodegenState {
             alloca_types: HashMap::new(),
             i128_values: HashSet::new(),
             label_counter: 0,
+            pic_mode: false,
+            local_symbols: HashSet::new(),
         }
     }
 
@@ -82,6 +89,26 @@ impl CodegenState {
 
     pub fn is_i128_value(&self, v: u32) -> bool {
         self.i128_values.contains(&v)
+    }
+
+    /// Returns true if the given symbol needs GOT indirection in PIC mode.
+    /// A symbol needs GOT if PIC is enabled AND it's not a local (static) symbol.
+    /// Local labels (starting with '.') are always PIC-safe via RIP-relative.
+    pub fn needs_got(&self, name: &str) -> bool {
+        if !self.pic_mode {
+            return false;
+        }
+        // Local labels (.Lxxx) never need GOT
+        if name.starts_with('.') {
+            return false;
+        }
+        // Symbols defined with internal linkage (static) don't need GOT
+        !self.local_symbols.contains(name)
+    }
+
+    /// Returns true if a function call needs PLT indirection in PIC mode.
+    pub fn needs_plt(&self, name: &str) -> bool {
+        self.needs_got(name)
     }
 }
 
@@ -306,6 +333,32 @@ pub trait ArchCodegen {
 
 /// Generate assembly for a module using the given architecture's codegen.
 pub fn generate_module(cg: &mut dyn ArchCodegen, module: &IrModule) -> String {
+    // Build the set of locally-defined symbols for PIC mode.
+    // In PIC mode, only symbols with internal linkage (static) are guaranteed
+    // not to be interposed. Non-static globals/functions need GOT/PLT because
+    // they could be preempted by another shared library (ELF symbol preemption).
+    // String literal labels (starting with .L) are always local.
+    {
+        let state = cg.state();
+        for func in &module.functions {
+            if func.is_static {
+                state.local_symbols.insert(func.name.clone());
+            }
+        }
+        for global in &module.globals {
+            if global.is_static {
+                state.local_symbols.insert(global.name.clone());
+            }
+        }
+        // String/wide string literal labels are always local (compiler-generated .L labels)
+        for (label, _) in &module.string_literals {
+            state.local_symbols.insert(label.clone());
+        }
+        for (label, _) in &module.wide_string_literals {
+            state.local_symbols.insert(label.clone());
+        }
+    }
+
     // Emit data sections
     let ptr_dir = cg.ptr_directive();
     common::emit_data_sections(&mut cg.state().out, module, ptr_dir);

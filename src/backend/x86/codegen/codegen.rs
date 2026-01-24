@@ -37,6 +37,11 @@ impl X86Codegen {
         }
     }
 
+    /// Enable position-independent code generation.
+    pub fn set_pic(&mut self, pic: bool) {
+        self.state.pic_mode = pic;
+    }
+
     pub fn generate(mut self, module: &IrModule) -> String {
         generate_module(&mut self, module)
     }
@@ -1615,7 +1620,11 @@ impl ArchCodegen for X86Codegen {
         }
 
         if let Some(name) = direct_name {
-            self.state.emit(&format!("    call {}", name));
+            if self.state.needs_plt(name) {
+                self.state.emit(&format!("    call {}@PLT", name));
+            } else {
+                self.state.emit(&format!("    call {}", name));
+            }
         } else if let Some(ptr) = func_ptr {
             self.state.emit("    pushq %rax"); // save AL
             self.operand_to_rax(ptr);
@@ -1655,7 +1664,13 @@ impl ArchCodegen for X86Codegen {
     }
 
     fn emit_global_addr(&mut self, dest: &Value, name: &str) {
-        self.state.emit(&format!("    leaq {}(%rip), %rax", name));
+        if self.state.needs_got(name) {
+            // PIC mode: load the address from the GOT
+            self.state.emit(&format!("    movq {}@GOTPCREL(%rip), %rax", name));
+        } else {
+            // Non-PIC or local symbol: direct RIP-relative LEA
+            self.state.emit(&format!("    leaq {}(%rip), %rax", name));
+        }
         self.store_rax_to(dest);
     }
 

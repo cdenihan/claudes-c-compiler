@@ -134,9 +134,15 @@ fn main() {
                 // -m32, -m64, -march=, -mtune=, etc.
             }
 
-            // Feature flags (ignored for now)
+            // Feature flags
+            "-fPIC" | "-fpic" => {
+                driver.pic = true;
+            }
+            "-fno-PIC" | "-fno-pic" => {
+                driver.pic = false;
+            }
             arg if arg.starts_with("-f") => {
-                // -fno-pie, -fpic, -fPIC, -fomit-frame-pointer, etc.
+                // Other -f flags ignored for now
             }
 
             // Linker flags

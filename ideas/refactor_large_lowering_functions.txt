@@ -1,7 +1,14 @@
-LOW PRIORITY: One remaining lowering function refactoring
+LOW PRIORITY: Remaining lowering function refactoring opportunities
 
-All significant refactoring items are complete. The only remaining opportunity:
+Completed:
+- lower_local_decl (stmt.rs): decomposed from 552 lines to ~130 lines via stmt_init.rs helpers
+- lower_stmt Return arm: decomposed from 194 lines to 4 lines via stmt_return.rs
+- Duplicated scope-tracking pattern: extracted to shadow_local_for_scope/shadow_static_for_scope
+- Duplicated function meta registration: extracted to register_block_func_meta
+- Removed unnecessary cond_label_ref clone in for-loop lowering
 
-- lower_function (lowering.rs, ~340 lines): could be split into lower_function_params,
-  lower_function_body, emit_implicit_return. But the function already has clear phase
-  comments and reasonable structure, so this is cosmetic.
+Remaining (diminishing returns):
+- lower_function (lowering.rs, ~497 lines): has clear phase comments, could split param
+  handling into sub-methods but structure is already readable
+- emit_struct_init (stmt.rs, ~438 lines): complex but inherently so due to C designated
+  initializer spec. Could extract CType::Array arms but adds indirection without clarity gain

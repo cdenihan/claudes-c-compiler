@@ -53,8 +53,17 @@ impl Target {
 
     /// Generate assembly for an IR module using this target's code generator.
     pub fn generate_assembly(&self, module: &IrModule) -> String {
+        self.generate_assembly_with_options(module, false)
+    }
+
+    /// Generate assembly with PIC (position-independent code) option.
+    pub fn generate_assembly_with_options(&self, module: &IrModule, pic: bool) -> String {
         match self {
-            Target::X86_64 => x86::X86Codegen::new().generate(module),
+            Target::X86_64 => {
+                let mut cg = x86::X86Codegen::new();
+                cg.set_pic(pic);
+                cg.generate(module)
+            }
             Target::Aarch64 => arm::ArmCodegen::new().generate(module),
             Target::Riscv64 => riscv::RiscvCodegen::new().generate(module),
         }

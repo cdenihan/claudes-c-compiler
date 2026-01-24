@@ -55,12 +55,8 @@ impl Lowerer {
             decl
         };
 
-        // First, register any struct/union definition from the type specifier
         self.register_struct_type(&decl.type_spec);
 
-        // If this is a typedef, register the mapping and skip variable emission.
-        // Uses resolve_typedef_derived() to avoid duplicating the derived-declarator
-        // walk logic (Pointer wrapping, Array dim collection in reverse order).
         if decl.is_typedef {
             for declarator in &decl.declarators {
                 if !declarator.name.is_empty() {
@@ -73,126 +69,23 @@ impl Lowerer {
 
         for declarator in &decl.declarators {
             if declarator.name.is_empty() {
-                continue; // Skip anonymous declarations (e.g., bare struct definitions)
+                continue;
             }
 
-            // Handle extern declarations inside function bodies:
-            // they reference a global symbol, not a local variable
+            // Extern declarations reference a global symbol, not a local variable
             if decl.is_extern {
-                // Remove from locals, but track in scope frame so pop_scope()
-                // restores the local when this block exits. This ensures that
-                // `extern int a;` inside a block only shadows the local `a`
-                // within that block, not permanently.
-                if let Some(prev_local) = self.locals.remove(&declarator.name) {
-                    if let Some(frame) = self.scope_stack.last_mut() {
-                        frame.locals_shadowed.push((declarator.name.clone(), prev_local));
-                    }
-                }
-                // Also remove from static_local_names so that the extern name
-                // resolves to the true global, not a same-named static local
-                if let Some(prev_static) = self.static_local_names.remove(&declarator.name) {
-                    if let Some(frame) = self.scope_stack.last_mut() {
-                        frame.statics_shadowed.push((declarator.name.clone(), prev_static));
-                    }
-                }
-                // Check if this is a function declaration (extern int f(int))
-                // before treating it as a variable
-                let is_func_decl = declarator.derived.iter().any(|d| matches!(d, DerivedDeclarator::Function(_, _)));
-                if is_func_decl {
-                    // Fall through to the function declaration handler below
-                } else {
-                    if !self.globals.contains_key(&declarator.name) {
-                        let ext_da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
-                        self.globals.insert(declarator.name.clone(), GlobalInfo::from_analysis(&ext_da));
-                    }
+                if self.lower_extern_decl(decl, declarator) {
                     continue;
                 }
+                // Fall through to function declaration handler if it was an extern func decl
             }
 
-            // Handle block-scope function declarations: int f(int);
-            // These declare an external function, not a local variable.
-            // Register in known_functions and skip local variable allocation.
-            {
-                let mut ptr_count = 0;
-                let mut func_info = None;
-                for d in &declarator.derived {
-                    match d {
-                        DerivedDeclarator::Pointer => ptr_count += 1,
-                        DerivedDeclarator::Function(p, v) => {
-                            func_info = Some((p.clone(), *v));
-                            break;
-                        }
-                        DerivedDeclarator::FunctionPointer(_, _) => break,
-                        _ => {}
-                    }
-                }
-                if let Some((params, variadic)) = func_info {
-                    // This is a function declaration, not a variable
-                    self.known_functions.insert(declarator.name.clone());
-                    let mut ret_ty = self.type_spec_to_ir(&decl.type_spec);
-                    if ptr_count > 0 {
-                        ret_ty = IrType::Ptr;
-                    }
-                    self.func_meta.return_types.insert(declarator.name.clone(), ret_ty);
-                    let param_tys: Vec<IrType> = params.iter().map(|p| {
-                        self.type_spec_to_ir(&p.type_spec)
-                    }).collect();
-                    let param_bool_flags: Vec<bool> = params.iter().map(|p| {
-                        matches!(self.resolve_type_spec(&p.type_spec), TypeSpecifier::Bool)
-                    }).collect();
-                    if !variadic || !param_tys.is_empty() {
-                        self.func_meta.param_types.insert(declarator.name.clone(), param_tys);
-                        self.func_meta.param_bool_flags.insert(declarator.name.clone(), param_bool_flags);
-                    }
-                    if variadic {
-                        self.func_meta.variadic.insert(declarator.name.clone());
-                    }
-                    // Remove from locals, tracking in scope frame for restoration
-                    // when this block exits. This ensures function declarations only
-                    // shadow variables within their block scope.
-                    if let Some(prev_local) = self.locals.remove(&declarator.name) {
-                        if let Some(frame) = self.scope_stack.last_mut() {
-                            frame.locals_shadowed.push((declarator.name.clone(), prev_local));
-                        }
-                    }
-                    continue;
-                }
-
-                // Also handle typedef-based function declarations in block scope
-                // (e.g., `func_t add;` where func_t is `typedef int func_t(int);`)
-                if declarator.derived.is_empty() && declarator.init.is_none() {
-                    if let TypeSpecifier::TypedefName(tname) = &decl.type_spec {
-                        if let Some(fti) = self.function_typedefs.get(tname).cloned() {
-                            self.known_functions.insert(declarator.name.clone());
-                            let ret_ty = self.type_spec_to_ir(&fti.return_type);
-                            self.func_meta.return_types.insert(declarator.name.clone(), ret_ty);
-                            let param_tys: Vec<IrType> = fti.params.iter().map(|p| {
-                                self.type_spec_to_ir(&p.type_spec)
-                            }).collect();
-                            let param_bool_flags: Vec<bool> = fti.params.iter().map(|p| {
-                                matches!(self.resolve_type_spec(&p.type_spec), TypeSpecifier::Bool)
-                            }).collect();
-                            if !fti.variadic || !param_tys.is_empty() {
-                                self.func_meta.param_types.insert(declarator.name.clone(), param_tys);
-                                self.func_meta.param_bool_flags.insert(declarator.name.clone(), param_bool_flags);
-                            }
-                            if fti.variadic {
-                                self.func_meta.variadic.insert(declarator.name.clone());
-                            }
-                            // Track removal for scope restoration
-                            if let Some(prev_local) = self.locals.remove(&declarator.name) {
-                                if let Some(frame) = self.scope_stack.last_mut() {
-                                    frame.locals_shadowed.push((declarator.name.clone(), prev_local));
-                                }
-                            }
-                            continue;
-                        }
-                    }
-                }
+            // Block-scope function declarations: `int f(int);` or typedef-based `func_t add;`
+            if self.try_lower_block_func_decl(decl, declarator) {
+                continue;
             }
 
-            // Shared declaration analysis: computes base_ty, var_ty, array/pointer info,
-            // struct layout, pointee type, etc. in one place (also used by lower_global_decl).
+            // Shared declaration analysis
             let mut da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
             self.fixup_unsized_array(&mut da, &decl.type_spec, &declarator.derived, &declarator.init);
 
@@ -213,13 +106,11 @@ impl Lowerer {
                 None
             };
 
-            // Handle static local variables: emit as globals with mangled names
             if decl.is_static {
                 self.lower_local_static_decl(&decl, &declarator, &da);
                 continue;
             }
 
-            // Compute VLA runtime size if any array dimension is non-constant
             let vla_size = if da.is_array {
                 self.compute_vla_runtime_size(&decl.type_spec, &declarator.derived)
             } else {
@@ -236,7 +127,7 @@ impl Lowerer {
             local_info.vla_size = vla_size;
             self.insert_local_scoped(declarator.name.clone(), local_info);
 
-            // Track function pointer return and param types for correct calling convention
+            // Track function pointer return and param types
             for d in &declarator.derived {
                 if let DerivedDeclarator::FunctionPointer(params, _) = d {
                     let ret_ty = self.type_spec_to_ir(&decl.type_spec);
@@ -252,337 +143,21 @@ impl Lowerer {
             if let Some(ref init) = declarator.init {
                 match init {
                     Initializer::Expr(expr) => {
-                        if da.is_array && (da.base_ty == IrType::I8 || da.base_ty == IrType::U8) {
-                            // Char array from string literal: char s[] = "hello"
-                            if let Expr::StringLiteral(s, _) = expr {
-                                self.emit_string_to_alloca(alloca, s, 0);
-                            } else if let Expr::WideStringLiteral(s, _) = expr {
-                                // Wide string to char array: store each byte
-                                self.emit_string_to_alloca(alloca, s, 0);
-                            } else {
-                                // Non-string expression initializer for char array (e.g., pointer assignment)
-                                let val = self.lower_expr(expr);
-                                self.emit(Instruction::Store { val, ptr: alloca, ty: da.var_ty });
-                            }
-                        } else if da.is_array && da.base_ty == IrType::I32 {
-                            // wchar_t/int array from wide string: wchar_t s[] = L"hello"
-                            if let Expr::WideStringLiteral(s, _) = expr {
-                                self.emit_wide_string_to_alloca(alloca, s, 0);
-                            } else if let Expr::StringLiteral(s, _) = expr {
-                                // Narrow string to wchar_t array: promote each byte to I32
-                                self.emit_wide_string_to_alloca(alloca, s, 0);
-                            } else {
-                                let val = self.lower_expr(expr);
-                                self.emit(Instruction::Store { val, ptr: alloca, ty: da.var_ty });
-                            }
-                        } else if da.is_struct {
-                            // Struct copy-initialization: struct Point b = a;
-                            // For expressions producing packed struct data (small struct
-                            // function call returns, ternaries over them, etc.), the value
-                            // IS the struct data, not an address. Store directly.
-                            if self.expr_produces_packed_struct_data(expr) && da.actual_alloc_size <= 8 {
-                                let val = self.lower_expr(expr);
-                                self.emit(Instruction::Store { val, ptr: alloca, ty: IrType::I64 });
-                            } else {
-                                let src_addr = self.get_struct_base_addr(expr);
-                                self.emit(Instruction::Memcpy {
-                                    dest: alloca,
-                                    src: src_addr,
-                                    size: da.actual_alloc_size,
-                                });
-                            }
-                        } else if is_complex {
-                            // Complex variable initialization: _Complex double z = expr;
-                            // The expression might be:
-                            // 1. Already complex (returns ptr to {real, imag} pair) -> memcpy
-                            // 2. A real/integer scalar -> convert to complex first
-                            let resolved_ts = self.resolve_type_spec(&decl.type_spec);
-                            let complex_ctype = self.type_spec_to_ctype(&resolved_ts);
-                            let src = self.lower_expr_to_complex(expr, &complex_ctype);
-                            self.emit(Instruction::Memcpy {
-                                dest: alloca,
-                                src,
-                                size: da.actual_alloc_size,
-                            });
-                        } else {
-                            // Track const-qualified integer variable values for compile-time
-                            // array size evaluation (e.g., const int len = 5000; int arr[len];)
-                            if decl.is_const && !da.is_pointer && !da.is_array && !da.is_struct {
-                                if let Some(const_val) = self.eval_const_expr(expr) {
-                                    if let Some(ival) = self.const_to_i64(&const_val) {
-                                        self.insert_const_local_scoped(declarator.name.clone(), ival);
-                                    }
+                        // Track const values before lowering (needed for VLA sizes)
+                        if decl.is_const && !da.is_pointer && !da.is_array && !da.is_struct && !is_complex {
+                            if let Some(const_val) = self.eval_const_expr(expr) {
+                                if let Some(ival) = self.const_to_i64(&const_val) {
+                                    self.insert_const_local_scoped(declarator.name.clone(), ival);
                                 }
                             }
-                            // Check if RHS is complex but LHS is non-complex:
-                            // extract real part first, then convert to target type.
-                            let rhs_ctype = self.expr_ctype(expr);
-                            let val = if rhs_ctype.is_complex() && !is_complex {
-                                let complex_val = self.lower_expr(expr);
-                                let ptr = self.operand_to_value(complex_val);
-                                let real_part = self.load_complex_real(ptr, &rhs_ctype);
-                                let from_ty = Self::complex_component_ir_type(&rhs_ctype);
-                                self.emit_implicit_cast(real_part, from_ty, da.var_ty)
-                            } else {
-                                let val = self.lower_expr(expr);
-                                // Insert implicit cast for type mismatches
-                                // (e.g., float f = 'a', int x = 3.14, char c = 99.0)
-                                let expr_ty = self.get_expr_type(expr);
-                                self.emit_implicit_cast(val, expr_ty, da.var_ty)
-                            };
-                            // _Bool variables clamp any value to 0 or 1
-                            let val = if da.is_bool { self.emit_bool_normalize(val) } else { val };
-                            self.emit(Instruction::Store { val, ptr: alloca, ty: da.var_ty });
                         }
+                        self.lower_local_init_expr(expr, alloca, &da, is_complex, decl);
                     }
                     Initializer::List(items) => {
-                        if is_complex { // complex_elem_ctype check already set above
-                            // Complex initializer list: _Complex double z = {real, imag}
-                            let resolved_ts = self.resolve_type_spec(&decl.type_spec);
-                            let complex_ctype = self.type_spec_to_ctype(&resolved_ts);
-                            let comp_ty = Self::complex_component_ir_type(&complex_ctype);
-                            // Store real part (first item)
-                            if let Some(item) = items.first() {
-                                if let Initializer::Expr(expr) = &item.init {
-                                    let val = self.lower_expr(expr);
-                                    let expr_ty = self.get_expr_type(expr);
-                                    let val = self.emit_implicit_cast(val, expr_ty, comp_ty);
-                                    self.emit(Instruction::Store { val, ptr: alloca, ty: comp_ty });
-                                }
-                            } else {
-                                let zero = Self::complex_zero(comp_ty);
-                                self.emit(Instruction::Store { val: zero, ptr: alloca, ty: comp_ty });
-                            }
-                            // Store imag part (second item) at offset
-                            let comp_size = Self::complex_component_size(&complex_ctype);
-                            let imag_ptr = self.emit_gep_offset(alloca, comp_size, IrType::I8);
-                            if let Some(item) = items.get(1) {
-                                if let Initializer::Expr(expr) = &item.init {
-                                    let val = self.lower_expr(expr);
-                                    let expr_ty = self.get_expr_type(expr);
-                                    let val = self.emit_implicit_cast(val, expr_ty, comp_ty);
-                                    self.emit(Instruction::Store { val, ptr: imag_ptr, ty: comp_ty });
-                                }
-                            } else {
-                                let zero = Self::complex_zero(comp_ty);
-                                self.emit(Instruction::Store { val: zero, ptr: imag_ptr, ty: comp_ty });
-                            }
-                        } else if da.is_struct {
-                            // Initialize struct fields from initializer list
-                            // Supports designated initializers and nested struct init
-                            if let Some(layout) = self.locals.get(&declarator.name).and_then(|l| l.struct_layout.clone()) {
-                                // Zero-initialize first if any designators or partial init
-                                let has_designators = items.iter().any(|item| !item.designators.is_empty());
-                                if has_designators || items.len() < layout.fields.len() {
-                                    self.zero_init_alloca(alloca, layout.size);
-                                }
-                                self.emit_struct_init(items, alloca, &layout, 0);
-                            }
-                        } else if da.is_array && da.elem_size > 0 {
-                            // Check if this is an array of structs
-                            let elem_struct_layout = self.locals.get(&declarator.name)
-                                .and_then(|l| l.struct_layout.clone());
-                            if da.array_dim_strides.len() > 1 && elem_struct_layout.is_none() {
-                                // Multi-dimensional array of scalars: zero first, then fill
-                                self.zero_init_alloca(alloca, da.alloc_size);
-                                // For pointer arrays (elem_size=8 but elem_ir_ty=I8),
-                                // use I64 as the element type for stores.
-                                let md_elem_ty = if da.is_array_of_pointers || da.is_array_of_func_ptrs { IrType::I64 } else { da.elem_ir_ty };
-                                self.lower_array_init_list(items, alloca, md_elem_ty, &da.array_dim_strides);
-                            } else if let Some(ref s_layout) = elem_struct_layout {
-                                // Array of structs: init each element using struct layout.
-                                // For multi-dimensional arrays (e.g., struct s arr[2][2]),
-                                // da.elem_size is the row stride, but we need the actual struct
-                                // size for per-element indexing in flat init.
-                                let struct_size = s_layout.size;
-                                // For multi-dim arrays, the number of struct elements is
-                                // alloc_size / struct_size (total flattened count).
-                                let is_multidim = da.array_dim_strides.len() > 1;
-                                // row_size: number of struct elements per outer dimension
-                                let row_size = if is_multidim && struct_size > 0 {
-                                    da.elem_size / struct_size
-                                } else {
-                                    0
-                                };
-                                self.zero_init_alloca(alloca, da.alloc_size);
-                                let mut flat_struct_idx = 0usize;
-                                let mut item_idx = 0usize;
-                                while item_idx < items.len() {
-                                    let item = &items[item_idx];
-                                    // Handle designators for index positioning
-                                    if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
-                                        if let Some(idx_val) = self.eval_const_expr_for_designator(idx_expr) {
-                                            if is_multidim {
-                                                // For 2D arrays, [idx] designates the outer dimension
-                                                flat_struct_idx = idx_val * row_size;
-                                            } else {
-                                                flat_struct_idx = idx_val;
-                                            }
-                                        }
-                                    }
-                                    let base_byte_offset = flat_struct_idx * struct_size;
-                                    // Check for field designator after index designator: [idx].field = val
-                                    let field_designator_name = item.designators.iter().find_map(|d| {
-                                        if let Designator::Field(ref name) = d {
-                                            Some(name.clone())
-                                        } else {
-                                            None
-                                        }
-                                    });
-                                    match &item.init {
-                                        Initializer::List(sub_items) => {
-                                            if is_multidim {
-                                                // Multi-dim braced sub-list: {1,2,3,4} fills one row
-                                                // of structs. Consume sub_items across struct elements.
-                                                let mut sub_idx = 0usize;
-                                                let mut row_elem = 0usize;
-                                                while sub_idx < sub_items.len() && row_elem < row_size {
-                                                    let row_offset = (flat_struct_idx + row_elem) * struct_size;
-                                                    match &sub_items[sub_idx].init {
-                                                        Initializer::List(inner) => {
-                                                            // Braced struct init: {a, b}
-                                                            let elem_base = self.emit_gep_offset(alloca, row_offset, IrType::I8);
-                                                            self.lower_local_struct_init(inner, elem_base, s_layout);
-                                                            sub_idx += 1;
-                                                            row_elem += 1;
-                                                        }
-                                                        Initializer::Expr(_) => {
-                                                            // Flat scalars filling struct fields
-                                                            let consumed = self.emit_struct_init(&sub_items[sub_idx..], alloca, s_layout, row_offset);
-                                                            sub_idx += consumed.max(1);
-                                                            row_elem += 1;
-                                                        }
-                                                    }
-                                                }
-                                                flat_struct_idx += row_size;
-                                            } else {
-                                                // 1D: Initialize struct fields from sub-list
-                                                let elem_base = self.emit_gep_offset(alloca, base_byte_offset, IrType::I8);
-                                                self.lower_local_struct_init(sub_items, elem_base, s_layout);
-                                                flat_struct_idx += 1;
-                                            }
-                                            item_idx += 1;
-                                        }
-                                        Initializer::Expr(e) => {
-                                            if let Some(ref fname) = field_designator_name {
-                                                // Designated field: [idx].field = val
-                                                if let Some(field) = s_layout.fields.iter().find(|f| &f.name == fname) {
-                                                    let field_ty = IrType::from_ctype(&field.ty);
-                                                    let val = self.lower_and_cast_init_expr(e, field_ty);
-                                                    self.emit_store_at_offset(alloca, base_byte_offset + field.offset, val, field_ty);
-                                                }
-                                                item_idx += 1;
-                                            } else {
-                                                // Flat init: consume items for all fields of this struct
-                                                let consumed = self.emit_struct_init(&items[item_idx..], alloca, s_layout, base_byte_offset);
-                                                item_idx += consumed.max(1);
-                                                flat_struct_idx += 1;
-                                                continue; // skip the increment below
-                                            }
-                                        }
-                                    }
-                                }
-                            } else if let Some(ref cplx_ctype) = complex_elem_ctype {
-                                // Array of complex elements: each element is a {real, imag} pair
-                                // Use Memcpy for each element from the expression result
-                                self.zero_init_alloca(alloca, da.alloc_size);
-                                let mut current_idx = 0usize;
-                                for item in items.iter() {
-                                    if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
-                                        if let Some(idx_val) = self.eval_const_expr_for_designator(idx_expr) {
-                                            current_idx = idx_val;
-                                        }
-                                    }
-                                    let init_expr = match &item.init {
-                                        Initializer::Expr(e) => Some(e),
-                                        Initializer::List(sub_items) => {
-                                            Self::unwrap_nested_init_expr(sub_items)
-                                        }
-                                    };
-                                    if let Some(e) = init_expr {
-                                        let src = self.lower_expr_to_complex(e, cplx_ctype);
-                                        self.emit_memcpy_at_offset(alloca, current_idx * da.elem_size, src, da.elem_size);
-                                    }
-                                    current_idx += 1;
-                                }
-                            } else {
-                                // 1D array: supports designated initializers [idx] = val
-                                // Also zero-fill first if partially initialized.
-                                let num_elems = da.alloc_size / da.elem_size.max(1);
-                                let has_designators = items.iter().any(|item| !item.designators.is_empty());
-                                if has_designators || items.len() < num_elems {
-                                    // Partial initialization or designators: zero the entire array first
-                                    self.zero_init_alloca(alloca, da.alloc_size);
-                                }
-
-                                // Detect arrays of complex types. Complex elements are stored as
-                                // {real, imag} pairs and lower_expr returns a pointer to a stack
-                                // temp. We need to Memcpy from that pointer to the array slot.
-                                let is_complex_elem_array = matches!(
-                                    self.resolve_type_spec(&decl.type_spec),
-                                    TypeSpecifier::ComplexFloat | TypeSpecifier::ComplexDouble | TypeSpecifier::ComplexLongDouble
-                                );
-
-                                // For arrays of pointers, the element type is Ptr (8 bytes),
-                                // not the base type spec (which would be e.g. I32 for int *arr[N]).
-                                let elem_store_ty = if da.is_array_of_pointers || da.is_array_of_func_ptrs { IrType::I64 } else { da.elem_ir_ty };
-
-                                let mut current_idx = 0usize;
-                                for item in items.iter() {
-                                    // Check for index designator
-                                    if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
-                                        if let Some(idx_val) = self.eval_const_expr_for_designator(idx_expr) {
-                                            current_idx = idx_val;
-                                        }
-                                    }
-
-                                    // Handle each item, with special case for string literals in char arrays
-                                    // For double-brace init like {{expr}}, unwrap the nested list
-                                    let init_expr = match &item.init {
-                                        Initializer::Expr(e) => Some(e),
-                                        Initializer::List(sub_items) => {
-                                            // Double-brace: unwrap nested list to get the first expression
-                                            Self::unwrap_nested_init_expr(sub_items)
-                                        }
-                                    };
-                                    if let Some(e) = init_expr {
-                                        if !da.is_array_of_pointers && (da.elem_ir_ty == IrType::I8 || da.elem_ir_ty == IrType::U8) {
-                                            if let Expr::StringLiteral(s, _) = e {
-                                                self.emit_string_to_alloca(alloca, s, current_idx * da.elem_size);
-                                                current_idx += 1;
-                                                continue;
-                                            }
-                                        }
-                                        if is_complex_elem_array {
-                                            // Complex array element: lower_expr returns a pointer to
-                                            // a stack-allocated {real, imag} pair. Memcpy from that
-                                            // pointer to the target array slot.
-                                            let val = self.lower_expr(e);
-                                            let src = self.operand_to_value(val);
-                                            self.emit_memcpy_at_offset(alloca, current_idx * da.elem_size, src, da.elem_size);
-                                        } else {
-                                            let val = self.lower_expr(e);
-                                            let expr_ty = self.get_expr_type(e);
-                                            let val = self.emit_implicit_cast(val, expr_ty, elem_store_ty);
-                                            self.emit_array_element_store(alloca, val, current_idx * da.elem_size, elem_store_ty);
-                                        }
-                                    }
-                                    current_idx += 1;
-                                }
-                            }
-                        } else {
-                            // Scalar with braces: int x = { 1 };
-                            // C11 6.7.9: A scalar can be initialized with a braced expression.
-                            if let Some(first) = items.first() {
-                                if let Initializer::Expr(expr) = &first.init {
-                                    let val = self.lower_expr(expr);
-                                    let expr_ty = self.get_expr_type(expr);
-                                    let val = self.emit_implicit_cast(val, expr_ty, da.var_ty);
-                                    let val = if da.is_bool { self.emit_bool_normalize(val) } else { val };
-                                    self.emit(Instruction::Store { val, ptr: alloca, ty: da.var_ty });
-                                }
-                            }
-                        }
+                        self.lower_local_init_list(
+                            items, alloca, &da, is_complex, &complex_elem_ctype,
+                            decl, &declarator.name,
+                        );
                     }
                 }
             }
@@ -681,7 +256,7 @@ impl Lowerer {
 
     /// Lower an expression to a complex value, converting if needed.
     /// Returns a Value (pointer to the complex {real, imag} pair).
-    fn lower_expr_to_complex(&mut self, expr: &Expr, target_ctype: &CType) -> Value {
+    pub(super) fn lower_expr_to_complex(&mut self, expr: &Expr, target_ctype: &CType) -> Value {
         let expr_ctype = self.expr_ctype(expr);
         let val = self.lower_expr(expr);
         if expr_ctype.is_complex() {
@@ -700,7 +275,7 @@ impl Lowerer {
 
     /// Initialize a local struct from an initializer list.
     /// `base` is the base address of the struct in memory.
-    fn lower_local_struct_init(
+    pub(super) fn lower_local_struct_init(
         &mut self,
         items: &[InitializerItem],
         base: Value,
@@ -937,196 +512,8 @@ impl Lowerer {
     pub(super) fn lower_stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Return(expr, _span) => {
-                let op = expr.as_ref().map(|e| {
-                    // For struct returns with sret (> 16 bytes), copy struct data to the
-                    // hidden sret pointer and return that pointer.
-                    if let Some(sret_alloca) = self.current_sret_ptr {
-                        if let Some(struct_size) = self.struct_value_size(e) {
-                            if struct_size > 16 {
-                                let src_addr = self.get_struct_base_addr(e);
-                                // Load the sret pointer from its alloca
-                                let sret_ptr = self.fresh_value();
-                                self.emit(Instruction::Load { dest: sret_ptr, ptr: sret_alloca, ty: IrType::Ptr });
-                                // Memcpy struct data to sret destination
-                                self.emit(Instruction::Memcpy { dest: sret_ptr, src: src_addr, size: struct_size });
-                                // Return the sret pointer
-                                return Operand::Value(sret_ptr);
-                            }
-                        }
-                        // For complex returns with sret, copy complex data to sret pointer
-                        let expr_ct = self.expr_ctype(e);
-                        let ret_ct = self.func_return_ctypes.get(&self.current_function_name.clone()).cloned();
-                        if expr_ct.is_complex() {
-                            let val = self.lower_expr(e);
-                            let src_addr = if let Some(ref rct) = ret_ct {
-                                if rct.is_complex() && expr_ct != *rct {
-                                    // Convert complex expression to function return type
-                                    let ptr = self.operand_to_value(val);
-                                    let converted = self.complex_to_complex(ptr, &expr_ct, rct);
-                                    self.operand_to_value(converted)
-                                } else {
-                                    self.operand_to_value(val)
-                                }
-                            } else {
-                                self.operand_to_value(val)
-                            };
-                            let complex_size = ret_ct.as_ref().unwrap_or(&expr_ct).size();
-                            let sret_ptr = self.fresh_value();
-                            self.emit(Instruction::Load { dest: sret_ptr, ptr: sret_alloca, ty: IrType::Ptr });
-                            self.emit(Instruction::Memcpy { dest: sret_ptr, src: src_addr, size: complex_size });
-                            return Operand::Value(sret_ptr);
-                        }
-                        // Non-complex expression returned from sret complex function:
-                        // convert scalar to complex and copy to sret pointer.
-                        // Use scalar_to_complex (IR-type based) for accurate type handling
-                        // when expr_ctype may not match the actual IR type (e.g., function calls).
-                        if let Some(ref rct) = ret_ct {
-                            if rct.is_complex() {
-                                let val = self.lower_expr(e);
-                                let src_ir_ty = self.get_expr_type(e);
-                                let rct_clone = rct.clone();
-                                let complex_val = self.scalar_to_complex(val, src_ir_ty, &rct_clone);
-                                let src_addr = self.operand_to_value(complex_val);
-                                let complex_size = rct_clone.size();
-                                let sret_ptr = self.fresh_value();
-                                self.emit(Instruction::Load { dest: sret_ptr, ptr: sret_alloca, ty: IrType::Ptr });
-                                self.emit(Instruction::Memcpy { dest: sret_ptr, src: src_addr, size: complex_size });
-                                return Operand::Value(sret_ptr);
-                            }
-                        }
-                    }
-                    // For 9-16 byte struct returns (two-register return), load the struct
-                    // data as two I64 values packed into an I128 (low in rax, high in rdx).
-                    // Use U64 casts to zero-extend (struct data is unsigned raw bytes).
-                    if let Some(struct_size) = self.struct_value_size(e) {
-                        if struct_size > 8 && struct_size <= 16 {
-                            let addr = self.get_struct_base_addr(e);
-                            // Load low 8 bytes
-                            let lo = self.fresh_value();
-                            self.emit(Instruction::Load { dest: lo, ptr: addr, ty: IrType::I64 });
-                            // Load high 8 bytes
-                            let hi_ptr = self.fresh_value();
-                            self.emit(Instruction::GetElementPtr { dest: hi_ptr, base: addr, offset: Operand::Const(IrConst::I64(8)), ty: IrType::I64 });
-                            let hi = self.fresh_value();
-                            self.emit(Instruction::Load { dest: hi, ptr: hi_ptr, ty: IrType::I64 });
-                            // Pack into I128: (hi << 64) | lo  (zero-extend both halves)
-                            let hi_wide = self.fresh_value();
-                            self.emit(Instruction::Cast { dest: hi_wide, src: Operand::Value(hi), from_ty: IrType::U64, to_ty: IrType::I128 });
-                            let lo_wide = self.fresh_value();
-                            self.emit(Instruction::Cast { dest: lo_wide, src: Operand::Value(lo), from_ty: IrType::U64, to_ty: IrType::I128 });
-                            let shifted = self.fresh_value();
-                            self.emit(Instruction::BinOp { dest: shifted, op: IrBinOp::Shl, lhs: Operand::Value(hi_wide), rhs: Operand::Const(IrConst::I64(64)), ty: IrType::I128 });
-                            let packed = self.fresh_value();
-                            self.emit(Instruction::BinOp { dest: packed, op: IrBinOp::Or, lhs: Operand::Value(shifted), rhs: Operand::Value(lo_wide), ty: IrType::I128 });
-                            return Operand::Value(packed);
-                        }
-                    }
-                    // For small struct returns (<= 8 bytes), load the struct data
-                    // from its address so it goes into rax as data (not as a pointer).
-                    if let Some(struct_size) = self.struct_value_size(e) {
-                        if struct_size <= 8 {
-                            let addr = self.get_struct_base_addr(e);
-                            let dest = self.fresh_value();
-                            self.emit(Instruction::Load { dest, ptr: addr, ty: IrType::I64 });
-                            return Operand::Value(dest);
-                        }
-                    }
-                    // For non-sret complex returns, handle type conversion and register-based return.
-                    let expr_ct = self.expr_ctype(e);
-                    let ret_ct = self.func_return_ctypes.get(&self.current_function_name.clone()).cloned();
-                    if expr_ct.is_complex() {
-                        if let Some(ref rct) = ret_ct {
-                            // Determine the source pointer for the complex value
-                            let val = self.lower_expr(e);
-                            let src_ptr = if rct.is_complex() && expr_ct != *rct {
-                                // Complex-to-complex conversion (different precision)
-                                let ptr = self.operand_to_value(val);
-                                let converted = self.complex_to_complex(ptr, &expr_ct, rct);
-                                self.operand_to_value(converted)
-                            } else {
-                                self.operand_to_value(val)
-                            };
-
-                            // _Complex double: return real in xmm0 (as F64), imag in xmm1
-                            if *rct == CType::ComplexDouble && !self.func_meta.sret_functions.contains_key(&self.current_function_name) {
-                                let real = self.load_complex_real(src_ptr, rct);
-                                let imag = self.load_complex_imag(src_ptr, rct);
-                                // Set xmm1 to imag part before return
-                                self.emit(Instruction::SetReturnF64Second { src: imag });
-                                // Return real part (goes into xmm0)
-                                return real;
-                            }
-
-                            // _Complex float: load packed 8 bytes as F64 for XMM register return
-                            if *rct == CType::ComplexFloat && !self.func_meta.sret_functions.contains_key(&self.current_function_name) {
-                                let packed = self.fresh_value();
-                                self.emit(Instruction::Load { dest: packed, ptr: src_ptr, ty: IrType::F64 });
-                                return Operand::Value(packed);
-                            }
-                        }
-                        // Complex expression returned from non-complex function:
-                        // extract real part and convert to return type (C11 6.3.1.7)
-                        let ret_ty = self.current_return_type;
-                        if ret_ty != IrType::Ptr {
-                            let val2 = self.lower_expr(e);
-                            let ptr = self.operand_to_value(val2);
-                            let real_part = self.load_complex_real(ptr, &expr_ct);
-                            let from_ty = Self::complex_component_ir_type(&expr_ct);
-                            let val2 = self.emit_implicit_cast(real_part, from_ty, ret_ty);
-                            return if self.current_return_is_bool { self.emit_bool_normalize(val2) } else { val2 };
-                        }
-                    }
-                    // Non-complex expression returned from a complex-returning function:
-                    // convert scalar to complex and handle appropriately
-                    {
-                        let ret_ct = self.func_return_ctypes.get(&self.current_function_name.clone()).cloned();
-                        if let Some(ref rct) = ret_ct {
-                            if rct.is_complex() && !expr_ct.is_complex() {
-                                let val = self.lower_expr(e);
-                                let src_ir_ty = self.get_expr_type(e);
-                                let rct_clone = rct.clone();
-                                let complex_val = self.scalar_to_complex(val, src_ir_ty, &rct_clone);
-
-                                // _Complex double: decompose into two FP return registers
-                                if rct_clone == CType::ComplexDouble && !self.func_meta.sret_functions.contains_key(&self.current_function_name) {
-                                    let src_ptr = self.operand_to_value(complex_val);
-                                    let real = self.load_complex_real(src_ptr, &rct_clone);
-                                    let imag = self.load_complex_imag(src_ptr, &rct_clone);
-                                    self.emit(Instruction::SetReturnF64Second { src: imag });
-                                    return real;
-                                }
-
-                                // For sret returns, copy to the hidden pointer
-                                if let Some(sret_alloca) = self.current_sret_ptr {
-                                    let src_addr = self.operand_to_value(complex_val);
-                                    let complex_size = rct_clone.size();
-                                    let sret_ptr = self.fresh_value();
-                                    self.emit(Instruction::Load { dest: sret_ptr, ptr: sret_alloca, ty: IrType::Ptr });
-                                    self.emit(Instruction::Memcpy { dest: sret_ptr, src: src_addr, size: complex_size });
-                                    return Operand::Value(sret_ptr);
-                                }
-                                // For non-sret complex float, pack into I64 for register return
-                                if rct_clone == CType::ComplexFloat && !self.func_meta.sret_functions.contains_key(&self.current_function_name) {
-                                    let ptr = self.operand_to_value(complex_val);
-                                    let packed = self.fresh_value();
-                                    self.emit(Instruction::Load { dest: packed, ptr, ty: IrType::I64 });
-                                    return Operand::Value(packed);
-                                }
-                                return complex_val;
-                            }
-                        }
-                    }
-                    let val = self.lower_expr(e);
-                    let ret_ty = self.current_return_type;
-                    let expr_ty = self.get_expr_type(e);
-                    // Insert implicit cast for return value type mismatch
-                    // Handles: float<->int, float<->float, and integer narrowing
-                    let val = self.emit_implicit_cast(val, expr_ty, ret_ty);
-                    // _Bool functions clamp return value to 0 or 1
-                    if self.current_return_is_bool { self.emit_bool_normalize(val) } else { val }
-                });
+                let op = expr.as_ref().map(|e| self.lower_return_expr(e));
                 self.terminate(Terminator::Return(op));
-                // Start a new unreachable block for any code after return
                 let label = self.fresh_label("post_ret");
                 self.start_block(label);
             }
@@ -1224,11 +611,10 @@ impl Lowerer {
                 self.break_labels.push(end_label.clone());
                 self.continue_labels.push(inc_label.clone());
 
-                let cond_label_ref = cond_label.clone();
                 self.terminate(Terminator::Branch(cond_label.clone()));
 
                 // Condition
-                self.start_block(cond_label);
+                self.start_block(cond_label.clone());
                 if let Some(cond) = cond {
                     let cond_val = self.lower_condition_expr(cond);
                     self.terminate(Terminator::CondBranch {
@@ -1250,7 +636,7 @@ impl Lowerer {
                 if let Some(inc) = inc {
                     self.lower_expr(inc);
                 }
-                self.terminate(Terminator::Branch(cond_label_ref));
+                self.terminate(Terminator::Branch(cond_label));
 
                 self.break_labels.pop();
                 self.continue_labels.pop();

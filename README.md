@@ -181,6 +181,11 @@ A C compiler written from scratch in Rust, targeting x86-64, AArch64, and RISC-V
   `__sync_val_compare_and_swap`, `__sync_bool_compare_and_swap`, `__sync_lock_test_and_set/release`,
   and `__sync_synchronize`. x86 uses `lock` prefix instructions, ARM64 uses ldxr/stxr exclusive
   access, RISC-V uses AMO instructions and lr/sc.
+- **Position-independent code (-fPIC)**: Full PIC codegen for x86-64. External symbol access
+  goes through GOT (`movq sym@GOTPCREL(%rip), %rax`), external function calls use PLT
+  (`call sym@PLT`), and static/local symbols use direct RIP-relative addressing. Shared
+  library compilation (`-fPIC -shared`) produces correct `.so` files. This unblocks
+  PostgreSQL's shared library build (dict_snowball.so, libpq.so, etc.).
 - **Flat struct/array initialization fix**: Fixed struct initialization with flat (non-braced)
   initializer lists when the struct contains array fields. Now correctly consumes multiple
   items from the init list for array fields (e.g., `struct { int a[10]; int b; } x = {1,2,...,10,11}`).
@@ -225,7 +230,7 @@ A C compiler written from scratch in Rust, targeting x86-64, AArch64, and RISC-V
 | sqlite | PARTIAL | Builds; 573/622 (92%) sqllogictest pass |
 | libjpeg-turbo | PASS | Builds; cjpeg/djpeg roundtrip and jpegtran pass |
 | redis | PASS | All tests pass (version, cli, SET/GET roundtrip) |
-| postgres | PARTIAL | Configure passes; SSE intrinsics supported; build fails on shared library linking (needs PIC/GOT codegen) |
+| postgres | PARTIAL | Build succeeds (PIC/GOT codegen, SSE intrinsics); initdb crashes (runtime codegen bug in MemoryContextAllocZero) |
 
 ### What's Not Yet Implemented
 - Parser support for GNU C extensions in system headers (`__attribute__`, `__asm__` renames)

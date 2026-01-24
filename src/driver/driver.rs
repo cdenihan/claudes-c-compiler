@@ -52,6 +52,8 @@ pub struct Driver {
     pub shared_lib: bool,
     /// Whether to omit standard library linking (-nostdlib)
     pub nostdlib: bool,
+    /// Whether to generate position-independent code (-fPIC/-fpic)
+    pub pic: bool,
 }
 
 impl Driver {
@@ -73,6 +75,7 @@ impl Driver {
             static_link: false,
             shared_lib: false,
             nostdlib: false,
+            pic: false,
         }
     }
 
@@ -327,7 +330,9 @@ impl Driver {
         eliminate_phis(&mut module);
 
         // Generate assembly using target-specific codegen
-        let asm = self.target.generate_assembly(&module);
+        // PIC mode: enabled by -fPIC/-fpic flag or implicitly when building shared libraries
+        let pic = self.pic || self.shared_lib;
+        let asm = self.target.generate_assembly_with_options(&module, pic);
 
         if self.verbose {
             eprintln!("Generated {:?} assembly ({} bytes)", self.target, asm.len());

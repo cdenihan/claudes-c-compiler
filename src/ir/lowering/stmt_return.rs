@@ -1,0 +1,239 @@
+//! Return statement lowering.
+//!
+//! Extracted from stmt.rs to reduce that file's complexity. The `Stmt::Return`
+//! match arm was 194 lines handling sret, two-register returns, complex returns,
+//! and scalar-to-complex conversions. This module breaks that into focused helpers.
+
+use crate::frontend::parser::ast::*;
+use crate::ir::ir::*;
+use crate::common::types::{IrType, CType};
+use super::lowering::Lowerer;
+
+impl Lowerer {
+    /// Lower a return statement's expression to an operand.
+    /// Handles all return conventions: sret, two-register, complex decomposition,
+    /// and scalar returns with implicit casts.
+    pub(super) fn lower_return_expr(&mut self, e: &Expr) -> Operand {
+        // Try sret return first (large structs and complex types via hidden pointer)
+        if let Some(sret_alloca) = self.current_sret_ptr {
+            if let Some(op) = self.try_sret_return(e, sret_alloca) {
+                return op;
+            }
+        }
+
+        // Two-register struct return (9-16 bytes packed into I128)
+        if let Some(op) = self.try_two_reg_struct_return(e) {
+            return op;
+        }
+
+        // Small struct return (<= 8 bytes loaded as I64)
+        if let Some(op) = self.try_small_struct_return(e) {
+            return op;
+        }
+
+        // Complex expression returned from complex-returning function
+        if let Some(op) = self.try_complex_return(e) {
+            return op;
+        }
+
+        // Non-complex expression returned from complex-returning function
+        if let Some(op) = self.try_scalar_to_complex_return(e) {
+            return op;
+        }
+
+        // Default: scalar return with implicit cast
+        let val = self.lower_expr(e);
+        let ret_ty = self.current_return_type;
+        let expr_ty = self.get_expr_type(e);
+        let val = self.emit_implicit_cast(val, expr_ty, ret_ty);
+        if self.current_return_is_bool { self.emit_bool_normalize(val) } else { val }
+    }
+
+    /// Try to handle return via sret (hidden pointer for large structs/complex).
+    /// Returns Some(operand) if this is an sret return, None otherwise.
+    fn try_sret_return(&mut self, e: &Expr, sret_alloca: Value) -> Option<Operand> {
+        // Large struct return (> 16 bytes)
+        if let Some(struct_size) = self.struct_value_size(e) {
+            if struct_size > 16 {
+                let src_addr = self.get_struct_base_addr(e);
+                let sret_ptr = self.fresh_value();
+                self.emit(Instruction::Load { dest: sret_ptr, ptr: sret_alloca, ty: IrType::Ptr });
+                self.emit(Instruction::Memcpy { dest: sret_ptr, src: src_addr, size: struct_size });
+                return Some(Operand::Value(sret_ptr));
+            }
+        }
+
+        // Complex expression returned via sret
+        let expr_ct = self.expr_ctype(e);
+        let ret_ct = self.func_return_ctypes.get(&self.current_function_name.clone()).cloned();
+        if expr_ct.is_complex() {
+            let val = self.lower_expr(e);
+            let src_addr = if let Some(ref rct) = ret_ct {
+                if rct.is_complex() && expr_ct != *rct {
+                    let ptr = self.operand_to_value(val);
+                    let converted = self.complex_to_complex(ptr, &expr_ct, rct);
+                    self.operand_to_value(converted)
+                } else {
+                    self.operand_to_value(val)
+                }
+            } else {
+                self.operand_to_value(val)
+            };
+            let complex_size = ret_ct.as_ref().unwrap_or(&expr_ct).size();
+            let sret_ptr = self.fresh_value();
+            self.emit(Instruction::Load { dest: sret_ptr, ptr: sret_alloca, ty: IrType::Ptr });
+            self.emit(Instruction::Memcpy { dest: sret_ptr, src: src_addr, size: complex_size });
+            return Some(Operand::Value(sret_ptr));
+        }
+
+        // Non-complex expression returned from sret complex function
+        if let Some(ref rct) = ret_ct {
+            if rct.is_complex() {
+                let val = self.lower_expr(e);
+                let src_ir_ty = self.get_expr_type(e);
+                let rct_clone = rct.clone();
+                let complex_val = self.scalar_to_complex(val, src_ir_ty, &rct_clone);
+                let src_addr = self.operand_to_value(complex_val);
+                let complex_size = rct_clone.size();
+                let sret_ptr = self.fresh_value();
+                self.emit(Instruction::Load { dest: sret_ptr, ptr: sret_alloca, ty: IrType::Ptr });
+                self.emit(Instruction::Memcpy { dest: sret_ptr, src: src_addr, size: complex_size });
+                return Some(Operand::Value(sret_ptr));
+            }
+        }
+
+        None
+    }
+
+    /// Try two-register struct return (9-16 bytes packed into I128).
+    fn try_two_reg_struct_return(&mut self, e: &Expr) -> Option<Operand> {
+        let struct_size = self.struct_value_size(e)?;
+        if struct_size <= 8 || struct_size > 16 {
+            return None;
+        }
+        let addr = self.get_struct_base_addr(e);
+        // Load low 8 bytes
+        let lo = self.fresh_value();
+        self.emit(Instruction::Load { dest: lo, ptr: addr, ty: IrType::I64 });
+        // Load high bytes
+        let hi_ptr = self.fresh_value();
+        self.emit(Instruction::GetElementPtr { dest: hi_ptr, base: addr, offset: Operand::Const(IrConst::I64(8)), ty: IrType::I64 });
+        let hi = self.fresh_value();
+        self.emit(Instruction::Load { dest: hi, ptr: hi_ptr, ty: IrType::I64 });
+        // Pack into I128: (hi << 64) | lo (zero-extend both halves)
+        let hi_wide = self.fresh_value();
+        self.emit(Instruction::Cast { dest: hi_wide, src: Operand::Value(hi), from_ty: IrType::U64, to_ty: IrType::I128 });
+        let lo_wide = self.fresh_value();
+        self.emit(Instruction::Cast { dest: lo_wide, src: Operand::Value(lo), from_ty: IrType::U64, to_ty: IrType::I128 });
+        let shifted = self.fresh_value();
+        self.emit(Instruction::BinOp { dest: shifted, op: IrBinOp::Shl, lhs: Operand::Value(hi_wide), rhs: Operand::Const(IrConst::I64(64)), ty: IrType::I128 });
+        let packed = self.fresh_value();
+        self.emit(Instruction::BinOp { dest: packed, op: IrBinOp::Or, lhs: Operand::Value(shifted), rhs: Operand::Value(lo_wide), ty: IrType::I128 });
+        Some(Operand::Value(packed))
+    }
+
+    /// Try small struct return (<= 8 bytes loaded as I64).
+    fn try_small_struct_return(&mut self, e: &Expr) -> Option<Operand> {
+        let struct_size = self.struct_value_size(e)?;
+        if struct_size > 8 {
+            return None;
+        }
+        let addr = self.get_struct_base_addr(e);
+        let dest = self.fresh_value();
+        self.emit(Instruction::Load { dest, ptr: addr, ty: IrType::I64 });
+        Some(Operand::Value(dest))
+    }
+
+    /// Try returning a complex expression from a complex-returning function.
+    /// Handles decomposition into register pairs or I64 packing.
+    fn try_complex_return(&mut self, e: &Expr) -> Option<Operand> {
+        let expr_ct = self.expr_ctype(e);
+        if !expr_ct.is_complex() {
+            return None;
+        }
+
+        let ret_ct = self.func_return_ctypes.get(&self.current_function_name.clone()).cloned();
+        if let Some(ref rct) = ret_ct {
+            let val = self.lower_expr(e);
+            let src_ptr = if rct.is_complex() && expr_ct != *rct {
+                let ptr = self.operand_to_value(val);
+                let converted = self.complex_to_complex(ptr, &expr_ct, rct);
+                self.operand_to_value(converted)
+            } else {
+                self.operand_to_value(val)
+            };
+
+            // _Complex double: return real in xmm0, imag in xmm1
+            if *rct == CType::ComplexDouble && !self.func_meta.sret_functions.contains_key(&self.current_function_name) {
+                let real = self.load_complex_real(src_ptr, rct);
+                let imag = self.load_complex_imag(src_ptr, rct);
+                self.emit(Instruction::SetReturnF64Second { src: imag });
+                return Some(real);
+            }
+
+            // _Complex float: load packed 8 bytes as F64 for XMM register return
+            if *rct == CType::ComplexFloat && !self.func_meta.sret_functions.contains_key(&self.current_function_name) {
+                let packed = self.fresh_value();
+                self.emit(Instruction::Load { dest: packed, ptr: src_ptr, ty: IrType::F64 });
+                return Some(Operand::Value(packed));
+            }
+        }
+
+        // Complex expression returned from non-complex function: extract real part
+        let ret_ty = self.current_return_type;
+        if ret_ty != IrType::Ptr {
+            let val2 = self.lower_expr(e);
+            let ptr = self.operand_to_value(val2);
+            let real_part = self.load_complex_real(ptr, &expr_ct);
+            let from_ty = Self::complex_component_ir_type(&expr_ct);
+            let val2 = self.emit_implicit_cast(real_part, from_ty, ret_ty);
+            return Some(if self.current_return_is_bool { self.emit_bool_normalize(val2) } else { val2 });
+        }
+
+        None
+    }
+
+    /// Try converting a non-complex scalar to complex for return from a complex function.
+    fn try_scalar_to_complex_return(&mut self, e: &Expr) -> Option<Operand> {
+        let expr_ct = self.expr_ctype(e);
+        let ret_ct = self.func_return_ctypes.get(&self.current_function_name.clone()).cloned();
+        let rct = ret_ct.as_ref()?;
+        if !rct.is_complex() || expr_ct.is_complex() {
+            return None;
+        }
+
+        let val = self.lower_expr(e);
+        let src_ir_ty = self.get_expr_type(e);
+        let rct_clone = rct.clone();
+        let complex_val = self.scalar_to_complex(val, src_ir_ty, &rct_clone);
+
+        // _Complex double: decompose into two FP return registers
+        if rct_clone == CType::ComplexDouble && !self.func_meta.sret_functions.contains_key(&self.current_function_name) {
+            let src_ptr = self.operand_to_value(complex_val);
+            let real = self.load_complex_real(src_ptr, &rct_clone);
+            let imag = self.load_complex_imag(src_ptr, &rct_clone);
+            self.emit(Instruction::SetReturnF64Second { src: imag });
+            return Some(real);
+        }
+
+        // For sret returns, copy to the hidden pointer
+        if let Some(sret_alloca) = self.current_sret_ptr {
+            let src_addr = self.operand_to_value(complex_val);
+            let complex_size = rct_clone.size();
+            let sret_ptr = self.fresh_value();
+            self.emit(Instruction::Load { dest: sret_ptr, ptr: sret_alloca, ty: IrType::Ptr });
+            self.emit(Instruction::Memcpy { dest: sret_ptr, src: src_addr, size: complex_size });
+            return Some(Operand::Value(sret_ptr));
+        }
+
+        // For non-sret complex float, pack into I64 for register return
+        if rct_clone == CType::ComplexFloat && !self.func_meta.sret_functions.contains_key(&self.current_function_name) {
+            let ptr = self.operand_to_value(complex_val);
+            let packed = self.fresh_value();
+            self.emit(Instruction::Load { dest: packed, ptr, ty: IrType::I64 });
+            return Some(Operand::Value(packed));
+        }
+
+        Some(complex_val)
+    }
+}

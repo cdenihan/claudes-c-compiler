@@ -5,6 +5,8 @@ pub mod expr_atomics;
 pub mod expr_calls;
 pub mod expr_assign;
 pub mod stmt;
+mod stmt_init;
+mod stmt_return;
 pub mod lvalue;
 pub mod types;
 pub mod structs;

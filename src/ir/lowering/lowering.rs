@@ -473,6 +473,26 @@ impl Lowerer {
         }
     }
 
+    /// Remove a local variable from `self.locals`, tracking the removal in the
+    /// current scope frame so `pop_scope()` restores it. Use this when a block-scope
+    /// declaration (extern, function decl) needs to shadow a local variable.
+    pub(super) fn shadow_local_for_scope(&mut self, name: &str) {
+        if let Some(prev_local) = self.locals.remove(name) {
+            if let Some(frame) = self.scope_stack.last_mut() {
+                frame.locals_shadowed.push((name.to_string(), prev_local));
+            }
+        }
+    }
+
+    /// Remove a static local name, tracking the removal in the current scope frame.
+    pub(super) fn shadow_static_for_scope(&mut self, name: &str) {
+        if let Some(prev_static) = self.static_local_names.remove(name) {
+            if let Some(frame) = self.scope_stack.last_mut() {
+                frame.statics_shadowed.push((name.to_string(), prev_static));
+            }
+        }
+    }
+
     /// Insert a local variable, tracking the change in the current scope frame.
     pub(super) fn insert_local_scoped(&mut self, name: String, info: LocalInfo) {
         if let Some(frame) = self.scope_stack.last_mut() {
