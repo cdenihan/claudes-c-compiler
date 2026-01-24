@@ -1,0 +1,14 @@
+Fix RISC-V large frame register conflict (t5/t6 clobbering)
+
+Problem: emit_store_to_s0 and emit_load_from_s0 use t5 as scratch for large
+stack offsets (>2048 bytes). But t5 is also used as a call argument temp
+register in the call emission Phase 4 (temp_regs = ["t3","t4","t5","t6",...]).
+When loading a 4th+ argument via operand_to_t0 -> emit_load_from_s0, the t5
+scratch clobbers the value held in t5 from a previous argument.
+
+Fix:
+1. Change emit_store_to_s0 and emit_load_from_s0 to use t6 as scratch
+2. Remove t6 from call argument temp pool (keep t3, t4, t5, s2-s5)
+3. Change inline asm float const loading from t6 to t5
+
+Status: in progress
