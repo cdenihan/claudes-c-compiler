@@ -1,1 +1,0 @@
-{"task": "fix_static_local_init_scoping", "status": "in_progress", "description": "Fix scoping bug where static local pointer initializers resolve to global variables instead of local statics with the same name"}
