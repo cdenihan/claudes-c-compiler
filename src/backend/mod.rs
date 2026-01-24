@@ -5,6 +5,7 @@ pub mod state;       // CodegenState, StackSlot, SlotAddr
 pub mod traits;      // ArchCodegen trait with default implementations
 pub mod generation;  // Module/function/instruction dispatch
 pub mod call_abi;    // Call argument classification and stack computation
+pub mod call_emit;   // Callee-side parameter classification (shared by emit_store_params)
 pub mod cast;        // Cast and float operation classification
 pub mod inline_asm;  // InlineAsmEmitter trait and shared framework
 

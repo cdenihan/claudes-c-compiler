@@ -127,11 +127,6 @@ impl X86Codegen {
     // Convention: 128-bit values use %rax (low 64 bits) and %rdx (high 64 bits).
     // Stack slots for 128-bit values are 16 bytes: slot(%rbp) = low, slot+8(%rbp) = high.
 
-    /// Check if a type is 128-bit.
-    fn is_i128_type(ty: IrType) -> bool {
-        matches!(ty, IrType::I128 | IrType::U128)
-    }
-
     /// Load a 128-bit operand into %rax (low) and %rdx (high).
     fn operand_to_rax_rdx(&mut self, op: &Operand) {
         match op {
@@ -836,171 +831,91 @@ impl ArchCodegen for X86Codegen {
 
     fn emit_store_params(&mut self, func: &IrFunction) {
         let xmm_regs = ["xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"];
-        let mut int_reg_idx = 0usize;
-        let mut float_reg_idx = 0usize;
-        // Stack-passed parameters start at 16(%rbp) (after saved rbp + return addr)
-        let mut stack_param_offset: i64 = 16;
-        for (_i, param) in func.params.iter().enumerate() {
-            let is_long_double = param.ty.is_long_double();
-            let is_i128 = Self::is_i128_type(param.ty);
-            let is_float = param.ty.is_float() && !is_long_double;
-            // Check for struct-by-value parameter
-            let struct_size = param.struct_size;
-            let is_small_struct = struct_size.map_or(false, |s| s <= 16);
-            let is_large_struct = struct_size.map_or(false, |s| s > 16);
-            let struct_regs_needed = struct_size.map_or(0, |s| if s <= 8 { 1 } else if s <= 16 { 2 } else { 0 });
+        // Use shared parameter classification (same ABI config as emit_call).
+        let config = CallAbiConfig {
+            max_int_regs: 6, max_float_regs: 8,
+            align_i128_pairs: false,
+            f128_in_fp_regs: false, f128_in_gp_pairs: false,
+            variadic_floats_in_gp: false,
+        };
+        let param_classes = classify_params(func, &config);
+        // Stack-passed parameters start at 16(%rbp) (after saved rbp + return addr).
+        let stack_base: i64 = 16;
 
-            // Determine if this param overflows to the stack
-            // Large structs (> 16 bytes) are always MEMORY class (always stack-passed).
-            let is_stack_passed = if is_large_struct {
-                true
-            } else if is_small_struct {
-                int_reg_idx + struct_regs_needed > 6
-            } else if is_long_double {
-                true
-            } else if is_i128 {
-                int_reg_idx + 1 >= 6
-            } else if is_float {
-                float_reg_idx >= 8
+        for (i, _param) in func.params.iter().enumerate() {
+            let class = param_classes[i];
+
+            // Find the alloca for this parameter.
+            let (slot, ty) = if let Some((dest, ty)) = find_param_alloca(func, i) {
+                if let Some(slot) = self.state.get_slot(dest.0) {
+                    (slot, ty)
+                } else {
+                    continue; // Slot not assigned, skip.
+                }
             } else {
-                int_reg_idx >= 6
+                continue; // No alloca: classification already accounts for this param.
             };
 
-            if param.name.is_empty() {
-                // Unnamed param (e.g. hidden sret pointer): store to alloca if one
-                // exists, then advance register/stack counters.
-                if let Some((dest, _ty)) = find_param_alloca(func, _i) {
-                    if let Some(slot) = self.state.get_slot(dest.0) {
-                        if !is_stack_passed && !is_float && !is_long_double && !is_i128
-                            && !is_small_struct && !is_large_struct
-                        {
-                            // Regular integer/pointer param (covers sret hidden pointer)
-                            let store_instr = Self::mov_store_for_type(_ty);
-                            let reg = Self::reg_for_type(X86_ARG_REGS[int_reg_idx], _ty);
-                            self.state.emit(&format!("    {} %{}, {}(%rbp)", store_instr, reg, slot.0));
-                        }
-                    }
+            match class {
+                ParamClass::IntReg { reg_idx } => {
+                    let store_instr = Self::mov_store_for_type(ty);
+                    let reg = Self::reg_for_type(X86_ARG_REGS[reg_idx], ty);
+                    self.state.emit(&format!("    {} %{}, {}(%rbp)", store_instr, reg, slot.0));
                 }
-                if is_large_struct {
-                    let size = struct_size.unwrap();
-                    stack_param_offset += (((size + 7) / 8) as i64) * 8;
-                } else if is_small_struct {
-                    if is_stack_passed {
-                        stack_param_offset += ((struct_size.unwrap() as i64 + 7) / 8) * 8;
-                    } else {
-                        int_reg_idx += struct_regs_needed;
-                    }
-                } else if is_long_double {
-                    stack_param_offset += 16;
-                } else if is_i128 {
-                    if is_stack_passed { stack_param_offset += 16; } else { int_reg_idx += 2; }
-                } else if is_stack_passed {
-                    stack_param_offset += 8;
-                } else if is_float {
-                    float_reg_idx += 1;
-                } else {
-                    int_reg_idx += 1;
-                }
-                continue;
-            }
-            if let Some((dest, _ty)) = find_param_alloca(func, _i) {
-                if let Some(slot) = self.state.get_slot(dest.0) {
-                    if is_small_struct && !is_stack_passed {
-                        // Small struct by value: data arrives in 1-2 GP registers
-                        let size = struct_size.unwrap();
-                        // Store first register (up to 8 bytes) into alloca
-                        self.state.emit(&format!("    movq %{}, {}(%rbp)", X86_ARG_REGS[int_reg_idx], slot.0));
-                        if size > 8 {
-                            // Store second register
-                            self.state.emit(&format!("    movq %{}, {}(%rbp)", X86_ARG_REGS[int_reg_idx + 1], slot.0 + 8));
-                        }
-                        int_reg_idx += struct_regs_needed;
-                    } else if is_small_struct && is_stack_passed {
-                        // Small struct on stack: copy from stack to alloca
-                        let size = struct_size.unwrap();
-                        let n_qwords = (size + 7) / 8;
-                        for qi in 0..n_qwords {
-                            let src_off = stack_param_offset + (qi as i64 * 8);
-                            let dst_off = slot.0 + (qi as i64 * 8);
-                            self.state.emit(&format!("    movq {}(%rbp), %rax", src_off));
-                            self.state.emit(&format!("    movq %rax, {}(%rbp)", dst_off));
-                        }
-                        stack_param_offset += (n_qwords as i64) * 8;
-                    } else if is_large_struct {
-                        // Large struct (MEMORY class): raw data is on the stack.
-                        // Copy the struct data from the stack into the alloca.
-                        let size = struct_size.unwrap();
-                        let n_qwords = (size + 7) / 8;
-                        for qi in 0..n_qwords {
-                            let src_off = stack_param_offset + (qi as i64 * 8);
-                            let dst_off = slot.0 + (qi as i64 * 8);
-                            self.state.emit(&format!("    movq {}(%rbp), %rax", src_off));
-                            self.state.emit(&format!("    movq %rax, {}(%rbp)", dst_off));
-                        }
-                        stack_param_offset += (n_qwords as i64) * 8;
-                    } else if is_long_double {
-                        self.state.emit(&format!("    fldt {}(%rbp)", stack_param_offset));
-                        self.state.emit("    subq $8, %rsp");
-                        self.state.emit("    fstpl (%rsp)");
-                        self.state.emit("    movq (%rsp), %rax");
-                        self.state.emit("    addq $8, %rsp");
+                ParamClass::FloatReg { reg_idx } => {
+                    if ty == IrType::F32 {
+                        self.state.emit(&format!("    movd %{}, %eax", xmm_regs[reg_idx]));
                         self.state.emit(&format!("    movq %rax, {}(%rbp)", slot.0));
-                        stack_param_offset += 16;
-                    } else if is_i128 && !is_stack_passed {
-                        self.state.emit(&format!("    movq %{}, {}(%rbp)", X86_ARG_REGS[int_reg_idx], slot.0));
-                        self.state.emit(&format!("    movq %{}, {}(%rbp)", X86_ARG_REGS[int_reg_idx + 1], slot.0 + 8));
-                        int_reg_idx += 2;
-                    } else if is_i128 && is_stack_passed {
-                        self.state.emit(&format!("    movq {}(%rbp), %rax", stack_param_offset));
-                        self.state.emit(&format!("    movq %rax, {}(%rbp)", slot.0));
-                        self.state.emit(&format!("    movq {}(%rbp), %rax", stack_param_offset + 8));
-                        self.state.emit(&format!("    movq %rax, {}(%rbp)", slot.0 + 8));
-                        stack_param_offset += 16;
-                    } else if is_stack_passed {
-                        self.state.emit(&format!("    movq {}(%rbp), %rax", stack_param_offset));
-                        let store_instr = Self::mov_store_for_type(_ty);
-                        let reg = Self::reg_for_type("rax", _ty);
-                        self.state.emit(&format!("    {} %{}, {}(%rbp)", store_instr, reg, slot.0));
-                        stack_param_offset += 8;
-                    } else if is_float {
-                        if _ty == IrType::F32 {
-                            self.state.emit(&format!("    movd %{}, %eax", xmm_regs[float_reg_idx]));
-                            self.state.emit(&format!("    movq %rax, {}(%rbp)", slot.0));
-                        } else {
-                            self.state.emit(&format!("    movq %{}, {}(%rbp)",
-                                xmm_regs[float_reg_idx], slot.0));
-                        }
-                        float_reg_idx += 1;
                     } else {
-                        let store_instr = Self::mov_store_for_type(_ty);
-                        let reg = Self::reg_for_type(X86_ARG_REGS[int_reg_idx], _ty);
-                        self.state.emit(&format!("    {} %{}, {}(%rbp)", store_instr, reg, slot.0));
-                        int_reg_idx += 1;
+                        self.state.emit(&format!("    movq %{}, {}(%rbp)", xmm_regs[reg_idx], slot.0));
                     }
                 }
-            } else {
-                // No alloca found - just advance counters
-                if is_large_struct {
-                    // MEMORY class: always on stack, raw data
-                    let size = struct_size.unwrap();
-                    stack_param_offset += (((size + 7) / 8) as i64) * 8;
-                } else if is_small_struct {
-                    if is_stack_passed {
-                        stack_param_offset += ((struct_size.unwrap() as i64 + 7) / 8) * 8;
-                    } else {
-                        int_reg_idx += struct_regs_needed;
-                    }
-                } else if is_long_double {
-                    stack_param_offset += 16;
-                } else if is_i128 {
-                    if is_stack_passed { stack_param_offset += 16; } else { int_reg_idx += 2; }
-                } else if is_stack_passed {
-                    stack_param_offset += 8;
-                } else if is_float {
-                    float_reg_idx += 1;
-                } else {
-                    int_reg_idx += 1;
+                ParamClass::I128RegPair { base_reg_idx } => {
+                    self.state.emit(&format!("    movq %{}, {}(%rbp)", X86_ARG_REGS[base_reg_idx], slot.0));
+                    self.state.emit(&format!("    movq %{}, {}(%rbp)", X86_ARG_REGS[base_reg_idx + 1], slot.0 + 8));
                 }
+                ParamClass::StructByValReg { base_reg_idx, size } => {
+                    self.state.emit(&format!("    movq %{}, {}(%rbp)", X86_ARG_REGS[base_reg_idx], slot.0));
+                    if size > 8 {
+                        self.state.emit(&format!("    movq %{}, {}(%rbp)", X86_ARG_REGS[base_reg_idx + 1], slot.0 + 8));
+                    }
+                }
+                ParamClass::F128AlwaysStack { offset } => {
+                    // x86: F128 (long double) always passes on stack via x87.
+                    let src = stack_base + offset;
+                    self.state.emit(&format!("    fldt {}(%rbp)", src));
+                    self.state.emit("    subq $8, %rsp");
+                    self.state.emit("    fstpl (%rsp)");
+                    self.state.emit("    movq (%rsp), %rax");
+                    self.state.emit("    addq $8, %rsp");
+                    self.state.emit(&format!("    movq %rax, {}(%rbp)", slot.0));
+                }
+                ParamClass::I128Stack { offset } => {
+                    let src = stack_base + offset;
+                    self.state.emit(&format!("    movq {}(%rbp), %rax", src));
+                    self.state.emit(&format!("    movq %rax, {}(%rbp)", slot.0));
+                    self.state.emit(&format!("    movq {}(%rbp), %rax", src + 8));
+                    self.state.emit(&format!("    movq %rax, {}(%rbp)", slot.0 + 8));
+                }
+                ParamClass::StackScalar { offset } => {
+                    let src = stack_base + offset;
+                    self.state.emit(&format!("    movq {}(%rbp), %rax", src));
+                    let store_instr = Self::mov_store_for_type(ty);
+                    let reg = Self::reg_for_type("rax", ty);
+                    self.state.emit(&format!("    {} %{}, {}(%rbp)", store_instr, reg, slot.0));
+                }
+                ParamClass::StructStack { offset, size } | ParamClass::LargeStructStack { offset, size } => {
+                    let src = stack_base + offset;
+                    let n_qwords = (size + 7) / 8;
+                    for qi in 0..n_qwords {
+                        let src_off = src + (qi as i64 * 8);
+                        let dst_off = slot.0 + (qi as i64 * 8);
+                        self.state.emit(&format!("    movq {}(%rbp), %rax", src_off));
+                        self.state.emit(&format!("    movq %rax, {}(%rbp)", dst_off));
+                    }
+                }
+                // These variants don't occur for x86 (no F128 in FP/GP pair regs).
+                ParamClass::F128FpReg { .. } | ParamClass::F128GpPair { .. } | ParamClass::F128Stack { .. } => {}
             }
         }
     }
@@ -1286,22 +1201,8 @@ impl ArchCodegen for X86Codegen {
         self.store_rax_to(dest);
     }
 
-    /// Override emit_binop to handle 128-bit integer ops on x86-64.
-    fn emit_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
-        if Self::is_i128_type(ty) {
-            self.emit_i128_binop(dest, op, lhs, rhs);
-            return;
-        }
-        if ty.is_float() {
-            let float_op = classify_float_binop(op)
-                .unwrap_or_else(|| panic!("unsupported float binop: {:?} on type {:?}", op, ty));
-            self.emit_float_binop(dest, float_op, lhs, rhs, ty);
-            return;
-        }
-        self.emit_int_binop(dest, op, lhs, rhs, ty);
-    }
-
-    // emit_float_binop uses the shared default implementation
+    // emit_binop uses the shared default implementation (handles i128/float/int dispatch).
+    // emit_float_binop uses the shared default implementation.
 
     fn emit_int_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
         self.operand_to_rax(lhs);
@@ -1392,7 +1293,7 @@ impl ArchCodegen for X86Codegen {
     }
 
     fn emit_cmp(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
-        if Self::is_i128_type(ty) {
+        if is_i128_type(ty) {
             self.emit_i128_cmp(dest, op, lhs, rhs);
             return;
         }
@@ -1630,7 +1531,7 @@ impl ArchCodegen for X86Codegen {
         }
 
         if let Some(dest) = dest {
-            if Self::is_i128_type(return_type) {
+            if is_i128_type(return_type) {
                 self.store_rax_rdx_to(&dest);
             } else if return_type == IrType::F32 {
                 self.state.emit("    movd %xmm0, %eax");

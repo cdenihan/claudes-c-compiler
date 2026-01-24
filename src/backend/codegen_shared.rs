@@ -15,5 +15,6 @@ pub use super::state::*;
 pub use super::traits::*;
 pub use super::generation::*;
 pub use super::call_abi::*;
+pub use super::call_emit::*;
 pub use super::cast::*;
 pub use super::inline_asm::*;

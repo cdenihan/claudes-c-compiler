@@ -723,17 +723,13 @@ impl ArchCodegen for ArmCodegen {
     fn emit_store_params(&mut self, func: &IrFunction) {
         let frame_size = self.current_frame_size;
 
-        // For variadic functions: save all register args to save areas first,
-        // before any other processing. This allows va_arg to access register-passed
-        // variadic arguments.
+        // For variadic functions: save all register args to save areas first.
         if func.is_variadic {
-            // Save x0-x7 to GP register save area using stp pairs
             let gp_base = self.va_gp_save_offset;
             for i in (0..8).step_by(2) {
                 let offset = gp_base + (i as i64) * 8;
                 self.emit_stp_to_sp(&format!("x{}", i), &format!("x{}", i + 1), offset);
             }
-            // Save q0-q7 to FP register save area using stp pairs (128-bit each)
             let fp_base = self.va_fp_save_offset;
             for i in (0..8).step_by(2) {
                 let offset = fp_base + (i as i64) * 16;
@@ -741,267 +737,179 @@ impl ArchCodegen for ArmCodegen {
             }
         }
 
-        // Classify each param: int reg, float reg, i128 pair, struct by value, or stack-passed
-        let mut int_reg_idx = 0usize;
-        let mut float_reg_idx = 0usize;
-        // Classes: 'i' = int reg, 'f' = float reg, 'p' = i128 GP pair,
-        // 's' = stack (8 bytes), 'S' = stack F128 (16 bytes, 16-byte aligned),
-        // 'V' = small struct by value in GP regs, 'M' = large struct on stack,
-        // 'v' = small struct overflow to stack
-        let mut param_class: Vec<char> = Vec::new();
-        let mut param_int_reg: Vec<usize> = Vec::new();
-        let mut param_float_reg: Vec<usize> = Vec::new();
-        let mut stack_offsets: Vec<i64> = Vec::new();
-        let mut stack_offset: i64 = 0;
+        // Use shared parameter classification (same ABI config as emit_call).
+        let config = CallAbiConfig {
+            max_int_regs: 8, max_float_regs: 8,
+            align_i128_pairs: true,
+            f128_in_fp_regs: true, f128_in_gp_pairs: false,
+            variadic_floats_in_gp: false,
+        };
+        let param_classes = classify_params(func, &config);
 
-        for param in func.params.iter() {
-            let is_float = param.ty.is_float();
-            let is_i128 = is_i128_type(param.ty);
-            let is_long_double = param.ty.is_long_double();
-            let struct_size = param.struct_size;
+        // Phase 1: Store all GP register params first (before x0 gets clobbered by float moves).
+        for (i, _param) in func.params.iter().enumerate() {
+            let class = param_classes[i];
+            if !class.uses_gp_reg() { continue; }
 
-            if let Some(size) = struct_size {
-                if size <= 16 {
-                    // AAPCS64: Small struct by value in 1-2 GP registers
-                    let regs_needed = if size <= 8 { 1 } else { 2 };
-                    if int_reg_idx + regs_needed <= 8 {
-                        param_class.push('V');
-                        param_int_reg.push(int_reg_idx);
-                        param_float_reg.push(0);
-                        stack_offsets.push(0);
-                        int_reg_idx += regs_needed;
-                    } else {
-                        // Overflow to stack
-                        param_class.push('v');
-                        param_int_reg.push(0);
-                        param_float_reg.push(0);
-                        stack_offsets.push(stack_offset);
-                        stack_offset += ((size + 7) & !7) as i64;
-                        int_reg_idx = 8;
-                    }
-                } else {
-                    // Large struct: passed on stack (MEMORY class)
-                    param_class.push('M');
-                    param_int_reg.push(0);
-                    param_float_reg.push(0);
-                    stack_offsets.push(stack_offset);
-                    stack_offset += ((size + 7) & !7) as i64;
-                }
-            } else if is_i128 {
-                // AAPCS64: 128-bit integers in even-aligned GP register pair
-                if int_reg_idx % 2 != 0 { int_reg_idx += 1; }
-                if int_reg_idx + 1 < 8 {
-                    param_class.push('p');
-                    param_int_reg.push(int_reg_idx);
-                    param_float_reg.push(0);
-                    stack_offsets.push(0);
-                    int_reg_idx += 2;
-                } else {
-                    // Align to 16 bytes for i128 on stack
-                    stack_offset = (stack_offset + 15) & !15;
-                    param_class.push('s');
-                    param_int_reg.push(0);
-                    param_float_reg.push(0);
-                    stack_offsets.push(stack_offset);
-                    stack_offset += 16;
-                    int_reg_idx = 8;
-                }
-            } else if is_float && float_reg_idx < 8 {
-                param_class.push('f');
-                param_float_reg.push(float_reg_idx);
-                param_int_reg.push(0);
-                stack_offsets.push(0);
-                float_reg_idx += 1;
-            } else if !is_float && int_reg_idx < 8 {
-                param_class.push('i');
-                param_int_reg.push(int_reg_idx);
-                param_float_reg.push(0);
-                stack_offsets.push(0);
-                int_reg_idx += 1;
-            } else if is_long_double {
-                // F128 overflow to stack: 16 bytes, 16-byte aligned
-                stack_offset = (stack_offset + 15) & !15;
-                param_class.push('S');
-                param_int_reg.push(0);
-                param_float_reg.push(0);
-                stack_offsets.push(stack_offset);
-                stack_offset += 16;
-            } else {
-                param_class.push('s');
-                param_int_reg.push(0);
-                param_float_reg.push(0);
-                stack_offsets.push(stack_offset);
-                stack_offset += 8;
-            }
-        }
+            let (slot, ty) = match find_param_alloca(func, i) {
+                Some((dest, ty)) => match self.state.get_slot(dest.0) {
+                    Some(slot) => (slot, ty),
+                    None => continue,
+                },
+                None => continue,
+            };
 
-        // Phase 1: Store all INTEGER register params first (before x0 gets clobbered by float moves).
-        // This includes struct-by-value params ('V') which arrive in GP registers.
-        for (i, param) in func.params.iter().enumerate() {
-            if param_class[i] == 'V' {
-                // Small struct by value: data arrives in 1-2 GP registers.
-                // Store the register data directly into the alloca.
-                if param.name.is_empty() { continue; }
-                if let Some((dest, _ty)) = find_param_alloca(func, i) {
-                    if let Some(slot) = self.state.get_slot(dest.0) {
-                        let size = param.struct_size.unwrap_or(8);
-                        let lo_reg = ARM_ARG_REGS[param_int_reg[i]];
-                        self.emit_store_to_sp(lo_reg, slot.0, "str");
-                        if size > 8 {
-                            let hi_reg = ARM_ARG_REGS[param_int_reg[i] + 1];
-                            self.emit_store_to_sp(hi_reg, slot.0 + 8, "str");
-                        }
-                    }
-                }
-                continue;
-            }
-            if param_class[i] == 'p' {
-                // 128-bit integer param: arrives in even-aligned GP register pair
-                if param.name.is_empty() { continue; }
-                if let Some((dest, _ty)) = find_param_alloca(func, i) {
-                    if let Some(slot) = self.state.get_slot(dest.0) {
-                        let lo_reg = ARM_ARG_REGS[param_int_reg[i]];
-                        let hi_reg = ARM_ARG_REGS[param_int_reg[i] + 1];
-                        self.emit_store_to_sp(lo_reg, slot.0, "str");
-                        self.emit_store_to_sp(hi_reg, slot.0 + 8, "str");
-                    }
-                }
-                continue;
-            }
-            if param_class[i] != 'i' { continue; }
-            // Unnamed params (e.g. hidden sret pointer) still need storage if they have an alloca
-            if param.name.is_empty() {
-                if let Some((dest, _ty)) = find_param_alloca(func, i) {
-                    if let Some(slot) = self.state.get_slot(dest.0) {
-                        let reg = ARM_ARG_REGS[param_int_reg[i]];
-                        self.emit_store_to_sp(reg, slot.0, "str");
-                    }
-                }
-                continue;
-            }
-            if let Some((dest, ty)) = find_param_alloca(func, i) {
-                if let Some(slot) = self.state.get_slot(dest.0) {
+            match class {
+                ParamClass::IntReg { reg_idx } => {
                     let store_instr = Self::str_for_type(ty);
-                    let reg = Self::reg_for_type(ARM_ARG_REGS[param_int_reg[i]], ty);
+                    let reg = Self::reg_for_type(ARM_ARG_REGS[reg_idx], ty);
                     self.emit_store_to_sp(reg, slot.0, store_instr);
                 }
+                ParamClass::I128RegPair { base_reg_idx } => {
+                    self.emit_store_to_sp(ARM_ARG_REGS[base_reg_idx], slot.0, "str");
+                    self.emit_store_to_sp(ARM_ARG_REGS[base_reg_idx + 1], slot.0 + 8, "str");
+                }
+                ParamClass::StructByValReg { base_reg_idx, size } => {
+                    self.emit_store_to_sp(ARM_ARG_REGS[base_reg_idx], slot.0, "str");
+                    if size > 8 {
+                        self.emit_store_to_sp(ARM_ARG_REGS[base_reg_idx + 1], slot.0 + 8, "str");
+                    }
+                }
+                _ => {} // Non-GP classes handled below.
             }
         }
 
-        // Phase 2: Store all FLOAT register params (uses x0 as scratch, but int regs already saved).
-        // Check if any F128 params need __trunctfdf2 conversion, which clobbers Q regs.
-        let has_f128_params = func.params.iter().enumerate().any(|(i, p)| {
-            param_class[i] == 'f' && p.ty.is_long_double()
+        // Phase 2: Store FP register params.
+        // Check if any F128 params arrived in FP registers and need __trunctfdf2 conversion.
+        let has_f128_fp_params = param_classes.iter().enumerate().any(|(i, c)| {
+            matches!(c, ParamClass::F128FpReg { .. }) &&
+            find_param_alloca(func, i).is_some()
         });
 
-        if has_f128_params {
-            // Save all Q registers to the stack before F128 conversions clobber them.
-            // Save q0-q7 (8 regs * 16 bytes = 128 bytes).
+        if has_f128_fp_params {
+            // Save q0-q7 (128 bytes) before __trunctfdf2 clobbers them.
             self.emit_sub_sp(128);
             for i in 0..8usize {
                 self.state.emit(&format!("    str q{}, [sp, #{}]", i, i * 16));
             }
 
-            // Process non-F128 float params first (from saved Q area)
-            for (i, param) in func.params.iter().enumerate() {
-                if param_class[i] != 'f' || param.name.is_empty() || param.ty.is_long_double() { continue; }
-                if let Some((dest, ty)) = find_param_alloca(func, i) {
-                    if let Some(slot) = self.state.get_slot(dest.0) {
-                        let fp_reg_off = (param_float_reg[i] * 16) as i64;
-                        if ty == IrType::F32 {
-                            self.state.emit(&format!("    ldr s0, [sp, #{}]", fp_reg_off));
-                            self.state.emit("    fmov w0, s0");
-                        } else {
-                            self.state.emit(&format!("    ldr d0, [sp, #{}]", fp_reg_off));
-                            self.state.emit("    fmov x0, d0");
-                        }
-                        self.emit_store_to_sp("x0", slot.0 + 128, "str");
-                    }
+            // Process non-F128 float params first (from saved Q area).
+            for (i, _param) in func.params.iter().enumerate() {
+                let reg_idx = match param_classes[i] {
+                    ParamClass::FloatReg { reg_idx } => reg_idx,
+                    _ => continue,
+                };
+                let (slot, ty) = match find_param_alloca(func, i) {
+                    Some((dest, ty)) => match self.state.get_slot(dest.0) {
+                        Some(slot) => (slot, ty),
+                        None => continue,
+                    },
+                    None => continue,
+                };
+                let fp_reg_off = (reg_idx * 16) as i64;
+                if ty == IrType::F32 {
+                    self.state.emit(&format!("    ldr s0, [sp, #{}]", fp_reg_off));
+                    self.state.emit("    fmov w0, s0");
+                } else {
+                    self.state.emit(&format!("    ldr d0, [sp, #{}]", fp_reg_off));
+                    self.state.emit("    fmov x0, d0");
                 }
+                self.emit_store_to_sp("x0", slot.0 + 128, "str");
             }
 
-            // Process F128 params: load Q register from save area, call __trunctfdf2
-            for (i, param) in func.params.iter().enumerate() {
-                if param_class[i] != 'f' || param.name.is_empty() || !param.ty.is_long_double() { continue; }
-                if let Some((dest, _ty)) = find_param_alloca(func, i) {
-                    if let Some(slot) = self.state.get_slot(dest.0) {
-                        let fp_reg_off = (param_float_reg[i] * 16) as i64;
-                        // Load the saved Q register value into q0 for __trunctfdf2
-                        self.state.emit(&format!("    ldr q0, [sp, #{}]", fp_reg_off));
-                        self.state.emit("    bl __trunctfdf2");
-                        // __trunctfdf2 returns f64 in d0
-                        self.state.emit("    fmov x0, d0");
-                        self.emit_store_to_sp("x0", slot.0 + 128, "str");
-                    }
-                }
+            // Process F128 FP reg params: load from save area, call __trunctfdf2.
+            for (i, _param) in func.params.iter().enumerate() {
+                let reg_idx = match param_classes[i] {
+                    ParamClass::F128FpReg { reg_idx } => reg_idx,
+                    _ => continue,
+                };
+                let slot = match find_param_alloca(func, i) {
+                    Some((dest, _)) => match self.state.get_slot(dest.0) {
+                        Some(slot) => slot,
+                        None => continue,
+                    },
+                    None => continue,
+                };
+                let fp_reg_off = (reg_idx * 16) as i64;
+                self.state.emit(&format!("    ldr q0, [sp, #{}]", fp_reg_off));
+                self.state.emit("    bl __trunctfdf2");
+                self.state.emit("    fmov x0, d0");
+                self.emit_store_to_sp("x0", slot.0 + 128, "str");
             }
 
-            // Restore stack
             self.emit_add_sp(128);
         } else {
-            // No F128 params: use the simple path
-            for (i, param) in func.params.iter().enumerate() {
-                if param_class[i] != 'f' || param.name.is_empty() { continue; }
-                if let Some((dest, ty)) = find_param_alloca(func, i) {
-                    if let Some(slot) = self.state.get_slot(dest.0) {
-                        if ty == IrType::F32 {
-                            self.state.emit(&format!("    fmov w0, s{}", param_float_reg[i]));
-                            self.emit_store_to_sp("x0", slot.0, "str");
-                        } else {
-                            self.state.emit(&format!("    fmov x0, d{}", param_float_reg[i]));
-                            self.emit_store_to_sp("x0", slot.0, "str");
-                        }
-                    }
+            // No F128 FP params: simple path.
+            for (i, _param) in func.params.iter().enumerate() {
+                let reg_idx = match param_classes[i] {
+                    ParamClass::FloatReg { reg_idx } => reg_idx,
+                    _ => continue,
+                };
+                let (slot, ty) = match find_param_alloca(func, i) {
+                    Some((dest, ty)) => match self.state.get_slot(dest.0) {
+                        Some(slot) => (slot, ty),
+                        None => continue,
+                    },
+                    None => continue,
+                };
+                if ty == IrType::F32 {
+                    self.state.emit(&format!("    fmov w0, s{}", reg_idx));
+                } else {
+                    self.state.emit(&format!("    fmov x0, d{}", reg_idx));
                 }
+                self.emit_store_to_sp("x0", slot.0, "str");
             }
         }
 
         // Phase 3: Store stack-passed params (above callee's frame).
-        // 's' = regular stack params (8 bytes), 'S' = F128 stack params (16 bytes),
-        // 'v' = small struct overflow to stack, 'M' = large struct on stack
         for (i, param) in func.params.iter().enumerate() {
-            if !matches!(param_class[i], 's' | 'S' | 'v' | 'M') { continue; }
-            if param.name.is_empty() { continue; }
-            if let Some((dest, ty)) = find_param_alloca(func, i) {
-                if let Some(slot) = self.state.get_slot(dest.0) {
-                    let caller_offset = frame_size + stack_offsets[i];
-                    if param_class[i] == 'v' || param_class[i] == 'M' {
-                        // Struct by value on stack: copy raw struct data from caller's
-                        // stack into the callee's alloca.
-                        let size = param.struct_size.unwrap_or(8);
-                        let n_dwords = (size + 7) / 8;
-                        for qi in 0..n_dwords {
-                            let src_off = caller_offset + (qi as i64 * 8);
-                            let dst_off = slot.0 + (qi as i64 * 8);
-                            self.emit_load_from_sp("x0", src_off, "ldr");
-                            self.emit_store_to_sp("x0", dst_off, "str");
-                        }
-                    } else if param_class[i] == 'S' {
-                        // F128 stack param: load 128-bit value and convert to f64
-                        // Load the quad-precision value from the caller's stack into q0
-                        self.emit_load_from_sp("x0", caller_offset, "ldr");
-                        self.emit_load_from_sp("x1", caller_offset + 8, "ldr");
-                        // Reconstruct f128 in q0 from x0 (lo) and x1 (hi)
-                        self.state.emit("    fmov d0, x0");
-                        self.state.emit("    mov v0.d[1], x1");
-                        // Convert f128 to f64 via __trunctfdf2
-                        self.state.emit("    bl __trunctfdf2");
-                        // __trunctfdf2 returns f64 in d0; store as 8-byte f64
-                        self.state.emit("    fmov x0, d0");
-                        self.emit_store_to_sp("x0", slot.0, "str");
-                    } else if is_i128_type(ty) {
-                        // 128-bit integer stack param: load both halves
-                        self.emit_load_from_sp("x0", caller_offset, "ldr");
-                        self.emit_store_to_sp("x0", slot.0, "str");
-                        self.emit_load_from_sp("x0", caller_offset + 8, "ldr");
-                        self.emit_store_to_sp("x0", slot.0 + 8, "str");
-                    } else {
-                        self.emit_load_from_sp("x0", caller_offset, "ldr");
-                        let store_instr = Self::str_for_type(ty);
-                        let reg = Self::reg_for_type("x0", ty);
-                        self.emit_store_to_sp(reg, slot.0, store_instr);
+            let class = param_classes[i];
+            if !class.is_stack() { continue; }
+
+            let (slot, ty) = match find_param_alloca(func, i) {
+                Some((dest, ty)) => match self.state.get_slot(dest.0) {
+                    Some(slot) => (slot, ty),
+                    None => continue,
+                },
+                None => continue,
+            };
+
+            match class {
+                ParamClass::StructStack { offset, size } | ParamClass::LargeStructStack { offset, size } => {
+                    let caller_offset = frame_size + offset;
+                    let n_dwords = (size + 7) / 8;
+                    for qi in 0..n_dwords {
+                        let src_off = caller_offset + (qi as i64 * 8);
+                        let dst_off = slot.0 + (qi as i64 * 8);
+                        self.emit_load_from_sp("x0", src_off, "ldr");
+                        self.emit_store_to_sp("x0", dst_off, "str");
                     }
                 }
+                ParamClass::F128Stack { offset } => {
+                    let caller_offset = frame_size + offset;
+                    self.emit_load_from_sp("x0", caller_offset, "ldr");
+                    self.emit_load_from_sp("x1", caller_offset + 8, "ldr");
+                    self.state.emit("    fmov d0, x0");
+                    self.state.emit("    mov v0.d[1], x1");
+                    self.state.emit("    bl __trunctfdf2");
+                    self.state.emit("    fmov x0, d0");
+                    self.emit_store_to_sp("x0", slot.0, "str");
+                }
+                ParamClass::I128Stack { offset } => {
+                    let caller_offset = frame_size + offset;
+                    self.emit_load_from_sp("x0", caller_offset, "ldr");
+                    self.emit_store_to_sp("x0", slot.0, "str");
+                    self.emit_load_from_sp("x0", caller_offset + 8, "ldr");
+                    self.emit_store_to_sp("x0", slot.0 + 8, "str");
+                }
+                ParamClass::StackScalar { offset } => {
+                    let caller_offset = frame_size + offset;
+                    self.emit_load_from_sp("x0", caller_offset, "ldr");
+                    let store_instr = Self::str_for_type(ty);
+                    let reg = Self::reg_for_type("x0", ty);
+                    self.emit_store_to_sp(reg, slot.0, store_instr);
+                }
+                _ => {} // Non-stack classes already handled.
             }
         }
     }
@@ -1306,11 +1214,7 @@ impl ArchCodegen for ArmCodegen {
     // emit_float_binop uses the shared default implementation
 
     fn emit_int_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
-        if is_i128_type(ty) {
-            self.emit_i128_binop(dest, op, lhs, rhs);
-            return;
-        }
-
+        // Note: i128 dispatch is handled by the shared emit_binop default in traits.rs.
         self.operand_to_x0(lhs);
         self.state.emit("    mov x1, x0");
         self.operand_to_x0(rhs);

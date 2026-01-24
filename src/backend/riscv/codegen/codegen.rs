@@ -759,387 +759,191 @@ impl ArchCodegen for RiscvCodegen {
     }
 
     fn emit_store_params(&mut self, func: &IrFunction) {
+        let float_arg_regs = ["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"];
+
         // For variadic functions: save all integer register args (a0-a7) to the
-        // register save area at POSITIVE offsets from s0 (above the frame pointer).
-        // Layout: a0 at s0+0, a1 at s0+8, ..., a7 at s0+56.
-        // This makes the register save area contiguous with the caller's stack-passed
-        // arguments at s0+64, s0+72, etc.
+        // register save area at POSITIVE offsets from s0.
         if func.is_variadic {
             for i in 0..8usize {
-                let offset = (i as i64) * 8;
-                self.emit_store_to_s0(RISCV_ARG_REGS[i], offset, "sd");
+                self.emit_store_to_s0(RISCV_ARG_REGS[i], (i as i64) * 8, "sd");
             }
         }
 
-        let float_arg_regs = ["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"];
-        let mut int_reg_idx = 0usize;
-        let mut float_reg_idx = 0usize;
-        // Stack-passed params are at positive offsets from s0.
-        // For non-variadic: s0 = old_sp, stack params at s0+0, s0+8, ...
-        // For variadic: s0 = old_sp - 64, stack params at s0+64, s0+72, ...
-        //   (because the register save area occupies s0+0..s0+56)
-        let mut stack_param_offset: i64 = if func.is_variadic { 64 } else { 0 };
+        // Use shared parameter classification (same ABI config as emit_call).
+        let config = CallAbiConfig {
+            max_int_regs: 8, max_float_regs: 8,
+            align_i128_pairs: true,
+            f128_in_fp_regs: false, f128_in_gp_pairs: true,
+            variadic_floats_in_gp: func.is_variadic,
+        };
+        let param_classes = classify_params(func, &config);
 
-        // Phase 1: If there are any F128 params in GP registers, save all GP and FP arg regs
-        // to the stack first, because __trunctfdf2 calls will clobber them.
-        // Save area layout: a0-a7 (64 bytes) then fa0-fa7 (64 bytes) = 128 bytes total.
-        let has_f128_reg_params = func.params.iter().any(|p| {
-            p.ty.is_long_double()
-        });
+        // Stack-passed params are at positive s0 offsets.
+        // For variadic: register save area occupies s0+0..s0+56, stack params at s0+64+.
+        let stack_base: i64 = if func.is_variadic { 64 } else { 0 };
+
+        // Check if any F128 params exist (need to save all regs before __trunctfdf2).
+        let has_f128_reg_params = param_classes.iter().any(|c| matches!(c, ParamClass::F128GpPair { .. }));
         let f128_save_offset: i64 = if has_f128_reg_params && !func.is_variadic {
             self.state.emit("    addi sp, sp, -128");
-            // Save GP arg regs a0-a7
             for i in 0..8usize {
                 self.state.emit(&format!("    sd {}, {}(sp)", RISCV_ARG_REGS[i], i * 8));
             }
-            // Save FP arg regs fa0-fa7
             for i in 0..8usize {
                 self.state.emit(&format!("    fsd fa{}, {}(sp)", i, 64 + i * 8));
             }
-            0i64 // base offset from sp where a0 is saved; fa0 at offset 64
+            0i64
         } else {
             0
         };
 
-        for (_i, param) in func.params.iter().enumerate() {
-            let is_long_double = param.ty.is_long_double();
-            let is_i128_param = is_i128_type(param.ty);
-            let is_float = param.ty.is_float() && !is_long_double;
-            let struct_size = param.struct_size;
+        for (i, _param) in func.params.iter().enumerate() {
+            let class = param_classes[i];
 
-            // Handle struct-by-value params first (before general classification)
-            if let Some(size) = struct_size {
-                let is_small_struct = size <= 16;
-                let regs_needed = if size <= 8 { 1 } else { 2 };
-                let struct_is_stack_passed = if is_small_struct {
-                    int_reg_idx + regs_needed > 8
-                } else {
-                    true // Large structs always on stack
-                };
-
-                if param.name.is_empty() {
-                    if struct_is_stack_passed {
-                        stack_param_offset += ((size + 7) & !7) as i64;
-                        if is_small_struct { int_reg_idx = 8; }
-                    } else {
-                        int_reg_idx += regs_needed;
-                    }
-                    continue;
-                }
-                if let Some((dest, _ty)) = find_param_alloca(func, _i) {
-                    if let Some(slot) = self.state.get_slot(dest.0) {
-                        if is_small_struct && !struct_is_stack_passed {
-                            // Small struct by value: data arrives in 1-2 GP registers.
-                            if has_f128_reg_params {
-                                // Load from GP save area
-                                let lo_off = f128_save_offset + (int_reg_idx as i64) * 8;
-                                self.state.emit(&format!("    ld t0, {}(sp)", lo_off));
-                                self.emit_store_to_s0("t0", slot.0, "sd");
-                                if size > 8 {
-                                    let hi_off = f128_save_offset + ((int_reg_idx + 1) as i64) * 8;
-                                    self.state.emit(&format!("    ld t0, {}(sp)", hi_off));
-                                    self.emit_store_to_s0("t0", slot.0 + 8, "sd");
-                                }
-                            } else if func.is_variadic {
-                                // Load from register save area at s0+idx*8
-                                let lo_off = (int_reg_idx as i64) * 8;
-                                self.emit_load_from_s0("t0", lo_off, "ld");
-                                self.emit_store_to_s0("t0", slot.0, "sd");
-                                if size > 8 {
-                                    let hi_off = ((int_reg_idx + 1) as i64) * 8;
-                                    self.emit_load_from_s0("t0", hi_off, "ld");
-                                    self.emit_store_to_s0("t0", slot.0 + 8, "sd");
-                                }
-                            } else {
-                                // Direct from registers
-                                self.emit_store_to_s0(RISCV_ARG_REGS[int_reg_idx], slot.0, "sd");
-                                if size > 8 {
-                                    self.emit_store_to_s0(RISCV_ARG_REGS[int_reg_idx + 1], slot.0 + 8, "sd");
-                                }
-                            }
-                            int_reg_idx += regs_needed;
-                        } else {
-                            // Struct on stack (large or overflowed): copy from caller's stack
-                            let n_dwords = (size + 7) / 8;
-                            for qi in 0..n_dwords {
-                                let src_off = stack_param_offset + (qi as i64 * 8);
-                                let dst_off = slot.0 + (qi as i64 * 8);
-                                self.emit_load_from_s0("t0", src_off, "ld");
-                                self.emit_store_to_s0("t0", dst_off, "sd");
-                            }
-                            stack_param_offset += ((size + 7) & !7) as i64;
-                            if is_small_struct { int_reg_idx = 8; }
-                        }
-                    }
-                } else {
-                    // No alloca found - just advance counters
-                    if struct_is_stack_passed {
-                        stack_param_offset += ((size + 7) & !7) as i64;
-                        if is_small_struct { int_reg_idx = 8; }
-                    } else {
-                        int_reg_idx += regs_needed;
-                    }
-                }
-                continue;
-            }
-
-            // For variadic functions: ALL args (including floats) go through GP registers.
-            // For non-variadic: FP args go to fa0-fa7 first, then spill to GP regs.
-            let is_float_in_gpr = if func.is_variadic {
-                false // In variadic functions, floats are always in GP regs (handled in else branch)
-            } else {
-                is_float && float_reg_idx >= 8 && int_reg_idx < 8
+            let (slot, ty) = match find_param_alloca(func, i) {
+                Some((dest, ty)) => match self.state.get_slot(dest.0) {
+                    Some(slot) => (slot, ty),
+                    None => continue,
+                },
+                None => continue,
             };
 
-            let is_stack_passed = if is_i128_param {
-                // 128-bit integer needs aligned register pair
-                let aligned = (int_reg_idx + 1) & !1;
-                aligned + 1 >= 8
-            } else if func.is_variadic {
-                if is_long_double {
-                    let aligned = (int_reg_idx + 1) & !1;
-                    aligned + 1 >= 8
-                } else {
-                    int_reg_idx >= 8
-                }
-            } else if is_long_double {
-                let aligned = (int_reg_idx + 1) & !1;
-                aligned + 1 >= 8
-            } else if is_float {
-                float_reg_idx >= 8 && int_reg_idx >= 8
-            } else {
-                int_reg_idx >= 8
-            };
-
-            if param.name.is_empty() {
-                // Unnamed params (e.g. hidden sret pointer) still need storage if
-                // they have an alloca and are in a register.
-                if !is_stack_passed && !is_i128_param && !is_long_double && !is_float
-                    && !is_float_in_gpr
-                {
-                    if let Some((dest, _ty)) = find_param_alloca(func, _i) {
-                        if let Some(slot) = self.state.get_slot(dest.0) {
-                            if func.is_variadic {
-                                let off = (int_reg_idx as i64) * 8;
-                                self.emit_load_from_s0("t0", off, "ld");
-                                self.emit_store_to_s0("t0", slot.0, "sd");
-                            } else if has_f128_reg_params {
-                                let off = f128_save_offset + (int_reg_idx as i64) * 8;
-                                self.state.emit(&format!("    ld t0, {}(sp)", off));
-                                self.emit_store_to_s0("t0", slot.0, "sd");
-                            } else {
-                                self.emit_store_to_s0(RISCV_ARG_REGS[int_reg_idx], slot.0, "sd");
-                            }
-                        }
-                    }
-                }
-                if is_stack_passed {
-                    if is_i128_param || is_long_double {
-                        stack_param_offset = (stack_param_offset + 15) & !15;
-                        stack_param_offset += 16;
-                        int_reg_idx = 8;
-                    } else {
-                        stack_param_offset += 8;
-                    }
-                } else if is_i128_param {
-                    if int_reg_idx % 2 != 0 { int_reg_idx += 1; }
-                    int_reg_idx += 2;
-                } else if is_long_double {
-                    if int_reg_idx % 2 != 0 { int_reg_idx += 1; }
-                    int_reg_idx += 2;
-                } else if func.is_variadic {
-                    int_reg_idx += 1;
-                } else if is_float_in_gpr {
-                    int_reg_idx += 1;
-                } else if is_float {
-                    float_reg_idx += 1;
-                } else {
-                    int_reg_idx += 1;
-                }
-                continue;
-            }
-            if let Some((dest, ty)) = find_param_alloca(func, _i) {
-                if let Some(slot) = self.state.get_slot(dest.0) {
-                    // Handle i128 parameters first (both variadic and non-variadic)
-                    if is_i128_param && !is_stack_passed {
-                        // 128-bit integer in aligned GP register pair
-                        if int_reg_idx % 2 != 0 { int_reg_idx += 1; }
-                        if func.is_variadic {
-                            // Load from register save area at s0+idx*8
-                            let lo_off = (int_reg_idx as i64) * 8;
-                            let hi_off = ((int_reg_idx + 1) as i64) * 8;
-                            self.emit_load_from_s0("t0", lo_off, "ld");
-                            self.emit_store_to_s0("t0", slot.0, "sd");
-                            self.emit_load_from_s0("t0", hi_off, "ld");
-                            self.emit_store_to_s0("t0", slot.0 + 8, "sd");
-                        } else if has_f128_reg_params {
-                            // Load from GP save area
-                            let lo_off = f128_save_offset + (int_reg_idx as i64) * 8;
-                            let hi_off = f128_save_offset + ((int_reg_idx + 1) as i64) * 8;
-                            self.state.emit(&format!("    ld t0, {}(sp)", lo_off));
-                            self.emit_store_to_s0("t0", slot.0, "sd");
-                            self.state.emit(&format!("    ld t0, {}(sp)", hi_off));
-                            self.emit_store_to_s0("t0", slot.0 + 8, "sd");
-                        } else {
-                            // Direct from registers
-                            self.emit_store_to_s0(RISCV_ARG_REGS[int_reg_idx], slot.0, "sd");
-                            self.emit_store_to_s0(RISCV_ARG_REGS[int_reg_idx + 1], slot.0 + 8, "sd");
-                        }
-                        int_reg_idx += 2;
-                    } else if is_i128_param && is_stack_passed {
-                        // 128-bit integer on stack
-                        stack_param_offset = (stack_param_offset + 15) & !15;
-                        self.emit_load_from_s0("t0", stack_param_offset, "ld");
-                        self.emit_store_to_s0("t0", slot.0, "sd");
-                        self.emit_load_from_s0("t0", stack_param_offset + 8, "ld");
-                        self.emit_store_to_s0("t0", slot.0 + 8, "sd");
-                        stack_param_offset += 16;
-                        int_reg_idx = 8;
-                    } else if func.is_variadic {
-                        // In variadic functions, ALL named params come through GP registers.
-                        // We already saved a0-a7 at s0+0..s0+56. Load from the save area.
-                        if is_long_double && !is_stack_passed {
-                            // F128 arrives in aligned GP register pair
-                            if int_reg_idx % 2 != 0 { int_reg_idx += 1; }
-                            // Load from register save area at s0 + idx*8
-                            let lo_off = (int_reg_idx as i64) * 8;
-                            let hi_off = ((int_reg_idx + 1) as i64) * 8;
-                            self.emit_load_from_s0("a0", lo_off, "ld");
-                            self.emit_load_from_s0("a1", hi_off, "ld");
-                            self.state.emit("    call __trunctfdf2");
-                            self.state.emit("    fmv.x.d t0, fa0");
-                            self.emit_store_to_s0("t0", slot.0, "sd");
-                            int_reg_idx += 2;
-                        } else if is_long_double && is_stack_passed {
-                            // F128 on stack
-                            stack_param_offset = (stack_param_offset + 15) & !15;
-                            self.emit_load_from_s0("a0", stack_param_offset, "ld");
-                            self.emit_load_from_s0("a1", stack_param_offset + 8, "ld");
-                            self.state.emit("    call __trunctfdf2");
-                            self.state.emit("    fmv.x.d t0, fa0");
-                            self.emit_store_to_s0("t0", slot.0, "sd");
-                            stack_param_offset += 16;
-                            int_reg_idx = 8;
-                        } else if is_stack_passed {
-                            self.emit_load_from_s0("t0", stack_param_offset, "ld");
-                            let store_instr = Self::store_for_type(ty);
-                            self.emit_store_to_s0("t0", slot.0, store_instr);
-                            stack_param_offset += 8;
-                        } else {
-                            // Named param in GP register (including float params).
-                            // For variadic, a0-a7 were saved to s0+0..s0+56. Load from there.
-                            // We can also just use the register directly since we saved it first.
-                            let store_instr = Self::store_for_type(ty);
-                            self.emit_store_to_s0(RISCV_ARG_REGS[int_reg_idx], slot.0, store_instr);
-                            int_reg_idx += 1;
-                        }
-                    } else if is_long_double && !is_stack_passed {
-                        // F128 arrives in GP register pair (aligned to even).
-                        // GP regs were saved to stack in phase 1; load from saved area.
-                        if int_reg_idx % 2 != 0 { int_reg_idx += 1; }
-                        // Load saved lo:hi from the save area
-                        let lo_off = f128_save_offset + (int_reg_idx as i64) * 8;
-                        let hi_off = f128_save_offset + ((int_reg_idx + 1) as i64) * 8;
-                        self.state.emit(&format!("    ld a0, {}(sp)", lo_off));
-                        self.state.emit(&format!("    ld a1, {}(sp)", hi_off));
-                        self.state.emit("    call __trunctfdf2");
-                        // Result is in fa0, move to GP reg and store
-                        self.state.emit("    fmv.x.d t0, fa0");
-                        self.emit_store_to_s0("t0", slot.0, "sd");
-                        int_reg_idx += 2;
-                    } else if is_long_double && is_stack_passed {
-                        // F128 stack-passed: 16 bytes, 16-byte aligned.
-                        // Stack params are at positive s0 offsets regardless of
-                        // whether there's an f128 register save area (which is
-                        // at sp, below s0).
-                        stack_param_offset = (stack_param_offset + 15) & !15;
-                        // Load the f128 from caller's stack and call __trunctfdf2
-                        self.emit_load_from_s0("a0", stack_param_offset, "ld");
-                        self.emit_load_from_s0("a1", stack_param_offset + 8, "ld");
-                        self.state.emit("    call __trunctfdf2");
-                        self.state.emit("    fmv.x.d t0, fa0");
-                        self.emit_store_to_s0("t0", slot.0, "sd");
-                        stack_param_offset += 16;
-                        int_reg_idx = 8;
-                    } else if is_stack_passed {
-                        // Stack-passed parameter: load from positive s0 offset
-                        self.emit_load_from_s0("t0", stack_param_offset, "ld");
+            match class {
+                ParamClass::IntReg { reg_idx } => {
+                    // GP register param - load from save area if F128 regs were saved.
+                    if has_f128_reg_params && !func.is_variadic {
+                        let off = f128_save_offset + (reg_idx as i64) * 8;
+                        self.state.emit(&format!("    ld t0, {}(sp)", off));
                         let store_instr = Self::store_for_type(ty);
                         self.emit_store_to_s0("t0", slot.0, store_instr);
-                        stack_param_offset += 8;
-                    } else if is_float_in_gpr {
-                        // FP arg that spilled to a GP register (fa0-fa7 exhausted)
-                        // The value arrives as raw bits in an integer register
-                        if has_f128_reg_params {
-                            let off = f128_save_offset + (int_reg_idx as i64) * 8;
-                            self.state.emit(&format!("    ld t0, {}(sp)", off));
-                        } else {
-                            self.state.emit(&format!("    mv t0, {}", RISCV_ARG_REGS[int_reg_idx]));
-                        }
-                        self.emit_store_to_s0("t0", slot.0, "sd");
-                        int_reg_idx += 1;
-                    } else if is_float {
-                        // Float params arrive in fa0-fa7 per RISC-V calling convention
-                        if has_f128_reg_params {
-                            // FP regs were saved to stack; load from save area
-                            let fp_off = f128_save_offset + 64 + (float_reg_idx as i64) * 8;
-                            if ty == IrType::F32 {
-                                self.state.emit(&format!("    flw ft0, {}(sp)", fp_off));
-                                self.state.emit("    fmv.x.w t0, ft0");
-                            } else {
-                                self.state.emit(&format!("    fld ft0, {}(sp)", fp_off));
-                                self.state.emit("    fmv.x.d t0, ft0");
-                            }
-                        } else if ty == IrType::F32 {
-                            // F32 param: extract 32-bit float from fa-reg
-                            self.state.emit(&format!("    fmv.x.w t0, {}", float_arg_regs[float_reg_idx]));
-                        } else {
-                            // F64 param: extract 64-bit double from fa-reg
-                            self.state.emit(&format!("    fmv.x.d t0, {}", float_arg_regs[float_reg_idx]));
-                        }
-                        self.emit_store_to_s0("t0", slot.0, "sd");
-                        float_reg_idx += 1;
+                    } else if func.is_variadic {
+                        // For variadic, use register directly (already saved to save area).
+                        let store_instr = Self::store_for_type(ty);
+                        self.emit_store_to_s0(RISCV_ARG_REGS[reg_idx], slot.0, store_instr);
                     } else {
-                        // GP register param - load from save area if we have F128 params
-                        if has_f128_reg_params {
-                            let off = f128_save_offset + (int_reg_idx as i64) * 8;
-                            self.state.emit(&format!("    ld t0, {}(sp)", off));
-                            let store_instr = Self::store_for_type(ty);
-                            self.emit_store_to_s0("t0", slot.0, store_instr);
-                        } else {
-                            let store_instr = Self::store_for_type(ty);
-                            self.emit_store_to_s0(RISCV_ARG_REGS[int_reg_idx], slot.0, store_instr);
-                        }
-                        int_reg_idx += 1;
+                        let store_instr = Self::store_for_type(ty);
+                        self.emit_store_to_s0(RISCV_ARG_REGS[reg_idx], slot.0, store_instr);
                     }
                 }
-            } else {
-                if is_long_double {
-                    if is_stack_passed {
-                        stack_param_offset = (stack_param_offset + 15) & !15;
-                        stack_param_offset += 16;
-                        int_reg_idx = 8;
+                ParamClass::FloatReg { reg_idx } => {
+                    if has_f128_reg_params && !func.is_variadic {
+                        // FP regs were saved to stack; load from save area.
+                        let fp_off = f128_save_offset + 64 + (reg_idx as i64) * 8;
+                        if ty == IrType::F32 {
+                            self.state.emit(&format!("    flw ft0, {}(sp)", fp_off));
+                            self.state.emit("    fmv.x.w t0, ft0");
+                        } else {
+                            self.state.emit(&format!("    fld ft0, {}(sp)", fp_off));
+                            self.state.emit("    fmv.x.d t0, ft0");
+                        }
+                    } else if ty == IrType::F32 {
+                        self.state.emit(&format!("    fmv.x.w t0, {}", float_arg_regs[reg_idx]));
                     } else {
-                        if int_reg_idx % 2 != 0 { int_reg_idx += 1; }
-                        int_reg_idx += 2;
+                        self.state.emit(&format!("    fmv.x.d t0, {}", float_arg_regs[reg_idx]));
                     }
-                } else if is_stack_passed {
-                    stack_param_offset += 8;
-                } else if func.is_variadic {
-                    // Variadic: all args in GP regs
-                    int_reg_idx += 1;
-                } else if is_float_in_gpr {
-                    // FP arg spilled to GPR - consume a GPR slot
-                    int_reg_idx += 1;
-                } else if is_float {
-                    float_reg_idx += 1;
-                } else {
-                    int_reg_idx += 1;
+                    self.emit_store_to_s0("t0", slot.0, "sd");
                 }
+                ParamClass::I128RegPair { base_reg_idx } => {
+                    if func.is_variadic {
+                        let lo_off = (base_reg_idx as i64) * 8;
+                        let hi_off = ((base_reg_idx + 1) as i64) * 8;
+                        self.emit_load_from_s0("t0", lo_off, "ld");
+                        self.emit_store_to_s0("t0", slot.0, "sd");
+                        self.emit_load_from_s0("t0", hi_off, "ld");
+                        self.emit_store_to_s0("t0", slot.0 + 8, "sd");
+                    } else if has_f128_reg_params {
+                        let lo_off = f128_save_offset + (base_reg_idx as i64) * 8;
+                        let hi_off = f128_save_offset + ((base_reg_idx + 1) as i64) * 8;
+                        self.state.emit(&format!("    ld t0, {}(sp)", lo_off));
+                        self.emit_store_to_s0("t0", slot.0, "sd");
+                        self.state.emit(&format!("    ld t0, {}(sp)", hi_off));
+                        self.emit_store_to_s0("t0", slot.0 + 8, "sd");
+                    } else {
+                        self.emit_store_to_s0(RISCV_ARG_REGS[base_reg_idx], slot.0, "sd");
+                        self.emit_store_to_s0(RISCV_ARG_REGS[base_reg_idx + 1], slot.0 + 8, "sd");
+                    }
+                }
+                ParamClass::StructByValReg { base_reg_idx, size } => {
+                    if has_f128_reg_params && !func.is_variadic {
+                        let lo_off = f128_save_offset + (base_reg_idx as i64) * 8;
+                        self.state.emit(&format!("    ld t0, {}(sp)", lo_off));
+                        self.emit_store_to_s0("t0", slot.0, "sd");
+                        if size > 8 {
+                            let hi_off = f128_save_offset + ((base_reg_idx + 1) as i64) * 8;
+                            self.state.emit(&format!("    ld t0, {}(sp)", hi_off));
+                            self.emit_store_to_s0("t0", slot.0 + 8, "sd");
+                        }
+                    } else if func.is_variadic {
+                        let lo_off = (base_reg_idx as i64) * 8;
+                        self.emit_load_from_s0("t0", lo_off, "ld");
+                        self.emit_store_to_s0("t0", slot.0, "sd");
+                        if size > 8 {
+                            let hi_off = ((base_reg_idx + 1) as i64) * 8;
+                            self.emit_load_from_s0("t0", hi_off, "ld");
+                            self.emit_store_to_s0("t0", slot.0 + 8, "sd");
+                        }
+                    } else {
+                        self.emit_store_to_s0(RISCV_ARG_REGS[base_reg_idx], slot.0, "sd");
+                        if size > 8 {
+                            self.emit_store_to_s0(RISCV_ARG_REGS[base_reg_idx + 1], slot.0 + 8, "sd");
+                        }
+                    }
+                }
+                ParamClass::F128GpPair { lo_reg_idx, hi_reg_idx } => {
+                    // F128 in GP register pair: call __trunctfdf2 to convert to f64.
+                    if func.is_variadic {
+                        let lo_off = (lo_reg_idx as i64) * 8;
+                        let hi_off = (hi_reg_idx as i64) * 8;
+                        self.emit_load_from_s0("a0", lo_off, "ld");
+                        self.emit_load_from_s0("a1", hi_off, "ld");
+                    } else {
+                        // Load from F128 save area.
+                        let lo_off = f128_save_offset + (lo_reg_idx as i64) * 8;
+                        let hi_off = f128_save_offset + (hi_reg_idx as i64) * 8;
+                        self.state.emit(&format!("    ld a0, {}(sp)", lo_off));
+                        self.state.emit(&format!("    ld a1, {}(sp)", hi_off));
+                    }
+                    self.state.emit("    call __trunctfdf2");
+                    self.state.emit("    fmv.x.d t0, fa0");
+                    self.emit_store_to_s0("t0", slot.0, "sd");
+                }
+                ParamClass::F128Stack { offset } | ParamClass::F128AlwaysStack { offset } => {
+                    let src = stack_base + offset;
+                    self.emit_load_from_s0("a0", src, "ld");
+                    self.emit_load_from_s0("a1", src + 8, "ld");
+                    self.state.emit("    call __trunctfdf2");
+                    self.state.emit("    fmv.x.d t0, fa0");
+                    self.emit_store_to_s0("t0", slot.0, "sd");
+                }
+                ParamClass::I128Stack { offset } => {
+                    let src = stack_base + offset;
+                    self.emit_load_from_s0("t0", src, "ld");
+                    self.emit_store_to_s0("t0", slot.0, "sd");
+                    self.emit_load_from_s0("t0", src + 8, "ld");
+                    self.emit_store_to_s0("t0", slot.0 + 8, "sd");
+                }
+                ParamClass::StackScalar { offset } => {
+                    let src = stack_base + offset;
+                    self.emit_load_from_s0("t0", src, "ld");
+                    let store_instr = Self::store_for_type(ty);
+                    self.emit_store_to_s0("t0", slot.0, store_instr);
+                }
+                ParamClass::StructStack { offset, size } | ParamClass::LargeStructStack { offset, size } => {
+                    let src = stack_base + offset;
+                    let n_dwords = (size + 7) / 8;
+                    for qi in 0..n_dwords {
+                        let src_off = src + (qi as i64 * 8);
+                        let dst_off = slot.0 + (qi as i64 * 8);
+                        self.emit_load_from_s0("t0", src_off, "ld");
+                        self.emit_store_to_s0("t0", dst_off, "sd");
+                    }
+                }
+                // F128 in FP reg doesn't happen on RISC-V.
+                ParamClass::F128FpReg { .. } => {}
             }
         }
 
-        // Phase 2: Clean up the F128 save area (128 bytes: 64 GP + 64 FP)
+        // Clean up the F128 save area.
         if has_f128_reg_params && !func.is_variadic {
             self.state.emit("    addi sp, sp, 128");
         }
@@ -1416,11 +1220,7 @@ impl ArchCodegen for RiscvCodegen {
     // emit_float_binop uses the shared default implementation
 
     fn emit_int_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
-        if is_i128_type(ty) {
-            self.emit_i128_binop(dest, op, lhs, rhs);
-            return;
-        }
-
+        // Note: i128 dispatch is handled by the shared emit_binop default in traits.rs.
         self.operand_to_t0(lhs);
         self.state.emit("    mv t1, t0");
         self.operand_to_t0(rhs);

@@ -137,8 +137,12 @@ pub trait ArchCodegen {
         }
     }
 
-    /// Emit a binary operation. Default: dispatches float/integer ops.
+    /// Emit a binary operation. Default: dispatches i128/float/integer ops.
     fn emit_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
+        if is_i128_type(ty) {
+            self.emit_i128_binop(dest, op, lhs, rhs);
+            return;
+        }
         if ty.is_float() {
             let float_op = classify_float_binop(op)
                 .unwrap_or_else(|| panic!("unsupported float binop: {:?} on type {:?}", op, ty));
