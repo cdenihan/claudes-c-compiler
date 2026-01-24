@@ -301,10 +301,22 @@ impl StructLayout {
                         if in_bitfield {
                             offset = bf_unit_offset + bf_unit_size;
                         }
-                        offset = align_up(offset, field_align);
-                        bf_unit_offset = offset;
+                        // GCC-compatible bitfield placement: try to fit the bitfield
+                        // within the naturally-aligned storage unit that contains the
+                        // current offset. Only advance to a new aligned unit if the
+                        // bitfield bits would overflow the current aligned unit.
+                        let aligned_start = offset & !(field_align - 1); // align_down
+                        let bit_pos_in_unit = ((offset - aligned_start) * 8) as u32;
+                        if bit_pos_in_unit + bw <= unit_bits {
+                            // Bitfield fits in the current aligned storage unit
+                            bf_unit_offset = aligned_start;
+                            bf_bit_pos = bit_pos_in_unit;
+                        } else {
+                            // Doesn't fit; start a new aligned storage unit
+                            bf_unit_offset = align_up(offset, field_align);
+                            bf_bit_pos = 0;
+                        }
                         bf_unit_size = field_size;
-                        bf_bit_pos = 0;
                         in_bitfield = true;
                     }
 

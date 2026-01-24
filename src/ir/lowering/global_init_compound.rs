@@ -45,9 +45,12 @@ impl Lowerer {
 
             let field_ty = &layout.fields[field_idx].ty;
 
-            // Check if this is a flat init filling an array field
+            // Check if this is a flat init filling an array field.
+            // A string literal initializing a char array is NOT flat init - it's a single
+            // complete initializer for the entire array (e.g., char c[10] = "hello").
+            let is_string_literal = matches!(&item.init, Initializer::Expr(Expr::StringLiteral(..)));
             if let CType::Array(_, Some(arr_size)) = field_ty {
-                if matches!(&item.init, Initializer::Expr(_)) {
+                if matches!(&item.init, Initializer::Expr(_)) && !is_string_literal {
                     // Flat init: consume up to arr_size items for this array field
                     let mut consumed = 0;
                     while consumed < *arr_size && (item_idx + consumed) < items.len() {
@@ -89,7 +92,7 @@ impl Lowerer {
                 let storage_unit_offset = field_offset;
                 let storage_unit_size = field_size; // All bitfields in this unit have the same type size
 
-                // Emit padding before this storage unit
+                // Emit padding before this storage unit (only if unit starts after current pos)
                 if storage_unit_offset > current_offset {
                     let pad = storage_unit_offset - current_offset;
                     push_zero_bytes(&mut elements, pad);
@@ -121,11 +124,18 @@ impl Lowerer {
                     fi += 1;
                 }
 
-                // Emit the packed storage unit as individual bytes
-                for &b in &unit_bytes {
+                // When the storage unit overlaps with already-written data
+                // (due to align_down placement), skip the overlapping bytes.
+                let skip = if current_offset > storage_unit_offset {
+                    current_offset - storage_unit_offset
+                } else {
+                    0
+                };
+                // Emit only the non-overlapping portion of the storage unit
+                for &b in &unit_bytes[skip..] {
                     elements.push(GlobalInit::Scalar(IrConst::I8(b as i8)));
                 }
-                current_offset += storage_unit_size;
+                current_offset = storage_unit_offset + storage_unit_size;
                 continue;
             }
 
@@ -163,12 +173,19 @@ impl Lowerer {
                     fi += 1;
                 }
 
-                // Emit the packed storage unit as bytes (little-endian)
+                // When the storage unit overlaps with already-written data
+                // (due to align_down placement), skip the overlapping bytes.
+                let skip = if current_offset > storage_offset {
+                    current_offset - storage_offset
+                } else {
+                    0
+                };
+                // Emit only the non-overlapping portion of the storage unit
                 let le = packed_val.to_le_bytes();
-                for i in 0..storage_size {
+                for i in skip..storage_size {
                     elements.push(GlobalInit::Scalar(IrConst::I8(le[i] as i8)));
                 }
-                current_offset += storage_size;
+                current_offset = storage_offset + storage_size;
                 continue;
             }
 
