@@ -331,204 +331,8 @@ impl ArmCodegen {
     }
 
     /// Emit a 128-bit integer binary operation.
-    fn emit_i128_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand) {
-        match op {
-            IrBinOp::Add => {
-                self.prep_i128_binop(lhs, rhs);
-                self.state.emit("    adds x0, x2, x4");
-                self.state.emit("    adc x1, x3, x5");
-            }
-            IrBinOp::Sub => {
-                self.prep_i128_binop(lhs, rhs);
-                self.state.emit("    subs x0, x2, x4");
-                self.state.emit("    sbc x1, x3, x5");
-            }
-            IrBinOp::Mul => {
-                // 128-bit multiply: result_lo = a_lo * b_lo (full widening)
-                // result_hi = a_hi * b_lo + a_lo * b_hi + umulh(a_lo, b_lo)
-                self.prep_i128_binop(lhs, rhs);
-                // x2:x3 = lhs (lo:hi), x4:x5 = rhs (lo:hi)
-                self.state.emit("    mul x0, x2, x4");       // x0 = lo(a_lo * b_lo)
-                self.state.emit("    umulh x1, x2, x4");     // x1 = hi(a_lo * b_lo)
-                self.state.emit("    madd x1, x3, x4, x1");  // x1 += a_hi * b_lo
-                self.state.emit("    madd x1, x2, x5, x1");  // x1 += a_lo * b_hi
-            }
-            IrBinOp::And => {
-                self.prep_i128_binop(lhs, rhs);
-                self.state.emit("    and x0, x2, x4");
-                self.state.emit("    and x1, x3, x5");
-            }
-            IrBinOp::Or => {
-                self.prep_i128_binop(lhs, rhs);
-                self.state.emit("    orr x0, x2, x4");
-                self.state.emit("    orr x1, x3, x5");
-            }
-            IrBinOp::Xor => {
-                self.prep_i128_binop(lhs, rhs);
-                self.state.emit("    eor x0, x2, x4");
-                self.state.emit("    eor x1, x3, x5");
-            }
-            IrBinOp::Shl => {
-                // 128-bit left shift by amount in x4 (low 64 bits of rhs)
-                self.prep_i128_binop(lhs, rhs);
-                // x2:x3 = value, x4 = shift amount
-                let lbl = self.state.fresh_label("shl128");
-                let done = self.state.fresh_label("shl128_done");
-                let noop = self.state.fresh_label("shl128_noop");
-                self.state.emit("    and x4, x4, #127");        // mask to 0-127
-                self.state.emit(&format!("    cbz x4, {}", noop)); // shift 0 = copy
-                self.state.emit("    cmp x4, #64");
-                self.state.emit(&format!("    b.ge {}", lbl));
-                // shift < 64: hi = (hi << n) | (lo >> (64-n)), lo = lo << n
-                self.state.emit("    lsl x1, x3, x4");
-                self.state.emit("    mov x5, #64");
-                self.state.emit("    sub x5, x5, x4");
-                self.state.emit("    lsr x6, x2, x5");
-                self.state.emit("    orr x1, x1, x6");
-                self.state.emit("    lsl x0, x2, x4");
-                self.state.emit(&format!("    b {}", done));
-                // shift >= 64: hi = lo << (n-64), lo = 0
-                self.state.emit(&format!("{}:", lbl));
-                self.state.emit("    sub x4, x4, #64");
-                self.state.emit("    lsl x1, x2, x4");
-                self.state.emit("    mov x0, #0");
-                self.state.emit(&format!("    b {}", done));
-                // shift == 0: copy input to output
-                self.state.emit(&format!("{}:", noop));
-                self.state.emit("    mov x0, x2");
-                self.state.emit("    mov x1, x3");
-                self.state.emit(&format!("{}:", done));
-            }
-            IrBinOp::LShr => {
-                // 128-bit logical right shift
-                self.prep_i128_binop(lhs, rhs);
-                let lbl = self.state.fresh_label("lshr128");
-                let done = self.state.fresh_label("lshr128_done");
-                let noop = self.state.fresh_label("lshr128_noop");
-                self.state.emit("    and x4, x4, #127");
-                self.state.emit(&format!("    cbz x4, {}", noop));
-                self.state.emit("    cmp x4, #64");
-                self.state.emit(&format!("    b.ge {}", lbl));
-                // shift < 64: lo = (lo >> n) | (hi << (64-n)), hi = hi >> n
-                self.state.emit("    lsr x0, x2, x4");
-                self.state.emit("    mov x5, #64");
-                self.state.emit("    sub x5, x5, x4");
-                self.state.emit("    lsl x6, x3, x5");
-                self.state.emit("    orr x0, x0, x6");
-                self.state.emit("    lsr x1, x3, x4");
-                self.state.emit(&format!("    b {}", done));
-                // shift >= 64: lo = hi >> (n-64), hi = 0
-                self.state.emit(&format!("{}:", lbl));
-                self.state.emit("    sub x4, x4, #64");
-                self.state.emit("    lsr x0, x3, x4");
-                self.state.emit("    mov x1, #0");
-                self.state.emit(&format!("    b {}", done));
-                // shift == 0: copy input to output
-                self.state.emit(&format!("{}:", noop));
-                self.state.emit("    mov x0, x2");
-                self.state.emit("    mov x1, x3");
-                self.state.emit(&format!("{}:", done));
-            }
-            IrBinOp::AShr => {
-                // 128-bit arithmetic right shift
-                self.prep_i128_binop(lhs, rhs);
-                let lbl = self.state.fresh_label("ashr128");
-                let done = self.state.fresh_label("ashr128_done");
-                let noop = self.state.fresh_label("ashr128_noop");
-                self.state.emit("    and x4, x4, #127");
-                self.state.emit(&format!("    cbz x4, {}", noop));
-                self.state.emit("    cmp x4, #64");
-                self.state.emit(&format!("    b.ge {}", lbl));
-                // shift < 64: lo = (lo >> n) | (hi << (64-n)), hi = hi >>a n
-                self.state.emit("    lsr x0, x2, x4");
-                self.state.emit("    mov x5, #64");
-                self.state.emit("    sub x5, x5, x4");
-                self.state.emit("    lsl x6, x3, x5");
-                self.state.emit("    orr x0, x0, x6");
-                self.state.emit("    asr x1, x3, x4");
-                self.state.emit(&format!("    b {}", done));
-                // shift >= 64: lo = hi >>a (n-64), hi = hi >>a 63
-                self.state.emit(&format!("{}:", lbl));
-                self.state.emit("    sub x4, x4, #64");
-                self.state.emit("    asr x0, x3, x4");
-                self.state.emit("    asr x1, x3, #63");
-                self.state.emit(&format!("    b {}", done));
-                // shift == 0: copy input to output
-                self.state.emit(&format!("{}:", noop));
-                self.state.emit("    mov x0, x2");
-                self.state.emit("    mov x1, x3");
-                self.state.emit(&format!("{}:", done));
-            }
-            IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem => {
-                // Call compiler-rt helper functions for 128-bit division
-                let func_name = match op {
-                    IrBinOp::SDiv => "__divti3",
-                    IrBinOp::UDiv => "__udivti3",
-                    IrBinOp::SRem => "__modti3",
-                    IrBinOp::URem => "__umodti3",
-                    _ => unreachable!(),
-                };
-                // AAPCS64: first 128-bit arg in x0:x1, second in x2:x3
-                self.operand_to_x0_x1(lhs);
-                self.state.emit("    mov x2, x0");
-                self.state.emit("    mov x3, x1");
-                self.operand_to_x0_x1(rhs);
-                self.state.emit("    mov x4, x0");
-                self.state.emit("    mov x5, x1");
-                // Move to correct argument registers: lhs in x0:x1, rhs in x2:x3
-                self.state.emit("    mov x0, x2");
-                self.state.emit("    mov x1, x3");
-                self.state.emit("    mov x2, x4");
-                self.state.emit("    mov x3, x5");
-                self.state.emit(&format!("    bl {}", func_name));
-                // Result in x0:x1
-            }
-        }
-        self.store_x0_x1_to(dest);
-    }
-
-    /// Emit a 128-bit comparison.
-    fn emit_i128_cmp(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand) {
-        self.prep_i128_binop(lhs, rhs);
-        // x2:x3 = lhs, x4:x5 = rhs
-        match op {
-            IrCmpOp::Eq => {
-                // XOR both halves and OR the differences
-                self.state.emit("    eor x0, x2, x4");
-                self.state.emit("    eor x1, x3, x5");
-                self.state.emit("    orr x0, x0, x1");
-                self.state.emit("    cmp x0, #0");
-                self.state.emit("    cset x0, eq");
-            }
-            IrCmpOp::Ne => {
-                self.state.emit("    eor x0, x2, x4");
-                self.state.emit("    eor x1, x3, x5");
-                self.state.emit("    orr x0, x0, x1");
-                self.state.emit("    cmp x0, #0");
-                self.state.emit("    cset x0, ne");
-            }
-            _ => {
-                // Ordered comparisons: compare high halves first, fall through to low if equal
-                let done = self.state.fresh_label("cmp128_done");
-                // Compare high halves
-                self.state.emit("    cmp x3, x5");
-                let (hi_cond, lo_cond) = match op {
-                    IrCmpOp::Slt | IrCmpOp::Sle => ("lt", if op == IrCmpOp::Slt { "lo" } else { "ls" }),
-                    IrCmpOp::Sgt | IrCmpOp::Sge => ("gt", if op == IrCmpOp::Sgt { "hi" } else { "hs" }),
-                    IrCmpOp::Ult | IrCmpOp::Ule => ("lo", if op == IrCmpOp::Ult { "lo" } else { "ls" }),
-                    IrCmpOp::Ugt | IrCmpOp::Uge => ("hi", if op == IrCmpOp::Ugt { "hi" } else { "hs" }),
-                    _ => unreachable!(),
-                };
-                self.state.emit(&format!("    cset x0, {}", hi_cond));
-                self.state.emit(&format!("    b.ne {}", done));
-                // High halves equal: compare low halves (always unsigned)
-                self.state.emit("    cmp x2, x4");
-                self.state.emit(&format!("    cset x0, {}", lo_cond));
-                self.state.emit(&format!("{}:", done));
-            }
-        }
-        self.store_x0_to(dest);
-    }
+    // emit_i128_binop and emit_i128_cmp use the shared default implementations
+    // via ArchCodegen trait defaults, with per-op primitives defined in the trait impl above.
 
     fn str_for_type(ty: IrType) -> &'static str {
         match ty {
@@ -1447,32 +1251,7 @@ impl ArchCodegen for ArmCodegen {
         self.state.emit("    fmov w0, s0");
     }
 
-    fn emit_float_binop(&mut self, dest: &Value, op: FloatOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
-        let mnemonic = match op {
-            FloatOp::Add => "fadd",
-            FloatOp::Sub => "fsub",
-            FloatOp::Mul => "fmul",
-            FloatOp::Div => "fdiv",
-        };
-        self.operand_to_x0(lhs);
-        self.state.emit("    mov x1, x0");
-        self.operand_to_x0(rhs);
-        self.state.emit("    mov x2, x0");
-        // F128 uses F64 instructions (long double computed at double precision)
-        if ty == IrType::F32 {
-            self.state.emit("    fmov s0, w1");
-            self.state.emit("    fmov s1, w2");
-            self.state.emit(&format!("    {} s0, s0, s1", mnemonic));
-            self.state.emit("    fmov w0, s0");
-            self.state.emit("    mov w0, w0"); // zero-extend
-        } else {
-            self.state.emit("    fmov d0, x1");
-            self.state.emit("    fmov d1, x2");
-            self.state.emit(&format!("    {} d0, d0, d1", mnemonic));
-            self.state.emit("    fmov x0, d0");
-        }
-        self.store_x0_to(dest);
-    }
+    // emit_float_binop uses the shared default implementation
 
     fn emit_int_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
         if is_i128_type(ty) {
@@ -1552,7 +1331,8 @@ impl ArchCodegen for ArmCodegen {
 
     fn emit_cmp(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
         if is_i128_type(ty) {
-            self.emit_i128_cmp(dest, op, lhs, rhs);
+            // Use shared i128 cmp dispatch
+            ArchCodegen::emit_i128_cmp(self, dest, op, lhs, rhs);
             return;
         }
         if ty.is_float() {
@@ -1560,7 +1340,6 @@ impl ArchCodegen for ArmCodegen {
             self.state.emit("    mov x1, x0");
             self.operand_to_x0(rhs);
             if ty == IrType::F32 {
-                // F32: bit pattern in low 32 bits, use s-registers
                 self.state.emit("    fmov s0, w1");
                 self.state.emit("    fmov s1, w0");
                 self.state.emit("    fcmp s0, s1");
@@ -2615,13 +2394,216 @@ impl ArchCodegen for ArmCodegen {
     }
 
     fn emit_copy_i128(&mut self, dest: &Value, src: &Operand) {
-        // Full 128-bit copy: load src into x0:x1, store to dest
         self.operand_to_x0_x1(src);
         self.store_x0_x1_to(dest);
     }
 
     fn emit_x86_sse_op(&mut self, dest: &Option<Value>, op: &X86SseOpKind, dest_ptr: &Option<Value>, args: &[Operand]) {
         self.emit_x86_sse_op_arm(dest, op, dest_ptr, args);
+    }
+
+    // ---- Float binop primitives ----
+
+    fn emit_float_binop_mnemonic(&self, op: FloatOp) -> &'static str {
+        match op {
+            FloatOp::Add => "fadd",
+            FloatOp::Sub => "fsub",
+            FloatOp::Mul => "fmul",
+            FloatOp::Div => "fdiv",
+        }
+    }
+
+    fn emit_float_binop_impl(&mut self, mnemonic: &str, ty: IrType) {
+        // secondary = lhs (in x1 via acc_to_secondary = mov x1, x0), acc = rhs (in x0)
+        // After the shared default: lhs loaded to acc, pushed to secondary, rhs loaded to acc
+        // On ARM, emit_acc_to_secondary does "mov x1, x0" so: x1=lhs, x0=rhs
+        // Move to x2 so we have x1=lhs, x2=rhs (matching original convention)
+        self.state.emit("    mov x2, x0");
+        if ty == IrType::F32 {
+            self.state.emit("    fmov s0, w1");
+            self.state.emit("    fmov s1, w2");
+            self.state.emit(&format!("    {} s0, s0, s1", mnemonic));
+            self.state.emit("    fmov w0, s0");
+            self.state.emit("    mov w0, w0"); // zero-extend
+        } else {
+            self.state.emit("    fmov d0, x1");
+            self.state.emit("    fmov d1, x2");
+            self.state.emit(&format!("    {} d0, d0, d1", mnemonic));
+            self.state.emit("    fmov x0, d0");
+        }
+    }
+
+    // ---- i128 binop primitives ----
+
+    fn emit_i128_prep_binop(&mut self, lhs: &Operand, rhs: &Operand) {
+        self.prep_i128_binop(lhs, rhs);
+    }
+
+    fn emit_i128_add(&mut self) {
+        self.state.emit("    adds x0, x2, x4");
+        self.state.emit("    adc x1, x3, x5");
+    }
+
+    fn emit_i128_sub(&mut self) {
+        self.state.emit("    subs x0, x2, x4");
+        self.state.emit("    sbc x1, x3, x5");
+    }
+
+    fn emit_i128_mul(&mut self) {
+        // x2:x3 = lhs (lo:hi), x4:x5 = rhs (lo:hi)
+        self.state.emit("    mul x0, x2, x4");       // x0 = lo(a_lo * b_lo)
+        self.state.emit("    umulh x1, x2, x4");     // x1 = hi(a_lo * b_lo)
+        self.state.emit("    madd x1, x3, x4, x1");  // x1 += a_hi * b_lo
+        self.state.emit("    madd x1, x2, x5, x1");  // x1 += a_lo * b_hi
+    }
+
+    fn emit_i128_and(&mut self) {
+        self.state.emit("    and x0, x2, x4");
+        self.state.emit("    and x1, x3, x5");
+    }
+
+    fn emit_i128_or(&mut self) {
+        self.state.emit("    orr x0, x2, x4");
+        self.state.emit("    orr x1, x3, x5");
+    }
+
+    fn emit_i128_xor(&mut self) {
+        self.state.emit("    eor x0, x2, x4");
+        self.state.emit("    eor x1, x3, x5");
+    }
+
+    fn emit_i128_shl(&mut self) {
+        let lbl = self.state.fresh_label("shl128");
+        let done = self.state.fresh_label("shl128_done");
+        let noop = self.state.fresh_label("shl128_noop");
+        self.state.emit("    and x4, x4, #127");
+        self.state.emit(&format!("    cbz x4, {}", noop));
+        self.state.emit("    cmp x4, #64");
+        self.state.emit(&format!("    b.ge {}", lbl));
+        self.state.emit("    lsl x1, x3, x4");
+        self.state.emit("    mov x5, #64");
+        self.state.emit("    sub x5, x5, x4");
+        self.state.emit("    lsr x6, x2, x5");
+        self.state.emit("    orr x1, x1, x6");
+        self.state.emit("    lsl x0, x2, x4");
+        self.state.emit(&format!("    b {}", done));
+        self.state.emit(&format!("{}:", lbl));
+        self.state.emit("    sub x4, x4, #64");
+        self.state.emit("    lsl x1, x2, x4");
+        self.state.emit("    mov x0, #0");
+        self.state.emit(&format!("    b {}", done));
+        self.state.emit(&format!("{}:", noop));
+        self.state.emit("    mov x0, x2");
+        self.state.emit("    mov x1, x3");
+        self.state.emit(&format!("{}:", done));
+    }
+
+    fn emit_i128_lshr(&mut self) {
+        let lbl = self.state.fresh_label("lshr128");
+        let done = self.state.fresh_label("lshr128_done");
+        let noop = self.state.fresh_label("lshr128_noop");
+        self.state.emit("    and x4, x4, #127");
+        self.state.emit(&format!("    cbz x4, {}", noop));
+        self.state.emit("    cmp x4, #64");
+        self.state.emit(&format!("    b.ge {}", lbl));
+        self.state.emit("    lsr x0, x2, x4");
+        self.state.emit("    mov x5, #64");
+        self.state.emit("    sub x5, x5, x4");
+        self.state.emit("    lsl x6, x3, x5");
+        self.state.emit("    orr x0, x0, x6");
+        self.state.emit("    lsr x1, x3, x4");
+        self.state.emit(&format!("    b {}", done));
+        self.state.emit(&format!("{}:", lbl));
+        self.state.emit("    sub x4, x4, #64");
+        self.state.emit("    lsr x0, x3, x4");
+        self.state.emit("    mov x1, #0");
+        self.state.emit(&format!("    b {}", done));
+        self.state.emit(&format!("{}:", noop));
+        self.state.emit("    mov x0, x2");
+        self.state.emit("    mov x1, x3");
+        self.state.emit(&format!("{}:", done));
+    }
+
+    fn emit_i128_ashr(&mut self) {
+        let lbl = self.state.fresh_label("ashr128");
+        let done = self.state.fresh_label("ashr128_done");
+        let noop = self.state.fresh_label("ashr128_noop");
+        self.state.emit("    and x4, x4, #127");
+        self.state.emit(&format!("    cbz x4, {}", noop));
+        self.state.emit("    cmp x4, #64");
+        self.state.emit(&format!("    b.ge {}", lbl));
+        self.state.emit("    lsr x0, x2, x4");
+        self.state.emit("    mov x5, #64");
+        self.state.emit("    sub x5, x5, x4");
+        self.state.emit("    lsl x6, x3, x5");
+        self.state.emit("    orr x0, x0, x6");
+        self.state.emit("    asr x1, x3, x4");
+        self.state.emit(&format!("    b {}", done));
+        self.state.emit(&format!("{}:", lbl));
+        self.state.emit("    sub x4, x4, #64");
+        self.state.emit("    asr x0, x3, x4");
+        self.state.emit("    asr x1, x3, #63");
+        self.state.emit(&format!("    b {}", done));
+        self.state.emit(&format!("{}:", noop));
+        self.state.emit("    mov x0, x2");
+        self.state.emit("    mov x1, x3");
+        self.state.emit(&format!("{}:", done));
+    }
+
+    fn emit_i128_divrem_call(&mut self, func_name: &str, lhs: &Operand, rhs: &Operand) {
+        // AAPCS64: first 128-bit arg in x0:x1, second in x2:x3
+        self.operand_to_x0_x1(lhs);
+        self.state.emit("    mov x2, x0");
+        self.state.emit("    mov x3, x1");
+        self.operand_to_x0_x1(rhs);
+        self.state.emit("    mov x4, x0");
+        self.state.emit("    mov x5, x1");
+        self.state.emit("    mov x0, x2");
+        self.state.emit("    mov x1, x3");
+        self.state.emit("    mov x2, x4");
+        self.state.emit("    mov x3, x5");
+        self.state.emit(&format!("    bl {}", func_name));
+        // Result in x0:x1
+    }
+
+    fn emit_i128_store_result(&mut self, dest: &Value) {
+        self.store_x0_x1_to(dest);
+    }
+
+    // ---- i128 cmp primitives ----
+
+    fn emit_i128_cmp_eq(&mut self, is_ne: bool) {
+        // x2:x3 = lhs, x4:x5 = rhs (after prep)
+        self.state.emit("    eor x0, x2, x4");
+        self.state.emit("    eor x1, x3, x5");
+        self.state.emit("    orr x0, x0, x1");
+        self.state.emit("    cmp x0, #0");
+        if is_ne {
+            self.state.emit("    cset x0, ne");
+        } else {
+            self.state.emit("    cset x0, eq");
+        }
+    }
+
+    fn emit_i128_cmp_ordered(&mut self, op: IrCmpOp) {
+        let done = self.state.fresh_label("cmp128_done");
+        self.state.emit("    cmp x3, x5");
+        let (hi_cond, lo_cond) = match op {
+            IrCmpOp::Slt | IrCmpOp::Sle => ("lt", if op == IrCmpOp::Slt { "lo" } else { "ls" }),
+            IrCmpOp::Sgt | IrCmpOp::Sge => ("gt", if op == IrCmpOp::Sgt { "hi" } else { "hs" }),
+            IrCmpOp::Ult | IrCmpOp::Ule => ("lo", if op == IrCmpOp::Ult { "lo" } else { "ls" }),
+            IrCmpOp::Ugt | IrCmpOp::Uge => ("hi", if op == IrCmpOp::Ugt { "hi" } else { "hs" }),
+            _ => unreachable!(),
+        };
+        self.state.emit(&format!("    cset x0, {}", hi_cond));
+        self.state.emit(&format!("    b.ne {}", done));
+        self.state.emit("    cmp x2, x4");
+        self.state.emit(&format!("    cset x0, {}", lo_cond));
+        self.state.emit(&format!("{}:", done));
+    }
+
+    fn emit_i128_cmp_store_result(&mut self, dest: &Value) {
+        self.store_x0_to(dest);
     }
 }
 

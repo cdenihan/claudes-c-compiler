@@ -257,8 +257,25 @@ pub trait ArchCodegen {
     }
 
     /// Emit a float binary operation (add/sub/mul/div).
-    /// The default `emit_binop` dispatches here after classifying the operation.
-    fn emit_float_binop(&mut self, dest: &Value, op: FloatOp, lhs: &Operand, rhs: &Operand, ty: IrType);
+    /// Default implementation uses `emit_float_binop_mnemonic` to get the arch-specific
+    /// instruction, then loads operands, moves to FP regs, performs the op, and stores.
+    fn emit_float_binop(&mut self, dest: &Value, op: FloatOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
+        let mnemonic = self.emit_float_binop_mnemonic(op);
+        self.emit_load_operand(lhs);
+        self.emit_acc_to_secondary();
+        self.emit_load_operand(rhs);
+        self.emit_float_binop_impl(mnemonic, ty);
+        self.emit_store_result(dest);
+    }
+
+    /// Get the instruction mnemonic for a float binary op.
+    /// x86: "add"/"sub"/"mul"/"div", ARM/RISC-V: "fadd"/"fsub"/"fmul"/"fdiv"
+    fn emit_float_binop_mnemonic(&self, op: FloatOp) -> &'static str;
+
+    /// Emit the arch-specific float binop instructions: move acc+secondary to FP regs,
+    /// perform the operation with the given mnemonic, move result back to acc.
+    /// `ty` determines F32 vs F64 register width.
+    fn emit_float_binop_impl(&mut self, mnemonic: &str, ty: IrType);
 
     /// Emit an integer binary operation (all IrBinOp variants).
     /// The default `emit_binop` dispatches here for non-float types.
@@ -724,6 +741,111 @@ pub trait ArchCodegen {
 
     /// Frame size including alignment and saved registers.
     fn aligned_frame_size(&self, raw_space: i64) -> i64;
+
+    // ---- 128-bit binary operation dispatch (shared algorithm) ----
+
+    /// Prepare operands for a 128-bit binary operation: load lhs and rhs into
+    /// the arch-specific register pairs/positions for i128 binops.
+    /// x86: lhs→rax:rdx, rhs→rcx:rsi. ARM: lhs→x2:x3, rhs→x4:x5. RISC-V: lhs→t3:t4, rhs→t5:t6
+    fn emit_i128_prep_binop(&mut self, lhs: &Operand, rhs: &Operand);
+
+    /// Emit an i128 add-with-carry. Operands already prepared by emit_i128_prep_binop.
+    fn emit_i128_add(&mut self);
+
+    /// Emit an i128 subtract-with-borrow. Operands already prepared.
+    fn emit_i128_sub(&mut self);
+
+    /// Emit an i128 multiply. Operands already prepared.
+    fn emit_i128_mul(&mut self);
+
+    /// Emit an i128 bitwise AND. Operands already prepared.
+    fn emit_i128_and(&mut self);
+
+    /// Emit an i128 bitwise OR. Operands already prepared.
+    fn emit_i128_or(&mut self);
+
+    /// Emit an i128 bitwise XOR. Operands already prepared.
+    fn emit_i128_xor(&mut self);
+
+    /// Emit an i128 left shift. Operands already prepared.
+    fn emit_i128_shl(&mut self);
+
+    /// Emit an i128 logical right shift. Operands already prepared.
+    fn emit_i128_lshr(&mut self);
+
+    /// Emit an i128 arithmetic right shift. Operands already prepared.
+    fn emit_i128_ashr(&mut self);
+
+    /// Emit an i128 division/remainder via compiler-rt call.
+    /// `func_name` is one of "__divti3", "__udivti3", "__modti3", "__umodti3".
+    /// Operands already prepared; must marshal to call ABI and call.
+    fn emit_i128_divrem_call(&mut self, func_name: &str, lhs: &Operand, rhs: &Operand);
+
+    /// Store the i128 result pair to a destination value (after an i128 binop).
+    /// x86: store rax:rdx. ARM: store x0:x1. RISC-V: store t0:t1.
+    fn emit_i128_store_result(&mut self, dest: &Value);
+
+    /// Emit an i128 binary operation. Default dispatches to per-op arch primitives.
+    fn emit_i128_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand) {
+        match op {
+            IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem => {
+                let func_name = match op {
+                    IrBinOp::SDiv => "__divti3",
+                    IrBinOp::UDiv => "__udivti3",
+                    IrBinOp::SRem => "__modti3",
+                    IrBinOp::URem => "__umodti3",
+                    _ => unreachable!(),
+                };
+                self.emit_i128_divrem_call(func_name, lhs, rhs);
+            }
+            _ => {
+                self.emit_i128_prep_binop(lhs, rhs);
+                match op {
+                    IrBinOp::Add => self.emit_i128_add(),
+                    IrBinOp::Sub => self.emit_i128_sub(),
+                    IrBinOp::Mul => self.emit_i128_mul(),
+                    IrBinOp::And => self.emit_i128_and(),
+                    IrBinOp::Or => self.emit_i128_or(),
+                    IrBinOp::Xor => self.emit_i128_xor(),
+                    IrBinOp::Shl => self.emit_i128_shl(),
+                    IrBinOp::LShr => self.emit_i128_lshr(),
+                    IrBinOp::AShr => self.emit_i128_ashr(),
+                    _ => unreachable!(),
+                }
+            }
+        }
+        self.emit_i128_store_result(dest);
+    }
+
+    // ---- 128-bit comparison dispatch (shared algorithm) ----
+
+    /// Prepare operands for a 128-bit comparison (same as binop prep).
+    /// After this: lhs and rhs are in arch-specific pair registers.
+    fn emit_i128_prep_cmp(&mut self, lhs: &Operand, rhs: &Operand) {
+        self.emit_i128_prep_binop(lhs, rhs);
+    }
+
+    /// Emit an i128 equality comparison (Eq or Ne). Store 0 or 1 in result.
+    /// Algorithm: XOR both halves, OR the results, check zero/nonzero.
+    fn emit_i128_cmp_eq(&mut self, is_ne: bool);
+
+    /// Emit an ordered i128 comparison (Slt, Sle, Sgt, Sge, Ult, Ule, Ugt, Uge).
+    /// Algorithm: compare high halves first, if equal compare low halves (unsigned).
+    fn emit_i128_cmp_ordered(&mut self, op: IrCmpOp);
+
+    /// Store the i128 comparison result (single integer 0/1) to dest.
+    fn emit_i128_cmp_store_result(&mut self, dest: &Value);
+
+    /// Emit an i128 comparison. Default dispatches Eq/Ne vs ordered to primitives.
+    fn emit_i128_cmp(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand) {
+        self.emit_i128_prep_cmp(lhs, rhs);
+        match op {
+            IrCmpOp::Eq => self.emit_i128_cmp_eq(false),
+            IrCmpOp::Ne => self.emit_i128_cmp_eq(true),
+            _ => self.emit_i128_cmp_ordered(op),
+        }
+        self.emit_i128_cmp_store_result(dest);
+    }
 
     /// Emit an X86 SSE operation. Default is no-op (non-x86 targets).
     fn emit_x86_sse_op(&mut self, _dest: &Option<Value>, _op: &X86SseOpKind, _dest_ptr: &Option<Value>, _args: &[Operand]) {}

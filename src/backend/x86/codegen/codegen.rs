@@ -467,112 +467,6 @@ impl X86Codegen {
         self.state.emit("    popq %rdx");
     }
 
-    /// Emit 128-bit binary operation.
-    /// Convention: lhs in %rax:%rdx (low:high), rhs pushed onto stack.
-    /// Result in %rax:%rdx, then stored to 16-byte dest slot.
-    fn emit_binop_i128(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
-        let _is_unsigned = ty.is_unsigned();
-        match op {
-            IrBinOp::Add => {
-                self.prep_i128_binop(lhs, rhs);
-                self.state.emit("    addq %rcx, %rax");
-                self.state.emit("    adcq %rsi, %rdx");
-            }
-            IrBinOp::Sub => {
-                self.prep_i128_binop(lhs, rhs);
-                self.state.emit("    subq %rcx, %rax");
-                self.state.emit("    sbbq %rsi, %rdx");
-            }
-            IrBinOp::Mul => {
-                self.operand_to_rax_rdx(lhs);
-                self.state.emit("    pushq %rdx");  // a_hi
-                self.state.emit("    pushq %rax");  // a_lo
-                self.operand_to_rax_rdx(rhs);
-                self.state.emit("    movq %rax, %rcx");   // rcx = b_lo
-                self.state.emit("    movq %rdx, %rsi");   // rsi = b_hi
-                self.state.emit("    popq %rax");          // rax = a_lo
-                self.state.emit("    popq %rdi");          // rdi = a_hi
-                self.state.emit("    movq %rdi, %r8");
-                self.state.emit("    imulq %rcx, %r8");    // r8 = a_hi * b_lo
-                self.state.emit("    movq %rax, %r9");
-                self.state.emit("    imulq %rsi, %r9");    // r9 = a_lo * b_hi
-                self.state.emit("    mulq %rcx");          // rdx:rax = a_lo * b_lo
-                self.state.emit("    addq %r8, %rdx");
-                self.state.emit("    addq %r9, %rdx");
-            }
-            IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem => {
-                let func_name = match op {
-                    IrBinOp::SDiv => "__divti3",
-                    IrBinOp::UDiv => "__udivti3",
-                    IrBinOp::SRem => "__modti3",
-                    IrBinOp::URem => "__umodti3",
-                    _ => unreachable!(),
-                };
-                self.operand_to_rax_rdx(rhs);
-                self.state.emit("    pushq %rdx");
-                self.state.emit("    pushq %rax");
-                self.operand_to_rax_rdx(lhs);
-                self.state.emit("    movq %rax, %rdi");
-                self.state.emit("    movq %rdx, %rsi");
-                self.state.emit("    popq %rdx");
-                self.state.emit("    popq %rcx");
-                self.state.emit(&format!("    call {}@PLT", func_name));
-            }
-            IrBinOp::And => {
-                self.prep_i128_binop(lhs, rhs);
-                self.state.emit("    andq %rcx, %rax");
-                self.state.emit("    andq %rsi, %rdx");
-            }
-            IrBinOp::Or => {
-                self.prep_i128_binop(lhs, rhs);
-                self.state.emit("    orq %rcx, %rax");
-                self.state.emit("    orq %rsi, %rdx");
-            }
-            IrBinOp::Xor => {
-                self.prep_i128_binop(lhs, rhs);
-                self.state.emit("    xorq %rcx, %rax");
-                self.state.emit("    xorq %rsi, %rdx");
-            }
-            IrBinOp::Shl => {
-                self.operand_to_rax_rdx(rhs);
-                self.state.emit("    movq %rax, %rcx");
-                self.operand_to_rax_rdx(lhs);
-                self.state.emit("    shldq %cl, %rax, %rdx");
-                self.state.emit("    shlq %cl, %rax");
-                self.state.emit("    testb $64, %cl");
-                self.state.emit("    je 1f");
-                self.state.emit("    movq %rax, %rdx");
-                self.state.emit("    xorq %rax, %rax");
-                self.state.emit("1:");
-            }
-            IrBinOp::LShr => {
-                self.operand_to_rax_rdx(rhs);
-                self.state.emit("    movq %rax, %rcx");
-                self.operand_to_rax_rdx(lhs);
-                self.state.emit("    shrdq %cl, %rdx, %rax");
-                self.state.emit("    shrq %cl, %rdx");
-                self.state.emit("    testb $64, %cl");
-                self.state.emit("    je 1f");
-                self.state.emit("    movq %rdx, %rax");
-                self.state.emit("    xorq %rdx, %rdx");
-                self.state.emit("1:");
-            }
-            IrBinOp::AShr => {
-                self.operand_to_rax_rdx(rhs);
-                self.state.emit("    movq %rax, %rcx");
-                self.operand_to_rax_rdx(lhs);
-                self.state.emit("    shrdq %cl, %rdx, %rax");
-                self.state.emit("    sarq %cl, %rdx");
-                self.state.emit("    testb $64, %cl");
-                self.state.emit("    je 1f");
-                self.state.emit("    movq %rdx, %rax");
-                self.state.emit("    sarq $63, %rdx");
-                self.state.emit("1:");
-            }
-        }
-        self.store_rax_rdx_to(dest);
-    }
-
     /// Load an operand value into any GP register (returned as string).
     /// Uses rcx as the scratch register.
     fn operand_to_reg(&mut self, op: &Operand, reg: &str) {
@@ -1383,7 +1277,7 @@ impl ArchCodegen for X86Codegen {
     /// Override emit_binop to handle 128-bit integer ops on x86-64.
     fn emit_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
         if Self::is_i128_type(ty) {
-            self.emit_binop_i128(dest, op, lhs, rhs, ty);
+            self.emit_i128_binop(dest, op, lhs, rhs);
             return;
         }
         if ty.is_float() {
@@ -1395,31 +1289,7 @@ impl ArchCodegen for X86Codegen {
         self.emit_int_binop(dest, op, lhs, rhs, ty);
     }
 
-    fn emit_float_binop(&mut self, dest: &Value, op: FloatOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
-        let (mov_to_xmm, mov_from_xmm) = if ty == IrType::F32 {
-            ("movd %eax, %xmm0", "movd %xmm0, %eax")
-        } else {
-            ("movq %rax, %xmm0", "movq %xmm0, %rax")
-        };
-        let mov_to_xmm1 = if ty == IrType::F32 { "movd %eax, %xmm1" } else { "movq %rax, %xmm1" };
-        self.operand_to_rax(lhs);
-        self.state.emit(&format!("    {}", mov_to_xmm));
-        self.state.emit("    pushq %rax");
-        self.operand_to_rax(rhs);
-        self.state.emit(&format!("    {}", mov_to_xmm1));
-        self.state.emit("    popq %rax");
-        // F128 uses F64 instructions (long double computed at double precision)
-        let suffix = if ty == IrType::F64 || ty == IrType::F128 { "sd" } else { "ss" };
-        let mnemonic = match op {
-            FloatOp::Add => "add",
-            FloatOp::Sub => "sub",
-            FloatOp::Mul => "mul",
-            FloatOp::Div => "div",
-        };
-        self.state.emit(&format!("    {}{} %xmm1, %xmm0", mnemonic, suffix));
-        self.state.emit(&format!("    {}", mov_from_xmm));
-        self.store_rax_to(dest);
-    }
+    // emit_float_binop uses the shared default implementation
 
     fn emit_int_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
         self.operand_to_rax(lhs);
@@ -1511,60 +1381,7 @@ impl ArchCodegen for X86Codegen {
 
     fn emit_cmp(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
         if Self::is_i128_type(ty) {
-            // 128-bit comparison: compare high halves first, then low
-            // lhs in rax:rdx, rhs in rcx:rsi
-            self.operand_to_rax_rdx(lhs);
-            self.state.emit("    pushq %rdx");  // lhs high
-            self.state.emit("    pushq %rax");  // lhs low
-            self.operand_to_rax_rdx(rhs);
-            self.state.emit("    movq %rax, %rcx");  // rhs low
-            self.state.emit("    movq %rdx, %rsi");  // rhs high
-            self.state.emit("    popq %rax");         // lhs low
-            self.state.emit("    popq %rdx");         // lhs high
-            // For eq/ne: both halves must match
-            // For ordered: compare high first, if equal compare low
-            match op {
-                IrCmpOp::Eq => {
-                    self.state.emit("    xorq %rcx, %rax");   // low diff
-                    self.state.emit("    xorq %rsi, %rdx");   // high diff
-                    self.state.emit("    orq %rdx, %rax");    // combine
-                    self.state.emit("    sete %al");
-                    self.state.emit("    movzbq %al, %rax");
-                }
-                IrCmpOp::Ne => {
-                    self.state.emit("    xorq %rcx, %rax");
-                    self.state.emit("    xorq %rsi, %rdx");
-                    self.state.emit("    orq %rdx, %rax");
-                    self.state.emit("    setne %al");
-                    self.state.emit("    movzbq %al, %rax");
-                }
-                _ => {
-                    // Ordered comparison: cmp high, branch if not equal, else cmp low
-                    self.state.emit("    cmpq %rsi, %rdx");   // cmp lhs_hi, rhs_hi
-                    let set_hi = match op {
-                        IrCmpOp::Slt | IrCmpOp::Sle => "setl",
-                        IrCmpOp::Sgt | IrCmpOp::Sge => "setg",
-                        IrCmpOp::Ult | IrCmpOp::Ule => "setb",
-                        IrCmpOp::Ugt | IrCmpOp::Uge => "seta",
-                        _ => unreachable!(),
-                    };
-                    self.state.emit(&format!("    {} %r8b", set_hi));  // result if high differs
-                    self.state.emit("    jne 1f");
-                    // High halves equal: compare low halves (always unsigned for low)
-                    self.state.emit("    cmpq %rcx, %rax");
-                    let set_lo = match op {
-                        IrCmpOp::Slt | IrCmpOp::Ult => "setb",
-                        IrCmpOp::Sle | IrCmpOp::Ule => "setbe",
-                        IrCmpOp::Sgt | IrCmpOp::Ugt => "seta",
-                        IrCmpOp::Sge | IrCmpOp::Uge => "setae",
-                        _ => unreachable!(),
-                    };
-                    self.state.emit(&format!("    {} %r8b", set_lo));
-                    self.state.emit("1:");
-                    self.state.emit("    movzbq %r8b, %rax");
-                }
-            }
-            self.store_rax_to(dest);
+            self.emit_i128_cmp(dest, op, lhs, rhs);
             return;
         }
         if ty.is_float() {
@@ -2283,13 +2100,183 @@ impl ArchCodegen for X86Codegen {
     }
 
     fn emit_copy_i128(&mut self, dest: &Value, src: &Operand) {
-        // 128-bit copy: load src into rax:rdx, store to dest
         self.operand_to_rax_rdx(src);
         self.store_rax_rdx_to(dest);
     }
 
     fn emit_x86_sse_op(&mut self, dest: &Option<Value>, op: &X86SseOpKind, dest_ptr: &Option<Value>, args: &[Operand]) {
         self.emit_x86_sse_op_impl(dest, op, dest_ptr, args);
+    }
+
+    // ---- Float binop primitives ----
+
+    fn emit_float_binop_mnemonic(&self, op: FloatOp) -> &'static str {
+        match op {
+            FloatOp::Add => "add",
+            FloatOp::Sub => "sub",
+            FloatOp::Mul => "mul",
+            FloatOp::Div => "div",
+        }
+    }
+
+    fn emit_float_binop_impl(&mut self, mnemonic: &str, ty: IrType) {
+        // secondary = lhs (pushed to stack), acc = rhs
+        let (mov_to_xmm0, mov_from_xmm0) = if ty == IrType::F32 {
+            ("movd %eax, %xmm0", "movd %xmm0, %eax")
+        } else {
+            ("movq %rax, %xmm0", "movq %xmm0, %rax")
+        };
+        let mov_to_xmm1 = if ty == IrType::F32 { "movd %eax, %xmm1" } else { "movq %rax, %xmm1" };
+        // rhs is in rax (acc), lhs was pushed (secondary)
+        self.state.emit(&format!("    {}", mov_to_xmm1)); // rhs -> xmm1
+        self.state.emit("    popq %rax"); // lhs from stack
+        self.state.emit(&format!("    {}", mov_to_xmm0)); // lhs -> xmm0
+        let suffix = if ty == IrType::F64 || ty == IrType::F128 { "sd" } else { "ss" };
+        self.state.emit(&format!("    {}{} %xmm1, %xmm0", mnemonic, suffix));
+        self.state.emit(&format!("    {}", mov_from_xmm0));
+    }
+
+    // ---- i128 binop primitives ----
+
+    fn emit_i128_prep_binop(&mut self, lhs: &Operand, rhs: &Operand) {
+        self.prep_i128_binop(lhs, rhs);
+    }
+
+    fn emit_i128_add(&mut self) {
+        self.state.emit("    addq %rcx, %rax");
+        self.state.emit("    adcq %rsi, %rdx");
+    }
+
+    fn emit_i128_sub(&mut self) {
+        self.state.emit("    subq %rcx, %rax");
+        self.state.emit("    sbbq %rsi, %rdx");
+    }
+
+    fn emit_i128_mul(&mut self) {
+        // After prep: lhs in rax:rdx, rhs in rcx:rsi
+        // Save to stack and rearrange for widening multiply
+        self.state.emit("    pushq %rdx");  // a_hi
+        self.state.emit("    pushq %rax");  // a_lo
+        self.state.emit("    movq %rcx, %r8"); // r8 = b_lo (from prep rhs low)
+        self.state.emit("    movq %rsi, %r9"); // r9 = b_hi (from prep rhs high)
+        self.state.emit("    popq %rax");       // rax = a_lo
+        self.state.emit("    popq %rdi");       // rdi = a_hi
+        self.state.emit("    movq %rdi, %rcx");
+        self.state.emit("    imulq %r8, %rcx");    // rcx = a_hi * b_lo
+        self.state.emit("    movq %rax, %rsi");
+        self.state.emit("    imulq %r9, %rsi");    // rsi = a_lo * b_hi
+        self.state.emit("    mulq %r8");           // rdx:rax = a_lo * b_lo
+        self.state.emit("    addq %rcx, %rdx");
+        self.state.emit("    addq %rsi, %rdx");
+    }
+
+    fn emit_i128_and(&mut self) {
+        self.state.emit("    andq %rcx, %rax");
+        self.state.emit("    andq %rsi, %rdx");
+    }
+
+    fn emit_i128_or(&mut self) {
+        self.state.emit("    orq %rcx, %rax");
+        self.state.emit("    orq %rsi, %rdx");
+    }
+
+    fn emit_i128_xor(&mut self) {
+        self.state.emit("    xorq %rcx, %rax");
+        self.state.emit("    xorq %rsi, %rdx");
+    }
+
+    fn emit_i128_shl(&mut self) {
+        // After prep: value in rax:rdx, shift amount low bits in rcx
+        // But prep puts rhs in rcx:rsi - we need shift amount in cl
+        self.state.emit("    shldq %cl, %rax, %rdx");
+        self.state.emit("    shlq %cl, %rax");
+        self.state.emit("    testb $64, %cl");
+        self.state.emit("    je 1f");
+        self.state.emit("    movq %rax, %rdx");
+        self.state.emit("    xorq %rax, %rax");
+        self.state.emit("1:");
+    }
+
+    fn emit_i128_lshr(&mut self) {
+        self.state.emit("    shrdq %cl, %rdx, %rax");
+        self.state.emit("    shrq %cl, %rdx");
+        self.state.emit("    testb $64, %cl");
+        self.state.emit("    je 1f");
+        self.state.emit("    movq %rdx, %rax");
+        self.state.emit("    xorq %rdx, %rdx");
+        self.state.emit("1:");
+    }
+
+    fn emit_i128_ashr(&mut self) {
+        self.state.emit("    shrdq %cl, %rdx, %rax");
+        self.state.emit("    sarq %cl, %rdx");
+        self.state.emit("    testb $64, %cl");
+        self.state.emit("    je 1f");
+        self.state.emit("    movq %rdx, %rax");
+        self.state.emit("    sarq $63, %rdx");
+        self.state.emit("1:");
+    }
+
+    fn emit_i128_divrem_call(&mut self, func_name: &str, lhs: &Operand, rhs: &Operand) {
+        // x86-64 SysV: args in rdi:rsi (lhs), rdx:rcx (rhs)
+        self.operand_to_rax_rdx(rhs);
+        self.state.emit("    pushq %rdx");
+        self.state.emit("    pushq %rax");
+        self.operand_to_rax_rdx(lhs);
+        self.state.emit("    movq %rax, %rdi");
+        self.state.emit("    movq %rdx, %rsi");
+        self.state.emit("    popq %rdx");
+        self.state.emit("    popq %rcx");
+        self.state.emit(&format!("    call {}@PLT", func_name));
+    }
+
+    fn emit_i128_store_result(&mut self, dest: &Value) {
+        self.store_rax_rdx_to(dest);
+    }
+
+    // ---- i128 cmp primitives ----
+
+    fn emit_i128_cmp_eq(&mut self, is_ne: bool) {
+        // After prep: lhs in rax:rdx, rhs in rcx:rsi
+        self.state.emit("    xorq %rcx, %rax");   // low diff
+        self.state.emit("    xorq %rsi, %rdx");   // high diff
+        self.state.emit("    orq %rdx, %rax");     // combine
+        if is_ne {
+            self.state.emit("    setne %al");
+        } else {
+            self.state.emit("    sete %al");
+        }
+        self.state.emit("    movzbq %al, %rax");
+    }
+
+    fn emit_i128_cmp_ordered(&mut self, op: IrCmpOp) {
+        // After prep: lhs in rax:rdx, rhs in rcx:rsi
+        self.state.emit("    cmpq %rsi, %rdx");   // cmp lhs_hi, rhs_hi
+        let set_hi = match op {
+            IrCmpOp::Slt | IrCmpOp::Sle => "setl",
+            IrCmpOp::Sgt | IrCmpOp::Sge => "setg",
+            IrCmpOp::Ult | IrCmpOp::Ule => "setb",
+            IrCmpOp::Ugt | IrCmpOp::Uge => "seta",
+            _ => unreachable!(),
+        };
+        self.state.emit(&format!("    {} %r8b", set_hi));
+        self.state.emit("    jne 1f");
+        // High halves equal: compare low halves (always unsigned)
+        self.state.emit("    cmpq %rcx, %rax");
+        let set_lo = match op {
+            IrCmpOp::Slt | IrCmpOp::Ult => "setb",
+            IrCmpOp::Sle | IrCmpOp::Ule => "setbe",
+            IrCmpOp::Sgt | IrCmpOp::Ugt => "seta",
+            IrCmpOp::Sge | IrCmpOp::Uge => "setae",
+            _ => unreachable!(),
+        };
+        self.state.emit(&format!("    {} %r8b", set_lo));
+        self.state.emit("1:");
+        self.state.emit("    movzbq %r8b, %rax");
+    }
+
+    fn emit_i128_cmp_store_result(&mut self, dest: &Value) {
+        self.store_rax_to(dest);
     }
 }
 

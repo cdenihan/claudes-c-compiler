@@ -17,7 +17,14 @@ Completed items:
   now use the shared default (no overrides needed).
 - emit_binop decomposed: default dispatches float→emit_float_binop, int→emit_int_binop.
   x86-64 overrides emit_binop for 128-bit integer arithmetic.
-  Each backend provides arch-specific emit_float_binop and emit_int_binop.
+- emit_float_binop: Shared default loads lhs/rhs, calls emit_float_binop_impl(mnemonic, ty).
+  Each backend provides emit_float_binop_mnemonic() and emit_float_binop_impl().
+- emit_i128_binop: Shared default dispatches to per-op primitives (emit_i128_add, emit_i128_sub,
+  emit_i128_mul, emit_i128_and/or/xor, emit_i128_shl/lshr/ashr, emit_i128_divrem_call).
+  Division/remainder func name selection is shared.
+- emit_i128_cmp: Shared default dispatches Eq/Ne to emit_i128_cmp_eq(is_ne) and ordered
+  comparisons to emit_i128_cmp_ordered(op). Algorithm structure (XOR+OR for equality,
+  high-then-low for ordered) is shared.
 - emit_inline_asm: Shared InlineAsmEmitter trait + emit_inline_asm_common() function
   extracts the 4-phase operand handling framework (classify constraints, assign registers,
   resolve tied/+ operands, build GCC numbering, load inputs, emit template, store outputs).
