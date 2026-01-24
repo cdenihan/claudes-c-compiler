@@ -398,8 +398,14 @@ impl Lowerer {
             Expr::Assign(lhs, _, _) | Expr::CompoundAssign(_, lhs, _, _) => {
                 self.expr_ctype(lhs)
             }
-            Expr::Conditional(_, then_expr, _, _) => {
-                self.expr_ctype(then_expr)
+            Expr::Conditional(_, then_expr, else_expr, _) => {
+                let then_ct = self.expr_ctype(then_expr);
+                if then_ct.is_complex() {
+                    then_ct
+                } else {
+                    let else_ct = self.expr_ctype(else_expr);
+                    if else_ct.is_complex() { else_ct } else { then_ct }
+                }
             }
             Expr::MemberAccess(base, field, _) => {
                 // Try to resolve struct field type
@@ -434,8 +440,27 @@ impl Lowerer {
             Expr::CompoundLiteral(type_spec, _, _) => {
                 self.type_spec_to_ctype(type_spec)
             }
+            Expr::VaArg(_, type_spec, _) => {
+                self.type_spec_to_ctype(type_spec)
+            }
+            Expr::StmtExpr(compound, _) => {
+                // Statement expression: type is the type of the last expression in the block
+                if let Some(last) = compound.items.last() {
+                    if let BlockItem::Statement(Stmt::Expr(Some(expr))) = last {
+                        return self.expr_ctype(expr);
+                    }
+                }
+                CType::Int
+            }
+            Expr::AddressOf(inner, _) => {
+                let inner_ct = self.expr_ctype(inner);
+                CType::Pointer(Box::new(inner_ct))
+            }
             _ => {
-                // Fallback: use the IR type to approximate
+                // Fallback: try get_expr_ctype for more precise type info
+                if let Some(ct) = self.get_expr_ctype(expr) {
+                    return ct;
+                }
                 CType::Int
             }
         }
@@ -511,30 +536,45 @@ impl Lowerer {
     /// Determine the common complex type for binary operations.
     /// Rules: ComplexLongDouble > ComplexDouble > ComplexFloat
     pub(super) fn common_complex_type(&self, a: &CType, b: &CType) -> CType {
-        let a_complex = match a {
-            CType::ComplexLongDouble => Some(CType::ComplexLongDouble),
-            CType::ComplexDouble => Some(CType::ComplexDouble),
-            CType::ComplexFloat => Some(CType::ComplexFloat),
-            CType::LongDouble => Some(CType::ComplexLongDouble),
-            CType::Double => Some(CType::ComplexDouble),
-            CType::Float => Some(CType::ComplexFloat),
-            _ => Some(CType::ComplexDouble), // integers promote to complex double
-        };
-        let b_complex = match b {
-            CType::ComplexLongDouble => Some(CType::ComplexLongDouble),
-            CType::ComplexDouble => Some(CType::ComplexDouble),
-            CType::ComplexFloat => Some(CType::ComplexFloat),
-            CType::LongDouble => Some(CType::ComplexLongDouble),
-            CType::Double => Some(CType::ComplexDouble),
-            CType::Float => Some(CType::ComplexFloat),
-            _ => Some(CType::ComplexDouble),
+        // Per C11 6.3.1.8: if one operand is complex and the other is real/integer,
+        // the result type is determined by the "usual arithmetic conversions" applied
+        // to the real type of the complex operand and the type of the other operand.
+        // Integer types smaller than double don't force promotion to ComplexDouble;
+        // instead, the result keeps the complex type unless the other operand is wider.
+        let rank_of = |ct: &CType| -> u8 {
+            match ct {
+                CType::ComplexLongDouble | CType::LongDouble => 3,
+                CType::ComplexDouble | CType::Double => 2,
+                CType::ComplexFloat | CType::Float => 1,
+                // Integer types: C standard says integer types convert to double
+                // when combined with a complex type that is double or wider,
+                // but when combined with complex float, they convert to float.
+                // However, long long / unsigned long may exceed float precision.
+                // For simplicity and correctness with most tests, we use the
+                // C rule: "the corresponding real type of the complex" wins unless
+                // the real operand has higher floating rank.
+                CType::Long | CType::ULong | CType::LongLong | CType::ULongLong => 0,
+                _ => 0, // char, short, int, uint -> rank 0 (no floating rank)
+            }
         };
 
-        // Pick the wider type
-        match (a_complex, b_complex) {
-            (Some(CType::ComplexLongDouble), _) | (_, Some(CType::ComplexLongDouble)) => CType::ComplexLongDouble,
-            (Some(CType::ComplexDouble), _) | (_, Some(CType::ComplexDouble)) => CType::ComplexDouble,
-            _ => CType::ComplexFloat,
+        let a_rank = rank_of(a);
+        let b_rank = rank_of(b);
+
+        // Result complex type is the wider of the two ranks.
+        // If one is complex and the other is integer (rank 0), the complex type wins.
+        let max_rank = a_rank.max(b_rank);
+        match max_rank {
+            3 => CType::ComplexLongDouble,
+            2 => CType::ComplexDouble,
+            1 => CType::ComplexFloat,
+            _ => {
+                // Both are integer types - promote to ComplexDouble (C default)
+                // But check if one is already complex
+                if a.is_complex() { return a.clone(); }
+                if b.is_complex() { return b.clone(); }
+                CType::ComplexDouble
+            }
         }
     }
 

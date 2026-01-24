@@ -8,10 +8,13 @@ use crate::backend::codegen_shared::*;
 pub struct X86Codegen {
     state: CodegenState,
     current_return_type: IrType,
-    /// For variadic functions: number of named integer/pointer parameters
+    /// For variadic functions: number of named integer/pointer parameters (excluding long double)
     num_named_int_params: usize,
-    /// For variadic functions: number of named floating-point parameters
+    /// For variadic functions: number of named float/double parameters (excluding long double)
     num_named_fp_params: usize,
+    /// For variadic functions: total bytes of named parameters that are always stack-passed
+    /// (e.g. long double = 16 bytes each, struct params passed by value on stack)
+    num_named_stack_bytes: usize,
     /// For variadic functions: stack offset of the register save area (negative from rbp)
     reg_save_area_offset: i64,
     /// Whether the current function is variadic
@@ -25,6 +28,7 @@ impl X86Codegen {
             current_return_type: IrType::I64,
             num_named_int_params: 0,
             num_named_fp_params: 0,
+            num_named_stack_bytes: 0,
             reg_save_area_offset: 0,
             is_variadic: false,
         }
@@ -367,12 +371,21 @@ impl ArchCodegen for X86Codegen {
     fn calculate_stack_space(&mut self, func: &IrFunction) -> i64 {
         // Track variadic function info
         self.is_variadic = func.is_variadic;
+        // Count named params by classification.
+        // On x86-64 System V ABI:
+        //   - long double (F128/x87) is ALWAYS passed on stack (16 bytes each)
+        //   - float/double passed in XMM registers (up to 8)
+        //   - integer/pointer passed in GP registers (up to 6)
         self.num_named_int_params = func.params.iter()
             .filter(|p| !p.ty.is_float())
             .count();
         self.num_named_fp_params = func.params.iter()
-            .filter(|p| p.ty.is_float())
+            .filter(|p| p.ty.is_float() && !p.ty.is_long_double())
             .count();
+        // Count stack bytes for always-stack-passed named params (long double = 16 bytes)
+        self.num_named_stack_bytes = func.params.iter()
+            .filter(|p| p.ty.is_long_double())
+            .count() * 16;
 
         let mut space = calculate_stack_space_common(&mut self.state, func, 0, |space, alloc_size| {
             // x86 uses negative offsets from rbp
@@ -1131,13 +1144,17 @@ impl ArchCodegen for X86Codegen {
         self.state.emit(&format!("    movl ${}, (%rax)", gp_offset));
         // fp_offset = 48 + min(num_named_fp_params, 8) * 16 (skip named FP params in XMM save area)
         // Each XMM register occupies 16 bytes in the register save area
+        // Note: long double (F128) is NOT included here - it's always stack-passed via x87
         let fp_offset = 48 + self.num_named_fp_params.min(8) * 16;
         self.state.emit(&format!("    movl ${}, 4(%rax)", fp_offset));
-        // overflow_arg_area = rbp + 16 + num_stack_named_params * 8
-        // Stack-passed named params are those beyond the 6 GP register params and 8 FP register params
+        // overflow_arg_area = rbp + 16 + stack_bytes_for_named_params
+        // Stack-passed named params include:
+        //   - GP params beyond 6 registers (8 bytes each)
+        //   - FP params beyond 8 XMM registers (8 bytes each)
+        //   - long double params (always stack-passed, 16 bytes each)
         let num_stack_int = if self.num_named_int_params > 6 { self.num_named_int_params - 6 } else { 0 };
         let num_stack_fp = if self.num_named_fp_params > 8 { self.num_named_fp_params - 8 } else { 0 };
-        let overflow_offset = 16 + (num_stack_int + num_stack_fp) * 8;
+        let overflow_offset = 16 + (num_stack_int + num_stack_fp) * 8 + self.num_named_stack_bytes;
         self.state.emit(&format!("    leaq {}(%rbp), %rcx", overflow_offset));
         self.state.emit("    movq %rcx, 8(%rax)");
         // reg_save_area = address of the saved registers in the prologue
