@@ -505,6 +505,7 @@ impl Lowerer {
             base_ty
         };
 
+        self.emitted_global_names.insert(label.clone());
         self.module.globals.push(IrGlobal {
             name: label.clone(),
             ty: global_ty,

@@ -914,11 +914,14 @@ impl Lowerer {
             }
             Expr::UnaryOp(UnaryOp::Neg, inner, _) | Expr::UnaryOp(UnaryOp::Plus, inner, _)
             | Expr::UnaryOp(UnaryOp::BitNot, inner, _) => {
-                let inner_ct = self.expr_ctype(inner);
-                if inner_ct.is_complex() {
-                    return IrType::Ptr;
-                }
                 let inner_ty = self.get_expr_type(inner);
+                // Only check for complex types if the inner type is Ptr (which complex uses)
+                if inner_ty == IrType::Ptr {
+                    let inner_ct = self.expr_ctype(inner);
+                    if inner_ct.is_complex() {
+                        return IrType::Ptr;
+                    }
+                }
                 if inner_ty.is_float() {
                     return inner_ty;
                 }
@@ -933,16 +936,6 @@ impl Lowerer {
             }
             Expr::BinaryOp(op, lhs, rhs, _) => {
                 match op {
-                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
-                        let lct = self.expr_ctype(lhs);
-                        let rct = self.expr_ctype(rhs);
-                        if lct.is_complex() || rct.is_complex() {
-                            return IrType::Ptr;
-                        }
-                    }
-                    _ => {}
-                }
-                match op {
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
                     | BinOp::LogicalAnd | BinOp::LogicalOr => IrType::I64,
                     BinOp::Shl | BinOp::Shr => {
@@ -956,6 +949,17 @@ impl Lowerer {
                     _ => {
                         let lty = self.get_expr_type(lhs);
                         let rty = self.get_expr_type(rhs);
+                        // Only check complex types if either operand is Ptr
+                        // (complex types are represented as Ptr in IR)
+                        if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) {
+                            if lty == IrType::Ptr || rty == IrType::Ptr {
+                                let lct = self.expr_ctype(lhs);
+                                let rct = self.expr_ctype(rhs);
+                                if lct.is_complex() || rct.is_complex() {
+                                    return IrType::Ptr;
+                                }
+                            }
+                        }
                         if lty == IrType::F128 || rty == IrType::F128 {
                             IrType::F128
                         } else if lty == IrType::F64 || rty == IrType::F64 {
@@ -1501,11 +1505,25 @@ impl Lowerer {
     /// Handles both inline field definitions and tag-only forward references.
     fn struct_union_layout(&self, ts: &TypeSpecifier) -> Option<StructLayout> {
         match ts {
-            TypeSpecifier::Struct(_, Some(fields), is_packed, pragma_pack)
-            | TypeSpecifier::Union(_, Some(fields), is_packed, pragma_pack) => {
-                let is_union = matches!(ts, TypeSpecifier::Union(..));
+            TypeSpecifier::Struct(tag, Some(fields), is_packed, pragma_pack) => {
+                // Use cached layout for tagged structs
+                if let Some(tag) = tag {
+                    if let Some(layout) = self.struct_layouts.get(&format!("struct.{}", tag)) {
+                        return Some(layout.clone());
+                    }
+                }
                 let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
-                Some(self.compute_struct_union_layout_packed(fields, is_union, max_field_align))
+                Some(self.compute_struct_union_layout_packed(fields, false, max_field_align))
+            }
+            TypeSpecifier::Union(tag, Some(fields), is_packed, pragma_pack) => {
+                // Use cached layout for tagged unions
+                if let Some(tag) = tag {
+                    if let Some(layout) = self.struct_layouts.get(&format!("union.{}", tag)) {
+                        return Some(layout.clone());
+                    }
+                }
+                let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
+                Some(self.compute_struct_union_layout_packed(fields, true, max_field_align))
             }
             TypeSpecifier::Struct(Some(tag), None, _, _) =>
                 self.get_struct_union_layout_by_tag("struct", tag).cloned(),

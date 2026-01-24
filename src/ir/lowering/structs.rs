@@ -77,14 +77,26 @@ impl Lowerer {
     pub(super) fn get_struct_layout_for_type(&self, ts: &TypeSpecifier) -> Option<StructLayout> {
         let ts = self.resolve_type_spec(ts);
         match ts {
-            TypeSpecifier::Struct(_, Some(fields), is_packed, pragma_pack) => {
+            TypeSpecifier::Struct(tag, Some(fields), is_packed, pragma_pack) => {
+                // Use cached layout for tagged structs that have been registered
+                if let Some(tag) = tag {
+                    if let Some(layout) = self.struct_layouts.get(&format!("struct.{}", tag)) {
+                        return Some(layout.clone());
+                    }
+                }
                 let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
                 Some(self.compute_struct_union_layout_packed(&fields, false, max_field_align))
             }
             TypeSpecifier::Struct(Some(tag), None, _, _) => {
                 self.struct_layouts.get(&format!("struct.{}", tag)).cloned()
             }
-            TypeSpecifier::Union(_, Some(fields), is_packed, pragma_pack) => {
+            TypeSpecifier::Union(tag, Some(fields), is_packed, pragma_pack) => {
+                // Use cached layout for tagged unions that have been registered
+                if let Some(tag) = tag {
+                    if let Some(layout) = self.struct_layouts.get(&format!("union.{}", tag)) {
+                        return Some(layout.clone());
+                    }
+                }
                 let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
                 Some(self.compute_struct_union_layout_packed(&fields, true, max_field_align))
             }

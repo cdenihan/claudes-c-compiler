@@ -277,6 +277,9 @@ pub struct Lowerer {
     pub(super) var_ctypes: HashMap<String, CType>,
     /// Return CType for known functions (needed for complex function calls).
     pub(super) func_return_ctypes: HashMap<String, CType>,
+    /// Set of global variable names that have been emitted to module.globals.
+    /// Used for O(1) duplicate checking instead of linear scan.
+    pub(super) emitted_global_names: HashSet<String>,
 }
 
 impl Lowerer {
@@ -313,6 +316,7 @@ impl Lowerer {
             current_sret_ptr: None,
             var_ctypes: HashMap::new(),
             func_return_ctypes: HashMap::new(),
+            emitted_global_names: HashSet::new(),
         }
     }
 
@@ -1136,8 +1140,7 @@ impl Lowerer {
                 if declarator.init.is_none() {
                     // Check if this is a tentative definition (non-extern without init)
                     // that needs to be emitted because only an extern was previously tracked
-                    let already_emitted = self.module.globals.iter().any(|g| g.name == declarator.name);
-                    if already_emitted {
+                    if self.emitted_global_names.contains(&declarator.name) {
                         // Already defined in .data/.bss, skip duplicate
                         continue;
                     }
@@ -1146,6 +1149,7 @@ impl Lowerer {
                 } else {
                     // Has initializer: remove the previous zero-init/extern global and re-emit with init
                     self.module.globals.retain(|g| g.name != declarator.name);
+                    self.emitted_global_names.remove(&declarator.name);
                 }
             }
 
@@ -1205,6 +1209,7 @@ impl Lowerer {
                 _ => da.actual_alloc_size,
             };
 
+            self.emitted_global_names.insert(declarator.name.clone());
             self.module.globals.push(IrGlobal {
                 name: declarator.name.clone(),
                 ty: global_ty,

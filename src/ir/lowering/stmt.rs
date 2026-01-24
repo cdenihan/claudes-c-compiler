@@ -5,30 +5,39 @@ use super::lowering::{Lowerer, LocalInfo, GlobalInfo, DeclAnalysis, SwitchFrame,
 
 impl Lowerer {
     pub(super) fn lower_compound_stmt(&mut self, compound: &CompoundStmt) {
-        // Save current locals, static local names, const values, and enum constants
-        // for block scope restoration. Enum constants declared in this block should
-        // not be visible in outer scopes.
-        let saved_locals = self.locals.clone();
-        let saved_static_local_names = self.static_local_names.clone();
-        let saved_const_local_values = self.const_local_values.clone();
-        let saved_enum_constants = self.enum_constants.clone();
+        // Check if this block contains any declarations. If not, we can skip
+        // the expensive save/restore of scope state entirely.
+        let has_declarations = compound.items.iter().any(|item| matches!(item, BlockItem::Declaration(_)));
 
-        for item in &compound.items {
-            match item {
-                BlockItem::Declaration(decl) => {
-                    // Collect enum constants from declarations within this block
-                    self.collect_enum_constants(&decl.type_spec);
-                    self.lower_local_decl(decl);
+        if has_declarations {
+            // Save current scope state for restoration after block exit.
+            let saved_locals = self.locals.clone();
+            let saved_static_local_names = self.static_local_names.clone();
+            let saved_const_local_values = self.const_local_values.clone();
+            let saved_enum_constants = self.enum_constants.clone();
+
+            for item in &compound.items {
+                match item {
+                    BlockItem::Declaration(decl) => {
+                        self.collect_enum_constants(&decl.type_spec);
+                        self.lower_local_decl(decl);
+                    }
+                    BlockItem::Statement(stmt) => self.lower_stmt(stmt),
                 }
-                BlockItem::Statement(stmt) => self.lower_stmt(stmt),
+            }
+
+            self.locals = saved_locals;
+            self.static_local_names = saved_static_local_names;
+            self.const_local_values = saved_const_local_values;
+            self.enum_constants = saved_enum_constants;
+        } else {
+            // No declarations: just lower statements without scope overhead.
+            for item in &compound.items {
+                if let BlockItem::Statement(stmt) = item {
+                    self.lower_stmt(stmt);
+                }
             }
         }
-
-        // Restore outer scope locals, static local names, const values, and enum constants
-        self.locals = saved_locals;
-        self.static_local_names = saved_static_local_names;
-        self.const_local_values = saved_const_local_values;
-        self.enum_constants = saved_enum_constants;
     }
 
     pub(super) fn lower_local_decl(&mut self, decl: &Declaration) {
@@ -665,6 +674,7 @@ impl Lowerer {
             da.var_ty
         };
 
+        self.emitted_global_names.insert(static_name.clone());
         self.module.globals.push(IrGlobal {
             name: static_name.clone(),
             ty: global_ty,
@@ -1204,11 +1214,13 @@ impl Lowerer {
                 self.start_block(end_label);
             }
             Stmt::For(init, cond, inc, body, _span) => {
-                // Save locals for for-init scope (C99: for-init decl has its own scope)
-                let saved_locals = self.locals.clone();
-                let saved_static_local_names = self.static_local_names.clone();
-                let saved_const_local_values = self.const_local_values.clone();
-                let saved_enum_constants = self.enum_constants.clone();
+                // Only save/restore scope state if the for-init is a declaration
+                // (C99: for-init decl has its own scope). Skip expensive clone otherwise.
+                let has_decl_init = init.as_ref().map_or(false, |i| matches!(i.as_ref(), ForInit::Declaration(_)));
+                let saved_locals = if has_decl_init { Some(self.locals.clone()) } else { None };
+                let saved_static_local_names = if has_decl_init { Some(self.static_local_names.clone()) } else { None };
+                let saved_const_local_values = if has_decl_init { Some(self.const_local_values.clone()) } else { None };
+                let saved_enum_constants = if has_decl_init { Some(self.enum_constants.clone()) } else { None };
 
                 // Init
                 if let Some(init) = init {
@@ -1263,11 +1275,11 @@ impl Lowerer {
                 self.start_block(end_label);
 
                 // Restore locals, static local names, const values, and enum constants
-                // to exit for-init scope
-                self.locals = saved_locals;
-                self.static_local_names = saved_static_local_names;
-                self.const_local_values = saved_const_local_values;
-                self.enum_constants = saved_enum_constants;
+                // to exit for-init scope (only if we saved them)
+                if let Some(saved) = saved_locals { self.locals = saved; }
+                if let Some(saved) = saved_static_local_names { self.static_local_names = saved; }
+                if let Some(saved) = saved_const_local_values { self.const_local_values = saved; }
+                if let Some(saved) = saved_enum_constants { self.enum_constants = saved; }
             }
             Stmt::DoWhile(body, cond, _span) => {
                 let body_label = self.fresh_label("do_body");
