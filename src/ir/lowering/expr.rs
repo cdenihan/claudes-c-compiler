@@ -1819,6 +1819,20 @@ impl Lowerer {
                         // Real-to-complex: e.g., passing int to _Complex double param
                         val = self.real_to_complex(val, &arg_ct, &pctypes[i]);
                     }
+                } else if i < pctypes.len() && !pctypes[i].is_complex() {
+                    // Complex-to-scalar: extract real part and cast to parameter type
+                    let arg_ct = self.expr_ctype(a);
+                    if arg_ct.is_complex() {
+                        let ptr = self.operand_to_value(val);
+                        let real_part = self.load_complex_real(ptr, &arg_ct);
+                        let comp_ir_ty = Self::complex_component_ir_type(&arg_ct);
+                        let param_ty = param_types.as_ref()
+                            .and_then(|pt| pt.get(i).copied())
+                            .unwrap_or(comp_ir_ty);
+                        let cast_val = self.emit_implicit_cast(real_part, comp_ir_ty, param_ty);
+                        arg_types.push(param_ty);
+                        return cast_val;
+                    }
                 }
             }
 
