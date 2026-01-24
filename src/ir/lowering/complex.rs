@@ -878,12 +878,13 @@ impl Lowerer {
         for (i, (val, ty)) in arg_vals.iter().zip(arg_types.iter()).enumerate() {
             let ctype = pctypes.get(i);
             let should_decompose = match ctype {
-                Some(CType::ComplexDouble) => true,
-                _ => {
-                    // Also check if the arg_type is Ptr and the expression has complex type
+                Some(CType::ComplexDouble) | Some(CType::ComplexLongDouble) => true,
+                Some(_) => false, // param type is known but not a decomposed complex type
+                None => {
+                    // No param type info: check if the arg_type is Ptr and the expression has complex type
                     if *ty == IrType::Ptr && i < args.len() {
                         let arg_ct = self.expr_ctype(&args[i]);
-                        matches!(arg_ct, CType::ComplexDouble)
+                        matches!(arg_ct, CType::ComplexDouble | CType::ComplexLongDouble)
                     } else {
                         false
                     }

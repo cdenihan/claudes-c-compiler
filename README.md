@@ -56,6 +56,11 @@ A C compiler written from scratch in Rust, targeting x86-64, AArch64, and RISC-V
   - Constant expression evaluation for initializers
 
 ### Recent Additions
+- **_Complex long double argument passing**: Fixed `_Complex long double` ABI compliance.
+  Previously CLD values were passed by pointer instead of being decomposed into two F128
+  stack arguments (x87 extended format). Now both caller and callee decompose CLD params
+  into real/imag F128 parts with proper `fldl`/`fstpt` conversion. Also fixes `_Complex double`
+  to `_Complex long double` promotion which produced garbage values.
 - **Parser error exit codes and diagnostics**: Parser errors now cause non-zero exit code
   (previously the compiler silently continued with exit 0). Added warnings for implicit function
   declarations and undeclared identifiers. This fixes autoconf configure script compatibility -

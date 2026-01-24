@@ -966,7 +966,7 @@ impl Lowerer {
         }
         for (orig_idx, p) in func.params.iter().enumerate() {
             let resolved = self.resolve_type_spec(&p.type_spec).clone();
-            let is_complex_decomposed = matches!(resolved, TypeSpecifier::ComplexDouble);
+            let is_complex_decomposed = matches!(resolved, TypeSpecifier::ComplexDouble | TypeSpecifier::ComplexLongDouble);
             if is_complex_decomposed {
                 let ct = self.type_spec_to_ctype(&resolved);
                 let comp_ty = Self::complex_component_ir_type(&ct);
