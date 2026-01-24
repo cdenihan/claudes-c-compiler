@@ -56,6 +56,16 @@ A C compiler written from scratch in Rust, targeting x86-64, AArch64, and RISC-V
   - Constant expression evaluation for initializers
 
 ### Recent Additions
+- **Fix union pointer arithmetic with stale CType sizes**: Fixed pointer arithmetic on union
+  members accessed through forward-declared union pointers (e.g., `(&obj->ts) + 1`). The
+  `AddressOf` handler in `get_pointer_elem_size_from_expr` was using `get_expr_type().size()`
+  which returns 8 (pointer size) for all struct/union types since they map to `IrType::Ptr`,
+  instead of the actual `sizeof` the union. Also fixed `resolve_ctype_size` to always prefer
+  the authoritative `struct_layouts` HashMap over potentially stale `cached_size` values in
+  `CType` objects. This was the root cause of Redis server failing to start — the Lua 5.1
+  `getstr(ts)` macro does `(const char*)((ts) + 1)` to get string data after a `TString`
+  header, and the wrong stride (8 instead of 24) caused Lua to read type metadata as string
+  content, producing empty string keys in the globals table and crashing during sandbox setup.
 - **Global init nested struct pointer collection and address-of member chains**: Fixed two bugs
   in global/static initializer system. (1) Nested struct init lists with braced sub-initializers
   (e.g., `.interface = { .init = myInit }`) were not collecting pointer/function-pointer
@@ -200,7 +210,7 @@ A C compiler written from scratch in Rust, targeting x86-64, AArch64, and RISC-V
 | jq | PASS | All 12 tests pass |
 | sqlite | PARTIAL | Builds; 573/622 (92%) sqllogictest pass |
 | libjpeg-turbo | PASS | Builds; cjpeg/djpeg roundtrip and jpegtran pass |
-| redis | PARTIAL | Builds; redis-server --version and redis-cli work; server starts but Lua init fails |
+| redis | PASS | All tests pass (version, cli, SET/GET roundtrip) |
 | postgres | PARTIAL | Configure passes; build fails on missing SSE intrinsic builtins |
 
 ### What's Not Yet Implemented

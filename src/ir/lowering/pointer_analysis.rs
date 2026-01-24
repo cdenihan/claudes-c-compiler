@@ -194,14 +194,14 @@ impl Lowerer {
     }
 
     /// Resolve the actual size of a CType, handling forward-declared/self-referential
-    /// struct/union types that have cached_size=0. Looks up the struct layout by tag
-    /// name to get the real size.
+    /// struct/union types whose cached_size may be stale (0 or wrong).
+    /// For tagged structs/unions, always prefer the authoritative struct_layouts
+    /// HashMap which is updated when the full definition is encountered.
     pub(super) fn resolve_ctype_size(&self, ctype: &CType) -> usize {
-        let sz = ctype.size();
-        if sz > 0 {
-            return sz;
-        }
-        // For struct/union with size 0, try to look up the actual layout by tag name
+        // For tagged struct/union types, always look up the authoritative layout first.
+        // The CType's cached_size may be stale if the type was captured before the
+        // full definition was processed (e.g., forward-declared union embedded in
+        // another type's CType that was built before the union was fully defined).
         match ctype {
             CType::Struct(st) => {
                 if let Some(tag) = &st.name {
@@ -221,7 +221,8 @@ impl Lowerer {
             }
             _ => {}
         }
-        sz
+        // Fall back to the cached size in the CType itself
+        ctype.size()
     }
 
     /// Get the element size for a pointer expression (for scaling in pointer arithmetic).
@@ -288,9 +289,11 @@ impl Lowerer {
                 8
             }
             Expr::AddressOf(inner, _) => {
-                // &x: pointer to typeof(x)
-                let ty = self.get_expr_type(inner);
-                ty.size()
+                // &x: pointer to typeof(x) — use sizeof_expr which correctly
+                // resolves struct/union sizes via CType and struct_layouts,
+                // unlike get_expr_type().size() which returns 8 for all
+                // struct/union types (since they map to IrType::Ptr in the IR).
+                self.sizeof_expr(inner).max(1)
             }
             Expr::Cast(ref type_spec, _, _) => {
                 if let TypeSpecifier::Pointer(ref inner) = type_spec {
