@@ -160,12 +160,31 @@ impl Lowerer {
     fn handle_complex_return(&mut self, dest: Value, ret_ct: &CType) -> Option<Operand> {
         match ret_ct {
             CType::ComplexFloat => {
-                // _Complex float: two packed F32 returned in xmm0 as F64
-                // Store the raw 8 bytes (two F32s) into an alloca
-                let alloca = self.fresh_value();
-                self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: 8, align: 0 });
-                self.emit(Instruction::Store { val: Operand::Value(dest), ptr: alloca, ty: IrType::F64 });
-                Some(Operand::Value(alloca))
+                if self.uses_packed_complex_float() {
+                    // x86-64: two packed F32 returned in xmm0 as F64
+                    // Store the raw 8 bytes (two F32s) into an alloca
+                    let alloca = self.fresh_value();
+                    self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: 8, align: 0 });
+                    self.emit(Instruction::Store { val: Operand::Value(dest), ptr: alloca, ty: IrType::F64 });
+                    Some(Operand::Value(alloca))
+                } else {
+                    // ARM/RISC-V: real F32 in first FP reg (dest), imag F32 in second FP reg
+                    let imag_val = self.fresh_value();
+                    self.emit(Instruction::GetReturnF32Second { dest: imag_val });
+                    let alloca = self.fresh_value();
+                    self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: 8, align: 0 });
+                    // Store real part (F32) at offset 0
+                    self.emit(Instruction::Store { val: Operand::Value(dest), ptr: alloca, ty: IrType::F32 });
+                    // Store imag part (F32) at offset 4
+                    let imag_ptr = self.fresh_value();
+                    self.emit(Instruction::BinOp {
+                        dest: imag_ptr, op: IrBinOp::Add,
+                        lhs: Operand::Value(alloca), rhs: Operand::Const(IrConst::I64(4)),
+                        ty: IrType::I64,
+                    });
+                    self.emit(Instruction::Store { val: Operand::Value(imag_val), ptr: imag_ptr, ty: IrType::F32 });
+                    Some(Operand::Value(alloca))
+                }
             }
             CType::ComplexDouble => {
                 // _Complex double: real in xmm0 (dest), imag in xmm1 (second return)

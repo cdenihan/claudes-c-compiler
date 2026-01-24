@@ -1911,6 +1911,34 @@ impl ArchCodegen for RiscvCodegen {
         }
     }
 
+    fn emit_get_return_f32_second(&mut self, dest: &Value) {
+        // After a function call, the second F32 return value is in fa1 (LP64D).
+        // Store it to the dest stack slot.
+        if let Some(slot) = self.state.get_slot(dest.0) {
+            self.emit_store_to_s0("fa1", slot.0, "fsw");
+        }
+    }
+
+    fn emit_set_return_f32_second(&mut self, src: &Operand) {
+        // Load src into fa1 for the second F32 return value (LP64D).
+        match src {
+            Operand::Value(v) => {
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    self.emit_load_from_s0("fa1", slot.0, "flw");
+                }
+            }
+            Operand::Const(IrConst::F32(f)) => {
+                let bits = f.to_bits() as i64;
+                self.state.emit(&format!("    li t0, {}", bits));
+                self.state.emit("    fmv.w.x fa1, t0");
+            }
+            _ => {
+                self.operand_to_t0(src);
+                self.state.emit("    fmv.w.x fa1, t0");
+            }
+        }
+    }
+
     fn emit_atomic_rmw(&mut self, dest: &Value, op: AtomicRmwOp, ptr: &Operand, val: &Operand, ty: IrType, ordering: AtomicOrdering) {
         // Load ptr into t1, val into t2
         self.operand_to_t0(ptr);

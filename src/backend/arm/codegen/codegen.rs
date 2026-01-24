@@ -2148,6 +2148,34 @@ impl ArchCodegen for ArmCodegen {
         }
     }
 
+    fn emit_get_return_f32_second(&mut self, dest: &Value) {
+        // After a function call, the second F32 return value is in s1 (AAPCS64).
+        // Store it to the dest stack slot.
+        if let Some(slot) = self.state.get_slot(dest.0) {
+            self.emit_store_to_sp("s1", slot.0, "str");
+        }
+    }
+
+    fn emit_set_return_f32_second(&mut self, src: &Operand) {
+        // Load src into s1 for the second F32 return value (AAPCS64).
+        match src {
+            Operand::Value(v) => {
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    self.emit_load_from_sp("s1", slot.0, "ldr");
+                }
+            }
+            Operand::Const(IrConst::F32(f)) => {
+                let bits = f.to_bits();
+                self.state.emit(&format!("    mov w0, #{}", bits));
+                self.state.emit("    fmov s1, w0");
+            }
+            _ => {
+                self.operand_to_x0(src);
+                self.state.emit("    fmov s1, w0");
+            }
+        }
+    }
+
     fn emit_atomic_rmw(&mut self, dest: &Value, op: AtomicRmwOp, ptr: &Operand, val: &Operand, ty: IrType, _ordering: AtomicOrdering) {
         // Load ptr into x1, val into x2
         self.operand_to_x0(ptr);

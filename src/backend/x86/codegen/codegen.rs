@@ -2050,6 +2050,35 @@ impl ArchCodegen for X86Codegen {
         }
     }
 
+    fn emit_get_return_f32_second(&mut self, dest: &Value) {
+        // x86-64 packs _Complex float into one xmm0 register, so this is unused.
+        // If somehow called, treat as F64 second return for safety.
+        if let Some(slot) = self.state.get_slot(dest.0) {
+            self.state.emit(&format!("    movss %xmm1, {}(%rbp)", slot.0));
+        }
+    }
+
+    fn emit_set_return_f32_second(&mut self, src: &Operand) {
+        // x86-64 packs _Complex float into one xmm0 register, so this is unused.
+        // If somehow called, treat as F32 second return for safety.
+        match src {
+            Operand::Value(v) => {
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    self.state.emit(&format!("    movss {}(%rbp), %xmm1", slot.0));
+                }
+            }
+            Operand::Const(IrConst::F32(f)) => {
+                let bits = f.to_bits();
+                self.state.emit(&format!("    movl ${}, %eax", bits));
+                self.state.emit("    movd %eax, %xmm1");
+            }
+            _ => {
+                self.operand_to_rax(src);
+                self.state.emit("    movd %eax, %xmm1");
+            }
+        }
+    }
+
     fn emit_atomic_rmw(&mut self, dest: &Value, op: AtomicRmwOp, ptr: &Operand, val: &Operand, ty: IrType, _ordering: AtomicOrdering) {
         // Load ptr into rcx, val into rax/rdx
         self.operand_to_rax(ptr);

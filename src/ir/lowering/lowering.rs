@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use crate::frontend::parser::ast::*;
 use crate::ir::ir::*;
 use crate::common::types::{IrType, StructLayout, CType};
+use crate::backend::Target;
 
 /// Resolve a typedef's derived declarators into the final TypeSpecifier.
 ///
@@ -293,6 +294,9 @@ impl ScopeFrame {
 
 /// Lowers AST to IR (alloca-based, not yet SSA).
 pub struct Lowerer {
+    /// Target architecture, used for ABI-specific lowering decisions
+    /// (e.g., _Complex float parameter/return conventions differ between x86-64 and ARM/RISC-V).
+    pub(super) target: Target,
     pub(super) next_value: u32,
     pub(super) next_label: u32,
     pub(super) next_string: u32,
@@ -364,8 +368,9 @@ pub struct Lowerer {
 }
 
 impl Lowerer {
-    pub fn new() -> Self {
+    pub fn new(target: Target) -> Self {
         Self {
+            target,
             next_value: 0,
             next_label: 0,
             next_string: 0,
@@ -401,6 +406,13 @@ impl Lowerer {
             scope_stack: Vec::new(),
             ctype_cache: std::cell::RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Returns true if the target uses x86-64 style packed _Complex float ABI
+    /// (two F32s packed into a single F64/xmm register).
+    /// Returns false for ARM/RISC-V which pass _Complex float as two separate F32 registers.
+    pub(super) fn uses_packed_complex_float(&self) -> bool {
+        self.target == Target::X86_64
     }
 
     /// Look up the shared type metadata for a variable by name.
@@ -776,14 +788,20 @@ impl Lowerer {
             ret_ty = IrType::Ptr;
         }
         // Complex return types need special IR type overrides:
-        // _Complex double: real in xmm0 (F64), imag in xmm1
-        // _Complex float: packed two F32 in one register (I64)
+        // _Complex double: real in first FP register (F64), imag in second
+        // _Complex float:
+        //   x86-64: packed two F32 in one xmm register -> F64
+        //   ARM/RISC-V: real in first FP register -> F32, imag in second FP register
         if ptr_count == 0 {
             let resolved = self.resolve_type_spec(ret_type_spec).clone();
             if matches!(resolved, TypeSpecifier::ComplexDouble) {
                 ret_ty = IrType::F64;
             } else if matches!(resolved, TypeSpecifier::ComplexFloat) {
-                ret_ty = IrType::F64;
+                if self.uses_packed_complex_float() {
+                    ret_ty = IrType::F64;
+                } else {
+                    ret_ty = IrType::F32;
+                }
             }
         }
         self.func_meta.return_types.insert(name.to_string(), ret_ty);
@@ -1013,13 +1031,21 @@ impl Lowerer {
             return_type = IrType::I128;
         }
 
-        // Complex returns via XMM registers, not sret. Override return type to F64.
-        // _Complex double: real in xmm0, imag in xmm1 (F64)
-        // _Complex float: two packed F32 in xmm0 (F64)
+        // Complex returns via FP registers, not sret. Override return type.
+        // _Complex double: real in first FP reg, imag in second (both F64)
+        // _Complex float:
+        //   x86-64: two packed F32 in one xmm0 -> F64
+        //   ARM/RISC-V: real in first FP reg (F32), imag in second FP reg (F32)
         if !uses_sret && !uses_two_reg_return {
             let resolved_ret = self.resolve_type_spec(&func.return_type).clone();
-            if matches!(resolved_ret, TypeSpecifier::ComplexDouble | TypeSpecifier::ComplexFloat) {
+            if matches!(resolved_ret, TypeSpecifier::ComplexDouble) {
                 return_type = IrType::F64;
+            } else if matches!(resolved_ret, TypeSpecifier::ComplexFloat) {
+                if self.uses_packed_complex_float() {
+                    return_type = IrType::F64;
+                } else {
+                    return_type = IrType::F32;
+                }
             }
         }
         self.current_return_type = return_type;
@@ -1038,10 +1064,17 @@ impl Lowerer {
             ir_param_to_orig.push(None); // sret param has no original
         }
         let mut complex_float_params: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let uses_packed_cf = self.uses_packed_complex_float();
         for (orig_idx, p) in func.params.iter().enumerate() {
             let resolved = self.resolve_type_spec(&p.type_spec).clone();
-            let is_complex_decomposed = matches!(resolved, TypeSpecifier::ComplexDouble | TypeSpecifier::ComplexLongDouble);
-            let is_complex_float = matches!(resolved, TypeSpecifier::ComplexFloat);
+            // On ARM/RISC-V, ComplexFloat is decomposed into two F32 params just like ComplexDouble.
+            // On x86-64, ComplexFloat is packed into a single F64 param.
+            let is_complex_decomposed = if uses_packed_cf {
+                matches!(resolved, TypeSpecifier::ComplexDouble | TypeSpecifier::ComplexLongDouble)
+            } else {
+                matches!(resolved, TypeSpecifier::ComplexFloat | TypeSpecifier::ComplexDouble | TypeSpecifier::ComplexLongDouble)
+            };
+            let is_complex_float = uses_packed_cf && matches!(resolved, TypeSpecifier::ComplexFloat);
             if is_complex_decomposed {
                 let ct = self.type_spec_to_ctype(&resolved);
                 let comp_ty = Self::complex_component_ir_type(&ct);
@@ -1053,7 +1086,7 @@ impl Lowerer {
                 ir_param_to_orig.push(Some(orig_idx));
                 complex_decomposed.insert(orig_idx);
             } else if is_complex_float {
-                // _Complex float: packed two F32 in one XMM register as F64
+                // _Complex float: packed two F32 in one XMM register as F64 (x86-64 only)
                 let name = p.name.clone().unwrap_or_default();
                 params.push(IrParam { name: format!("{}_packed", name), ty: IrType::F64 });
                 ir_param_to_orig.push(Some(orig_idx));
@@ -2249,6 +2282,6 @@ impl LocalInfo {
 
 impl Default for Lowerer {
     fn default() -> Self {
-        Self::new()
+        Self::new(Target::X86_64)
     }
 }

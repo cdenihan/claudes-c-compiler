@@ -175,11 +175,20 @@ impl Lowerer {
                 return Some(real);
             }
 
-            // _Complex float: load packed 8 bytes as F64 for XMM register return
+            // _Complex float: platform-specific return convention
             if *rct == CType::ComplexFloat && !self.func_meta.sret_functions.contains_key(&self.current_function_name) {
-                let packed = self.fresh_value();
-                self.emit(Instruction::Load { dest: packed, ptr: src_ptr, ty: IrType::F64 });
-                return Some(Operand::Value(packed));
+                if self.uses_packed_complex_float() {
+                    // x86-64: load packed 8 bytes as F64 for one XMM register return
+                    let packed = self.fresh_value();
+                    self.emit(Instruction::Load { dest: packed, ptr: src_ptr, ty: IrType::F64 });
+                    return Some(Operand::Value(packed));
+                } else {
+                    // ARM/RISC-V: return real in first FP reg (F32), imag in second FP reg (F32)
+                    let real = self.load_complex_real(src_ptr, rct);
+                    let imag = self.load_complex_imag(src_ptr, rct);
+                    self.emit(Instruction::SetReturnF32Second { src: imag });
+                    return Some(real);
+                }
             }
         }
 
@@ -235,12 +244,21 @@ impl Lowerer {
             return Some(Operand::Value(sret_ptr));
         }
 
-        // For non-sret complex float, pack into I64 for register return
+        // For non-sret complex float: platform-specific return convention
         if rct_clone == CType::ComplexFloat && !self.func_meta.sret_functions.contains_key(&self.current_function_name) {
             let ptr = self.operand_to_value(complex_val);
-            let packed = self.fresh_value();
-            self.emit(Instruction::Load { dest: packed, ptr, ty: IrType::I64 });
-            return Some(Operand::Value(packed));
+            if self.uses_packed_complex_float() {
+                // x86-64: pack into I64 for one XMM register return
+                let packed = self.fresh_value();
+                self.emit(Instruction::Load { dest: packed, ptr, ty: IrType::I64 });
+                return Some(Operand::Value(packed));
+            } else {
+                // ARM/RISC-V: return real in first FP reg, imag in second
+                let real = self.load_complex_real(ptr, &rct_clone);
+                let imag = self.load_complex_imag(ptr, &rct_clone);
+                self.emit(Instruction::SetReturnF32Second { src: imag });
+                return Some(real);
+            }
         }
 
         Some(complex_val)

@@ -314,8 +314,8 @@ impl Driver {
             return Err(format!("{} error(s) during semantic analysis", errors.len()));
         }
 
-        // Lower to IR
-        let lowerer = Lowerer::new();
+        // Lower to IR (target-aware for ABI-specific lowering decisions)
+        let lowerer = Lowerer::new(self.target);
         let mut module = lowerer.lower(&ast);
 
         if self.verbose {

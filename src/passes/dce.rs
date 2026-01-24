@@ -159,7 +159,11 @@ fn collect_instruction_uses(inst: &Instruction, used: &mut HashSet<u32>) {
         }
         Instruction::LabelAddr { .. } => {}
         Instruction::GetReturnF64Second { .. } => {}
+        Instruction::GetReturnF32Second { .. } => {}
         Instruction::SetReturnF64Second { src } => {
+            collect_operand_uses(src, used);
+        }
+        Instruction::SetReturnF32Second { src } => {
             collect_operand_uses(src, used);
         }
         Instruction::InlineAsm { outputs, inputs, .. } => {
@@ -229,7 +233,9 @@ fn has_side_effects(inst: &Instruction) -> bool {
         Instruction::AtomicStore { .. } |
         Instruction::Fence { .. } |
         Instruction::GetReturnF64Second { .. } |
+        Instruction::GetReturnF32Second { .. } |
         Instruction::SetReturnF64Second { .. } |
+        Instruction::SetReturnF32Second { .. } |
         Instruction::InlineAsm { .. } |
         Instruction::X86SseOp { .. }
     )

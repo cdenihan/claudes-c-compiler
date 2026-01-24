@@ -219,6 +219,16 @@ pub enum Instruction {
     /// Must appear immediately before a Return terminator.
     SetReturnF64Second { src: Operand },
 
+    /// Get the second F32 return value from a function call (for _Complex float returns on ARM/RISC-V).
+    /// On ARM64: reads s1, on RISC-V: reads fa1 as float.
+    /// Must appear immediately after a Call/CallIndirect instruction.
+    GetReturnF32Second { dest: Value },
+
+    /// Set the second F32 return value before a return (for _Complex float returns on ARM/RISC-V).
+    /// On ARM64: writes s1, on RISC-V: writes fa1 as float.
+    /// Must appear immediately before a Return terminator.
+    SetReturnF32Second { src: Operand },
+
     /// Inline assembly statement
     InlineAsm {
         /// Assembly template string (with \n\t separators)
@@ -839,7 +849,8 @@ impl Instruction {
             | Instruction::AtomicLoad { dest, .. }
             | Instruction::Phi { dest, .. }
             | Instruction::LabelAddr { dest, .. }
-            | Instruction::GetReturnF64Second { dest } => Some(*dest),
+            | Instruction::GetReturnF64Second { dest }
+            | Instruction::GetReturnF32Second { dest } => Some(*dest),
             Instruction::Call { dest, .. }
             | Instruction::CallIndirect { dest, .. } => *dest,
             Instruction::X86SseOp { dest, .. } => *dest,
@@ -851,6 +862,7 @@ impl Instruction {
             | Instruction::AtomicStore { .. }
             | Instruction::Fence { .. }
             | Instruction::SetReturnF64Second { .. }
+            | Instruction::SetReturnF32Second { .. }
             | Instruction::InlineAsm { .. } => None,
         }
     }

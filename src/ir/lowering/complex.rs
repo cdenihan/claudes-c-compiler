@@ -870,9 +870,10 @@ impl Lowerer {
 
     /// Decompose complex arguments at a call site for ABI compliance.
     /// Replaces complex double/float pointer arguments with (real, imag) pairs.
-    /// Per SysV ABI:
-    /// - _Complex float: decompose to 2 F32 values (passed in XMM registers)
-    /// - _Complex double: decompose to 2 F64 values (passed in XMM registers)
+    /// ABI conventions:
+    /// - _Complex float on x86-64: pack two F32 into one F64 (one XMM register)
+    /// - _Complex float on ARM/RISC-V: decompose to 2 separate F32 values
+    /// - _Complex double: decompose to 2 F64 values (all platforms)
     /// - _Complex long double: keep as pointer (passed on stack)
     pub(super) fn decompose_complex_call_args(
         &mut self,
@@ -889,29 +890,33 @@ impl Lowerer {
             }
         };
 
+        let uses_packed_cf = self.uses_packed_complex_float();
         let mut new_vals = Vec::with_capacity(arg_vals.len() * 2);
         let mut new_types = Vec::with_capacity(arg_types.len() * 2);
 
         for (i, (val, ty)) in arg_vals.iter().zip(arg_types.iter()).enumerate() {
             let ctype = pctypes.get(i);
 
-            // Check for ComplexFloat: pack two F32 into a single F64 (xmm register)
-            // Per x86-64 SysV ABI: _Complex float is SSE class, both floats in one XMM slot
-            let is_complex_float = match ctype {
-                Some(CType::ComplexFloat) => true,
-                None => {
-                    if *ty == IrType::Ptr && i < args.len() {
-                        matches!(self.expr_ctype(&args[i]), CType::ComplexFloat)
-                    } else {
-                        false
+            // Check for ComplexFloat with x86-64 packed convention
+            let is_complex_float_packed = if uses_packed_cf {
+                match ctype {
+                    Some(CType::ComplexFloat) => true,
+                    None => {
+                        if *ty == IrType::Ptr && i < args.len() {
+                            matches!(self.expr_ctype(&args[i]), CType::ComplexFloat)
+                        } else {
+                            false
+                        }
                     }
+                    _ => false,
                 }
-                _ => false,
+            } else {
+                false
             };
 
-            if is_complex_float {
-                // Load the 8-byte complex float value as F64 (preserves bit pattern
-                // of two packed F32s) so it passes through an XMM register
+            if is_complex_float_packed {
+                // x86-64 only: Load the 8-byte complex float value as F64 (preserves bit pattern
+                // of two packed F32s) so it passes through one XMM register
                 let ptr = self.operand_to_value(val.clone());
                 let packed = self.fresh_value();
                 self.emit(Instruction::Load { dest: packed, ptr, ty: IrType::F64 });
@@ -920,14 +925,19 @@ impl Lowerer {
                 continue;
             }
 
+            // On ARM/RISC-V, ComplexFloat is decomposed like ComplexDouble.
             let should_decompose = match ctype {
+                Some(CType::ComplexFloat) => !uses_packed_cf,
                 Some(CType::ComplexDouble) | Some(CType::ComplexLongDouble) => true,
-                Some(_) => false, // param type is known but not a decomposed complex type
+                Some(_) => false,
                 None => {
-                    // No param type info: check if the arg_type is Ptr and the expression has complex type
                     if *ty == IrType::Ptr && i < args.len() {
                         let arg_ct = self.expr_ctype(&args[i]);
-                        matches!(arg_ct, CType::ComplexDouble | CType::ComplexLongDouble)
+                        match arg_ct {
+                            CType::ComplexFloat => !uses_packed_cf,
+                            CType::ComplexDouble | CType::ComplexLongDouble => true,
+                            _ => false,
+                        }
                     } else {
                         false
                     }

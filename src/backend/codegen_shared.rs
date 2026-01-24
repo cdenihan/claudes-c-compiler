@@ -587,6 +587,15 @@ pub trait ArchCodegen {
     /// On x86-64: write xmm1. On ARM64: write d1. On RISC-V: write fa1.
     fn emit_set_return_f64_second(&mut self, src: &Operand);
 
+    /// Emit code to capture the second F32 return value after a function call.
+    /// Used for _Complex float returns on ARM64 (s1) and RISC-V (fa1 as float).
+    /// x86-64 does not use this (packs both F32s into one xmm0).
+    fn emit_get_return_f32_second(&mut self, dest: &Value);
+
+    /// Emit code to set the second F32 return value before a return.
+    /// Used for _Complex float returns on ARM64 (s1) and RISC-V (fa1 as float).
+    fn emit_set_return_f32_second(&mut self, src: &Operand);
+
     /// Emit the function directive for the function type attribute.
     /// x86 uses "@function", ARM uses "%function".
     fn function_type_directive(&self) -> &'static str { "@function" }
@@ -817,6 +826,12 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction) {
         }
         Instruction::SetReturnF64Second { src } => {
             cg.emit_set_return_f64_second(src);
+        }
+        Instruction::GetReturnF32Second { dest } => {
+            cg.emit_get_return_f32_second(dest);
+        }
+        Instruction::SetReturnF32Second { src } => {
+            cg.emit_set_return_f32_second(src);
         }
         Instruction::InlineAsm { template, outputs, inputs, clobbers, operand_types } => {
             cg.emit_inline_asm(template, outputs, inputs, clobbers, operand_types);
