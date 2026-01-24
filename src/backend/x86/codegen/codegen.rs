@@ -439,6 +439,18 @@ impl X86Codegen {
         // rax = old value on success
     }
 
+    /// Load i128 operands for binary ops: lhs → rax:rdx, rhs → rcx:rsi.
+    fn prep_i128_binop(&mut self, lhs: &Operand, rhs: &Operand) {
+        self.operand_to_rax_rdx(lhs);
+        self.state.emit("    pushq %rdx");
+        self.state.emit("    pushq %rax");
+        self.operand_to_rax_rdx(rhs);
+        self.state.emit("    movq %rax, %rcx");
+        self.state.emit("    movq %rdx, %rsi");
+        self.state.emit("    popq %rax");
+        self.state.emit("    popq %rdx");
+    }
+
     /// Emit 128-bit binary operation.
     /// Convention: lhs in %rax:%rdx (low:high), rhs pushed onto stack.
     /// Result in %rax:%rdx, then stored to 16-byte dest slot.
@@ -446,26 +458,12 @@ impl X86Codegen {
         let _is_unsigned = ty.is_unsigned();
         match op {
             IrBinOp::Add => {
-                self.operand_to_rax_rdx(lhs);
-                self.state.emit("    pushq %rdx");
-                self.state.emit("    pushq %rax");
-                self.operand_to_rax_rdx(rhs);
-                self.state.emit("    movq %rax, %rcx");
-                self.state.emit("    movq %rdx, %rsi");
-                self.state.emit("    popq %rax");
-                self.state.emit("    popq %rdx");
+                self.prep_i128_binop(lhs, rhs);
                 self.state.emit("    addq %rcx, %rax");
                 self.state.emit("    adcq %rsi, %rdx");
             }
             IrBinOp::Sub => {
-                self.operand_to_rax_rdx(lhs);
-                self.state.emit("    pushq %rdx");
-                self.state.emit("    pushq %rax");
-                self.operand_to_rax_rdx(rhs);
-                self.state.emit("    movq %rax, %rcx");
-                self.state.emit("    movq %rdx, %rsi");
-                self.state.emit("    popq %rax");
-                self.state.emit("    popq %rdx");
+                self.prep_i128_binop(lhs, rhs);
                 self.state.emit("    subq %rcx, %rax");
                 self.state.emit("    sbbq %rsi, %rdx");
             }
@@ -505,38 +503,17 @@ impl X86Codegen {
                 self.state.emit(&format!("    call {}@PLT", func_name));
             }
             IrBinOp::And => {
-                self.operand_to_rax_rdx(lhs);
-                self.state.emit("    pushq %rdx");
-                self.state.emit("    pushq %rax");
-                self.operand_to_rax_rdx(rhs);
-                self.state.emit("    movq %rax, %rcx");
-                self.state.emit("    movq %rdx, %rsi");
-                self.state.emit("    popq %rax");
-                self.state.emit("    popq %rdx");
+                self.prep_i128_binop(lhs, rhs);
                 self.state.emit("    andq %rcx, %rax");
                 self.state.emit("    andq %rsi, %rdx");
             }
             IrBinOp::Or => {
-                self.operand_to_rax_rdx(lhs);
-                self.state.emit("    pushq %rdx");
-                self.state.emit("    pushq %rax");
-                self.operand_to_rax_rdx(rhs);
-                self.state.emit("    movq %rax, %rcx");
-                self.state.emit("    movq %rdx, %rsi");
-                self.state.emit("    popq %rax");
-                self.state.emit("    popq %rdx");
+                self.prep_i128_binop(lhs, rhs);
                 self.state.emit("    orq %rcx, %rax");
                 self.state.emit("    orq %rsi, %rdx");
             }
             IrBinOp::Xor => {
-                self.operand_to_rax_rdx(lhs);
-                self.state.emit("    pushq %rdx");
-                self.state.emit("    pushq %rax");
-                self.operand_to_rax_rdx(rhs);
-                self.state.emit("    movq %rax, %rcx");
-                self.state.emit("    movq %rdx, %rsi");
-                self.state.emit("    popq %rax");
-                self.state.emit("    popq %rdx");
+                self.prep_i128_binop(lhs, rhs);
                 self.state.emit("    xorq %rcx, %rax");
                 self.state.emit("    xorq %rsi, %rdx");
             }

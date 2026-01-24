@@ -94,7 +94,7 @@ impl Lowerer {
                             break;
                         }
                         if let Initializer::Expr(ref expr) = next_item.init {
-                            let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
+                            let val = self.eval_expr_or_zero(expr);
                             let elem_offset = field_offset + ai * elem_size;
                             self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
                         } else {
@@ -190,10 +190,15 @@ impl Lowerer {
         }
     }
 
+    /// Evaluate an expression to a constant, defaulting to zero.
+    fn eval_expr_or_zero(&self, expr: &Expr) -> IrConst {
+        self.eval_const_expr(expr).unwrap_or(IrConst::I64(0))
+    }
+
     /// Evaluate an initializer to a scalar constant (handles both Expr and brace-wrapped List).
     pub(super) fn eval_init_scalar(&self, init: &Initializer) -> IrConst {
         match init {
-            Initializer::Expr(expr) => self.eval_const_expr(expr).unwrap_or(IrConst::I64(0)),
+            Initializer::Expr(expr) => self.eval_expr_or_zero(expr),
             Initializer::List(sub_items) => {
                 sub_items.first()
                     .and_then(|first| {
@@ -342,15 +347,15 @@ impl Lowerer {
                                 if matches!(deep_inner.as_ref(), CType::Char | CType::UChar) {
                                     Self::write_string_to_bytes(bytes, inner_offset, s, *deep_size);
                                 } else {
-                                    let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
+                                    let val = self.eval_expr_or_zero(expr);
                                     self.write_const_to_bytes(bytes, inner_offset, &val, inner_ir_ty);
                                 }
                             } else {
-                                let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
+                                let val = self.eval_expr_or_zero(expr);
                                 self.write_const_to_bytes(bytes, inner_offset, &val, inner_ir_ty);
                             }
                         } else {
-                            let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
+                            let val = self.eval_expr_or_zero(expr);
                             self.write_const_to_bytes(bytes, inner_offset, &val, inner_ir_ty);
                         }
                     }
@@ -365,18 +370,18 @@ impl Lowerer {
                     if matches!(inner.as_ref(), CType::Char | CType::UChar) {
                         Self::write_string_to_bytes(bytes, elem_offset, s, *inner_size);
                     } else {
-                        let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
+                        let val = self.eval_expr_or_zero(expr);
                         self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
                     }
                 } else if matches!(elem_ty, CType::Char | CType::UChar) {
                     let val = s.as_bytes().first().map(|&b| IrConst::I8(b as i8)).unwrap_or(IrConst::I8(0));
                     self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
                 } else {
-                    let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
+                    let val = self.eval_expr_or_zero(expr);
                     self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
                 }
             } else {
-                let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
+                let val = self.eval_expr_or_zero(expr);
                 self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
             }
         } else if let Initializer::List(ref sub_items) = item.init {
@@ -388,7 +393,7 @@ impl Lowerer {
                     for (si, sub_item) in sub_items.iter().enumerate() {
                         if si >= *inner_size { break; }
                         if let Initializer::Expr(ref expr) = sub_item.init {
-                            let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
+                            let val = self.eval_expr_or_zero(expr);
                             let inner_offset = elem_offset + si * inner_elem_size;
                             self.write_const_to_bytes(bytes, inner_offset, &val, inner_ir_ty);
                         }
@@ -548,7 +553,7 @@ impl Lowerer {
                     }
                 }
                 let mut ai = 0usize;
-                let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
+                let val = self.eval_expr_or_zero(expr);
                 let elem_offset = field_offset + ai * elem_size;
                 if elem_offset + elem_size <= bytes.len() {
                     self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
@@ -559,7 +564,7 @@ impl Lowerer {
                     let next_item = &items[new_idx];
                     if !next_item.designators.is_empty() { break; }
                     if let Initializer::Expr(e) = &next_item.init {
-                        let val = self.eval_const_expr(e).unwrap_or(IrConst::I64(0));
+                        let val = self.eval_expr_or_zero(e);
                         let elem_offset = field_offset + ai * elem_size;
                         if elem_offset + elem_size <= bytes.len() {
                             self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
@@ -657,7 +662,7 @@ impl Lowerer {
                 if item_idx >= items.len() { break; }
                 let elem_offset = field_offset + ai * elem_size;
                 if let Initializer::Expr(e) = &items[item_idx].init {
-                    let val = self.eval_const_expr(e).unwrap_or(IrConst::I64(0));
+                    let val = self.eval_expr_or_zero(e);
                     self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
                 }
                 item_idx += 1;
@@ -679,7 +684,7 @@ impl Lowerer {
             let cur_item = &items[item_idx + consumed];
             if !cur_item.designators.is_empty() && consumed > 0 { break; }
             if let Initializer::Expr(e) = &cur_item.init {
-                let val = self.eval_const_expr(e).unwrap_or(IrConst::I64(0));
+                let val = self.eval_expr_or_zero(e);
                 let elem_offset = field_offset + ai * elem_size;
                 self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
                 consumed += 1;
@@ -1000,7 +1005,7 @@ impl Lowerer {
                             }
                         }
                     } else {
-                        let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
+                        let val = self.eval_expr_or_zero(expr);
                         let field_ir_ty = IrType::from_ctype(&field_layout.ty);
                         if let (Some(bit_offset), Some(bit_width)) = (field_layout.bit_offset, field_layout.bit_width) {
                             self.write_bitfield_to_bytes(bytes, field_offset, &val, field_ir_ty, bit_offset, bit_width);
@@ -1020,13 +1025,13 @@ impl Lowerer {
                             let elem_size = elem_ty.size();
                             for (i, sub_item) in sub_items.iter().enumerate() {
                                 if let Initializer::Expr(expr) = &sub_item.init {
-                                    let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
+                                    let val = self.eval_expr_or_zero(expr);
                                     self.write_const_to_bytes(bytes, field_offset + i * elem_size, &val, elem_ir_ty);
                                 }
                             }
                         } else if let Some(first) = sub_items.first() {
                             if let Initializer::Expr(expr) = &first.init {
-                                let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
+                                let val = self.eval_expr_or_zero(expr);
                                 let field_ir_ty = IrType::from_ctype(&field_layout.ty);
                                 self.write_const_to_bytes(bytes, field_offset, &val, field_ir_ty);
                             }

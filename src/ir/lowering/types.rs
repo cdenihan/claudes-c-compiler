@@ -280,6 +280,17 @@ impl Lowerer {
         }
     }
 
+    /// Resolve a variable name to its global name, checking static local names first.
+    fn resolve_to_global_name(&self, name: &str) -> Option<String> {
+        if let Some(mangled) = self.static_local_names.get(name) {
+            Some(mangled.clone())
+        } else if self.globals.contains_key(name) {
+            Some(name.to_string())
+        } else {
+            None
+        }
+    }
+
     /// Try to evaluate an expression as a global address constant.
     /// This handles patterns like:
     /// - `&x` (address of a global variable)
@@ -306,14 +317,45 @@ impl Lowerer {
                         None
                     }
                     // &arr[index] -> GlobalAddrOffset("arr", index * elem_size)
-                    // Also handles nested subscripts: &arr[i][j] -> GlobalAddrOffset("arr", i*stride0 + j*stride1)
                     Expr::ArraySubscript(base, index, _) => {
-                        self.eval_global_array_subscript_addr(base, index)
+                        if let Expr::Identifier(name, _) = base.as_ref() {
+                            if let Some(global_name) = self.resolve_to_global_name(name) {
+                                if let Some(ginfo) = self.globals.get(&global_name) {
+                                    if ginfo.is_array {
+                                        if let Some(idx_val) = self.eval_const_expr(index) {
+                                            if let Some(idx) = self.const_to_i64(&idx_val) {
+                                                let offset = idx * ginfo.elem_size as i64;
+                                                if offset == 0 {
+                                                    return Some(GlobalInit::GlobalAddr(global_name));
+                                                }
+                                                return Some(GlobalInit::GlobalAddrOffset(global_name, offset));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        None
                     }
                     // &s.field -> GlobalAddrOffset("s", field_offset)
-                    // Also handles nested: &s.a.b -> GlobalAddrOffset("s", offset_a + offset_b)
-                    Expr::MemberAccess(_, _, _) => {
-                        self.eval_global_member_access_addr(inner)
+                    Expr::MemberAccess(base, field, _) => {
+                        if let Expr::Identifier(name, _) = base.as_ref() {
+                            if let Some(global_name) = self.resolve_to_global_name(name) {
+                                if let Some(ginfo) = self.globals.get(&global_name) {
+                                    if let Some(ref layout) = ginfo.struct_layout {
+                                        for f in &layout.fields {
+                                            if f.name == *field {
+                                                if f.offset == 0 {
+                                                    return Some(GlobalInit::GlobalAddr(global_name));
+                                                }
+                                                return Some(GlobalInit::GlobalAddrOffset(global_name, f.offset as i64));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        None
                     }
                     _ => None,
                 }
@@ -409,204 +451,6 @@ impl Lowerer {
                 } else {
                     Some(GlobalInit::GlobalAddrOffset(name, total))
                 }
-            }
-            _ => None,
-        }
-    }
-
-    /// Evaluate `&arr[i]` or `&arr[i][j][k]...` for global initializers.
-    /// Recursively handles nested array subscripts to compute the total byte offset.
-    fn eval_global_array_subscript_addr(&self, base: &Expr, index: &Expr) -> Option<GlobalInit> {
-        // Evaluate the index as a constant
-        let idx_val = self.eval_const_expr(index)?;
-        let idx = self.const_to_i64(&idx_val)?;
-
-        match base {
-            Expr::Identifier(name, _) => {
-                // Base case: arr[index] where arr is a global array
-                let resolved = if let Some(mangled) = self.static_local_names.get(name.as_str()) {
-                    Some(mangled.clone())
-                } else if self.globals.contains_key(name.as_str()) {
-                    Some(name.clone())
-                } else {
-                    None
-                };
-                let global_name = resolved?;
-                let ginfo = self.globals.get(&global_name)?;
-                if !ginfo.is_array {
-                    return None;
-                }
-                let offset = idx * ginfo.elem_size as i64;
-                if offset == 0 {
-                    Some(GlobalInit::GlobalAddr(global_name))
-                } else {
-                    Some(GlobalInit::GlobalAddrOffset(global_name, offset))
-                }
-            }
-            Expr::ArraySubscript(inner_base, inner_index, _) => {
-                // Recursive case: arr[i][j] -- first compute &arr[i], then add j * inner_stride
-                // Get the base address from the outer subscript
-                let base_init = self.eval_global_array_subscript_addr(inner_base, inner_index)?;
-
-                // We need to determine the element size at this subscript level.
-                // For arr[i][j], after arr[i] we have a sub-array, and indexing into it
-                // requires knowing the stride of the next dimension.
-                let stride = self.get_subscript_stride(inner_base, inner_index)?;
-                let byte_offset = idx * stride as i64;
-
-                match base_init {
-                    GlobalInit::GlobalAddr(name) => {
-                        if byte_offset == 0 {
-                            Some(GlobalInit::GlobalAddr(name))
-                        } else {
-                            Some(GlobalInit::GlobalAddrOffset(name, byte_offset))
-                        }
-                    }
-                    GlobalInit::GlobalAddrOffset(name, base_off) => {
-                        let total = base_off + byte_offset;
-                        if total == 0 {
-                            Some(GlobalInit::GlobalAddr(name))
-                        } else {
-                            Some(GlobalInit::GlobalAddrOffset(name, total))
-                        }
-                    }
-                    _ => None,
-                }
-            }
-            _ => None,
-        }
-    }
-
-    /// Get the stride (element size) for the result of an array subscript operation.
-    /// For a[i] where a is int[6][9], the result type is int[9], so stride is sizeof(int) = 4.
-    /// For a[i] where a is int[2][3][4], the result is int[3][4], stride = 3*4*4 = 48... no,
-    /// we need the element size of the RESULT of the subscript, not the subscript itself.
-    /// Actually for &a[i][j], after a[i] gives int[9], subscripting with [j] gives int, stride = 4.
-    fn get_subscript_stride(&self, base: &Expr, _index: &Expr) -> Option<usize> {
-        // Find the root array name to get stride information
-        let (root_name, depth) = self.find_array_root_and_depth(base, 1);
-        let root_name = root_name?;
-
-        let resolved = if let Some(mangled) = self.static_local_names.get(root_name.as_str()) {
-            Some(mangled.clone())
-        } else if self.globals.contains_key(root_name.as_str()) {
-            Some(root_name.clone())
-        } else {
-            None
-        };
-        let global_name = resolved?;
-        let ginfo = self.globals.get(&global_name)?;
-
-        // array_dim_strides for int a[6][9] = [36, 4]
-        // depth=1 means we already subscripted once (a[i]), so we want stride at index 1 = 4
-        // depth=0 means base is the identifier, stride at index 0 = 36
-        if !ginfo.array_dim_strides.is_empty() && depth < ginfo.array_dim_strides.len() {
-            Some(ginfo.array_dim_strides[depth])
-        } else {
-            // Fallback: use elem_size for 1D arrays
-            Some(ginfo.elem_size)
-        }
-    }
-
-    /// Walk down nested ArraySubscript expressions to find the root array identifier
-    /// and the nesting depth. Returns (root_name, depth) where depth is the number of
-    /// subscript levels above the root.
-    fn find_array_root_and_depth(&self, expr: &Expr, current_depth: usize) -> (Option<String>, usize) {
-        match expr {
-            Expr::Identifier(name, _) => (Some(name.clone()), current_depth),
-            Expr::ArraySubscript(base, _, _) => {
-                self.find_array_root_and_depth(base, current_depth + 1)
-            }
-            _ => (None, current_depth),
-        }
-    }
-
-    /// Evaluate `&s.field` or `&s.a.b.c` for global initializers.
-    /// Recursively handles nested member accesses to compute the total byte offset.
-    fn eval_global_member_access_addr(&self, expr: &Expr) -> Option<GlobalInit> {
-        // Compute the global name and total byte offset by walking the chain of member accesses
-        let (global_name, total_offset) = self.eval_global_member_chain(expr)?;
-        if total_offset == 0 {
-            Some(GlobalInit::GlobalAddr(global_name))
-        } else {
-            Some(GlobalInit::GlobalAddrOffset(global_name, total_offset as i64))
-        }
-    }
-
-    /// Walk a chain of MemberAccess expressions (e.g., s.a.b.c) and compute
-    /// the total byte offset. Returns (global_name, total_byte_offset).
-    fn eval_global_member_chain(&self, expr: &Expr) -> Option<(String, usize)> {
-        match expr {
-            Expr::MemberAccess(base, field, _) => {
-                match base.as_ref() {
-                    Expr::Identifier(name, _) => {
-                        // Base case: s.field
-                        let resolved = if let Some(mangled) = self.static_local_names.get(name.as_str()) {
-                            Some(mangled.clone())
-                        } else if self.globals.contains_key(name.as_str()) {
-                            Some(name.clone())
-                        } else {
-                            None
-                        };
-                        let global_name = resolved?;
-                        let ginfo = self.globals.get(&global_name)?;
-                        let layout = ginfo.struct_layout.as_ref()?;
-                        let f = layout.fields.iter().find(|f| f.name == *field)?;
-                        Some((global_name, f.offset))
-                    }
-                    Expr::MemberAccess(_, _, _) => {
-                        // Recursive case: s.a.b - first get offset of s.a, then add offset of b
-                        let (global_name, base_offset) = self.eval_global_member_chain(base)?;
-                        // Now find the struct layout for the type of 'base' to get field offset
-                        let field_offset = self.get_nested_field_offset(base, field)?;
-                        Some((global_name, base_offset + field_offset))
-                    }
-                    Expr::ArraySubscript(_, _, _) => {
-                        // arr[i].field - compute arr[i] offset, then add field offset
-                        // TODO: Handle this case for completeness
-                        None
-                    }
-                    _ => None,
-                }
-            }
-            _ => None,
-        }
-    }
-
-    /// Get the offset of a field within the type resulting from a member access expression.
-    /// For example, if `base_expr` is `s.a` where `s.a` has type `struct Inner`,
-    /// and `field` is "y", returns the offset of y within `struct Inner`.
-    fn get_nested_field_offset(&self, base_expr: &Expr, field: &str) -> Option<usize> {
-        // We need to find the type of base_expr. Walk the expression to find the
-        // struct type, then look up the field.
-        let base_type = self.get_global_expr_struct_type(base_expr)?;
-        let layout = self.get_struct_layout_for_ctype(&base_type)?;
-        let f = layout.fields.iter().find(|f| f.name == field)?;
-        Some(f.offset)
-    }
-
-    /// Get the CType of a member access expression on a global.
-    /// E.g., for `s.a` where `s` is a global struct and `a` is a struct field,
-    /// returns the CType of field `a`.
-    fn get_global_expr_struct_type(&self, expr: &Expr) -> Option<CType> {
-        match expr {
-            Expr::Identifier(name, _) => {
-                let resolved = if let Some(mangled) = self.static_local_names.get(name.as_str()) {
-                    Some(mangled.clone())
-                } else if self.globals.contains_key(name.as_str()) {
-                    Some(name.clone())
-                } else {
-                    None
-                };
-                let global_name = resolved?;
-                let ginfo = self.globals.get(&global_name)?;
-                ginfo.c_type.clone()
-            }
-            Expr::MemberAccess(base, field, _) => {
-                let base_type = self.get_global_expr_struct_type(base)?;
-                let layout = self.get_struct_layout_for_ctype(&base_type)?;
-                let f = layout.fields.iter().find(|f| f.name == *field)?;
-                Some(f.ty.clone())
             }
             _ => None,
         }
