@@ -1955,12 +1955,16 @@ impl Lowerer {
         // so p->field works.
         let struct_layout = self.get_struct_layout_for_type(type_spec)
             .or_else(|| {
-                // For typedef'd pointer-to-struct, peel off Pointer to get layout
+                // For typedef'd pointer-to-struct or array-of-struct, peel wrappers
                 let resolved = self.resolve_type_spec(type_spec);
-                if let TypeSpecifier::Pointer(inner) = resolved {
-                    self.get_struct_layout_for_type(inner)
-                } else {
-                    None
+                match resolved {
+                    TypeSpecifier::Pointer(inner) => {
+                        self.get_struct_layout_for_type(inner)
+                    }
+                    TypeSpecifier::Array(inner, _) => {
+                        self.get_struct_layout_for_type(inner)
+                    }
+                    _ => None,
                 }
             });
         let is_struct = struct_layout.is_some() && !is_pointer && !is_array;

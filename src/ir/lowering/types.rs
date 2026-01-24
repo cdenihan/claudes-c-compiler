@@ -586,16 +586,23 @@ impl Lowerer {
             return (8, elem_size, false, true, strides);
         }
 
-        // If the resolved type itself is an Array (e.g., va_list = Array(Char, 24))
+        // If the resolved type itself is an Array (e.g., va_list = Array(Char, 24),
+        // or typedef'd multi-dimensional arrays like typedef int arr_t[2][3])
         // and there are no derived array declarators, handle it as an array type.
         if !has_array && !has_pointer {
-            if let TypeSpecifier::Array(elem, size_expr) = ts {
-                let elem_size = self.sizeof_type(elem).max(1);
-                let dim = size_expr.as_ref().and_then(|e| {
-                    self.expr_as_array_size(e).map(|n| n as usize)
-                }).unwrap_or(1);
-                let total = dim * elem_size;
-                return (total, elem_size, true, false, vec![elem_size]);
+            if let TypeSpecifier::Array(_, _) = ts {
+                // Collect all dimensions from nested Array types
+                let all_dims = self.collect_type_array_dims(ts);
+                // Find the innermost (non-array) element type
+                let mut inner = ts;
+                while let TypeSpecifier::Array(elem, _) = inner {
+                    inner = elem.as_ref();
+                }
+                let base_elem_size = self.sizeof_type(inner).max(1);
+                let total: usize = all_dims.iter().product::<usize>() * base_elem_size;
+                let strides = Self::compute_strides_from_dims(&all_dims, base_elem_size);
+                let elem_size = if strides.len() > 1 { strides[0] } else { base_elem_size };
+                return (total, elem_size, true, false, strides);
             }
         }
 

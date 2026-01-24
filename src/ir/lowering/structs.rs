@@ -102,6 +102,11 @@ impl Lowerer {
             TypeSpecifier::Union(Some(tag), None, _, _) => {
                 self.struct_layouts.get(&format!("union.{}", tag)).cloned()
             }
+            // For typedef'd array types like `typedef S arr_t[4]`, peel the
+            // Array wrapper(s) to find the inner struct/union element type.
+            TypeSpecifier::Array(inner, _) => {
+                self.get_struct_layout_for_type(inner)
+            }
             _ => None,
         }
     }
