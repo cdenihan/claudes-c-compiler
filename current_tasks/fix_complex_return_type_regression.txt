@@ -1,0 +1,15 @@
+Task: Fix complex return type ABI regression from lowerer refactoring
+Status: IN PROGRESS
+
+Problem:
+The compute_function_return_type() function introduced during the lowerer
+decomposition refactoring did not apply complex ABI overrides when computing
+the IR return type for function definitions. It returned IrType::Ptr for
+complex types instead of F64 (ComplexDouble) or F32/F64 (ComplexFloat).
+
+The register_function_meta() function (which runs in the first pass for
+forward declarations) correctly applies these overrides, but
+compute_function_return_type() was not using the already-registered signature.
+
+Fix: Use the already-registered return type from func_meta.sigs in
+compute_function_return_type() instead of recomputing from type_spec_to_ir.
