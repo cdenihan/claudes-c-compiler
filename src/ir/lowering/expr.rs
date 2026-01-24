@@ -706,7 +706,25 @@ impl Lowerer {
         let size = match (&ctype, init) {
             (CType::Array(ref elem_ct, None), Initializer::List(items)) => {
                 let elem_size = elem_ct.size_ctx(&self.types.struct_layouts).max(1);
-                elem_size * items.len()
+                // For char/unsigned char arrays with a single string literal initializer,
+                // the array size is the string length + 1 (null terminator)
+                if elem_size == 1 && items.len() == 1 {
+                    if let Initializer::Expr(ref expr) = items[0].init {
+                        if let Expr::StringLiteral(ref s, _) | Expr::WideStringLiteral(ref s, _) = expr {
+                            if matches!(expr, Expr::StringLiteral(_, _)) {
+                                s.chars().count() + 1
+                            } else {
+                                (s.chars().count() + 1) * 4
+                            }
+                        } else {
+                            elem_size * items.len()
+                        }
+                    } else {
+                        elem_size * items.len()
+                    }
+                } else {
+                    elem_size * items.len()
+                }
             }
             _ => self.sizeof_type(type_spec),
         };
@@ -728,6 +746,18 @@ impl Lowerer {
         ty: IrType, size: usize,
     ) {
         let elem_size = self.compound_literal_elem_size(type_spec);
+
+        // For char/unsigned char array compound literals with a single string literal,
+        // copy the string bytes directly instead of storing a pointer.
+        if elem_size == 1 && items.len() == 1 && items[0].designators.is_empty() {
+            if let Initializer::Expr(ref expr) = items[0].init {
+                if let Expr::StringLiteral(ref s, _) = expr {
+                    self.emit_string_to_alloca(alloca, s, 0);
+                    return;
+                }
+            }
+        }
+
         let has_designators = items.iter().any(|item| !item.designators.is_empty());
         if has_designators {
             self.zero_init_alloca(alloca, size);
@@ -840,8 +870,23 @@ impl Lowerer {
         let struct_layout = self.get_struct_layout_for_type(type_spec);
         match init {
             Initializer::Expr(expr) => {
-                let val = self.lower_expr(expr);
-                self.emit(Instruction::Store { val, ptr: alloca, ty });
+                // For char array compound literals with string literal initializer,
+                // copy string bytes instead of storing pointer
+                let is_char_array = matches!(ty, IrType::I8 | IrType::U8) && {
+                    let ctype = self.type_spec_to_ctype(type_spec);
+                    matches!(ctype, CType::Array(_, _))
+                };
+                if is_char_array {
+                    if let Expr::StringLiteral(ref s, _) = expr {
+                        self.emit_string_to_alloca(alloca, s, 0);
+                    } else {
+                        let val = self.lower_expr(expr);
+                        self.emit(Instruction::Store { val, ptr: alloca, ty });
+                    }
+                } else {
+                    let val = self.lower_expr(expr);
+                    self.emit(Instruction::Store { val, ptr: alloca, ty });
+                }
             }
             Initializer::List(items) => {
                 if let Some(ref layout) = struct_layout {

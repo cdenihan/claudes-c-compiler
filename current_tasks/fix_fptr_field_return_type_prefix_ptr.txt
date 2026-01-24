@@ -1,0 +1,21 @@
+Fix: function pointer struct field with pointer return type misclassified as struct return
+
+Bug: In build_full_ctype(), prefix Pointer declarators before the function pointer
+core (Pointer+FunctionPointer) were incorrectly applied as outer wrappers on the
+function pointer type. They should instead be folded into the function's return type.
+
+Example: `Page *(*xFetch)(Cache*, unsigned, int)` has derived declarators:
+  [Pointer, Pointer, FunctionPointer(params)]
+  prefix=[Pointer] is the `*` in return type `Page *`
+  core=[Pointer, FunctionPointer] is the `(*)(params)` syntax
+
+Before fix: CType = Pointer(Pointer(Function(return_type=Struct(Page))))
+After fix:  CType = Pointer(Function(return_type=Pointer(Struct(Page))))
+
+Impact: This caused calls through struct member function pointers returning pointers
+(e.g., sqlite3GlobalConfig.pcache2.xFetch) to be treated as returning structs by value.
+The compiler would read rax:rdx as a two-register struct return instead of treating
+rax as a pointer return. This was the root cause of the SQLite regression (all 622
+tests segfaulting) and the libjpeg-turbo regression.
+
+Status: IN PROGRESS
