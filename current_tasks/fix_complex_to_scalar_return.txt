@@ -1,0 +1,13 @@
+Fix complex-to-scalar return conversion for F64/double return type
+
+Problem: When a function returns a scalar type (e.g., double) but the return
+expression is a complex type, the real part extraction was skipped for F64
+return types. The guard condition `ret_ty != IrType::F64` in the return
+statement lowering incorrectly excluded double returns from complex-to-scalar
+conversion.
+
+Fix: Remove the F64 exclusion from the guard in stmt.rs return handling,
+so that all scalar return types (including F64) properly extract the real
+part of a complex expression.
+
+Status: In progress
