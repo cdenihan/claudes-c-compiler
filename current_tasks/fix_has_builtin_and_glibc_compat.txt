@@ -1,0 +1,10 @@
+Task: fix_has_builtin_and_glibc_compat
+Status: in_progress
+
+Fix __has_builtin to properly detect supported builtins, bump __GNUC_MINOR__ to 8
+for glibc prereq compatibility, and add __float128 -> long double mapping for
+glibc header compatibility. Adds regression tests for __has_builtin detection
+and braced string array initialization.
+
+These fixes enable libpng to pass all tests and improve mbedtls compatibility
+(md5 self-test now passes).
