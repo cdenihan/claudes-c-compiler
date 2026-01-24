@@ -620,6 +620,10 @@ impl SemanticAnalyzer {
                 // typeof(type-name): just resolve the inner type
                 self.type_spec_to_ctype(inner)
             }
+            TypeSpecifier::FunctionPointer(return_type, _params, _variadic) => {
+                // Function pointer type: treat as pointer for sema purposes
+                CType::Pointer(Box::new(self.type_spec_to_ctype(return_type)))
+            }
         }
     }
 

@@ -1,6 +1,6 @@
 use crate::frontend::parser::ast::*;
 use crate::ir::ir::*;
-use crate::common::types::{IrType, StructField, StructLayout, CType};
+use crate::common::types::{IrType, StructField, StructLayout, CType, FunctionType};
 use crate::common::source::Span;
 use super::lowering::{Lowerer, FuncSig};
 
@@ -501,6 +501,7 @@ impl Lowerer {
                 }
             }
             TypeSpecifier::TypeofType(inner) => self.type_spec_to_ir(inner),
+            TypeSpecifier::FunctionPointer(_, _, _) => IrType::Ptr, // function pointer is a pointer
         }
     }
 
@@ -1158,6 +1159,15 @@ impl Lowerer {
             TypeSpecifier::ComplexDouble => CType::ComplexDouble,
             TypeSpecifier::ComplexLongDouble => CType::ComplexLongDouble,
             TypeSpecifier::Pointer(inner) => CType::Pointer(Box::new(self.type_spec_to_ctype(inner))),
+            TypeSpecifier::FunctionPointer(return_type, params, variadic) => {
+                let ret_ctype = self.type_spec_to_ctype(return_type);
+                let param_ctypes = self.convert_param_decls_to_ctypes(params);
+                CType::Pointer(Box::new(CType::Function(Box::new(FunctionType {
+                    return_type: ret_ctype,
+                    params: param_ctypes,
+                    variadic: *variadic,
+                }))))
+            }
             TypeSpecifier::Array(elem, size_expr) => {
                 let elem_ctype = self.type_spec_to_ctype(elem);
                 let size = size_expr.as_ref().and_then(|e| {

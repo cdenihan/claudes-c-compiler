@@ -149,6 +149,9 @@ pub enum TypeSpecifier {
     TypedefName(String),
     Pointer(Box<TypeSpecifier>),
     Array(Box<TypeSpecifier>, Option<Box<Expr>>),
+    /// Function pointer type from cast/sizeof: return_type, params, variadic
+    /// E.g., `(jv (*)(void*, jv))` produces FunctionPointer(jv, [void*, jv], false)
+    FunctionPointer(Box<TypeSpecifier>, Vec<ParamDecl>, bool),
     /// typeof(expr) - GCC extension: type of an expression
     Typeof(Box<Expr>),
     /// typeof(type-name) - GCC extension: type from a type name

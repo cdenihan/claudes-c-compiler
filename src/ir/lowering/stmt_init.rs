@@ -337,8 +337,14 @@ impl Lowerer {
         decl: &Declaration,
         declarator_name: &str,
     ) {
-        let elem_struct_layout = self.func_mut().locals.get(declarator_name)
-            .and_then(|l| l.struct_layout.clone());
+        // For arrays of function pointers or pointer arrays, the struct layout
+        // (from the return type or pointee type) must not trigger struct init path.
+        let elem_struct_layout = if da.is_array_of_func_ptrs || da.is_array_of_pointers {
+            None
+        } else {
+            self.func_mut().locals.get(declarator_name)
+                .and_then(|l| l.struct_layout.clone())
+        };
 
         if let Some(ref cplx_ctype) = complex_elem_ctype {
             // Array of complex elements (handles both 1D and multi-dimensional)

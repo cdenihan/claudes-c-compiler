@@ -716,10 +716,14 @@ impl Parser {
             if let Some(ptr_depth) = self.try_parse_paren_abstract_declarator() {
                 if matches!(self.peek(), TokenKind::LParen) {
                     // Function pointer cast: (*)(params)
-                    self.skip_balanced_parens();
-                    for _ in 0..ptr_depth {
+                    let (params, variadic) = self.parse_param_list();
+                    // result_type is the return type; wrap it as a function pointer
+                    // ptr_depth-1 pointers wrap the return type (for ptr-to-ptr-to-func etc.),
+                    // and one pointer level is the function pointer itself
+                    for _ in 0..ptr_depth.saturating_sub(1) {
                         result_type = TypeSpecifier::Pointer(Box::new(result_type));
                     }
+                    result_type = TypeSpecifier::FunctionPointer(Box::new(result_type), params, variadic);
                 } else if matches!(self.peek(), TokenKind::LBracket) {
                     // Pointer to array: (*)[N]
                     while matches!(self.peek(), TokenKind::LBracket) {
