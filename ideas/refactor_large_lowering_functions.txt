@@ -1,18 +1,12 @@
 LOW PRIORITY: Remaining refactoring of large functions in IR lowering module
 
-Items 1, 2, and 3 have been completed:
-- try_lower_atomic_builtin: converted to table-driven dispatch with classify_fetch_op(),
-  classify_op_fetch(), shared helpers (emit_post_rmw_compute, emit_atomic_xchg,
-  emit_cmpxchg_with_writeback, load_through_ptr, store_through_ptr). Unified __atomic_*
-  and __sync_* variants.
-- fill_struct_global_bytes: extracted 15+ helper functions (write_string_to_bytes,
-  fill_nested_designator_composite, fill_nested_designator_array, fill_composite_field,
-  fill_array_field, fill_fam_field, fill_array_of_composites, fill_array_of_scalars,
-  fill_flat_array_of_composites, fill_flat_array_of_scalars, try_fill_string_literal_init,
-  get_composite_layout, eval_init_scalar, extract_index_designator). Reduced max nesting
-  from 7-8 levels to 3-4.
-- lower_global_init: extracted typed_zero_const(), maybe_promote_long_double() helpers
-  to eliminate repeated long-double promotion patterns.
+Items 1, 2, 3, 4b, 4c have been completed:
+- try_lower_atomic_builtin: table-driven dispatch (classify_fetch_op, classify_op_fetch)
+- fill_struct_global_bytes: 15+ extracted helpers, reduced nesting from 7-8 to 3-4 levels
+- lower_global_init: typed_zero_const(), maybe_promote_long_double() helpers
+- Global init subsystem extracted to global_init.rs (1950+ lines, 44 functions)
+- Shared helpers extracted: resolve_typedef_derived(), register_function_meta(),
+  intern_string_literal(), push_zero_bytes() - eliminating 18+ duplication sites
 
 Remaining (lower priority, less severe):
 

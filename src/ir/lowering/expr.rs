@@ -117,9 +117,7 @@ impl Lowerer {
     // -----------------------------------------------------------------------
 
     fn lower_string_literal(&mut self, s: &str) -> Operand {
-        let label = format!(".Lstr{}", self.next_string);
-        self.next_string += 1;
-        self.module.string_literals.push((label.clone(), s.to_string()));
+        let label = self.intern_string_literal(s);
         let dest = self.fresh_value();
         self.emit(Instruction::GlobalAddr { dest, name: label });
         Operand::Value(dest)

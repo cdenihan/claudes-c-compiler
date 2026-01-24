@@ -6,7 +6,14 @@ because it handles every C language construct.
 ## Module Organization
 
 - **lowering.rs** - Core `Lowerer` struct with sub-structs (`SwitchFrame`, `FunctionMeta`),
-  `lower()` entry point, function/global scaffolding, and global initializer emission
+  `lower()` entry point (multi-pass: typedefs → signatures → enums → lowering),
+  function lowering (`lower_function`), global declaration processing, VLA parameter
+  stride computation, and pointer type resolution utilities. Also provides shared
+  helpers: `resolve_typedef_derived()`, `register_function_meta()`, `intern_string_literal()`.
+- **global_init.rs** - Global initializer lowering subsystem. Handles struct/union
+  initializers (nested, designated, bitfield, flexible array members), array initializers
+  (multi-dimensional, flat, pointer arrays), compound literals, and scalar initializers.
+  Entry point is `lower_global_init()`. Uses `push_zero_bytes()` for padding emission.
 - **expr.rs** - Expression lowering. `lower_expr()` dispatches to focused helpers:
   - Binary ops: `lower_binary_op` → `try_lower_pointer_arithmetic` / `lower_arithmetic_binop`
   - Calls: `lower_function_call` → `try_lower_builtin_call` / `try_lower_atomic_builtin`
@@ -20,6 +27,7 @@ because it handles every C language construct.
 - **types.rs** - `TypeSpecifier` → `IrType` mapping, sizeof/alignof (via `scalar_type_size_align`),
   constant expression evaluation, struct layout computation (`compute_struct_union_layout`)
 - **structs.rs** - Struct/union layout cache, member offset resolution, struct base address computation
+- **complex.rs** - Complex number (`_Complex`) lowering for arithmetic, assignment, and casts
 
 ## Architecture
 
