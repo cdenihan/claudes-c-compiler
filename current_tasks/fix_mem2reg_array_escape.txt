@@ -1,0 +1,21 @@
+Task: Fix mem2reg incorrectly promoting array allocas whose address escapes via Store val
+
+Status: In progress
+
+Problem:
+mem2reg was promoting small array allocas (size <= 8 bytes) to SSA even when their
+address was used as the value operand of a Store instruction (array-to-pointer decay).
+This caused NULL to be generated instead of the array's stack address when code like
+`Y.p = local_array;` was compiled.
+
+Root cause: The Store instruction match in find_promotable_allocas only checked the
+`ptr` field for candidate tracking, but not the `val` field for disqualification.
+The `instruction_used_values` function also skipped Store entirely, so the val operand
+was invisible to the disqualification logic.
+
+Fix:
+1. In find_promotable_allocas: check Store.val for alloca references and disqualify them
+2. In instruction_used_values: track Store.val operand
+
+This fixes the mbedtls selftest crash (SIGSEGV in mbedtls_mpi_cmp_mpi called from
+mbedtls_mpi_cmp_int which uses the pattern: `uint_t p[1]; Y.p = p;`)
