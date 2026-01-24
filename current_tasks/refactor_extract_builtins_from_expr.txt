@@ -1,0 +1,27 @@
+Task: Extract builtin/atomic/FP-classification code from expr.rs into builtins.rs
+Status: In progress
+
+Problem:
+expr.rs is 3192 lines - the largest file in the project. ~900 lines (28%) are
+dedicated to handling builtin functions, atomic intrinsics, and FP classification
+functions. These have no coupling to expression lowering logic and should be in
+their own module.
+
+Changes:
+1. Create src/ir/lowering/builtins.rs with all builtin handling code:
+   - try_lower_builtin_call (the main dispatch)
+   - All FP classification (isnan, isinf, isfinite, isnormal, signbit, isinf_sign, fpclassify)
+   - FP classification helpers (fp_masks, fp_abs_bits, lower_fp_classify_arg, etc.)
+   - All atomic builtins (try_lower_atomic_builtin, classify_fetch_op, classify_op_fetch, etc.)
+   - Helper: emit_call_instruction (used by both builtins and regular calls)
+
+2. Extract common helpers:
+   - common_float_type(a, b) -> IrType (eliminates 3 duplicated cascades)
+   - is_aggregate_type(ct) -> bool (eliminates 4+ duplicated checks)
+   - maybe_normalize_bool() helper (eliminates 3 duplicated patterns)
+   - fp_classify_preamble() helper (eliminates 6 duplicated preambles)
+
+3. Clean up emit_call_instruction to share code between 4 CallIndirect emission sites
+
+Impact: Reduces expr.rs from 3192 to ~2200 lines, improves code organization,
+eliminates duplicated patterns.
