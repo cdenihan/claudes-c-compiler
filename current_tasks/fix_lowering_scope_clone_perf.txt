@@ -12,5 +12,11 @@ Fix approach:
    - Track which keys were added in the current scope
    - On scope exit, remove only those keys (O(scope_additions) instead of O(total_map_size))
 2. Skip lowering unused static inline functions (dead code from headers)
+3. Wrap StructType in Arc inside CType to avoid deep-cloning struct field lists
+   (was 54% of time spent in malloc/free from CType cloning per perf profile)
 
-Status: In progress
+Results:
+- mbedtls ssl_tls.c: lowering phase 5.5s -> 84ms (66x speedup)
+- mbedtls debug.c: lowering phase 2.8s -> 10ms (280x speedup)
+
+Status: Complete
