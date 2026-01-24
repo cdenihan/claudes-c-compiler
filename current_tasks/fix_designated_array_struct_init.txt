@@ -1,0 +1,20 @@
+Fix designated initializer for arrays of structs with [index].field syntax
+
+Bug: When initializing an array of structs using the pattern:
+  [0].a = val1,
+  [0].b = val2,
+  [0].c = val3,
+  [1].a = val4,
+
+Each separate designated initializer line advances the array index
+instead of staying on the same element. So [0].b = val2 actually
+writes to [1].a instead of [0].b.
+
+Root cause: The global initializer handling in stmt_init.rs
+doesn't correctly track the current array element index when
+multiple field designators refer to the same array element.
+
+This is the root cause of the PostgreSQL initdb crash:
+- mcxt_methods[] array uses [MCTX_ASET_ID].alloc = ..., [MCTX_ASET_ID].free_p = ...
+- The vtable ends up with wrong function pointers
+- context->methods->alloc calls the wrong function (AllocSetReset instead of AllocSetAlloc)
