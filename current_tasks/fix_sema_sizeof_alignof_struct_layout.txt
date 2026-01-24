@@ -1,0 +1,21 @@
+Task: Fix sizeof_type_spec and alignof_type_spec returning wrong values for struct/union types
+
+Root cause of PostgreSQL bind() EFAULT and likely other ABI issues.
+
+Problem:
+sizeof_type_spec() in sema.rs had a catch-all `_ => 8` that returned hardcoded 8
+for ALL struct/union/typedef types instead of looking up their actual cached layout sizes.
+alignof_type_spec() had the same `_ => 8` catch-all problem.
+
+This caused incorrect array dimension computation when array sizes use sizeof(struct_type)
+in their dimension expression (like struct sockaddr_in's sin_zero padding field).
+The wrong array dimension propagated into cached struct layouts, causing ABI mismatches
+when structs were passed to functions.
+
+Fix:
+1. sizeof_type_spec: Already fixed to look up struct/union layouts, resolve typedefs,
+   compute inline struct sizes, and handle complex/enum types correctly.
+2. alignof_type_spec: Updated to match - look up struct/union alignment from cached
+   layouts, resolve typedefs via align_ctx(), handle all type specifiers properly.
+
+Status: IN PROGRESS
