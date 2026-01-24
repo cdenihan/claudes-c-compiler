@@ -211,16 +211,28 @@ impl Lowerer {
                 // the return value to a temporary alloca so we have an address.
                 let struct_size = self.struct_value_size(expr).unwrap_or(8);
 
-                // Check if this is an sret call (struct > 8 bytes with hidden pointer)
-                let is_sret = if let Expr::Identifier(name, _) = func_expr.as_ref() {
-                    self.func_meta.sret_functions.contains_key(name)
+                // Check if this is an sret call (struct > 16 bytes with hidden pointer)
+                // or a two-register return (9-16 bytes) - both return an alloca address
+                let returns_address = if let Expr::Identifier(name, _) = func_expr.as_ref() {
+                    // Detect function pointer variables: identifiers that are
+                    // local/global variables rather than known function names
+                    let is_fptr_var = (self.locals.contains_key(name) && !self.known_functions.contains(name))
+                        || (!self.locals.contains_key(name) && self.globals.contains_key(name) && !self.known_functions.contains(name));
+                    if is_fptr_var {
+                        // Indirect call through variable: use struct size to determine ABI
+                        struct_size > 8
+                    } else {
+                        self.func_meta.sret_functions.contains_key(name)
+                            || self.func_meta.two_reg_return_functions.contains_key(name)
+                    }
                 } else {
-                    false
+                    // Indirect call through expression: determine from return type
+                    struct_size > 8
                 };
 
-                if is_sret {
-                    // For sret calls, lower_expr returns the alloca address directly
-                    // (the struct data is already there)
+                if returns_address {
+                    // For sret and two-register calls, lower_expr returns the alloca
+                    // address directly (the struct data is already there)
                     let val = self.lower_expr(expr);
                     match val {
                         Operand::Value(v) => v,
@@ -231,7 +243,7 @@ impl Lowerer {
                         }
                     }
                 } else {
-                    // Non-sret: small struct (<= 8 bytes), return value in rax IS
+                    // Small struct (<= 8 bytes): return value in rax IS
                     // the packed struct data, not an address.
                     let val = self.lower_expr(expr);
                     let alloca = self.fresh_value();
@@ -269,16 +281,21 @@ impl Lowerer {
 
     /// Check if an expression produces packed struct data (non-address value)
     /// rather than a pointer to struct data. This happens for small structs
-    /// (<= 8 bytes) returned from non-sret function calls, either directly
-    /// or through ternary/comma expressions.
+    /// (<= 8 bytes) returned from non-sret, non-two-reg function calls, either
+    /// directly or through ternary/comma expressions.
     pub(super) fn expr_produces_packed_struct_data(&self, expr: &Expr) -> bool {
         match expr {
             Expr::FunctionCall(func_expr, _, _) => {
-                // Already handled above in get_struct_base_addr, but include for completeness
+                let struct_size = self.struct_value_size(expr).unwrap_or(8);
+                if struct_size > 8 {
+                    // 9+ byte structs: sret or two-reg return, both produce addresses
+                    return false;
+                }
+                // Small struct (<= 8 bytes): produces packed data unless somehow sret
                 if let Expr::Identifier(name, _) = func_expr.as_ref() {
                     !self.func_meta.sret_functions.contains_key(name)
+                        && !self.func_meta.two_reg_return_functions.contains_key(name)
                 } else {
-                    // Indirect call - assume non-sret for small structs
                     true
                 }
             }

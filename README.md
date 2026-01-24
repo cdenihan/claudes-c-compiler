@@ -56,6 +56,16 @@ A C compiler written from scratch in Rust, targeting x86-64, AArch64, and RISC-V
   - Constant expression evaluation for initializers
 
 ### Recent Additions
+- **Two-register struct return ABI (9-16 byte structs)**: Fixed SysV AMD64 ABI compliance for
+  structs between 9-16 bytes. These must be returned in rax+rdx registers, not via hidden sret
+  pointer (which is only for >16 bytes). The fix covers direct calls, explicit function pointer
+  calls (`S16 (*fn)(long, long) = make; fn(10, 20)`), and typedef'd function pointer calls
+  (`typedef S16 (*fn_t)(long, long); fn_t fn = make; fn(30, 40)`). Also fixed `get_expr_ctype`
+  to extract return types from function pointer variable CTypes for indirect calls, and
+  `extract_func_ptr_return_ctype` to handle typedef'd function pointer CTypes (which lack the
+  `Function` wrapper). This was the root cause of jq runtime crashes — jq's core `jv` type is a
+  16-byte struct passed by value through function pointers, and the ABI mismatch corrupted
+  comparison results (making `1 > 2` evaluate to `true`).
 - **128-bit compound assignment fix**: Fixed `usual_arithmetic_conversions` to use I128/U128
   as the operation type for 128-bit integers (was always forcing I64). This caused compound
   assignments (`|=`, `+=`, `&=`, `<<=`, etc.) on `__uint128_t`/`__int128` to silently
@@ -152,7 +162,7 @@ A C compiler written from scratch in Rust, targeting x86-64, AArch64, and RISC-V
 | zlib | PARTIAL | Build succeeds; minigzip passes, self-test partially fails |
 | mbedtls | PARTIAL | Library builds; selftest: md5/sha/aes pass, rsa sign fails, ecp segfault |
 | libpng | PASS | Builds and pngtest passes |
-| jq | PARTIAL | Builds successfully; 3/12 tests pass, runtime segfaults on queries |
+| jq | PARTIAL | Builds; 139/447 jq.test pass, 0 crashes (was segfaulting on all queries) |
 | sqlite | PARTIAL | Builds; 573/622 (92%) sqllogictest pass |
 | libjpeg-turbo | PASS | Builds; cjpeg/djpeg roundtrip and jpegtran pass |
 | redis | FAIL | Build fails: -shared flag needed for xxhash (in progress) |

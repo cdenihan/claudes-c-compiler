@@ -938,11 +938,11 @@ impl Lowerer {
         match stmt {
             Stmt::Return(expr, _span) => {
                 let op = expr.as_ref().map(|e| {
-                    // For struct returns with sret (> 8 bytes), copy struct data to the
+                    // For struct returns with sret (> 16 bytes), copy struct data to the
                     // hidden sret pointer and return that pointer.
                     if let Some(sret_alloca) = self.current_sret_ptr {
                         if let Some(struct_size) = self.struct_value_size(e) {
-                            if struct_size > 8 {
+                            if struct_size > 16 {
                                 let src_addr = self.get_struct_base_addr(e);
                                 // Load the sret pointer from its alloca
                                 let sret_ptr = self.fresh_value();
@@ -993,6 +993,32 @@ impl Lowerer {
                                 self.emit(Instruction::Memcpy { dest: sret_ptr, src: src_addr, size: complex_size });
                                 return Operand::Value(sret_ptr);
                             }
+                        }
+                    }
+                    // For 9-16 byte struct returns (two-register return), load the struct
+                    // data as two I64 values packed into an I128 (low in rax, high in rdx).
+                    // Use U64 casts to zero-extend (struct data is unsigned raw bytes).
+                    if let Some(struct_size) = self.struct_value_size(e) {
+                        if struct_size > 8 && struct_size <= 16 {
+                            let addr = self.get_struct_base_addr(e);
+                            // Load low 8 bytes
+                            let lo = self.fresh_value();
+                            self.emit(Instruction::Load { dest: lo, ptr: addr, ty: IrType::I64 });
+                            // Load high 8 bytes
+                            let hi_ptr = self.fresh_value();
+                            self.emit(Instruction::GetElementPtr { dest: hi_ptr, base: addr, offset: Operand::Const(IrConst::I64(8)), ty: IrType::I64 });
+                            let hi = self.fresh_value();
+                            self.emit(Instruction::Load { dest: hi, ptr: hi_ptr, ty: IrType::I64 });
+                            // Pack into I128: (hi << 64) | lo  (zero-extend both halves)
+                            let hi_wide = self.fresh_value();
+                            self.emit(Instruction::Cast { dest: hi_wide, src: Operand::Value(hi), from_ty: IrType::U64, to_ty: IrType::I128 });
+                            let lo_wide = self.fresh_value();
+                            self.emit(Instruction::Cast { dest: lo_wide, src: Operand::Value(lo), from_ty: IrType::U64, to_ty: IrType::I128 });
+                            let shifted = self.fresh_value();
+                            self.emit(Instruction::BinOp { dest: shifted, op: IrBinOp::Shl, lhs: Operand::Value(hi_wide), rhs: Operand::Const(IrConst::I64(64)), ty: IrType::I128 });
+                            let packed = self.fresh_value();
+                            self.emit(Instruction::BinOp { dest: packed, op: IrBinOp::Or, lhs: Operand::Value(shifted), rhs: Operand::Value(lo_wide), ty: IrType::I128 });
+                            return Operand::Value(packed);
                         }
                     }
                     // For small struct returns (<= 8 bytes), load the struct data

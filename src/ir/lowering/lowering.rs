@@ -229,9 +229,12 @@ pub(super) struct FunctionMeta {
     pub ptr_param_types: HashMap<String, Vec<IrType>>,
     /// Function name -> return CType mapping (for pointer-returning functions).
     pub return_ctypes: HashMap<String, CType>,
-    /// Functions that return structs > 8 bytes and need hidden sret pointer.
+    /// Functions that return structs > 16 bytes and need hidden sret pointer.
     /// Maps function name to the struct return size.
     pub sret_functions: HashMap<String, usize>,
+    /// Functions that return structs of 9-16 bytes via two registers (rax+rdx).
+    /// Maps function name to the struct return size.
+    pub two_reg_return_functions: HashMap<String, usize>,
 }
 
 /// Records undo operations for scope-based variable management.
@@ -755,13 +758,20 @@ impl Lowerer {
             }
         }
 
-        // Detect struct/complex returns > 8 bytes that need sret (hidden pointer) convention
+        // Detect struct/complex returns that need special ABI handling.
+        // Per SysV AMD64 ABI (and equivalent ARM64/RISC-V ABIs):
+        // - Structs <= 8 bytes: returned in one register (rax/x0/a0)
+        // - Structs 9-16 bytes (INTEGER class): returned in two registers (rax+rdx/x0+x1/a0+a1)
+        // - Structs > 16 bytes: use hidden sret pointer as first argument
         if ptr_count == 0 {
             let resolved = self.resolve_type_spec(ret_type_spec).clone();
             if matches!(resolved, TypeSpecifier::Struct(_, _, _, _) | TypeSpecifier::Union(_, _, _, _)) {
                 let size = self.sizeof_type(ret_type_spec);
-                if size > 8 {
+                if size > 16 {
                     self.func_meta.sret_functions.insert(name.to_string(), size);
+                } else if size > 8 {
+                    // 9-16 byte structs: return via two registers
+                    self.func_meta.two_reg_return_functions.insert(name.to_string(), size);
                 }
             }
             // _Complex long double uses sret (too large for registers).
@@ -939,11 +949,18 @@ impl Lowerer {
             self.func_return_ctypes.insert(func.name.clone(), ret_ctype);
         }
 
-        // Check if this function uses sret (returns struct > 8 bytes via hidden pointer)
+        // Check if this function uses sret (returns struct > 16 bytes via hidden pointer)
         let uses_sret = self.func_meta.sret_functions.contains_key(&func.name);
+        // Check if this function returns a 9-16 byte struct via two registers
+        let uses_two_reg_return = self.func_meta.two_reg_return_functions.contains_key(&func.name);
+
+        // For two-register struct returns (9-16 bytes), use I128 as the IR return type
+        if uses_two_reg_return {
+            return_type = IrType::I128;
+        }
 
         // _Complex double returns via xmm0+xmm1, not sret. Override return type to F64.
-        if !uses_sret {
+        if !uses_sret && !uses_two_reg_return {
             let resolved_ret = self.resolve_type_spec(&func.return_type).clone();
             if matches!(resolved_ret, TypeSpecifier::ComplexDouble) {
                 return_type = IrType::F64;

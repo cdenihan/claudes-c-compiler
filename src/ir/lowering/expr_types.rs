@@ -125,6 +125,65 @@ impl Lowerer {
         }
     }
 
+    /// For indirect calls (function pointer calls), determine if the return type is a struct
+    /// and return its size. Returns None if not a struct return or if the type cannot be determined.
+    pub(super) fn get_call_return_struct_size(&self, func: &Expr) -> Option<usize> {
+        // For indirect calls, extract the return type from the function pointer's CType
+        let func_ctype = match func {
+            Expr::Identifier(name, _) => {
+                // Could be a function pointer variable
+                if let Some(vi) = self.lookup_var_info(name) {
+                    vi.c_type.clone()
+                } else {
+                    None
+                }
+            }
+            Expr::Deref(inner, _) => self.get_expr_ctype(inner),
+            _ => self.get_expr_ctype(func),
+        };
+
+        if let Some(ctype) = func_ctype {
+            // Navigate through CType to find the return type
+            let ret_ctype = Self::extract_func_ptr_return_ctype(&ctype);
+            if let Some(ret_ct) = ret_ctype {
+                if matches!(ret_ct, CType::Struct(_) | CType::Union(_)) {
+                    return Some(ret_ct.size());
+                }
+            }
+        }
+        None
+    }
+
+    /// Extract the return CType from a function pointer CType.
+    /// Handles Pointer(Function(ft)) patterns and peels the extra Pointer wrapper
+    /// that build_full_ctype adds.
+    fn extract_func_ptr_return_ctype(ctype: &CType) -> Option<CType> {
+        match ctype {
+            CType::Pointer(inner) => match inner.as_ref() {
+                CType::Function(ft) => {
+                    // Peel one Pointer wrapper from return type (added by declarator syntax)
+                    match &ft.return_type {
+                        CType::Pointer(ret_inner) => Some(ret_inner.as_ref().clone()),
+                        other => Some(other.clone()),
+                    }
+                }
+                // For typedef function pointers, the CType may be Pointer(ReturnType)
+                // without the Function wrapper (build_full_ctype stores only the return
+                // type for typedef'd function pointer variables). Since this function is
+                // only called when we know the expression is a function call, the inner
+                // type IS the return type.
+                other => Some(other.clone()),
+            },
+            CType::Function(ft) => {
+                match &ft.return_type {
+                    CType::Pointer(ret_inner) => Some(ret_inner.as_ref().clone()),
+                    other => Some(other.clone()),
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Return the IR type for known builtins that return float or specific types.
     /// Returns None for builtins without special return type handling.
     pub(super) fn builtin_return_type(name: &str) -> Option<IrType> {
@@ -897,6 +956,24 @@ impl Lowerer {
                 if let Expr::Identifier(name, _) = func.as_ref() {
                     if let Some(ctype) = self.func_meta.return_ctypes.get(name) {
                         return Some(ctype.clone());
+                    }
+                }
+                // For indirect calls through function pointer variables,
+                // extract the return type from the pointer's CType
+                let func_ctype = match func.as_ref() {
+                    Expr::Identifier(name, _) => {
+                        if let Some(vi) = self.lookup_var_info(name) {
+                            vi.c_type.clone()
+                        } else {
+                            None
+                        }
+                    }
+                    Expr::Deref(inner, _) => self.get_expr_ctype(inner),
+                    _ => self.get_expr_ctype(func),
+                };
+                if let Some(ctype) = func_ctype {
+                    if let Some(ret_ct) = Self::extract_func_ptr_return_ctype(&ctype) {
+                        return Some(ret_ct);
                     }
                 }
                 None

@@ -773,11 +773,49 @@ impl Lowerer {
             }
         }
 
-        // Check if this call needs sret (returns struct > 8 bytes)
-        let sret_size = if let Expr::Identifier(name, _) = func {
-            self.func_meta.sret_functions.get(name).copied()
+        // Check if this call needs sret (returns struct > 16 bytes) or two-register return (9-16 bytes)
+        let (sret_size, two_reg_size) = if let Expr::Identifier(name, _) = func {
+            // Check if this identifier is a function pointer variable (local or global)
+            // rather than a direct function call. Function pointer variables need
+            // struct size analysis from their type, not from the function registry.
+            let is_fptr_var = (self.locals.contains_key(name) && !self.known_functions.contains(name))
+                || (!self.locals.contains_key(name) && self.globals.contains_key(name) && !self.known_functions.contains(name));
+
+            if is_fptr_var {
+                // Indirect call through function pointer variable
+                let ret_struct_size = self.get_call_return_struct_size(func);
+                if let Some(size) = ret_struct_size {
+                    if size > 16 {
+                        (Some(size), None)
+                    } else if size > 8 {
+                        (None, Some(size))
+                    } else {
+                        (None, None)
+                    }
+                } else {
+                    (None, None)
+                }
+            } else {
+                // Direct function call - look up by function name
+                (
+                    self.func_meta.sret_functions.get(name).copied(),
+                    self.func_meta.two_reg_return_functions.get(name).copied(),
+                )
+            }
         } else {
-            None
+            // Non-identifier function expression (e.g., (*fptr)(), array[i]())
+            let ret_struct_size = self.get_call_return_struct_size(func);
+            if let Some(size) = ret_struct_size {
+                if size > 16 {
+                    (Some(size), None)
+                } else if size > 8 {
+                    (None, Some(size))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            }
         };
 
         // Lower arguments with implicit casts
@@ -833,10 +871,30 @@ impl Lowerer {
         };
 
         // Dispatch: direct call, function pointer call, or indirect call
-        let call_ret_ty = self.emit_call_instruction(func, dest, arg_vals, arg_types, call_variadic, num_fixed_args);
+        let call_ret_ty = self.emit_call_instruction(func, dest, arg_vals, arg_types, call_variadic, num_fixed_args, two_reg_size, sret_size);
 
         // For sret calls, the struct data is now in the alloca - return its address
         if let Some(alloca) = sret_alloca {
+            return Operand::Value(alloca);
+        }
+
+        // For two-register struct returns (9-16 bytes), the call returns I128.
+        // Unpack into a struct alloca: low 8 bytes from rax, high bytes from rdx.
+        if let Some(size) = two_reg_size {
+            let alloca = self.fresh_value();
+            self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size });
+            // Extract low 8 bytes (rax)
+            let lo = self.fresh_value();
+            self.emit(Instruction::Cast { dest: lo, src: Operand::Value(dest), from_ty: IrType::I128, to_ty: IrType::I64 });
+            self.emit(Instruction::Store { val: Operand::Value(lo), ptr: alloca, ty: IrType::I64 });
+            // Extract high bytes (rdx): shift right by 64
+            let shifted = self.fresh_value();
+            self.emit(Instruction::BinOp { dest: shifted, op: IrBinOp::LShr, lhs: Operand::Value(dest), rhs: Operand::Const(IrConst::I64(64)), ty: IrType::I128 });
+            let hi = self.fresh_value();
+            self.emit(Instruction::Cast { dest: hi, src: Operand::Value(shifted), from_ty: IrType::I128, to_ty: IrType::I64 });
+            let hi_ptr = self.fresh_value();
+            self.emit(Instruction::GetElementPtr { dest: hi_ptr, base: alloca, offset: Operand::Const(IrConst::I64(8)), ty: IrType::I64 });
+            self.emit(Instruction::Store { val: Operand::Value(hi), ptr: hi_ptr, ty: IrType::I64 });
             return Operand::Value(alloca);
         }
 
@@ -1842,13 +1900,17 @@ impl Lowerer {
                     Some(CType::Struct(_)) | Some(CType::Union(_))
                 );
                 if is_struct_ret {
-                    let is_sret = if let Expr::Identifier(name, _) = func_expr.as_ref() {
+                    // Check if this returns an address (sret or two-reg return)
+                    let returns_address = if let Expr::Identifier(name, _) = func_expr.as_ref() {
                         self.func_meta.sret_functions.contains_key(name)
+                            || self.func_meta.two_reg_return_functions.contains_key(name)
                     } else {
-                        false
+                        // Indirect call: structs > 8 bytes return addresses
+                        let struct_size = self.struct_value_size(a).unwrap_or(8);
+                        struct_size > 8
                     };
-                    if !is_sret {
-                        // Non-sret: return value is packed struct data, not a pointer.
+                    if !returns_address {
+                        // Small struct (<= 8 bytes): return value is packed struct data.
                         // Store it to a temporary alloca so we can pass the address.
                         let struct_size = self.struct_value_size(a).unwrap_or(8);
                         let alloc_size = if struct_size > 0 { struct_size } else { 8 };
@@ -1900,9 +1962,17 @@ impl Lowerer {
         arg_types: Vec<IrType>,
         is_variadic: bool,
         num_fixed_args: usize,
+        two_reg_size: Option<usize>,
+        _sret_size: Option<usize>,
     ) -> IrType {
         // Determine indirect call return type from function pointer CType info
-        let indirect_ret_ty = self.get_func_ptr_return_ir_type(func);
+        let mut indirect_ret_ty = self.get_func_ptr_return_ir_type(func);
+
+        // For two-register struct returns (9-16 bytes), override return type to I128
+        // so the backend stores both rax and rdx.
+        if two_reg_size.is_some() {
+            indirect_ret_ty = IrType::I128;
+        }
 
         match func {
             Expr::Identifier(name, _) => {
@@ -1940,7 +2010,11 @@ impl Lowerer {
                     indirect_ret_ty
                 } else {
                     // Direct call - look up return type
-                    let ret_ty = self.func_meta.return_types.get(name).copied().unwrap_or(IrType::I64);
+                    let mut ret_ty = self.func_meta.return_types.get(name).copied().unwrap_or(IrType::I64);
+                    // Override to I128 for two-register struct returns (9-16 bytes)
+                    if self.func_meta.two_reg_return_functions.contains_key(name) {
+                        ret_ty = IrType::I128;
+                    }
                     self.emit(Instruction::Call {
                         dest: Some(dest), func: name.clone(),
                         args: arg_vals, arg_types, return_type: ret_ty, is_variadic, num_fixed_args,
