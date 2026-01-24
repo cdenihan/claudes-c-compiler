@@ -1,0 +1,11 @@
+Fix complex compound assignment with integer promotion
+
+Bug: complex_float_var += int_value produces wrong results because:
+1. common_complex_type() incorrectly promotes integers to ComplexDouble
+2. lower_compound_assign doesn't handle type mismatch between LHS and result
+
+Fix:
+1. Integer types now adopt the other operand's complex type per C11 6.3.1.8
+2. Compound assign now converts LHS to result type, performs op, then converts back
+
+Status: In progress
