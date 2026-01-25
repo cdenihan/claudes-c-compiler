@@ -1028,7 +1028,35 @@ impl Lowerer {
 
                 self.start_block(dispatch_label);
 
-                if total_checks == 0 {
+                // Optimization: if the switch expression is a compile-time constant
+                // (e.g., sizeof(T)), directly jump to the matching case. This avoids
+                // emitting dead dispatch branches that may contain type-mismatched
+                // inline assembly (critical for kernel cmpxchg/xchg macros).
+                let const_switch_val = match &val {
+                    Operand::Const(c) => self.const_to_i64(c),
+                    _ => None,
+                };
+
+                if let Some(switch_int) = const_switch_val {
+                    // Find matching case
+                    let mut target = fallback;
+                    for (case_val, case_label) in cases.iter() {
+                        if *case_val == switch_int {
+                            target = *case_label;
+                            break;
+                        }
+                    }
+                    // Check range cases if no exact match found yet
+                    if target == fallback {
+                        for (low, high, range_label) in case_ranges.iter() {
+                            if switch_int >= *low && switch_int <= *high {
+                                target = *range_label;
+                                break;
+                            }
+                        }
+                    }
+                    self.terminate(Terminator::Branch(target));
+                } else if total_checks == 0 {
                     // No cases, just go to default or end
                     self.terminate(Terminator::Branch(fallback));
                 } else {

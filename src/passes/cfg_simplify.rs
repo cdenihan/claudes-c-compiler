@@ -1,10 +1,11 @@
 //! CFG Simplification pass.
 //!
 //! Simplifies the control flow graph by:
-//! 1. Converting `CondBranch` where both targets are the same to `Branch`
-//! 2. Threading jump chains: if block A branches to empty block B which just
+//! 1. Folding `CondBranch` with a known-constant condition to `Branch`
+//! 2. Converting `CondBranch` where both targets are the same to `Branch`
+//! 3. Threading jump chains: if block A branches to empty block B which just
 //!    branches to C, redirect A to branch directly to C (only when safe)
-//! 3. Removing dead (unreachable) blocks that have no predecessors
+//! 4. Removing dead (unreachable) blocks that have no predecessors
 //!
 //! This pass runs to a fixpoint, since one simplification can enable others.
 //! Phi nodes in successor blocks are updated when edges are redirected.
@@ -32,6 +33,7 @@ fn simplify_cfg(func: &mut IrFunction) -> usize {
     let mut total = 0;
     loop {
         let mut changed = 0;
+        changed += fold_constant_cond_branches(func);
         changed += simplify_redundant_cond_branches(func);
         changed += thread_jump_chains(func);
         changed += remove_dead_blocks(func);
@@ -57,6 +59,46 @@ fn simplify_redundant_cond_branches(func: &mut IrFunction) -> usize {
         }
     }
     count
+}
+
+/// Fold `CondBranch` with a known-constant condition into an unconditional `Branch`.
+///
+/// After constant folding + copy propagation, a CondBranch may have a constant
+/// condition (e.g., `CondBranch { cond: Const(1), true_label, false_label }`).
+/// This arises in switch(sizeof(T)) patterns where the dispatch comparisons
+/// fold to constants. Converting these to unconditional branches enables dead
+/// block removal to eliminate the unreachable switch cases.
+fn fold_constant_cond_branches(func: &mut IrFunction) -> usize {
+    let mut count = 0;
+    for block in &mut func.blocks {
+        if let Terminator::CondBranch { cond, true_label, false_label } = &block.terminator {
+            let const_val = match cond {
+                Operand::Const(c) => Some(is_const_nonzero(c)),
+                _ => None,
+            };
+            if let Some(is_true) = const_val {
+                let target = if is_true { *true_label } else { *false_label };
+                block.terminator = Terminator::Branch(target);
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Check if a constant value is nonzero (truthy).
+fn is_const_nonzero(c: &IrConst) -> bool {
+    match c {
+        IrConst::I8(v) => *v != 0,
+        IrConst::I16(v) => *v != 0,
+        IrConst::I32(v) => *v != 0,
+        IrConst::I64(v) => *v != 0,
+        IrConst::I128(v) => *v != 0,
+        IrConst::F32(v) => *v != 0.0,
+        IrConst::F64(v) => *v != 0.0,
+        IrConst::LongDouble(v) => *v != 0.0,
+        IrConst::Zero => false,
+    }
 }
 
 /// Check if threading a CondBranch's two edges to the same final target would
