@@ -1,0 +1,12 @@
+Fix global initializer constant address expressions involving struct member access
+
+The compiler fails to handle global pointer initializers like:
+  int *ptr = &items[1].id;
+  int *ptr = &((Upgrade_items + 1)->uaattrid);
+
+The issue is in resolve_chained_member_access() in const_eval.rs:
+- It doesn't handle ArraySubscript as a base of a MemberAccess chain
+- eval_global_addr_expr() doesn't handle PointerMemberAccess expressions
+
+Fix: extend resolve_chained_member_access to handle ArraySubscript base,
+and add PointerMemberAccess support to eval_global_addr_expr.
