@@ -4,7 +4,7 @@ Project Verification Triage
 Status of all 16 verification targets as of 2026-01-25.
 Failures are based on running verify_*.py scripts.
 
-PASSING (12):
+PASSING (13):
   - zlib:          PASS (all backends)
   - lua:           PASS (all backends)
   - libsodium:     PASS (all backends — fixed GEP fold i128 bug)
@@ -17,6 +17,7 @@ PASSING (12):
   - libffi:        PASS (all backends)
   - musl:          PASS (all backends)
   - tcc:           PASS (all backends)
+  - jq:            PASS (all backends — fixed type checker double evaluation)
 
 PARTIAL:
   mbedtls:
@@ -29,13 +30,6 @@ PARTIAL:
             mbedtls_mpi_mul_mpi against GCC output.
 
 FAILING:
-  jq:
-    Status: FAIL / TIMEOUT (all backends)
-    Notes: Build times out after 60 seconds. Likely a compile-time
-           hang in a large function (e.g., jv_print or parse).
-    Action: Identify which file/function causes the hang. May be
-            LICM or another optimization pass running in O(n^2).
-
   liburing:
     Status: FAIL (all backends)
     Notes: Builds but all 5 runtime tests fail. io_uring_queue_init
@@ -51,6 +45,5 @@ FAILING:
 
 PRIORITY ORDER for fixing:
   1. Fix mbedtls ECP/RSA (close to passing, already partially works)
-  2. Fix jq compile-time hang (likely optimization issue)
-  3. Fix postgres initdb (complex, low priority)
-  4. Verify liburing is an environment issue
+  2. Fix postgres initdb (complex, low priority)
+  3. Verify liburing is an environment issue

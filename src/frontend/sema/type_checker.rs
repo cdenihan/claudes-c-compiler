@@ -242,6 +242,10 @@ impl<'a> ExprTypeChecker<'a> {
     }
 
     /// Infer the CType of a binary operation.
+    ///
+    /// Evaluates each operand's type at most once to avoid exponential blowup
+    /// on deeply nested expression chains like `+1+1+1+...+1` (which appear in
+    /// preprocessor-generated enum initializers).
     fn infer_binop_ctype(&self, op: &BinOp, lhs: &Expr, rhs: &Expr) -> Option<CType> {
         // Comparison and logical operators always produce int
         match op {
@@ -252,33 +256,36 @@ impl<'a> ExprTypeChecker<'a> {
             _ => {}
         }
 
+        // Evaluate each operand type once and reuse the results.
+        let lct = self.infer_expr_ctype(lhs);
+        let rct = self.infer_expr_ctype(rhs);
+
         // Shift operators: result type is the promoted type of the left operand
         if matches!(op, BinOp::Shl | BinOp::Shr) {
-            if let Some(lct) = self.infer_expr_ctype(lhs) {
-                return Some(lct.integer_promoted());
+            if let Some(l) = lct {
+                return Some(l.integer_promoted());
             }
             return Some(CType::Int);
         }
 
         // Pointer arithmetic for Add and Sub
         if matches!(op, BinOp::Add | BinOp::Sub) {
-            if let Some(lct) = self.infer_expr_ctype(lhs) {
-                match &lct {
+            if let Some(ref l) = lct {
+                match l {
                     CType::Pointer(_) => {
                         if *op == BinOp::Sub {
-                            // ptr - ptr = ptrdiff_t (long)
-                            if let Some(rct) = self.infer_expr_ctype(rhs) {
-                                if rct.is_pointer_like() {
+                            if let Some(ref r) = rct {
+                                if r.is_pointer_like() {
                                     return Some(CType::Long);
                                 }
                             }
                         }
-                        return Some(lct);
+                        return lct;
                     }
                     CType::Array(elem, _) => {
                         if *op == BinOp::Sub {
-                            if let Some(rct) = self.infer_expr_ctype(rhs) {
-                                if rct.is_pointer_like() {
+                            if let Some(ref r) = rct {
+                                if r.is_pointer_like() {
                                     return Some(CType::Long);
                                 }
                             }
@@ -290,10 +297,10 @@ impl<'a> ExprTypeChecker<'a> {
             }
             if *op == BinOp::Add {
                 // int + ptr case
-                if let Some(rct) = self.infer_expr_ctype(rhs) {
-                    match rct {
-                        CType::Pointer(_) => return Some(rct),
-                        CType::Array(elem, _) => return Some(CType::Pointer(elem)),
+                if let Some(ref r) = rct {
+                    match r {
+                        CType::Pointer(_) => return rct,
+                        CType::Array(elem, _) => return Some(CType::Pointer(elem.clone())),
                         _ => {}
                     }
                 }
@@ -301,8 +308,6 @@ impl<'a> ExprTypeChecker<'a> {
         }
 
         // Arithmetic/bitwise: usual arithmetic conversions
-        let lct = self.infer_expr_ctype(lhs);
-        let rct = self.infer_expr_ctype(rhs);
         match (lct, rct) {
             (Some(l), Some(r)) => Some(CType::usual_arithmetic_conversion(&l, &r)),
             (Some(l), None) => Some(l.integer_promoted()),
