@@ -293,11 +293,24 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
     }
 
     // Phase 4: Extend intervals for values that are live-in or live-out of blocks.
+    // A value that is live-in to a block must have its interval cover the entire
+    // block (from block start to block end). If blocks are not in program-point
+    // order relative to the value's definition (e.g., a value defined in a later
+    // block is live-in to an earlier block due to CFG edges), we must also extend
+    // the interval *start* backward to cover the earlier block.
     for idx in 0..num_blocks {
         let start = block_start_points[idx];
         let end = block_end_points[idx];
 
         live_in[idx].for_each_set_bit(|dense_idx| {
+            // Extend interval start: if this block starts before the value's
+            // current def_point, the value is live here so the interval must
+            // begin no later than this block's start.
+            let def_entry = &mut def_points[dense_idx];
+            if *def_entry == u32::MAX || start < *def_entry {
+                *def_entry = start;
+            }
+
             let entry = &mut last_use_points[dense_idx];
             if *entry == u32::MAX {
                 *entry = start;
@@ -308,6 +321,15 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
         });
 
         live_out[idx].for_each_set_bit(|dense_idx| {
+            // Extend interval start for live-out values too: if a value is
+            // live-out of a block that precedes its definition in program
+            // point order, the interval must start no later than this block's
+            // start.
+            let def_entry = &mut def_points[dense_idx];
+            if *def_entry == u32::MAX || start < *def_entry {
+                *def_entry = start;
+            }
+
             let entry = &mut last_use_points[dense_idx];
             if *entry == u32::MAX {
                 *entry = end;
