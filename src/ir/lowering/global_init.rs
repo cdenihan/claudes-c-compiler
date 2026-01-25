@@ -113,6 +113,10 @@ impl Lowerer {
                 if let Some(addr_init) = self.eval_global_addr_expr(expr) {
                     return addr_init;
                 }
+                // Try label difference: &&lab1 - &&lab2 (computed goto dispatch tables)
+                if let Some(label_diff) = self.eval_label_diff_expr(expr, base_ty.size().max(4)) {
+                    return label_diff;
+                }
                 // Complex global initializer: try to evaluate as {real, imag} pair
                 {
                     let ctype = self.type_spec_to_ctype(_type_spec);
@@ -261,6 +265,11 @@ impl Lowerer {
                             if matches!(expr, Expr::LabelAddr(_, _)) {
                                 return true;
                             }
+                            // Also detect label addresses nested in binary ops
+                            // (e.g., &&lab1 - &&lab0 for computed goto dispatch tables)
+                            if Self::expr_contains_label_addr(expr) {
+                                return true;
+                            }
                             if self.eval_const_expr(expr).is_none() && self.eval_global_addr_expr(expr).is_some() {
                                 return true;
                             }
@@ -284,7 +293,7 @@ impl Lowerer {
                             }
                             if current_idx < num_elems {
                                 let mut elem_parts = Vec::new();
-                                self.collect_compound_init_element(&item.init, &mut elem_parts);
+                                self.collect_compound_init_element(&item.init, &mut elem_parts, elem_size);
                                 if let Some(elem) = elem_parts.into_iter().next() {
                                     elements[current_idx] = elem;
                                 }
@@ -990,7 +999,8 @@ impl Lowerer {
     /// Collect a single compound initializer element, handling nested lists (double-brace init).
     /// For `{{"str"}}`, unwraps the nested list to find the string literal.
     /// For `{"str"}`, directly handles the string literal expression.
-    fn collect_compound_init_element(&mut self, init: &Initializer, elements: &mut Vec<GlobalInit>) {
+    /// `elem_size` is the byte size of the target element (used for label diffs).
+    fn collect_compound_init_element(&mut self, init: &Initializer, elements: &mut Vec<GlobalInit>, elem_size: usize) {
         match init {
             Initializer::Expr(expr) => {
                 if let Expr::StringLiteral(s, _) = expr {
@@ -1003,6 +1013,9 @@ impl Lowerer {
                     elements.push(GlobalInit::GlobalAddr(scoped_label.as_label()));
                 } else if let Some(val) = self.eval_const_expr(expr) {
                     elements.push(GlobalInit::Scalar(val));
+                } else if let Some(label_diff) = self.eval_label_diff_expr(expr, elem_size) {
+                    // Label difference: &&lab1 - &&lab2 (computed goto dispatch tables)
+                    elements.push(label_diff);
                 } else if let Some(addr) = self.eval_string_literal_addr_expr(expr) {
                     // String literal +/- offset: "str" + N -> GlobalAddrOffset
                     elements.push(addr);
@@ -1017,11 +1030,61 @@ impl Lowerer {
                 // Unwrap the nested list and process the first element as the value
                 // for this array slot.
                 if sub_items.len() >= 1 {
-                    self.collect_compound_init_element(&sub_items[0].init, elements);
+                    self.collect_compound_init_element(&sub_items[0].init, elements, elem_size);
                 } else {
                     elements.push(GlobalInit::Zero);
                 }
             }
+        }
+    }
+
+    /// Try to evaluate a label difference expression: `&&lab1 - &&lab2`.
+    /// Returns `GlobalLabelDiff(lab1_label, lab2_label, byte_size)` if the
+    /// expression is a subtraction of two label addresses.
+    /// The `byte_size` parameter specifies the target element width (4 for int, 8 for long).
+    /// Only valid inside a function (labels must be in the enclosing function scope).
+    fn eval_label_diff_expr(&mut self, expr: &Expr, byte_size: usize) -> Option<GlobalInit> {
+        // Label differences are only valid inside functions (static locals).
+        // Guard against file-scope globals where func_state is None.
+        if self.func_state.is_none() {
+            return None;
+        }
+        if let Expr::BinaryOp(BinOp::Sub, lhs, rhs, _) = expr {
+            let lhs_inner = Self::strip_casts(lhs);
+            let rhs_inner = Self::strip_casts(rhs);
+            if let (Expr::LabelAddr(lab1, _), Expr::LabelAddr(lab2, _)) = (lhs_inner, rhs_inner) {
+                let scoped1 = self.get_or_create_user_label(lab1);
+                let scoped2 = self.get_or_create_user_label(lab2);
+                return Some(GlobalInit::GlobalLabelDiff(
+                    scoped1.as_label(),
+                    scoped2.as_label(),
+                    byte_size,
+                ));
+            }
+        }
+        None
+    }
+
+    /// Strip cast expressions to find the underlying expression.
+    fn strip_casts(expr: &Expr) -> &Expr {
+        match expr {
+            Expr::Cast(_, inner, _) => Self::strip_casts(inner),
+            _ => expr,
+        }
+    }
+
+    /// Check if an expression contains label address references in binary ops
+    /// (e.g., &&lab1 - &&lab0 for computed goto dispatch tables).
+    // TODO: More complex nested arithmetic with label addresses
+    // (e.g., (&&lab1 - &&lab2) + offset) is not detected here.
+    fn expr_contains_label_addr(expr: &Expr) -> bool {
+        match expr {
+            Expr::LabelAddr(_, _) => true,
+            Expr::BinaryOp(_, lhs, rhs, _) => {
+                Self::expr_contains_label_addr(lhs) || Self::expr_contains_label_addr(rhs)
+            }
+            Expr::Cast(_, inner, _) => Self::expr_contains_label_addr(inner),
+            _ => false,
         }
     }
 

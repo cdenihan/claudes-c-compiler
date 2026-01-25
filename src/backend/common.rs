@@ -412,6 +412,9 @@ fn emit_global_def(out: &mut AsmOutput, g: &IrGlobal, ptr_dir: PtrDirective) {
                 out.emit_fmt(format_args!("    {} {}{}", ptr_dir.as_str(), label, offset));
             }
         }
+        GlobalInit::GlobalLabelDiff(lab1, lab2, byte_size) => {
+            emit_label_diff(out, lab1, lab2, *byte_size);
+        }
         GlobalInit::Compound(elements) => {
             for elem in elements {
                 match elem {
@@ -437,6 +440,9 @@ fn emit_global_def(out: &mut AsmOutput, g: &IrGlobal, ptr_dir: PtrDirective) {
                             out.emit_fmt(format_args!("    {} {}{}", ptr_dir.as_str(), label, offset));
                         }
                     }
+                    GlobalInit::GlobalLabelDiff(lab1, lab2, byte_size) => {
+                        emit_label_diff(out, lab1, lab2, *byte_size);
+                    }
                     GlobalInit::WideString(chars) => {
                         for &ch in chars {
                             out.emit_fmt(format_args!("    .long {}", ch));
@@ -457,7 +463,17 @@ fn emit_global_def(out: &mut AsmOutput, g: &IrGlobal, ptr_dir: PtrDirective) {
     }
 }
 
-/// Emit a constant data value as an assembly directive.
+/// Emit a label difference as a sized assembly directive (`.long lab1-lab2`, etc.).
+fn emit_label_diff(out: &mut AsmOutput, lab1: &str, lab2: &str, byte_size: usize) {
+    let dir = match byte_size {
+        1 => ".byte",
+        2 => ".short",
+        4 => ".long",
+        _ => ".quad",
+    };
+    out.emit_fmt(format_args!("    {} {}-{}", dir, lab1, lab2));
+}
+
 pub fn emit_const_data(out: &mut AsmOutput, c: &IrConst, ty: IrType, ptr_dir: PtrDirective) {
     // If the constant type is narrower than the global's declared type, widen it
     // (sign-extend for signed, zero-extend for unsigned).

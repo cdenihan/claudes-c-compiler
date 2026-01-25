@@ -82,6 +82,10 @@ pub enum GlobalInit {
     /// Compound initializer: a sequence of initializer elements (for arrays/structs
     /// containing address expressions, e.g., `int *ptrs[] = {&a, &b, 0}`).
     Compound(Vec<GlobalInit>),
+    /// Difference of two labels (&&lab1 - &&lab2) for computed goto dispatch tables.
+    /// Fields: (label1, label2, byte_size) where byte_size is the width of the
+    /// resulting integer (4 for int, 8 for long).
+    GlobalLabelDiff(String, String, usize),
 }
 
 impl GlobalInit {
@@ -96,6 +100,7 @@ impl GlobalInit {
             GlobalInit::Zero => 0,
             GlobalInit::String(s) => s.len(),
             GlobalInit::WideString(ws) => ws.len() * 4,
+            GlobalInit::GlobalLabelDiff(_, _, size) => *size,
         }
     }
 }
