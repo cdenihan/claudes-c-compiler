@@ -1,0 +1,21 @@
+Fix: Inline asm callee-saved register preservation
+
+Bug: When inline asm uses callee-saved registers via specific constraints
+(e.g., "b" for rbx on x86-64), the function prologue/epilogue doesn't
+save/restore those registers. This causes callee-saved register corruption
+visible to the caller.
+
+Root cause: The register allocator is completely disabled for functions with
+inline asm (returning empty used_regs). The inline asm framework correctly
+assigns specific registers but doesn't propagate that information to the
+prologue/epilogue generator.
+
+Fix: After inline asm operand processing, collect all callee-saved registers
+used by specific constraints or listed in clobbers, and ensure they're saved
+in the function prologue/epilogue.
+
+Impact: Fixes mbedtls MPI multiplication failure (and cascade: RSA, ECP,
+ECJPAKE tests). The mbedtls bn_mul.h uses inline asm with "b" constraint
+(rbx) for bignum multiply-accumulate.
+
+Applies to: x86-64, AArch64, and RISC-V backends.
