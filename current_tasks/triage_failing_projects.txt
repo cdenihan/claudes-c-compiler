@@ -1,2 +1,0 @@
-Triage failing projects: create ideas/project_triage.txt tracking which verification
-projects are currently failing, and clean up obsolete ideas files.

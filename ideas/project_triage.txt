@@ -1,0 +1,90 @@
+Project Verification Triage
+============================
+
+Status of all 16 verification targets as of 2026-01-25.
+Failures are based on running verify_*.py scripts.
+
+PASSING (no action needed):
+  - zlib:          PASS (all backends)
+  - libuv:         PASS (all backends)
+  - libffi:        PASS (all backends)
+  - libjpeg-turbo: PASS (all backends)
+
+FAILING — needs investigation and fixes:
+
+  lua:
+    Status: FAIL (all backends)
+    Notes: Was previously passing per README. Likely a regression.
+    Action: Bisect recent commits to find which change broke it.
+
+  mbedtls:
+    Status: FAIL (x86 fails, arm fails; times out on some backends)
+    Notes: Was previously passing per README. Possible regression or timeout issue.
+    Action: Check for runtime hang (possible LICM or codegen regression). Debug x86 first.
+
+  libpng:
+    Status: FAIL (all backends)
+    Notes: Was previously passing per README. Depends on zlib which still passes.
+    Action: Investigate build or test failure; may be related to lua/mbedtls regression.
+
+  jq:
+    Status: FAIL / TIMEOUT (all backends)
+    Notes: Was previously passing per README. Times out during build or test.
+    Action: Check for infinite loop in generated code or compile-time hang.
+
+  sqlite:
+    Status: FAIL / TIMEOUT (all backends)
+    Notes: Was previously passing per README. Times out during build or test.
+    Action: Likely same root cause as jq — possible LICM or optimization regression causing hangs.
+
+  redis:
+    Status: FAIL (all backends)
+    Notes: Was previously passing per README.
+    Action: Investigate build/link/runtime failure.
+
+  postgres:
+    Status: FAIL (all backends)
+    Notes: Was previously PARTIAL (build succeeded, initdb failed). May have regressed further.
+    Action: Low priority — was never fully passing. Fix other regressions first.
+
+  libsodium:
+    Status: FAIL (all backends)
+    Notes: Was previously passing per README.
+    Action: Investigate; may share root cause with other regressions.
+
+  mquickjs:
+    Status: FAIL (all backends)
+    Notes: Was previously passing per README.
+    Action: Investigate; may share root cause with other regressions.
+
+  liburing:
+    Status: FAIL (x86)
+    Notes: Was previously PARTIAL (builds but tests need kernel support). x86 now fails.
+    Action: Low priority — check if build itself broke.
+
+  tcc:
+    Status: FAIL / TIMEOUT (all backends)
+    Notes: Was previously passing per README. Known LICM regression (commit 7bd1987)
+           causes TCC binary to hang. verify_tcc.py is blocked by this.
+    Action: Fix the LICM regression. This is documented and likely affects other projects too.
+
+  musl:
+    Status: PARTIAL (not listed in current failures; build+link works)
+    Notes: Hello test passes, some stdio tests fail. malloc works (register asm variable fix).
+    Action: Fix stdio printf output issues. Lower priority than full regressions above.
+
+COMMON THEMES:
+  - Multiple projects that were previously passing now fail or timeout.
+  - The LICM regression (commit 7bd1987) documented in the TCC notes may be a
+    root cause for timeouts in jq, sqlite, and tcc.
+  - Many failures are likely regressions from recent optimization/codegen changes.
+  - Recommended approach: fix the LICM regression first, then re-test all projects
+    to see how many are restored.
+
+PRIORITY ORDER for fixing:
+  1. Fix LICM regression (unblocks tcc, possibly jq, sqlite)
+  2. Fix lua (small project, easy to debug)
+  3. Fix libsodium, mquickjs (were fully passing)
+  4. Fix mbedtls, libpng, redis (were fully passing)
+  5. Fix jq, sqlite timeouts (if not fixed by LICM fix)
+  6. Improve postgres, liburing, musl (were only partial)

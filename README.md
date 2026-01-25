@@ -67,7 +67,7 @@ See `git log` for full history. Key milestones:
 - Position-independent code (`-fPIC`) for x86-64 shared libraries
 - Inline assembly support for x86, ARM, and RISC-V
 - Transparent union ABI, `__int128`, `_Complex` arithmetic
-- Compiles Lua, zlib, mbedtls, libpng, jq, SQLite, libjpeg-turbo successfully
+- Has compiled Lua, zlib, mbedtls, libpng, jq, SQLite, libjpeg-turbo (some currently regressed; see build status table)
 - GCC-compatible query flags (-dumpmachine, -dumpversion) for autoconf support
 - Assembly file (.S/.s) passthrough to target assembler
 - XMM register "x" constraint support for x86 inline assembly
@@ -79,22 +79,24 @@ See `git log` for full history. Key milestones:
 
 | Project | Status | Notes |
 |---------|--------|-------|
-| lua | PASS | All 6 tests pass |
 | zlib | PASS | Build + self-test + minigzip roundtrip all pass |
-| mbedtls | PASS | All 7 selftests pass (md5, sha256, sha512, aes, rsa, ecp) |
-| libpng | PASS | Builds and pngtest passes |
-| jq | PASS | All 12 tests pass |
-| sqlite | PASS | All 622 sqllogictest pass (100%) |
-| libjpeg-turbo | PASS | Builds; cjpeg/djpeg roundtrip and jpegtran pass |
 | libuv | PASS | All 7 tests pass (version, loop, timer, idle, async, tcp_bind, fs) |
-| libsodium | PASS | All 7 tests pass |
-| redis | PASS | All 3 tests pass (version, cli, SET/GET roundtrip) |
-| liburing | PARTIAL | Builds successfully; tests require io_uring kernel support |
-| mquickjs | PASS | All 5 tests pass (closure, language, loop, builtin, bytecode roundtrip) |
-| postgres | PARTIAL | Build succeeds; `make check` initdb fails during regression |
-| musl | PARTIAL | Builds and links; hello test passes. malloc works (register asm variable fix). stdio printf output missing in some tests |
 | libffi | PASS | All 6 tests pass (call_int, call_double, call_pointer, call_void, call_many_args, closure) |
-| tcc | PASS | Builds TCC; 78/78 tests pass. Note: LICM regression (7bd1987) causes TCC binary to hang; verify_tcc.py blocked until fixed |
+| libjpeg-turbo | PASS | Builds; cjpeg/djpeg roundtrip and jpegtran pass |
+| lua | FAIL | Fails all backends (was passing; regression) |
+| mbedtls | FAIL | x86 fails, arm fails; times out on some backends (was passing; regression) |
+| libpng | FAIL | Fails all backends (was passing; regression) |
+| jq | FAIL | Times out all backends (was passing; likely LICM regression) |
+| sqlite | FAIL | Times out all backends (was passing; likely LICM regression) |
+| redis | FAIL | Fails all backends (was passing; regression) |
+| libsodium | FAIL | Fails all backends (was passing; regression) |
+| mquickjs | FAIL | Fails all backends (was passing; regression) |
+| tcc | FAIL | Fails/times out all backends; known LICM regression (7bd1987) causes hangs |
+| liburing | FAIL | x86 fails (was partial — builds but tests need kernel support) |
+| postgres | FAIL | Fails all backends (was partial — build succeeded, initdb failed) |
+| musl | PARTIAL | Builds and links; hello test passes. stdio printf output missing in some tests |
+
+See `ideas/project_triage.txt` for detailed failure analysis and fix priorities.
 
 ### What's Not Yet Implemented
 - Some GNU C extensions in system headers (partial `__attribute__` support)
