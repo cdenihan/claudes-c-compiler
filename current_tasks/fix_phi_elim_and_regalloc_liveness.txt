@@ -1,0 +1,28 @@
+Task: Fix phi elimination for computed goto and register allocator liveness intervals
+
+Problem 1 - Phi Elimination for Computed Goto (phi_eliminate.rs):
+IndirectBranch terminators use runtime-computed jump targets (goto *expr).
+When phi elimination creates trampoline blocks for critical edges from
+IndirectBranch predecessors, the runtime jump bypasses these trampolines
+entirely (it jumps directly to the target label, not the trampoline).
+This means phi copy instructions placed in trampolines never execute,
+causing incorrect SSA value propagation.
+
+Fix: Check for IndirectBranch predecessors and place phi copies before
+the terminator instead of in unreachable trampoline blocks.
+
+Problem 2 - Liveness Analysis Interval Start (liveness.rs):
+When blocks are not in program-point order relative to value definitions
+(e.g., a value defined in block at point 46 is live-in to a block at
+point 32 due to CFG edge ordering), the liveness analysis only extended
+the interval END but not the START. This caused the register allocator
+to see non-overlapping intervals [33,36] and [46,49] as compatible for
+the same register, when in reality the value at [46,49] is live through
+the block containing [33,36].
+
+This caused Lua's luaM_realloc_ to return GCdebt instead of newblock,
+because r14 was assigned to both values and the GCdebt computation
+overwrote the newblock return value.
+
+Fix: Extend interval start (def_points) backward when a value is live-in
+or live-out of a block with a lower program point than its definition.
