@@ -1229,7 +1229,7 @@ impl Lowerer {
                 if let Some(const_val) = self.eval_const_expr(&inp.expr) {
                     Operand::Const(const_val)
                 } else {
-                    sym_name = Self::extract_symbol_name(&inp.expr);
+                    sym_name = self.extract_symbol_name(&inp.expr);
                     self.lower_expr(&inp.expr)
                 }
             } else if constraint_is_memory_only(&constraint) {
@@ -1267,23 +1267,54 @@ impl Lowerer {
     }
 
     /// Extract a global symbol name from an expression, for use with inline asm
-    /// %P and %a modifiers. Handles:
-    /// - `func_name` (bare function identifier)
+    /// `"i"` constraint operands and `%P`/`%c`/`%a` modifiers. Handles:
+    /// - `func_name` (bare function identifier that is a known function or global)
     /// - `&var_name` (address-of global variable)
     /// - Casts of the above (e.g., `(void *)func_name`)
-    fn extract_symbol_name(expr: &Expr) -> Option<String> {
+    ///
+    /// Returns `None` for local variables/parameters, since those are not valid
+    /// assembly symbols and would produce invalid assembly if emitted literally.
+    fn extract_symbol_name(&self, expr: &Expr) -> Option<String> {
         match expr {
-            Expr::Identifier(name, _) => Some(name.clone()),
-            Expr::AddressOf(inner, _) => {
-                if let Expr::Identifier(name, _) = inner.as_ref() {
+            Expr::Identifier(name, _) => {
+                // Only return the name if it is a global symbol or known function,
+                // NOT a local variable or function parameter.
+                if self.is_global_or_function(name) {
                     Some(name.clone())
                 } else {
                     None
                 }
             }
-            Expr::Cast(_, inner, _) => Self::extract_symbol_name(inner),
+            Expr::AddressOf(inner, _) => {
+                if let Expr::Identifier(name, _) = inner.as_ref() {
+                    if self.is_global_or_function(name) {
+                        Some(name.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            Expr::Cast(_, inner, _) => self.extract_symbol_name(inner),
             _ => None,
         }
+    }
+
+    /// Check whether a name refers to a global variable, known function, or
+    /// enum constant (i.e., something that is a valid assembly-level symbol or
+    /// compile-time constant), as opposed to a local variable or parameter.
+    fn is_global_or_function(&self, name: &str) -> bool {
+        // Check if it's a local variable/parameter first — if so, it's NOT global
+        if let Some(ref fs) = self.func_state {
+            if fs.locals.contains_key(name) {
+                return false;
+            }
+        }
+        // It's a global if it's in the globals map, known functions, or enum constants
+        self.globals.contains_key(name)
+            || self.known_functions.contains(name)
+            || self.types.enum_constants.contains_key(name)
     }
 
     /// Look up the asm register name for a local variable, if it was declared with

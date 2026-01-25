@@ -1,0 +1,13 @@
+Fix two bugs:
+
+1. Array-of-pointers-to-arrays data emission: static int (*ap[3])[4] = {0,0,0}
+   emits .long 0 (4 bytes) per element instead of .xword/.quad 0 (8 bytes).
+   Root cause: analyze_declaration's is_array_of_pointers check compared ptr_pos
+   against the FIRST array in derived, but for int (*ap[3])[4] the pointer
+   appears BETWEEN two Array derivations (Array(4), Pointer, Array(3)).
+   Fix: Use rposition for last Array instead of position for first Array.
+
+2. ARM __builtin_popcount counts 64 bits instead of 32 for int-width arguments.
+   Root cause: emit_int_popcount used fmov d0, x0 (64-bit) unconditionally.
+   Fix: Use fmov s0, w0 for 32-bit types (zero-extending to clear upper bits).
+   Also fixed constant_fold's fold_unaryop to be width-aware for CLZ/CTZ/Bswap/Popcount.
