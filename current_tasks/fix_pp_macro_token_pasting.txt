@@ -1,0 +1,16 @@
+Fix preprocessor token spacing after macro expansion
+
+Problem: When a macro expands to a token like `-`, and the next token is `--`,
+the preprocessor produces `---` instead of `- --`. This is because the preprocessor
+does not insert whitespace between macro-expanded tokens and adjacent tokens that
+could form longer tokens when concatenated.
+
+Example:
+  #define M(x) x
+  c = a M(-)-- b;  // should expand to: c = a - -- b;
+                    // actually expands to: c = a --- b;
+
+This causes compiler_suite_0122_0011 to fail (and may affect other tests).
+
+The fix needs to be in the preprocessor's token output when expanding macros,
+ensuring a space is inserted between tokens that could merge.
