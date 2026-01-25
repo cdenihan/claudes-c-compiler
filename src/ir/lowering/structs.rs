@@ -599,7 +599,19 @@ impl Lowerer {
             Expr::Comma(_, last, _) => {
                 self.get_pointed_struct_layout(last)
             }
-            Expr::Assign(_, rhs, _) | Expr::CompoundAssign(_, _, rhs, _) => {
+            Expr::Assign(lhs, rhs, _) => {
+                // For assignment, the result has the LHS type; try LHS first, then RHS
+                if let Some(layout) = self.get_pointed_struct_layout(lhs) {
+                    return Some(layout);
+                }
+                self.get_pointed_struct_layout(rhs)
+            }
+            Expr::CompoundAssign(_, lhs, rhs, _) => {
+                // For compound assignment (e.g., ptr += 2), the result type is the LHS type.
+                // The RHS is typically an integer offset, not a pointer.
+                if let Some(layout) = self.get_pointed_struct_layout(lhs) {
+                    return Some(layout);
+                }
                 self.get_pointed_struct_layout(rhs)
             }
             _ => {

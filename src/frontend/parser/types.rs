@@ -264,7 +264,7 @@ impl Parser {
                     TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict => { self.advance(); }
                     TokenKind::Static => { self.advance(); self.parsing_static = true; }
                     TokenKind::Extern => { self.advance(); self.parsing_extern = true; }
-                    TokenKind::Register | TokenKind::Noreturn | TokenKind::ThreadLocal => { self.advance(); }
+                    TokenKind::Auto | TokenKind::Register | TokenKind::Noreturn | TokenKind::ThreadLocal => { self.advance(); }
                     TokenKind::Inline => { self.advance(); self.parsing_inline = true; }
                     TokenKind::Attribute => {
                         let (_, aligned, mode_ti, _) = self.parse_gcc_attributes();
@@ -278,21 +278,31 @@ impl Parser {
                 }
             }
         } else if *has_float {
-            // "float" can be followed by "_Complex"
+            // "float" can be followed by "_Complex" and storage class / qualifiers
             loop {
                 match self.peek() {
                     TokenKind::Complex => { self.advance(); *has_complex = true; }
                     TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict => { self.advance(); }
+                    TokenKind::Static => { self.advance(); self.parsing_static = true; }
+                    TokenKind::Extern => { self.advance(); self.parsing_extern = true; }
+                    TokenKind::Auto | TokenKind::Register | TokenKind::Noreturn | TokenKind::ThreadLocal => { self.advance(); }
+                    TokenKind::Inline => { self.advance(); self.parsing_inline = true; }
+                    TokenKind::Extension => { self.advance(); }
                     _ => break,
                 }
             }
         } else if *has_double {
-            // "double" can be followed by "long" and "_Complex"
+            // "double" can be followed by "long", "_Complex", and storage class / qualifiers
             loop {
                 match self.peek() {
                     TokenKind::Long => { self.advance(); *long_count += 1; }
                     TokenKind::Complex => { self.advance(); *has_complex = true; }
                     TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict => { self.advance(); }
+                    TokenKind::Static => { self.advance(); self.parsing_static = true; }
+                    TokenKind::Extern => { self.advance(); self.parsing_extern = true; }
+                    TokenKind::Auto | TokenKind::Register | TokenKind::Noreturn | TokenKind::ThreadLocal => { self.advance(); }
+                    TokenKind::Inline => { self.advance(); self.parsing_inline = true; }
+                    TokenKind::Extension => { self.advance(); }
                     _ => break,
                 }
             }
@@ -447,7 +457,7 @@ impl Parser {
                     self.advance();
                     self.parsing_extern = true;
                 }
-                TokenKind::Register | TokenKind::Noreturn | TokenKind::ThreadLocal => {
+                TokenKind::Auto | TokenKind::Register | TokenKind::Noreturn | TokenKind::ThreadLocal => {
                     self.advance();
                 }
                 TokenKind::Inline => {
