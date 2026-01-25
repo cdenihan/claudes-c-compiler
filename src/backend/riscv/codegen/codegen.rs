@@ -837,13 +837,21 @@ impl ArchCodegen for RiscvCodegen {
             (-(new_space as i64), new_space)
         });
 
-        // For variadic functions, count named GP params.
-        // The register save area (64 bytes for a0-a7) is placed ABOVE s0
-        // (at positive offsets from s0) so it's contiguous with the caller's
-        // stack-passed arguments. This means the frame_size below s0 does NOT
-        // include the register save area; it's accounted for in the prologue.
+        // For variadic functions, count the actual GP registers used by named
+        // parameters. A struct that occupies 2 GP regs counts as 2, not 1.
+        // This is critical for va_start to correctly point to the first variadic arg.
         if func.is_variadic {
-            self.va_named_gp_count = func.params.len().min(8);
+            let va_config = CallAbiConfig {
+                max_int_regs: 8, max_float_regs: 8,
+                align_i128_pairs: true,
+                f128_in_fp_regs: false, f128_in_gp_pairs: true,
+                variadic_floats_in_gp: true,
+            };
+            let param_classes = classify_params(func, &va_config);
+            self.va_named_gp_count = param_classes.iter()
+                .map(|c| c.gp_reg_count())
+                .sum::<usize>()
+                .min(8);
             self.is_variadic = true;
         } else {
             self.is_variadic = false;
@@ -1940,16 +1948,18 @@ impl ArchCodegen for RiscvCodegen {
 
     fn emit_va_arg(&mut self, dest: &Value, va_list_ptr: &Value, result_ty: IrType) {
         // RISC-V LP64D: va_list is just a void* (pointer to the next arg on stack).
-        // Load va_list pointer address into t1
-        if let Some(slot) = self.state.get_slot(va_list_ptr.0) {
-            if self.state.is_alloca(va_list_ptr.0) {
+        // Load va_list pointer address into t1.
+        // Must check register allocation FIRST: store_t0_to skips the stack
+        // for register-allocated values, so the slot would be stale.
+        if self.state.is_alloca(va_list_ptr.0) {
+            if let Some(slot) = self.state.get_slot(va_list_ptr.0) {
                 self.emit_addi_s0("t1", slot.0);
-            } else if let Some(&reg) = self.reg_assignments.get(&va_list_ptr.0) {
-                let reg_name = callee_saved_name(reg);
-                self.state.emit_fmt(format_args!("    mv t1, {}", reg_name));
-            } else {
-                self.emit_load_from_s0("t1", slot.0, "ld");
             }
+        } else if let Some(&reg) = self.reg_assignments.get(&va_list_ptr.0) {
+            let reg_name = callee_saved_name(reg);
+            self.state.emit_fmt(format_args!("    mv t1, {}", reg_name));
+        } else if let Some(slot) = self.state.get_slot(va_list_ptr.0) {
+            self.emit_load_from_s0("t1", slot.0, "ld");
         }
         // Load the current va_list pointer value (points to next arg)
         self.state.emit("    ld t2, 0(t1)");
@@ -1987,15 +1997,18 @@ impl ArchCodegen for RiscvCodegen {
         // stack-passed args are at s0+64, s0+72, etc. They form a contiguous
         // array of 8-byte slots. va_start sets va_list to point to the first
         // variadic argument.
-        if let Some(slot) = self.state.get_slot(va_list_ptr.0) {
-            if self.state.is_alloca(va_list_ptr.0) {
+        //
+        // Must check register allocation FIRST: store_t0_to skips the stack
+        // for register-allocated values, so the slot would be stale.
+        if self.state.is_alloca(va_list_ptr.0) {
+            if let Some(slot) = self.state.get_slot(va_list_ptr.0) {
                 self.emit_addi_s0("t0", slot.0);
-            } else if let Some(&reg) = self.reg_assignments.get(&va_list_ptr.0) {
-                let reg_name = callee_saved_name(reg);
-                self.state.emit_fmt(format_args!("    mv t0, {}", reg_name));
-            } else {
-                self.emit_load_from_s0("t0", slot.0, "ld");
             }
+        } else if let Some(&reg) = self.reg_assignments.get(&va_list_ptr.0) {
+            let reg_name = callee_saved_name(reg);
+            self.state.emit_fmt(format_args!("    mv t0, {}", reg_name));
+        } else if let Some(slot) = self.state.get_slot(va_list_ptr.0) {
+            self.emit_load_from_s0("t0", slot.0, "ld");
         }
 
         // Variadic args start at a[named_gp_count] in the register save area.
@@ -2010,27 +2023,29 @@ impl ArchCodegen for RiscvCodegen {
     // emit_va_end: uses default no-op implementation
 
     fn emit_va_copy(&mut self, dest_ptr: &Value, src_ptr: &Value) {
-        // Copy va_list (just 8 bytes on RISC-V - a single pointer)
-        if let Some(src_slot) = self.state.get_slot(src_ptr.0) {
-            if self.state.is_alloca(src_ptr.0) {
+        // Copy va_list (just 8 bytes on RISC-V - a single pointer).
+        // Must check register allocation FIRST: store_t0_to skips the stack
+        // for register-allocated values, so the slot would be stale.
+        if self.state.is_alloca(src_ptr.0) {
+            if let Some(src_slot) = self.state.get_slot(src_ptr.0) {
                 self.emit_addi_s0("t1", src_slot.0);
-            } else if let Some(&reg) = self.reg_assignments.get(&src_ptr.0) {
-                let reg_name = callee_saved_name(reg);
-                self.state.emit_fmt(format_args!("    mv t1, {}", reg_name));
-            } else {
-                self.emit_load_from_s0("t1", src_slot.0, "ld");
             }
+        } else if let Some(&reg) = self.reg_assignments.get(&src_ptr.0) {
+            let reg_name = callee_saved_name(reg);
+            self.state.emit_fmt(format_args!("    mv t1, {}", reg_name));
+        } else if let Some(src_slot) = self.state.get_slot(src_ptr.0) {
+            self.emit_load_from_s0("t1", src_slot.0, "ld");
         }
         self.state.emit("    ld t2, 0(t1)");
-        if let Some(dest_slot) = self.state.get_slot(dest_ptr.0) {
-            if self.state.is_alloca(dest_ptr.0) {
+        if self.state.is_alloca(dest_ptr.0) {
+            if let Some(dest_slot) = self.state.get_slot(dest_ptr.0) {
                 self.emit_addi_s0("t0", dest_slot.0);
-            } else if let Some(&reg) = self.reg_assignments.get(&dest_ptr.0) {
-                let reg_name = callee_saved_name(reg);
-                self.state.emit_fmt(format_args!("    mv t0, {}", reg_name));
-            } else {
-                self.emit_load_from_s0("t0", dest_slot.0, "ld");
             }
+        } else if let Some(&reg) = self.reg_assignments.get(&dest_ptr.0) {
+            let reg_name = callee_saved_name(reg);
+            self.state.emit_fmt(format_args!("    mv t0, {}", reg_name));
+        } else if let Some(dest_slot) = self.state.get_slot(dest_ptr.0) {
+            self.emit_load_from_s0("t0", dest_slot.0, "ld");
         }
         self.state.emit("    sd t2, 0(t0)");
     }

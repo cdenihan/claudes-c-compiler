@@ -63,6 +63,21 @@ impl ParamClass {
             ParamClass::StructByValReg { .. } | ParamClass::F128GpPair { .. }
         )
     }
+
+    /// Returns the number of GP registers consumed by this parameter classification.
+    /// Used by variadic function handling to compute the correct va_start offset.
+    pub fn gp_reg_count(&self) -> usize {
+        match self {
+            ParamClass::IntReg { .. } => 1,
+            ParamClass::I128RegPair { .. } => 2,
+            ParamClass::StructByValReg { size, .. } => {
+                // 1 reg for <=8 bytes, 2 regs for >8 bytes (up to 16)
+                if *size <= 8 { 1 } else { 2 }
+            }
+            ParamClass::F128GpPair { .. } => 2,
+            _ => 0, // FP regs and stack don't consume GP regs
+        }
+    }
 }
 
 /// Classify all parameters of a function for callee-side store emission.

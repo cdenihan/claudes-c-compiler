@@ -11,6 +11,23 @@ Float/double named params are now correctly handled as GP register args
 in variadic functions (per RISC-V LP64D ABI: all args to variadic functions
 go through integer registers).
 
+FIXED: va_list passed as function parameter now works correctly.
+lower_va_arg uses lower_expr for x86-64/AArch64 (array type va_list
+that decays to pointer) and lower_address_of for RISC-V (scalar void*).
+This fixes ARM Lua tests and all va_list parameter passing.
+
+FIXED: va_start/va_arg/va_copy register allocation awareness.
+The emit_va_start, emit_va_arg, and emit_va_copy functions now check
+register allocation (callee-saved registers) BEFORE falling back to
+stack slot access. Previously, they would load from stale/uninitialized
+stack slots when the va_list_ptr value was register-allocated.
+
+FIXED: va_named_gp_count for multi-register params (structs, i128).
+Previously used func.params.len() which counts IR parameters, not actual
+GP register slots. A 16-byte struct uses 2 GP registers but is 1 IR param.
+Now uses classify_params() to compute the true GP register usage, fixing
+struct-first-arg variadic functions.
+
 REMAINING ISSUES:
 1. Struct arguments in variadic calls are passed by pointer instead of by value.
    Small structs (<= 2*XLEN = 16 bytes) should be flattened into GP registers
@@ -19,8 +36,3 @@ REMAINING ISSUES:
 
 2. Long double (f128) va_arg may have alignment issues for structs containing
    long double members.
-
-3. FIXED: va_list passed as function parameter now works correctly.
-   lower_va_arg uses lower_expr for x86-64/AArch64 (array type va_list
-   that decays to pointer) and lower_address_of for RISC-V (scalar void*).
-   This fixes ARM Lua tests and all va_list parameter passing.
