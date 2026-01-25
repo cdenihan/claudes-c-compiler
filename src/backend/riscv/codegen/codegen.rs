@@ -1944,6 +1944,9 @@ impl ArchCodegen for RiscvCodegen {
         if let Some(slot) = self.state.get_slot(va_list_ptr.0) {
             if self.state.is_alloca(va_list_ptr.0) {
                 self.emit_addi_s0("t1", slot.0);
+            } else if let Some(&reg) = self.reg_assignments.get(&va_list_ptr.0) {
+                let reg_name = callee_saved_name(reg);
+                self.state.emit_fmt(format_args!("    mv t1, {}", reg_name));
             } else {
                 self.emit_load_from_s0("t1", slot.0, "ld");
             }
@@ -1987,6 +1990,9 @@ impl ArchCodegen for RiscvCodegen {
         if let Some(slot) = self.state.get_slot(va_list_ptr.0) {
             if self.state.is_alloca(va_list_ptr.0) {
                 self.emit_addi_s0("t0", slot.0);
+            } else if let Some(&reg) = self.reg_assignments.get(&va_list_ptr.0) {
+                let reg_name = callee_saved_name(reg);
+                self.state.emit_fmt(format_args!("    mv t0, {}", reg_name));
             } else {
                 self.emit_load_from_s0("t0", slot.0, "ld");
             }
@@ -2008,6 +2014,9 @@ impl ArchCodegen for RiscvCodegen {
         if let Some(src_slot) = self.state.get_slot(src_ptr.0) {
             if self.state.is_alloca(src_ptr.0) {
                 self.emit_addi_s0("t1", src_slot.0);
+            } else if let Some(&reg) = self.reg_assignments.get(&src_ptr.0) {
+                let reg_name = callee_saved_name(reg);
+                self.state.emit_fmt(format_args!("    mv t1, {}", reg_name));
             } else {
                 self.emit_load_from_s0("t1", src_slot.0, "ld");
             }
@@ -2016,6 +2025,9 @@ impl ArchCodegen for RiscvCodegen {
         if let Some(dest_slot) = self.state.get_slot(dest_ptr.0) {
             if self.state.is_alloca(dest_ptr.0) {
                 self.emit_addi_s0("t0", dest_slot.0);
+            } else if let Some(&reg) = self.reg_assignments.get(&dest_ptr.0) {
+                let reg_name = callee_saved_name(reg);
+                self.state.emit_fmt(format_args!("    mv t0, {}", reg_name));
             } else {
                 self.emit_load_from_s0("t0", dest_slot.0, "ld");
             }
