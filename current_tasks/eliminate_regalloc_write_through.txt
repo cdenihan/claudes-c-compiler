@@ -1,0 +1,16 @@
+Task: Eliminate write-through stack stores for register-allocated values (x86)
+
+The x86 backend uses a write-through strategy in store_rax_to(): when a value
+has a callee-saved register assignment, it writes to BOTH the stack slot AND
+the register. This produces a redundant memory write for every operation result
+that has a register.
+
+Changes:
+1. In store_rax_to(), skip the stack store when the value has a register assignment
+2. Update emit_load_ptr_from_slot to check register assignments (for GEP pointers)
+3. Update emit_slot_addr_to_secondary to check register assignments
+4. Update emit_memcpy_load_dest_addr/src_addr to check register assignments
+5. Skip stack slot allocation for register-allocated values in calculate_stack_space
+
+This eliminates ~50% of memory traffic for hot loops where values are
+register-allocated, giving significant speedup on compute-heavy benchmarks.

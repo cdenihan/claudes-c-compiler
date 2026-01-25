@@ -94,20 +94,26 @@ fn thread_jump_chains(func: &mut IrFunction) -> usize {
 
     // Resolve transitive chains with cycle detection.
     // If A -> B -> C where both B and C are forwarding blocks, resolve to A -> final.
-    let resolved: FxHashMap<BlockId, BlockId> = {
+    // We also track the immediate predecessor of the final target for phi updates:
+    // in chain B -> C -> D, the final target is D and the immediate predecessor is C.
+    // Phi nodes in D reference C (not B), so we need C to look up phi values.
+    let resolved: FxHashMap<BlockId, (BlockId, BlockId)> = {
         let mut resolved = FxHashMap::default();
         for &start in forwarding.keys() {
+            let mut prev = start;
             let mut current = start;
             let mut depth = 0;
             while let Some(&next) = forwarding.get(&current) {
                 if next == start || depth > MAX_CHAIN_DEPTH {
                     break; // cycle or too deep
                 }
+                prev = current;
                 current = next;
                 depth += 1;
             }
             if current != start {
-                resolved.insert(start, current);
+                // resolved maps: start -> (final_target, immediate_predecessor_of_final)
+                resolved.insert(start, (current, prev));
             }
         }
         resolved
@@ -117,27 +123,29 @@ fn thread_jump_chains(func: &mut IrFunction) -> usize {
         return 0;
     }
 
-    // Collect the redirections we need to make: (block_idx, old_intermediate, new_target)
-    // We process all blocks and collect the changes, then apply phi updates.
-    let mut redirections: Vec<(usize, Vec<(BlockId, BlockId)>)> = Vec::new();
+    // Collect the redirections we need to make.
+    // Each edge change: (old_intermediate, new_target, phi_lookup_block)
+    // phi_lookup_block is the immediate predecessor of new_target in the chain,
+    // which is the block whose label appears in new_target's phi nodes.
+    let mut redirections: Vec<(usize, Vec<(BlockId, BlockId, BlockId)>)> = Vec::new();
 
     for block_idx in 0..func.blocks.len() {
         let mut edge_changes = Vec::new();
 
         match &func.blocks[block_idx].terminator {
             Terminator::Branch(target) => {
-                if let Some(&resolved_target) = resolved.get(target) {
-                    edge_changes.push((*target, resolved_target));
+                if let Some(&(resolved_target, phi_block)) = resolved.get(target) {
+                    edge_changes.push((*target, resolved_target, phi_block));
                 }
             }
             Terminator::CondBranch { true_label, false_label, .. } => {
-                if let Some(&rt) = resolved.get(true_label) {
-                    edge_changes.push((*true_label, rt));
+                if let Some(&(rt, rt_phi)) = resolved.get(true_label) {
+                    edge_changes.push((*true_label, rt, rt_phi));
                 }
-                if let Some(&rf) = resolved.get(false_label) {
+                if let Some(&(rf, rf_phi)) = resolved.get(false_label) {
                     // Avoid duplicate if both targets resolve to same change
-                    if !edge_changes.iter().any(|(old, new)| *old == *false_label && *new == rf) {
-                        edge_changes.push((*false_label, rf));
+                    if !edge_changes.iter().any(|(old, new, _)| *old == *false_label && *new == rf) {
+                        edge_changes.push((*false_label, rf, rf_phi));
                     }
                 }
             }
@@ -163,14 +171,14 @@ fn thread_jump_chains(func: &mut IrFunction) -> usize {
         // Update the terminator
         match &mut func.blocks[*block_idx].terminator {
             Terminator::Branch(target) => {
-                for (old, new) in edge_changes {
+                for (old, new, _) in edge_changes {
                     if target == old {
                         *target = *new;
                     }
                 }
             }
             Terminator::CondBranch { true_label, false_label, .. } => {
-                for (old, new) in edge_changes {
+                for (old, new, _) in edge_changes {
                     if true_label == old {
                         *true_label = *new;
                     }
@@ -184,30 +192,25 @@ fn thread_jump_chains(func: &mut IrFunction) -> usize {
         count += 1;
 
         // Update phi nodes in the new target blocks.
-        // For each (old_intermediate -> new_target), find phi nodes in new_target
-        // that have incoming entries from old_intermediate and add entries from
-        // block_label with the same values.
-        //
-        // We need to handle the chain: block_label was going to old_intermediate,
-        // which forwarded to new_target. The phi in new_target expects an edge
-        // from old_intermediate. Now block_label goes directly to new_target,
-        // so we need to add (or update) an incoming entry for block_label.
-        for (old_intermediate, new_target) in edge_changes {
+        // For each edge change, we use phi_lookup_block (the immediate predecessor
+        // of new_target in the forwarding chain) to find the correct phi value.
+        // In a chain A -> B -> C -> D, when redirecting A from B to D:
+        //   - old_intermediate = B (the original target)
+        //   - new_target = D (the final resolved target)
+        //   - phi_lookup_block = C (D's phi entries reference C, not B)
+        for (_old_intermediate, new_target, phi_lookup_block) in edge_changes {
             // Find the new_target block and update its phi nodes
             for block in &mut func.blocks {
                 if block.label == *new_target {
                     for inst in &mut block.instructions {
                         if let Instruction::Phi { incoming, .. } = inst {
-                            // Find the value that would come from old_intermediate
-                            // and add an entry for block_label with the same value.
-                            let mut value_from_intermediate = None;
-                            for (val, label) in incoming.iter() {
-                                if *label == *old_intermediate {
-                                    value_from_intermediate = Some(*val);
-                                    break;
-                                }
-                            }
-                            if let Some(val) = value_from_intermediate {
+                            // Look up the phi value using the immediate predecessor
+                            // in the chain (phi_lookup_block), which is the block
+                            // that phi entries in new_target actually reference.
+                            let value_from_chain = incoming.iter()
+                                .find(|(_, label)| *label == *phi_lookup_block)
+                                .map(|(val, _)| *val);
+                            if let Some(val) = value_from_chain {
                                 // Only add if block_label doesn't already have an entry
                                 let already_has_entry = incoming.iter()
                                     .any(|(_, label)| *label == block_label);
