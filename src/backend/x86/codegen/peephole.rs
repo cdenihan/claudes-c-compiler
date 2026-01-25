@@ -11,8 +11,9 @@
 //!    redundant cltq, redundant zero/sign extensions) plus push/pop elimination
 //!    and binary-op push/pop rewriting.
 //!
-//! 2. **Global passes** (once): compare-and-branch fusion, global store forwarding
-//!    (across fallthrough labels), and dead store elimination.
+//! 2. **Global passes** (once): global store forwarding (across fallthrough
+//!    labels), dead store elimination, and compare-and-branch fusion (run last
+//!    so dead stores from round-tripped values are cleaned up first).
 //!
 //! 3. **Local cleanup** (up to 4 rounds): re-run local passes to clean up
 //!    opportunities exposed by global passes.
@@ -773,9 +774,14 @@ pub fn peephole_optimize(asm: String) -> String {
     }
 
     // Phase 2: Expensive global passes (run once)
-    let global_changed = fuse_compare_and_branch(&mut store, &mut infos);
-    let global_changed = global_changed | global_store_forwarding(&mut store, &mut infos);
+    // Store forwarding and dead store elimination run BEFORE compare-and-branch
+    // fusion so that dead store/load pairs are cleaned up first. This lets
+    // fuse_compare_and_branch correctly detect stores that are truly live
+    // (needed by another basic block) vs. dead stores left over from local
+    // store/load elimination.
+    let global_changed = global_store_forwarding(&mut store, &mut infos);
     let global_changed = global_changed | eliminate_dead_stores(&store, &mut infos);
+    let global_changed = global_changed | fuse_compare_and_branch(&mut store, &mut infos);
 
     // Phase 3: One more local cleanup if global passes made changes.
     // 4 iterations: cleanup after globals is shallow (mostly dead store + adjacent pairs).
@@ -2394,6 +2400,31 @@ mod tests {
         let result = peephole_optimize(asm);
         assert!(!result.contains("-24(%rbp), %rbx"),
             "should forward callee-saved reg across call: {}", result);
+    }
+
+    #[test]
+    fn test_compare_branch_fusion_store_preserved() {
+        // When there is a store-to-rbp between setCC and testq but NO
+        // corresponding load in the same basic block, the store is needed
+        // by another block. Fusion must be skipped entirely so the
+        // setCC+movzbq+store sequence is preserved.
+        let asm = [
+            "    cmpq $0, %rbx",
+            "    sete %al",
+            "    movzbq %al, %rax",
+            "    movq %rax, -40(%rbp)",
+            "    testq %rax, %rax",
+            "    jne .L309",
+            "    jmp .L311",
+        ].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(result.contains("sete %al"), "must preserve sete: {}", result);
+        assert!(result.contains("movzbq %al,"), "must preserve movzbq: {}", result);
+        assert!(result.contains("-40(%rbp)"), "must preserve store to stack slot: {}", result);
+        assert!(result.contains("testq %rax, %rax"), "must preserve testq: {}", result);
+        // Fusion would replace the sequence with a direct conditional jump
+        // after the cmpq, eliminating testq. Since testq is preserved, fusion
+        // did not fire.
     }
 
     #[test]
