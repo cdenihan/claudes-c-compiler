@@ -1,0 +1,15 @@
+Task: IR CFG Simplification Pass
+Status: In Progress
+
+Add a new IR optimization pass that simplifies the control flow graph:
+1. Dead block elimination - remove blocks with no predecessors (except entry)
+2. Empty block elimination - redirect through blocks that only contain Branch(target)
+3. Redundant CondBranch simplification - convert CondBranch where both targets are the same to Branch
+4. Jump chain threading - collapse A->B->C to A->C
+
+This will be added to the pass pipeline in passes/mod.rs and will handle
+phi node updates when redirecting edges.
+
+Impact: Every function generates empty/dead blocks from if/else, loops,
+break/continue/goto/return. Each dead IR block generates wasted assembly
+instructions. This is especially impactful since the backend is stack-based.
