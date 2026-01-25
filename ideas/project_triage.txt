@@ -30,10 +30,19 @@ FAILING:
             binary — if it also fails, this is an environment issue.
 
   postgres:
-    Status: FAIL (all backends)
-    Notes: Builds successfully. initdb fails at runtime.
-    Action: Debug initdb crash. Compare with GCC-compiled initdb.
+    Status: PARTIALLY FIXED (43/216 tests pass after sizeof fix)
+    Notes: sizeof(string_literal) in static initializers was returning
+           pointer size (8) instead of array size. Fixed in sema const_eval.
+           Remaining failures (173/216) are due to:
+           1. Server SIGSEGV crash during boolean queries (e.g.
+              SELECT istrue AND isnul AND istrue FROM booltbl4)
+              - cascades to all subsequent tests since server dies
+           2. Wrong numeric ln() results (original values returned
+              instead of logarithm)
+    Action: Debug the SIGSEGV crash (highest priority - cascading failure).
+            Try to reproduce with a small standalone C program.
 
 PRIORITY ORDER for fixing:
-  1. Fix postgres initdb (complex)
-  2. Verify liburing is an environment issue
+  1. Fix postgres SIGSEGV during boolean/NULL query execution
+  2. Fix postgres wrong numeric ln() computation
+  3. Verify liburing is an environment issue

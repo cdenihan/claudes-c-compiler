@@ -570,7 +570,20 @@ impl<'a> SemaConstEval<'a> {
     }
 
     /// Compute sizeof for an expression via its CType.
+    ///
+    /// Special cases: string literals are arrays, not pointers, inside sizeof
+    /// (C11 6.3.2.1p3: array-to-pointer decay does not apply to sizeof operands).
     fn sizeof_expr(&self, expr: &Expr) -> Option<usize> {
+        match expr {
+            // "hello" is char[6], not char* -- sizeof gives array size.
+            // Use chars().count() because high-byte escape sequences like \xff
+            // are stored as multi-byte UTF-8 in the Rust String but represent
+            // single bytes in C.
+            Expr::StringLiteral(s, _) => return Some(s.chars().count() + 1),
+            // L"hello" is wchar_t[6] (int[6] on Linux) -- sizeof gives array size
+            Expr::WideStringLiteral(s, _) => return Some((s.chars().count() + 1) * 4),
+            _ => {}
+        }
         let ctype = self.infer_expr_ctype(expr)?;
         Some(ctype.size_ctx(&self.types.struct_layouts))
     }
