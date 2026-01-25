@@ -1,5 +1,6 @@
 use crate::ir::ir::*;
 use crate::common::types::IrType;
+use crate::common::fx_hash::FxHashMap;
 use crate::backend::common::PtrDirective;
 use crate::backend::state::{CodegenState, StackSlot};
 use crate::backend::traits::ArchCodegen;
@@ -8,9 +9,26 @@ use crate::backend::call_abi::{CallAbiConfig, CallArgClass, compute_stack_push_b
 use crate::backend::call_emit::{ParamClass, classify_params};
 use crate::backend::cast::{CastKind, classify_cast, FloatOp};
 use crate::backend::inline_asm::{InlineAsmEmitter, AsmOperandKind, AsmOperand, emit_inline_asm_common};
+use crate::backend::regalloc::{self, PhysReg, RegAllocConfig};
+
+/// x86-64 callee-saved registers available for register allocation.
+/// System V AMD64 ABI callee-saved: rbx, r12, r13, r14, r15.
+/// rbp is the frame pointer and cannot be allocated.
+/// PhysReg encoding: 1=rbx, 2=r12, 3=r13, 4=r14, 5=r15.
+const X86_CALLEE_SAVED: [PhysReg; 5] = [
+    PhysReg(1), PhysReg(2), PhysReg(3), PhysReg(4), PhysReg(5),
+];
+
+/// Map a PhysReg index to its x86-64 register name.
+fn callee_saved_name(reg: PhysReg) -> &'static str {
+    match reg.0 {
+        1 => "rbx", 2 => "r12", 3 => "r13", 4 => "r14", 5 => "r15",
+        _ => unreachable!("invalid x86 callee-saved register index"),
+    }
+}
 
 /// x86-64 code generator. Implements the ArchCodegen trait for the shared framework.
-/// Uses System V AMD64 ABI with stack-based allocation (no register allocator yet).
+/// Uses System V AMD64 ABI with linear scan register allocation for callee-saved registers.
 pub struct X86Codegen {
     state: CodegenState,
     current_return_type: IrType,
@@ -29,6 +47,11 @@ pub struct X86Codegen {
     asm_scratch_idx: usize,
     /// Scratch register index for inline asm allocation (XMM registers)
     asm_xmm_scratch_idx: usize,
+    /// Register allocation results for the current function.
+    /// Maps value ID -> callee-saved register assignment.
+    reg_assignments: FxHashMap<u32, PhysReg>,
+    /// Which callee-saved registers are used and need save/restore.
+    used_callee_saved: Vec<PhysReg>,
 }
 
 impl X86Codegen {
@@ -43,6 +66,8 @@ impl X86Codegen {
             is_variadic: false,
             asm_scratch_idx: 0,
             asm_xmm_scratch_idx: 0,
+            reg_assignments: FxHashMap::default(),
+            used_callee_saved: Vec::new(),
         }
     }
 
@@ -120,7 +145,12 @@ impl X86Codegen {
                 if self.state.reg_cache.acc_has(v.0, is_alloca) {
                     return;
                 }
-                if self.state.get_slot(v.0).is_some() {
+                // Check register allocation: load from callee-saved register
+                if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                    let reg_name = callee_saved_name(reg);
+                    self.state.emit_fmt(format_args!("    movq %{}, %rax", reg_name));
+                    self.state.reg_cache.set_acc(v.0, false);
+                } else if self.state.get_slot(v.0).is_some() {
                     self.value_to_reg(v, "rax");
                     self.state.reg_cache.set_acc(v.0, is_alloca);
                 } else {
@@ -131,14 +161,21 @@ impl X86Codegen {
         }
     }
 
-    /// Store %rax to a value's stack slot. Updates the register cache to record
-    /// that %rax now holds dest's value.
+    /// Store %rax to a value's location (register and/or stack slot).
+    /// Write-through strategy: always write to stack slot for safety (other code
+    /// paths may read it directly), and also write to the callee-saved register
+    /// so subsequent loads via operand_to_rax can use the fast register path.
     fn store_rax_to(&mut self, dest: &Value) {
         if let Some(slot) = self.state.get_slot(dest.0) {
             self.state.emit_fmt(format_args!("    movq %rax, {}(%rbp)", slot.0));
-            // After storing to dest, %rax still holds dest's value
-            self.state.reg_cache.set_acc(dest.0, false);
         }
+        // Also mirror to the assigned callee-saved register.
+        if let Some(&reg) = self.reg_assignments.get(&dest.0) {
+            let reg_name = callee_saved_name(reg);
+            self.state.emit_fmt(format_args!("    movq %rax, %{}", reg_name));
+        }
+        // After storing to dest, %rax still holds dest's value
+        self.state.reg_cache.set_acc(dest.0, false);
     }
 
     /// Load an operand directly into %rcx, avoiding the push/pop pattern.
@@ -191,7 +228,11 @@ impl X86Codegen {
                 }
             }
             Operand::Value(v) => {
-                if self.state.get_slot(v.0).is_some() {
+                // Check register allocation: load from callee-saved register
+                if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                    let reg_name = callee_saved_name(reg);
+                    self.state.emit_fmt(format_args!("    movq %{}, %rcx", reg_name));
+                } else if self.state.get_slot(v.0).is_some() {
                     self.value_to_reg(v, "rcx");
                 } else {
                     self.state.emit("    xorq %rcx, %rcx");
@@ -224,8 +265,17 @@ impl X86Codegen {
     }
 
     /// Load a Value into a named register. For allocas, loads the address (leaq);
-    /// for regular values, loads the data (movq).
+    /// for register-allocated values, copies from the callee-saved register;
+    /// for regular values, loads the data (movq) from the stack slot.
     fn value_to_reg(&mut self, val: &Value, reg: &str) {
+        // Check register allocation first (allocas are never register-allocated)
+        if let Some(&phys_reg) = self.reg_assignments.get(&val.0) {
+            let reg_name = callee_saved_name(phys_reg);
+            if reg_name != reg {
+                self.state.emit_fmt(format_args!("    movq %{}, %{}", reg_name, reg));
+            }
+            return;
+        }
         if let Some(slot) = self.state.get_slot(val.0) {
             if self.state.is_alloca(val.0) {
                 self.state.emit_fmt(format_args!("    leaq {}(%rbp), %{}", slot.0, reg));
@@ -822,7 +872,18 @@ impl ArchCodegen for X86Codegen {
             self.reg_save_area_offset = -space;
         }
 
-        space
+        // Run register allocator: assign callee-saved registers to hot values.
+        let config = RegAllocConfig {
+            available_regs: X86_CALLEE_SAVED.to_vec(),
+        };
+        let alloc_result = regalloc::allocate_registers(func, &config);
+        self.reg_assignments = alloc_result.assignments;
+        self.used_callee_saved = alloc_result.used_regs;
+
+        // Add space for saving callee-saved registers.
+        // Each callee-saved register needs 8 bytes on the stack.
+        let callee_save_space = (self.used_callee_saved.len() as i64) * 8;
+        space + callee_save_space
     }
 
     fn aligned_frame_size(&self, raw_space: i64) -> i64 {
@@ -835,6 +896,15 @@ impl ArchCodegen for X86Codegen {
         self.state.emit("    movq %rsp, %rbp");
         if frame_size > 0 {
             self.state.emit_fmt(format_args!("    subq ${}, %rsp", frame_size));
+        }
+
+        // Save callee-saved registers used by the register allocator.
+        // They are saved at the bottom of the frame (highest negative offsets from rbp).
+        let used_regs = self.used_callee_saved.clone();
+        for (i, &reg) in used_regs.iter().enumerate() {
+            let offset = -(frame_size as i64) + (i as i64 * 8);
+            let reg_name = callee_saved_name(reg);
+            self.state.emit_fmt(format_args!("    movq %{}, {}(%rbp)", reg_name, offset));
         }
 
         // For variadic functions, save all arg registers to the register save area.
@@ -856,7 +926,14 @@ impl ArchCodegen for X86Codegen {
         }
     }
 
-    fn emit_epilogue(&mut self, _frame_size: i64) {
+    fn emit_epilogue(&mut self, frame_size: i64) {
+        // Restore callee-saved registers before frame teardown.
+        let used_regs = self.used_callee_saved.clone();
+        for (i, &reg) in used_regs.iter().enumerate() {
+            let offset = -(frame_size as i64) + (i as i64 * 8);
+            let reg_name = callee_saved_name(reg);
+            self.state.emit_fmt(format_args!("    movq {}(%rbp), %{}", offset, reg_name));
+        }
         self.state.emit("    movq %rbp, %rsp");
         self.state.emit("    popq %rbp");
     }
@@ -1037,8 +1114,8 @@ impl ArchCodegen for X86Codegen {
         // rax already holds the return value per SysV ABI — noop
     }
 
-    fn emit_epilogue_and_ret(&mut self, _frame_size: i64) {
-        self.emit_epilogue(0);
+    fn emit_epilogue_and_ret(&mut self, frame_size: i64) {
+        self.emit_epilogue(frame_size);
         self.state.emit("    ret");
     }
 

@@ -14,6 +14,7 @@ A C compiler written from scratch in Rust, targeting x86-64, AArch64, and RISC-V
 - Phi elimination for backend codegen (parallel copy lowering)
 - Optimization passes (constant folding, DCE, GVN, algebraic simplification, copy propagation, CFG simplification) operating on SSA form
 - x86-64 peephole optimizer (eliminates redundant store/load, push/pop, and jump patterns)
+- **Linear scan register allocator** with loop-aware liveness analysis (x86-64 and RISC-V backends)
 - Three backend targets with correct ABI handling
 
 ### Test Results (ratio 10 sample)
@@ -95,7 +96,7 @@ See `git log` for full history. Key milestones:
 ### What's Not Yet Implemented
 - Some GNU C extensions in system headers (partial `__attribute__` support)
 - Long double: partial support (x86 80-bit semantics not fully covered)
-- Register allocator (all values currently go to stack slots)
+- Full register allocator (linear scan with callee-saved registers on x86 and RISC-V; further optimization possible)
 - Native ELF writer (currently shells out to gcc for assembly + linking)
 - Some edge cases in complex number arithmetic
 

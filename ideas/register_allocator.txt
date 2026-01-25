@@ -1,14 +1,21 @@
-Implement a register allocator:
+Register allocator -- PARTIALLY DONE
 
-Note: SSA is now implemented. This can proceed.
+Linear scan register allocator with callee-saved registers is implemented for:
+- x86-64: rbx, r12-r15 (5 registers)
+- RISC-V: s1, s7-s11 (6 registers)
 
-Current codegen uses a stack-based approach where every value is stored
-on the stack. This is correct but very slow.
+Liveness analysis uses backward dataflow iteration and supports loops.
 
-Implement a linear scan or graph coloring register allocator:
-1. Build live intervals for each IR value
-2. Allocate registers using the chosen algorithm
-3. Insert spill/reload code for values that don't fit in registers
-4. Handle calling conventions (caller/callee-saved registers)
-
-This will dramatically improve code quality and runtime performance.
+Remaining improvements:
+1. Eliminate write-through: currently every store goes to both stack AND register.
+   Skip the stack store when the value is register-allocated and has no other
+   readers (requires use-def chains or a smarter analysis).
+2. Register-to-register operations: instead of rax/rcx accumulator model,
+   emit operations directly on callee-saved registers (e.g., addq %r12, %rbx
+   instead of movq %r12, %rax / addq %rbx, %rcx / ... / movq %rax, %r15).
+3. Spill/reload insertion: currently values that don't fit spill to the existing
+   stack slot. A proper spill/reload would move values between registers and
+   stack at optimal points.
+4. ARM backend integration: port the same pattern to AArch64.
+5. Call-clobber handling: currently functions with inline asm or atomics bail out.
+   Should instead insert saves around clobbering instructions.

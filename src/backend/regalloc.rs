@@ -4,9 +4,8 @@
 //! Values with the longest live ranges and most uses get priority for register
 //! assignment. Values that don't fit in available registers remain on the stack.
 //!
-//! This allocator is designed for the RISC-V backend initially, using callee-saved
-//! registers (s1-s11) to avoid save/restore around every call. Other backends can
-//! adopt it later.
+//! Shared by all backends: x86-64 (rbx, r12-r15) and RISC-V (s1, s7-s11).
+//! Uses callee-saved registers so no save/restore is needed around calls.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
@@ -73,27 +72,16 @@ pub fn allocate_registers(
         };
     }
 
-    // TODO: Implement proper loop-aware liveness analysis (backward dataflow with
-    // live-in/live-out per block) to extend intervals across back-edges. Currently
-    // uses simple linear numbering which doesn't correctly handle loops.
-    //
-    // Disable register allocation for functions with loops (back-edges in CFG).
-    // A value defined at point P used at point Q < P (via back-edge) won't have
-    // its interval extended properly, causing the register to be reused while still live.
-    if has_back_edges(func) {
-        return RegAllocResult {
-            assignments: FxHashMap::default(),
-            used_regs: Vec::new(),
-        };
-    }
-
+    // Liveness analysis now uses backward dataflow iteration to correctly
+    // handle loops (values live across back-edges have their intervals extended).
     let liveness = compute_live_intervals(func);
 
     // Count uses per value for prioritization.
     let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
 
     // Use a whitelist approach: only allocate registers for values produced
-    // by simple, well-understood instructions that go through operand_to_t0/store_t0_to.
+    // by simple, well-understood instructions that store results via the
+    // standard accumulator path (e.g., store_rax_to on x86, store_t0_to on RISC-V).
     let mut eligible: FxHashSet<u32> = FxHashSet::default();
 
     for block in &func.blocks {
@@ -128,6 +116,18 @@ pub fn allocate_registers(
                 }
                 Instruction::GetElementPtr { dest, .. } => {
                     eligible.insert(dest.0);
+                }
+                Instruction::Copy { dest, src } => {
+                    // Copy instructions (often from phi elimination) are eligible
+                    // unless the source is a float, long double, or i128 constant
+                    // (these use different register paths).
+                    let is_ineligible = matches!(src,
+                        Operand::Const(IrConst::F32(_)) | Operand::Const(IrConst::F64(_)) |
+                        Operand::Const(IrConst::LongDouble(_)) | Operand::Const(IrConst::I128(_))
+                    );
+                    if !is_ineligible {
+                        eligible.insert(dest.0);
+                    }
                 }
                 _ => {}
             }
@@ -268,36 +268,3 @@ fn count_terminator_uses(term: &Terminator, use_count: &mut FxHashMap<u32, u32>)
     }
 }
 
-/// Detect whether a function's CFG has back-edges (i.e., loops).
-/// A back-edge is a branch from a block to an earlier-or-same block in the
-/// block ordering. This is a conservative check: it may flag irreducible
-/// control flow as loops, which is fine (we just skip register allocation).
-fn has_back_edges(func: &IrFunction) -> bool {
-    // Build a map from BlockId -> position in block list.
-    let block_index: FxHashMap<u32, usize> = func.blocks.iter().enumerate()
-        .map(|(i, b)| (b.label.0, i))
-        .collect();
-
-    for (idx, block) in func.blocks.iter().enumerate() {
-        let targets = match &block.terminator {
-            Terminator::Branch(target) => vec![target.0],
-            Terminator::CondBranch { true_label, false_label, .. } => {
-                vec![true_label.0, false_label.0]
-            }
-            Terminator::IndirectBranch { possible_targets, .. } => {
-                possible_targets.iter().map(|t| t.0).collect()
-            }
-            _ => vec![],
-        };
-
-        for target_id in targets {
-            if let Some(&target_idx) = block_index.get(&target_id) {
-                if target_idx <= idx {
-                    return true; // Back-edge found: branch to same or earlier block
-                }
-            }
-        }
-    }
-
-    false
-}
