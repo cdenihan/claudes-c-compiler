@@ -80,6 +80,18 @@ pub struct MacroDef {
 /// stripped from the final output in `expand_line()`.
 const BLUE_PAINT_MARKER: u8 = 0x01;
 
+/// Strip all blue-paint markers from a string.
+/// Used when substituting arguments into ## token paste operations,
+/// since the pasted result is a new token that should be rescanned
+/// without inheriting blue paint from its operands.
+fn strip_blue_paint(s: &str) -> String {
+    if s.as_bytes().contains(&BLUE_PAINT_MARKER) {
+        s.replace(BLUE_PAINT_MARKER as char, "")
+    } else {
+        s.to_string()
+    }
+}
+
 /// Stores all macro definitions and handles expansion.
 #[derive(Debug, Clone)]
 pub struct MacroTable {
@@ -642,7 +654,7 @@ impl MacroTable {
                 let left_token = extract_trailing_ident(&result);
                 if let Some(ref left_ident) = left_token {
                     if left_ident == "__VA_ARGS__" && is_variadic {
-                        let va_args = self.get_va_args(params, args);
+                        let va_args = strip_blue_paint(&self.get_va_args(params, args));
                         let trim_len = result.len() - "__VA_ARGS__".len();
                         result.truncate(trim_len);
                         if va_args.is_empty() {
@@ -659,7 +671,10 @@ impl MacroTable {
                         let trim_len = result.len() - left_ident.len();
                         result.truncate(trim_len);
                         let arg = args.get(idx).map(|s| s.as_str()).unwrap_or("");
-                        result.push_str(arg);
+                        // Strip blue paint: ## creates a new token that must be rescanned
+                        // without inheriting blue paint from operands (C11 §6.10.3.3)
+                        let clean_arg = strip_blue_paint(arg);
+                        result.push_str(&clean_arg);
                     }
                 }
 
@@ -677,7 +692,7 @@ impl MacroTable {
                     let right_ident = bytes_to_str(bytes, start, i);
 
                     if right_ident == "__VA_ARGS__" && is_variadic {
-                        let va_args = self.get_va_args(params, args);
+                        let va_args = strip_blue_paint(&self.get_va_args(params, args));
                         if va_args.is_empty() {
                             while result.ends_with(' ') || result.ends_with('\t') {
                                 result.pop();
@@ -691,7 +706,7 @@ impl MacroTable {
                     } else if let Some(idx) = params.iter().position(|p| p == right_ident) {
                         let is_named_variadic_param = is_variadic && has_named_variadic && idx == params.len() - 1;
                         if is_named_variadic_param {
-                            let va_args = self.get_named_va_args(idx, args);
+                            let va_args = strip_blue_paint(&self.get_named_va_args(idx, args));
                             if va_args.is_empty() {
                                 while result.ends_with(' ') || result.ends_with('\t') {
                                     result.pop();
@@ -704,12 +719,15 @@ impl MacroTable {
                             }
                         } else {
                             let arg = args.get(idx).map(|s| s.as_str()).unwrap_or("");
-                            if arg.is_empty() {
+                            // Strip blue paint: ## creates a new token that must be rescanned
+                            // without inheriting blue paint from operands (C11 §6.10.3.3)
+                            let clean_arg = strip_blue_paint(arg);
+                            if clean_arg.is_empty() {
                                 if i < len && !result.is_empty() {
                                     result.push(' ');
                                 }
                             } else {
-                                result.push_str(arg);
+                                result.push_str(&clean_arg);
                             }
                         }
                     } else {
