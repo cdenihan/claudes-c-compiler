@@ -30,19 +30,23 @@ FAILING:
             binary — if it also fails, this is an environment issue.
 
   postgres:
-    Status: PARTIALLY FIXED (43/216 tests pass after sizeof fix)
-    Notes: sizeof(string_literal) in static initializers was returning
-           pointer size (8) instead of array size. Fixed in sema const_eval.
-           Remaining failures (173/216) are due to:
-           1. Server SIGSEGV crash during boolean queries (e.g.
-              SELECT istrue AND isnul AND istrue FROM booltbl4)
-              - cascades to all subsequent tests since server dies
-           2. Wrong numeric ln() results (original values returned
-              instead of logarithm)
-    Action: Debug the SIGSEGV crash (highest priority - cascading failure).
-            Try to reproduce with a small standalone C program.
+    Status: PARTIALLY FIXED (75/216 tests pass after peephole indirect jump fix)
+    Notes: Previous SIGSEGV crash during boolean queries is now FIXED.
+           Root cause: peephole store forwarding pass did not classify
+           `jmpq *%rax` (computed goto indirect jump) as a jump, so
+           computed goto target labels were treated as fallthrough-only.
+           This caused incorrect store-to-load forwarding across labels
+           that could be entered via indirect jump with different register
+           state. Fixed by adding JmpIndirect classification and marking
+           all labels as jump targets when indirect jumps are present.
+           Remaining failures (~141/216) are due to:
+           1. Wrong numeric ln()/sqrt()/log() results (original values
+              returned instead of correct computation)
+           2. Possible test runner timeout or connection issues for
+              later test groups
+    Action: Fix numeric computation bugs (ln/sqrt/log functions).
 
 PRIORITY ORDER for fixing:
-  1. Fix postgres SIGSEGV during boolean/NULL query execution
-  2. Fix postgres wrong numeric ln() computation
+  1. Fix postgres wrong numeric ln()/sqrt()/log() computation
+  2. Investigate remaining postgres test failures (may be test infrastructure)
   3. Verify liburing is an environment issue

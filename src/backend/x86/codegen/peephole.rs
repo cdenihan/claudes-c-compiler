@@ -69,6 +69,7 @@ enum LineKind {
 
     Label,              // `name:`
     Jmp,                // `jmp label`
+    JmpIndirect,        // `jmpq *%rax` or `jmp __x86_indirect_thunk_rax`
     CondJmp,            // `je`/`jne`/`jl`/... label
     Call,               // `call ...`
     Ret,                // `ret`
@@ -162,8 +163,8 @@ impl LineInfo {
     #[inline]
     fn is_barrier(self) -> bool {
         matches!(self.kind,
-            LineKind::Label | LineKind::Call | LineKind::Jmp | LineKind::CondJmp |
-            LineKind::Ret | LineKind::Directive)
+            LineKind::Label | LineKind::Call | LineKind::Jmp | LineKind::JmpIndirect |
+            LineKind::CondJmp | LineKind::Ret | LineKind::Directive)
     }
     #[inline]
     fn is_push(self) -> bool { matches!(self.kind, LineKind::Push { .. }) }
@@ -269,8 +270,18 @@ fn classify_line(raw: &str) -> LineInfo {
 
     // Control flow: dispatch on first byte
     if first == b'j' {
-        if sb.len() >= 4 && sb[1] == b'm' && sb[2] == b'p' && sb[3] == b' ' {
-            return line_info(LineKind::Jmp, ts);
+        if sb.len() >= 4 && sb[1] == b'm' && sb[2] == b'p' {
+            if sb[3] == b' ' {
+                // `jmp label` or `jmp __x86_indirect_thunk_rax`
+                if s.contains("indirect_thunk") {
+                    return line_info(LineKind::JmpIndirect, ts);
+                }
+                return line_info(LineKind::Jmp, ts);
+            }
+            if sb[3] == b'q' && sb.len() >= 5 && sb[4] == b' ' {
+                // `jmpq *%rax` – computed goto indirect jump
+                return line_info(LineKind::JmpIndirect, ts);
+            }
         }
         if is_conditional_jump(s) {
             return line_info(LineKind::CondJmp, ts);
@@ -997,7 +1008,7 @@ fn eliminate_push_pop_pairs(store: &LineStore, infos: &mut [LineInfo]) -> bool {
             if infos[j].is_push() {
                 break;
             }
-            if matches!(infos[j].kind, LineKind::Call | LineKind::Jmp | LineKind::Ret) {
+            if matches!(infos[j].kind, LineKind::Call | LineKind::Jmp | LineKind::JmpIndirect | LineKind::Ret) {
                 break;
             }
         }
@@ -1011,8 +1022,8 @@ fn eliminate_push_pop_pairs(store: &LineStore, infos: &mut [LineInfo]) -> bool {
 fn instruction_modifies_reg_id(info: &LineInfo, reg_id: RegId) -> bool {
     match info.kind {
         LineKind::StoreRbp { .. } | LineKind::Cmp | LineKind::Nop | LineKind::Empty
-        | LineKind::Label | LineKind::Directive | LineKind::Jmp | LineKind::CondJmp
-        | LineKind::SelfMove => false,
+        | LineKind::Label | LineKind::Directive | LineKind::Jmp | LineKind::JmpIndirect
+        | LineKind::CondJmp | LineKind::SelfMove => false,
         LineKind::LoadRbp { reg, .. } => reg == reg_id,
         LineKind::Pop { reg } => reg == reg_id,
         LineKind::Push { .. } => false, // push reads, doesn't modify the source reg
@@ -1855,7 +1866,7 @@ fn is_near_epilogue(infos: &[LineInfo], pos: usize) -> bool {
             // Stack pointer restoration (movq %rbp, %rsp) is classified as Other
             LineKind::Other { .. } => continue,
             // Found the return instruction - this is an epilogue
-            LineKind::Ret | LineKind::Jmp => return true,
+            LineKind::Ret | LineKind::Jmp | LineKind::JmpIndirect => return true,
             // Any other instruction type means we're not in the epilogue
             _ => return false,
         }
@@ -1886,6 +1897,7 @@ fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
     }
     let mut is_jump_target = vec![false; (max_label_num + 1) as usize];
     let mut has_non_numeric_jump_targets = false;
+    let mut has_indirect_jump = false;
     for i in 0..len {
         match infos[i].kind {
             LineKind::Jmp | LineKind::CondJmp => {
@@ -1900,8 +1912,20 @@ fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
                     }
                 }
             }
+            LineKind::JmpIndirect => {
+                has_indirect_jump = true;
+            }
             _ => {}
         }
+    }
+    // If the function contains any indirect jumps (computed goto), every label
+    // is a potential jump target. We can't statically determine which labels
+    // the indirect jump may reach, so conservatively mark them all.
+    if has_indirect_jump {
+        for v in is_jump_target.iter_mut() {
+            *v = true;
+        }
+        has_non_numeric_jump_targets = true;
     }
 
     // Phase 2: Forward scan with slot→register mappings.
@@ -2020,7 +2044,7 @@ fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
                 prev_was_unconditional_jump = false;
             }
 
-            LineKind::Jmp => {
+            LineKind::Jmp | LineKind::JmpIndirect => {
                 // After an unconditional jump, execution continues at the target.
                 // We can't know the state at the target (it may have other
                 // predecessors), so clear everything.
