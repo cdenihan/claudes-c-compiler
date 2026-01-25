@@ -771,6 +771,8 @@ impl Lowerer {
         let base_type_size = base_ty.size().max(1);
         if array_dim_strides.len() <= 1 {
             // 1D array: support designated initializers [idx] = val
+            // Designators may jump forward or backward, so we need to handle
+            // both cases: padding for forward jumps, overwriting for backward.
             let mut current_idx = 0usize;
             for item in items {
                 if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
@@ -778,12 +780,29 @@ impl Lowerer {
                         current_idx = idx;
                     }
                 }
-                // Pad values up to current_idx if needed
+                // Pad values up to current_idx if needed (forward jump)
                 while values.len() < current_idx {
                     values.push(self.zero_const(base_ty));
                 }
-                self.flatten_global_init_item_bool(&item.init, base_ty, values, is_bool_target);
-                current_idx = values.len();
+                if current_idx < values.len() {
+                    // Backward jump or overwrite: evaluate and write at the designated position
+                    let mut tmp = Vec::new();
+                    self.flatten_global_init_item_bool(&item.init, base_ty, &mut tmp, is_bool_target);
+                    let n = tmp.len();
+                    for (i, v) in tmp.into_iter().enumerate() {
+                        let pos = current_idx + i;
+                        if pos < values.len() {
+                            values[pos] = v;
+                        } else {
+                            values.push(v);
+                        }
+                    }
+                    current_idx += n.max(1);
+                } else {
+                    // Forward jump (already padded above): append at end
+                    self.flatten_global_init_item_bool(&item.init, base_ty, values, is_bool_target);
+                    current_idx = values.len();
+                }
             }
             return;
         }
@@ -816,30 +835,33 @@ impl Lowerer {
                 }
                 match &item.init {
                     Initializer::List(sub_items) => {
-                        // Braced sub-list at a designated position: recurse
-                        // Figure out which dimension level the remaining designators cover
+                        // Braced sub-list at a designated position: recurse into temp
+                        // and overwrite values at flat_idx to support backward jumps.
                         let remaining_dims = array_dim_strides.len().saturating_sub(index_designators.len());
                         let sub_strides = &array_dim_strides[array_dim_strides.len() - remaining_dims..];
-                        let _start_len = values.len();
-                        // Set values length to flat_idx so recursion appends from there
-                        values.truncate(flat_idx);
-                        while values.len() < flat_idx {
-                            values.push(self.zero_const(base_ty));
-                        }
+                        let mut tmp = Vec::new();
                         if sub_strides.is_empty() || remaining_dims == 0 {
-                            self.flatten_global_init_item_bool(&item.init, base_ty, values, is_bool_target);
+                            self.flatten_global_init_item_bool(&item.init, base_ty, &mut tmp, is_bool_target);
                         } else {
-                            self.flatten_global_array_init_bool(sub_items, sub_strides, base_ty, values, is_bool_target);
+                            self.flatten_global_array_init_bool(sub_items, sub_strides, base_ty, &mut tmp, is_bool_target);
                         }
-                        // Don't pad here - designated init doesn't imply sub-array boundary
+                        // Write tmp values at flat_idx, overwriting or extending as needed
+                        for (i, v) in tmp.into_iter().enumerate() {
+                            let pos = flat_idx + i;
+                            if pos < values.len() {
+                                values[pos] = v;
+                            } else {
+                                while values.len() < pos {
+                                    values.push(self.zero_const(base_ty));
+                                }
+                                values.push(v);
+                            }
+                        }
                     }
                     Initializer::Expr(expr) => {
                         if let Expr::StringLiteral(s, _) = expr {
-                            // String at designated position
-                            values.truncate(flat_idx);
-                            while values.len() < flat_idx {
-                                values.push(self.zero_const(base_ty));
-                            }
+                            // String at designated position: evaluate into temp and overwrite
+                            let mut tmp = Vec::new();
                             let string_sub_count = if index_designators.len() < array_dim_strides.len() {
                                 let remaining = &array_dim_strides[index_designators.len()..];
                                 if !remaining.is_empty() && base_type_size > 0 {
@@ -850,7 +872,19 @@ impl Lowerer {
                             } else {
                                 1
                             };
-                            self.inline_string_to_values(s, string_sub_count, base_ty, values);
+                            self.inline_string_to_values(s, string_sub_count, base_ty, &mut tmp);
+                            // Write tmp values at flat_idx, overwriting or extending
+                            for (i, v) in tmp.into_iter().enumerate() {
+                                let pos = flat_idx + i;
+                                if pos < values.len() {
+                                    values[pos] = v;
+                                } else {
+                                    while values.len() < pos {
+                                        values.push(self.zero_const(base_ty));
+                                    }
+                                    values.push(v);
+                                }
+                            }
                         } else {
                             // Scalar at designated flat position
                             if let Some(val) = self.eval_const_expr(expr) {
@@ -885,12 +919,16 @@ impl Lowerer {
                             continue;
                         }
                     }
-                    // Braced sub-list: recurse into next dimension, then pad to sub_elem_count
-                    let start_len = values.len();
-                    self.flatten_global_array_init_bool(sub_items, &array_dim_strides[1..], base_ty, values, is_bool_target);
-                    while values.len() < start_len + sub_elem_count {
-                        values.push(self.zero_const(base_ty));
+                    // Braced sub-list: recurse into a fresh temporary vector so that
+                    // designator indices are relative to the sub-array start, not the
+                    // accumulated values vector. This is essential for backward jumps.
+                    let mut sub_values = Vec::with_capacity(sub_elem_count);
+                    self.flatten_global_array_init_bool(sub_items, &array_dim_strides[1..], base_ty, &mut sub_values, is_bool_target);
+                    // Pad sub_values to sub_elem_count
+                    while sub_values.len() < sub_elem_count {
+                        sub_values.push(self.zero_const(base_ty));
                     }
+                    values.extend(sub_values.into_iter().take(sub_elem_count));
                     current_outer_idx += 1;
                 }
                 Initializer::Expr(expr) => {
