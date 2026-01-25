@@ -52,14 +52,16 @@ enum LineKind {
     CondJmp,            // `je`/`jne`/`jl`/... label
     Call,               // `call ...`
     Ret,                // `ret`
-    Push,               // `pushq %reg`
-    Pop,                // `popq %reg`
+    Push { reg: RegId },  // `pushq %reg`
+    Pop { reg: RegId },   // `popq %reg`
     SetCC,              // `setCC %al`
     Cmp,                // `cmpX`/`testX`/`ucomis*`
     Directive,          // Lines starting with `.`
 
-    /// Everything else (regular instructions)
-    Other,
+    /// Everything else (regular instructions).
+    /// `dest_reg` is the pre-parsed destination register family (REG_NONE if unknown).
+    /// This allows fast register-modification checks without re-parsing.
+    Other { dest_reg: RegId },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +94,8 @@ impl LineInfo {
             LineKind::Label | LineKind::Call | LineKind::Jmp | LineKind::CondJmp |
             LineKind::Ret | LineKind::Directive)
     }
+    #[inline]
+    fn is_push(self) -> bool { matches!(self.kind, LineKind::Push { .. }) }
 }
 
 // ── Line parsing ─────────────────────────────────────────────────────────────
@@ -161,12 +165,14 @@ fn classify_line(raw: &str) -> LineInfo {
         return LineInfo { kind: LineKind::CondJmp };
     }
 
-    // Push / Pop
+    // Push / Pop (extract register for fast checks)
     if s.starts_with("pushq ") {
-        return LineInfo { kind: LineKind::Push };
+        let reg = register_family(s[6..].trim()).unwrap_or(REG_NONE);
+        return LineInfo { kind: LineKind::Push { reg } };
     }
     if s.starts_with("popq ") {
-        return LineInfo { kind: LineKind::Pop };
+        let reg = register_family(s[5..].trim()).unwrap_or(REG_NONE);
+        return LineInfo { kind: LineKind::Pop { reg } };
     }
 
     // SetCC
@@ -183,7 +189,61 @@ fn classify_line(raw: &str) -> LineInfo {
         return LineInfo { kind: LineKind::Cmp };
     }
 
-    LineInfo { kind: LineKind::Other }
+    // Pre-parse destination register for fast modification checks.
+    let dest_reg = parse_dest_reg_fast(s);
+    LineInfo { kind: LineKind::Other { dest_reg } }
+}
+
+/// Fast extraction of the destination register family from a generic instruction.
+/// Handles the AT&T syntax convention where the last operand is the destination.
+/// Also handles implicit writes (cltq, cqto, div, mul, etc.).
+#[inline]
+fn parse_dest_reg_fast(s: &str) -> RegId {
+    let b = s.as_bytes();
+    // Implicit rax writers
+    if b.len() >= 4 {
+        if b[0] == b'c' && (s == "cltq" || s == "cqto" || s == "cdq" || s == "cqo") {
+            return 0; // rax family
+        }
+    }
+    // Single-operand div/idiv/mul implicitly write rax:rdx.
+    // Note: imul is not listed because the codegen only emits two/three-operand
+    // forms (imulq %rcx, %rax / imulq $imm, %rax, %rax) which write to the
+    // explicit destination, handled by the comma-based dest extraction below.
+    if b.len() >= 3 && (b[0] == b'd' || b[0] == b'i' || b[0] == b'm') {
+        if s.starts_with("div") || s.starts_with("idiv") || s.starts_with("mul") {
+            return 0; // rax family (also rdx, but we track rax as primary)
+        }
+    }
+    // Two-operand instructions: last operand is destination
+    if let Some(comma_pos) = memrchr(b',', b) {
+        let after_comma = &s[comma_pos + 1..];
+        let trimmed = after_comma.trim();
+        return register_family(trimmed).unwrap_or(REG_NONE);
+    }
+    // Single-operand instructions (inc, dec, not, neg, pop)
+    if b.len() >= 4 && (b[0] == b'i' || b[0] == b'd' || b[0] == b'n') {
+        if s.starts_with("inc") || s.starts_with("dec") || s.starts_with("not") || s.starts_with("neg") {
+            if let Some(space_pos) = s.find(' ') {
+                let operand = s[space_pos + 1..].trim();
+                return register_family(operand).unwrap_or(REG_NONE);
+            }
+        }
+    }
+    REG_NONE
+}
+
+/// Find the last occurrence of byte `needle` in `haystack`.
+#[inline]
+fn memrchr(needle: u8, haystack: &[u8]) -> Option<usize> {
+    let mut i = haystack.len();
+    while i > 0 {
+        i -= 1;
+        if haystack[i] == needle {
+            return Some(i);
+        }
+    }
+    None
 }
 
 /// Fast i32 parse for stack offsets like "-8", "-24", "0", etc.
@@ -273,11 +333,6 @@ fn parse_load_from_rbp_str(s: &str) -> Option<(&str, &str, MoveSize)> {
 // ── NOP helpers ──────────────────────────────────────────────────────────────
 
 #[inline]
-fn is_nop(line: &str) -> bool {
-    line.as_bytes().first() == Some(&0)
-}
-
-#[inline]
 fn mark_nop(line: &mut String, info: &mut LineInfo) {
     line.clear();
     line.push('\0');
@@ -295,6 +350,15 @@ fn replace_line(line: &mut String, info: &mut LineInfo, new_text: String) {
 
 /// Run peephole optimization on x86-64 assembly text.
 /// Returns the optimized assembly string.
+///
+/// Pass structure for speed:
+/// 1. Run cheap local passes iteratively until convergence (max 8 iterations).
+///    These are O(n) single-scan passes that only look at adjacent/nearby lines.
+/// 2. Run expensive global passes once. `global_store_forwarding` is O(n) but with
+///    higher constant factor due to tracking slot→register mappings. It subsumes
+///    the functionality of local store-load forwarding across wider windows.
+/// 3. Run local passes one more time to clean up opportunities exposed by the
+///    global passes (e.g., dead stores from forwarded loads).
 pub fn peephole_optimize(asm: String) -> String {
     // Pre-count lines to avoid Vec reallocation during split
     let line_count = count_newlines(asm.as_bytes()) + 1;
@@ -305,23 +369,42 @@ pub fn peephole_optimize(asm: String) -> String {
 
     let mut infos: Vec<LineInfo> = lines.iter().map(|l| classify_line(l)).collect();
 
+    // Phase 1: Iterative cheap local passes.
+    // 8 iterations is sufficient: local patterns rarely chain deeper than 3-4 levels.
     let mut changed = true;
     let mut pass_count = 0;
-    while changed && pass_count < 10 {
+    while changed && pass_count < 8 {
         changed = false;
-        // Fused pass: adjacent store/load patterns (same reg + different reg)
         changed |= eliminate_adjacent_store_load(&mut lines, &mut infos);
         changed |= eliminate_redundant_jumps(&mut lines, &mut infos);
         changed |= eliminate_push_pop_pairs(&mut lines, &mut infos);
         changed |= eliminate_binop_push_pop_pattern(&mut lines, &mut infos);
         changed |= eliminate_redundant_movq_self(&mut lines, &mut infos);
-        changed |= fuse_compare_and_branch(&mut lines, &mut infos);
-        changed |= forward_store_load_non_adjacent(&mut lines, &mut infos);
-        changed |= global_store_forwarding(&mut lines, &mut infos);
         changed |= eliminate_redundant_cltq(&mut lines, &mut infos);
         changed |= eliminate_redundant_zero_extend(&mut lines, &mut infos);
-        changed |= eliminate_dead_stores(&mut lines, &mut infos);
         pass_count += 1;
+    }
+
+    // Phase 2: Expensive global passes (run once)
+    let global_changed = fuse_compare_and_branch(&mut lines, &mut infos);
+    let global_changed = global_changed | global_store_forwarding(&mut lines, &mut infos);
+    let global_changed = global_changed | eliminate_dead_stores(&mut lines, &mut infos);
+
+    // Phase 3: One more local cleanup if global passes made changes.
+    // 4 iterations: cleanup after globals is shallow (mostly dead store + adjacent pairs).
+    if global_changed {
+        let mut changed2 = true;
+        let mut pass_count2 = 0;
+        while changed2 && pass_count2 < 4 {
+            changed2 = false;
+            changed2 |= eliminate_adjacent_store_load(&mut lines, &mut infos);
+            changed2 |= eliminate_redundant_jumps(&mut lines, &mut infos);
+            changed2 |= eliminate_redundant_movq_self(&mut lines, &mut infos);
+            changed2 |= eliminate_redundant_cltq(&mut lines, &mut infos);
+            changed2 |= eliminate_redundant_zero_extend(&mut lines, &mut infos);
+            changed2 |= eliminate_dead_stores(&mut lines, &mut infos);
+            pass_count2 += 1;
+        }
     }
 
     // Remove NOP markers and rebuild. Use total line bytes as capacity upper bound
@@ -426,56 +509,75 @@ fn eliminate_push_pop_pairs(lines: &mut [String], infos: &mut [LineInfo]) -> boo
     let len = lines.len();
 
     for i in 0..len.saturating_sub(2) {
-        if infos[i].kind != LineKind::Push {
-            continue;
-        }
+        let push_reg_id = match infos[i].kind {
+            LineKind::Push { reg } if reg != REG_NONE => reg,
+            _ => continue,
+        };
 
-        let push_line = trim_asm(&lines[i]);
-        if let Some(push_reg) = push_line.strip_prefix("pushq ") {
-            let push_reg = push_reg.trim();
-            if !push_reg.starts_with('%') {
+        for j in (i + 1)..std::cmp::min(i + 4, len) {
+            if infos[j].is_nop() {
                 continue;
             }
-
-            for j in (i + 1)..std::cmp::min(i + 4, len) {
-                if infos[j].is_nop() {
-                    continue;
-                }
-                // Use pre-parsed info for quick rejection
-                if infos[j].kind == LineKind::Pop {
-                    let line = trim_asm(&lines[j]);
-                    if let Some(pop_reg) = line.strip_prefix("popq ") {
-                        let pop_reg = pop_reg.trim();
-                        if pop_reg == push_reg {
-                            let mut safe = true;
-                            for k in (i + 1)..j {
-                                if infos[k].is_nop() {
-                                    continue;
-                                }
-                                if instruction_modifies_reg(trim_asm(&lines[k]), push_reg) {
-                                    safe = false;
-                                    break;
-                                }
-                            }
-                            if safe {
-                                mark_nop(&mut lines[i], &mut infos[i]);
-                                mark_nop(&mut lines[j], &mut infos[j]);
-                                changed = true;
-                            }
+            if let LineKind::Pop { reg: pop_reg_id } = infos[j].kind {
+                if pop_reg_id == push_reg_id {
+                    let mut safe = true;
+                    for k in (i + 1)..j {
+                        if infos[k].is_nop() {
+                            continue;
+                        }
+                        if instruction_modifies_reg_id(&infos[k], push_reg_id) {
+                            safe = false;
+                            break;
                         }
                     }
-                    break;
+                    if safe {
+                        mark_nop(&mut lines[i], &mut infos[i]);
+                        mark_nop(&mut lines[j], &mut infos[j]);
+                        changed = true;
+                    }
                 }
-                if infos[j].kind == LineKind::Push {
-                    break;
-                }
-                if matches!(infos[j].kind, LineKind::Call | LineKind::Jmp | LineKind::Ret) {
-                    break;
-                }
+                break;
+            }
+            if infos[j].is_push() {
+                break;
+            }
+            if matches!(infos[j].kind, LineKind::Call | LineKind::Jmp | LineKind::Ret) {
+                break;
             }
         }
     }
     changed
+}
+
+/// Fast check whether a line's instruction modifies a register identified by RegId.
+/// Uses pre-parsed `LineInfo` fields to avoid string parsing in the hot path.
+#[inline]
+fn instruction_modifies_reg_id(info: &LineInfo, reg_id: RegId) -> bool {
+    match info.kind {
+        LineKind::StoreRbp { .. } | LineKind::Cmp | LineKind::Nop | LineKind::Empty
+        | LineKind::Label | LineKind::Directive | LineKind::Jmp | LineKind::CondJmp => false,
+        LineKind::LoadRbp { reg, .. } => reg == reg_id,
+        LineKind::Pop { reg } => reg == reg_id,
+        LineKind::Push { .. } => false, // push reads, doesn't modify the source reg
+        LineKind::SetCC => reg_id == 0, // setCC writes %al (rax family)
+        LineKind::Call => matches!(reg_id, 0 | 1 | 2 | 6 | 7 | 8 | 9 | 10 | 11),
+        LineKind::Ret => false,
+        LineKind::Other { dest_reg } => {
+            if dest_reg == reg_id {
+                return true;
+            }
+            // div/idiv also clobber rdx (family 2), and rax (family 0)
+            // mul also clobbers rdx
+            // The dest_reg for these is already 0 (rax), check rdx separately
+            if dest_reg == 0 && reg_id == 2 {
+                // The parse_dest_reg_fast sets dest_reg=0 for div/idiv/mul
+                // These also clobber rdx. We conservatively say true.
+                // This is acceptable because push/pop pairs rarely involve rdx.
+                return true; // TODO: could be more precise
+            }
+            false
+        }
+    }
 }
 
 // ── Pattern 5: Binary-op push/pop pattern ────────────────────────────────────
@@ -486,57 +588,50 @@ fn eliminate_binop_push_pop_pattern(lines: &mut [String], infos: &mut [LineInfo]
 
     let mut i = 0;
     while i + 3 < len {
-        if infos[i].kind != LineKind::Push {
-            i += 1;
-            continue;
-        }
+        let push_reg_id = match infos[i].kind {
+            LineKind::Push { reg } if reg != REG_NONE => reg,
+            _ => { i += 1; continue; }
+        };
 
         let push_line = trim_asm(&lines[i]);
-        if let Some(push_reg) = push_line.strip_prefix("pushq ") {
-            let push_reg = push_reg.trim();
-            if !push_reg.starts_with('%') {
-                i += 1;
-                continue;
+        let push_reg = match push_line.strip_prefix("pushq ") {
+            Some(r) => r.trim(),
+            None => { i += 1; continue; }
+        };
+
+        // Find next 3 non-NOP lines
+        let mut real_indices = [0usize; 3];
+        let mut count = 0;
+        let mut j = i + 1;
+        while j < len && count < 3 {
+            if !infos[j].is_nop() {
+                real_indices[count] = j;
+                count += 1;
             }
+            j += 1;
+        }
 
-            // Find next 3 non-NOP lines
-            let mut real_indices = [0usize; 3];
-            let mut count = 0;
-            let mut j = i + 1;
-            while j < len && count < 3 {
-                if !infos[j].is_nop() {
-                    real_indices[count] = j;
-                    count += 1;
-                }
-                j += 1;
-            }
+        if count == 3 {
+            let load_idx = real_indices[0];
+            let move_idx = real_indices[1];
+            let pop_idx = real_indices[2];
 
-            if count == 3 {
-                let load_idx = real_indices[0];
-                let move_idx = real_indices[1];
-                let pop_idx = real_indices[2];
+            if let LineKind::Pop { reg: pop_reg_id } = infos[pop_idx].kind {
+                if pop_reg_id == push_reg_id {
+                    let load_line = trim_asm(&lines[load_idx]);
+                    let move_line = trim_asm(&lines[move_idx]);
 
-                if infos[pop_idx].kind == LineKind::Pop {
-                    let pop_line = trim_asm(&lines[pop_idx]);
-                    if let Some(pop_reg) = pop_line.strip_prefix("popq ") {
-                        let pop_reg = pop_reg.trim();
-                        if pop_reg == push_reg {
-                            let load_line = trim_asm(&lines[load_idx]);
-                            let move_line = trim_asm(&lines[move_idx]);
-
-                            if let Some(move_target) = parse_reg_to_reg_move(move_line, push_reg) {
-                                if instruction_writes_to(load_line, push_reg) && can_redirect_instruction(load_line) {
-                                    if let Some(new_load) = replace_dest_register(load_line, push_reg, move_target) {
-                                        mark_nop(&mut lines[i], &mut infos[i]);
-                                        let new_text = format!("    {}", new_load);
-                                        replace_line(&mut lines[load_idx], &mut infos[load_idx], new_text);
-                                        mark_nop(&mut lines[move_idx], &mut infos[move_idx]);
-                                        mark_nop(&mut lines[pop_idx], &mut infos[pop_idx]);
-                                        changed = true;
-                                        i = pop_idx + 1;
-                                        continue;
-                                    }
-                                }
+                    if let Some(move_target) = parse_reg_to_reg_move(move_line, push_reg) {
+                        if instruction_writes_to(load_line, push_reg) && can_redirect_instruction(load_line) {
+                            if let Some(new_load) = replace_dest_register(load_line, push_reg, move_target) {
+                                mark_nop(&mut lines[i], &mut infos[i]);
+                                let new_text = format!("    {}", new_load);
+                                replace_line(&mut lines[load_idx], &mut infos[load_idx], new_text);
+                                mark_nop(&mut lines[move_idx], &mut infos[move_idx]);
+                                mark_nop(&mut lines[pop_idx], &mut infos[pop_idx]);
+                                changed = true;
+                                i = pop_idx + 1;
+                                continue;
                             }
                         }
                     }
@@ -679,104 +774,6 @@ fn fuse_compare_and_branch(lines: &mut [String], infos: &mut [LineInfo]) -> bool
     changed
 }
 
-// ── Pattern 8: Forward store to non-adjacent load ────────────────────────────
-
-fn forward_store_load_non_adjacent(lines: &mut [String], infos: &mut [LineInfo]) -> bool {
-    let mut changed = false;
-    let len = lines.len();
-    const WINDOW: usize = 20;
-
-    for i in 0..len {
-        let (store_reg_id, store_offset, store_size) = match infos[i].kind {
-            LineKind::StoreRbp { reg, offset, size } => (reg, offset, size),
-            _ => continue,
-        };
-
-        // Get register name string for replacement (only needed if we find a match)
-        // We defer this to avoid parsing unless needed
-        let mut store_reg_str: Option<String> = None;
-
-        let mut reg_still_valid = true;
-        let end = std::cmp::min(i + WINDOW, len);
-
-        for j in (i + 1)..end {
-            if infos[j].is_nop() {
-                continue;
-            }
-
-            // Barrier check using pre-parsed info (fast integer comparison)
-            if infos[j].is_barrier() {
-                break;
-            }
-
-            // Another store to same offset kills forwarding
-            if let LineKind::StoreRbp { offset, .. } = infos[j].kind {
-                if offset == store_offset {
-                    break;
-                }
-            }
-
-            // Load from same offset?
-            if let LineKind::LoadRbp { reg: load_reg_id, offset: load_offset, size: load_size } = infos[j].kind {
-                if load_offset == store_offset && load_size == store_size && reg_still_valid {
-                    // Lazy-init the register name string
-                    if store_reg_str.is_none() {
-                        let trimmed = trim_asm(&lines[i]);
-                        let (sr, _, _) = parse_store_to_rbp_str(trimmed).unwrap();
-                        store_reg_str = Some(sr.to_string());
-                    }
-                    let sr = store_reg_str.as_ref().unwrap();
-
-                    if load_reg_id == store_reg_id {
-                        // Same register: load is redundant
-                        mark_nop(&mut lines[j], &mut infos[j]);
-                        changed = true;
-                        continue;
-                    } else {
-                        // Different register: replace with reg-to-reg move
-                        let load_line = trim_asm(&lines[j]);
-                        let (_, load_reg, _) = parse_load_from_rbp_str(load_line).unwrap();
-                        let new_text = format!("    {} {}, {}", store_size.mnemonic(), sr, load_reg);
-                        replace_line(&mut lines[j], &mut infos[j], new_text);
-                        changed = true;
-                        continue;
-                    }
-                }
-            }
-
-            // Check if instruction modifies the source register
-            if reg_still_valid {
-                // Quick check: if this line is a store to rbp, it only modifies
-                // a stack slot, not a register. Similarly loads only modify the dest reg.
-                match infos[j].kind {
-                    LineKind::StoreRbp { .. } => {
-                        // A store doesn't modify any GPR (the source is read, not written)
-                        // Already checked same-offset above, so this is safe to skip
-                    }
-                    LineKind::LoadRbp { reg, .. } => {
-                        // Load modifies its destination register
-                        if reg == store_reg_id {
-                            reg_still_valid = false;
-                        }
-                    }
-                    _ => {
-                        // Fall back to string-based check for other instructions
-                        if store_reg_str.is_none() {
-                            let trimmed = trim_asm(&lines[i]);
-                            let (sr, _, _) = parse_store_to_rbp_str(trimmed).unwrap();
-                            store_reg_str = Some(sr.to_string());
-                        }
-                        if instruction_modifies_reg(trim_asm(&lines[j]), store_reg_str.as_ref().unwrap()) {
-                            reg_still_valid = false;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    changed
-}
 
 // ── Pattern 9: Redundant cltq after movslq ───────────────────────────────────
 
@@ -865,7 +862,7 @@ fn eliminate_dead_stores(lines: &mut [String], infos: &mut [LineInfo]) -> bool {
 
             // Catch-all: check if line references the offset via string search
             // (handles leaq, movslq, etc. that aren't classified as store/load)
-            if infos[j].kind == LineKind::Other {
+            if matches!(infos[j].kind, LineKind::Other { .. }) {
                 // Build pattern once per outer iteration, reuse for all Other lines
                 if !pattern_built {
                     pattern_buf.clear();
@@ -991,33 +988,6 @@ fn replace_dest_register(inst: &str, old_reg: &str, new_reg: &str) -> Option<Str
     None
 }
 
-/// Check if an instruction modifies the given register.
-fn instruction_modifies_reg(inst: &str, reg: &str) -> bool {
-    if inst.is_empty() || is_nop(inst) || inst.ends_with(':') || inst.starts_with('.') {
-        return false;
-    }
-
-    if let Some((_op, operands)) = inst.split_once(' ') {
-        if let Some((_src, dst)) = operands.rsplit_once(',') {
-            let dst = dst.trim();
-            if dst == reg || register_overlaps(dst, reg) {
-                return true;
-            }
-        } else {
-            let operand = operands.trim();
-            if inst.starts_with("pop") && (operand == reg || register_overlaps(operand, reg)) {
-                return true;
-            }
-            if (inst.starts_with("inc") || inst.starts_with("dec") ||
-                inst.starts_with("not") || inst.starts_with("neg")) &&
-                (operand == reg || register_overlaps(operand, reg)) {
-                return true;
-            }
-        }
-    }
-
-    false
-}
 
 /// Parse a setCC instruction and return the condition code string.
 fn parse_setcc(s: &str) -> Option<&str> {
@@ -1328,6 +1298,13 @@ fn global_store_forwarding(lines: &mut [String], infos: &mut [LineInfo]) -> bool
                     });
                     reg_offsets[reg as usize].push(offset);
                 }
+                // Compact: remove inactive entries when the vec grows beyond 64.
+                // A typical basic block has 5-20 active slot mappings, so 64 gives
+                // ample headroom before compaction triggers. This keeps reverse-
+                // iteration scans O(active_count) rather than O(total_ever_inserted).
+                if slot_entries.len() > 64 {
+                    slot_entries.retain(|e| e.active);
+                }
                 prev_was_unconditional_jump = false;
             }
 
@@ -1398,15 +1375,14 @@ fn global_store_forwarding(lines: &mut [String], infos: &mut [LineInfo]) -> bool
                 prev_was_unconditional_jump = true;
             }
 
-            LineKind::Push | LineKind::Pop => {
-                if infos[i].kind == LineKind::Pop {
-                    let trimmed = trim_asm(&lines[i]);
-                    if let Some(reg_str) = trimmed.strip_prefix("popq ") {
-                        let reg_str = reg_str.trim();
-                        if let Some(fam) = register_family(reg_str) {
-                            invalidate_reg_flat(&mut slot_entries, &mut reg_offsets, fam);
-                        }
-                    }
+            LineKind::Push { .. } => {
+                // push reads a register, doesn't modify it
+                prev_was_unconditional_jump = false;
+            }
+
+            LineKind::Pop { reg } => {
+                if reg != REG_NONE {
+                    invalidate_reg_flat(&mut slot_entries, &mut reg_offsets, reg);
                 }
                 prev_was_unconditional_jump = false;
             }
@@ -1415,47 +1391,20 @@ fn global_store_forwarding(lines: &mut [String], infos: &mut [LineInfo]) -> bool
                 // Don't update prev_was_unconditional_jump.
             }
 
-            LineKind::Other => {
-                // For any other instruction, check which registers it modifies.
-                // Conservative: invalidate registers that appear as destinations.
-                let trimmed = trim_asm(&lines[i]);
-                if let Some((_op, operands)) = trimmed.split_once(' ') {
-                    if let Some((_src, dst)) = operands.rsplit_once(',') {
-                        let dst = dst.trim();
-                        if let Some(fam) = register_family(dst) {
-                            invalidate_reg_flat(&mut slot_entries, &mut reg_offsets, fam);
-                        }
-                    } else {
-                        // Single-operand instructions: inc, dec, not, neg, etc.
-                        let operand = operands.trim();
-                        if trimmed.starts_with("inc") || trimmed.starts_with("dec")
-                            || trimmed.starts_with("not") || trimmed.starts_with("neg")
+            LineKind::Other { dest_reg } => {
+                // Use pre-parsed destination register for fast invalidation.
+                if dest_reg != REG_NONE {
+                    invalidate_reg_flat(&mut slot_entries, &mut reg_offsets, dest_reg);
+                    // div/idiv/mul also clobber rdx (family 2).
+                    // parse_dest_reg_fast returns 0 (rax) for these; also invalidate rdx.
+                    if dest_reg == 0 {
+                        let trimmed = trim_asm(&lines[i]);
+                        if trimmed.starts_with("div") || trimmed.starts_with("idiv")
+                            || trimmed.starts_with("mul")
                         {
-                            if let Some(fam) = register_family(operand) {
-                                invalidate_reg_flat(&mut slot_entries, &mut reg_offsets, fam);
-                            }
+                            invalidate_reg_flat(&mut slot_entries, &mut reg_offsets, 2);
                         }
                     }
-                }
-                // Some instructions implicitly write rax (e.g., cltq, cqto, div, idiv, mul)
-                if trimmed == "cltq" || trimmed == "cqto" || trimmed == "cdq" || trimmed == "cqo"
-                    || trimmed.starts_with("div") || trimmed.starts_with("idiv")
-                    || trimmed.starts_with("mul") || trimmed.starts_with("imul")
-                {
-                    invalidate_reg_flat(&mut slot_entries, &mut reg_offsets, 0);
-                    // div/idiv/mul also clobber rdx
-                    if trimmed.starts_with("div") || trimmed.starts_with("idiv")
-                        || trimmed.starts_with("mul")
-                    {
-                        invalidate_reg_flat(&mut slot_entries, &mut reg_offsets, 2);
-                    }
-                }
-                if (trimmed.starts_with("movzbq ") || trimmed.starts_with("movzwq ")
-                    || trimmed.starts_with("movsbq ") || trimmed.starts_with("movswq ")
-                    || trimmed.starts_with("movslq "))
-                    && trimmed.ends_with("%rax")
-                {
-                    invalidate_reg_flat(&mut slot_entries, &mut reg_offsets, 0);
                 }
                 prev_was_unconditional_jump = false;
             }
