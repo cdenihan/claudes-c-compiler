@@ -290,6 +290,15 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction) {
     if !func.is_static {
         cg.state().emit_fmt(format_args!(".globl {}", func.name));
     }
+    // Emit visibility directive from __attribute__((visibility("..."))) on function defs
+    if let Some(ref vis) = func.visibility {
+        match vis.as_str() {
+            "hidden" => cg.state().emit_fmt(format_args!(".hidden {}", func.name)),
+            "protected" => cg.state().emit_fmt(format_args!(".protected {}", func.name)),
+            "internal" => cg.state().emit_fmt(format_args!(".internal {}", func.name)),
+            _ => {} // "default" or unknown: no directive needed
+        }
+    }
     cg.state().emit_fmt(format_args!(".type {}, {}", func.name, type_dir));
     cg.state().emit_fmt(format_args!("{}:", func.name));
 

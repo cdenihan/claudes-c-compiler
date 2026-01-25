@@ -30,6 +30,8 @@ pub struct FunctionDef {
     pub is_destructor: bool,
     /// __attribute__((section("..."))) - place in specific ELF section
     pub section: Option<String>,
+    /// __attribute__((visibility("hidden"|"default"|...)))
+    pub visibility: Option<String>,
     pub span: Span,
 }
 

@@ -1017,6 +1017,7 @@ impl Lowerer {
             is_variadic: func.variadic, is_declaration: false, is_static, stack_size: 0,
             next_value_id: next_val,
             section: func.section.clone(),
+            visibility: func.visibility.clone(),
         };
         self.module.functions.push(ir_func);
         self.pop_scope();

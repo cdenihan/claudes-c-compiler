@@ -117,6 +117,8 @@ pub struct IrFunction {
     pub next_value_id: u32,
     /// __attribute__((section("..."))) - place in specific ELF section.
     pub section: Option<String>,
+    /// __attribute__((visibility("hidden"|"default"|...)))
+    pub visibility: Option<String>,
 }
 
 /// A function parameter.
@@ -986,6 +988,7 @@ impl IrFunction {
             stack_size: 0,
             next_value_id: 0,
             section: None,
+            visibility: None,
         }
     }
 

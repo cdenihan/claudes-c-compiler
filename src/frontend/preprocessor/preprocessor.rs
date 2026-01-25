@@ -269,6 +269,12 @@ impl Preprocessor {
             ("__GCC_ATOMIC_POINTER_LOCK_FREE", "2"),
             // ELF/PIC
             ("__ELF__", "1"), ("__PIC__", "2"), ("__pic__", "2"),
+            // CET (Control-flow Enforcement Technology) - match GCC's default
+            // This is x86_64-only; removed for other targets in set_target().
+            // Value 3 = IBT (bit 0) + SHSTK (bit 1), matching GCC's default.
+            // Critical: must match the GCC that assembles .S files, because
+            // libffi's trampoline sizes depend on ENDBR_PRESENT which checks __CET__.
+            ("__CET__", "3"),
             // Pragma support flags
             ("__PRAGMA_REDEFINE_EXTNAME", "1"),
         ];
@@ -596,6 +602,7 @@ impl Preprocessor {
                 self.macros.undefine("__x86_64");
                 self.macros.undefine("__amd64__");
                 self.macros.undefine("__amd64");
+                self.macros.undefine("__CET__");
                 // Define aarch64 macros
                 self.define_simple_macro("__aarch64__", "1");
                 self.define_simple_macro("__ARM_64BIT_STATE", "1");
@@ -648,6 +655,7 @@ impl Preprocessor {
                 self.macros.undefine("__x86_64");
                 self.macros.undefine("__amd64__");
                 self.macros.undefine("__amd64");
+                self.macros.undefine("__CET__");
                 // Define riscv64 macros
                 self.define_simple_macro("__riscv", "1");
                 self.define_simple_macro("__riscv_xlen", "64");
