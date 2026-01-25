@@ -1,0 +1,16 @@
+Fix variadic argument integer promotion and minor frontend improvements.
+
+1. Integer promotion for variadic arguments (C11 6.5.2.2p6):
+   - char/short types passed to variadic functions were not being promoted to int
+   - This caused printf("%d", (int16_t)val) to print wrong values (unsigned instead of signed)
+   - Fix: add I8/U8/I16/U16 -> I32 promotion in lower_call_arguments
+
+2. _Thread_local storage class specifier recognition:
+   - Parser's is_type_specifier() did not include ThreadLocal token
+   - This caused _Thread_local declarations inside function bodies to fail to parse
+   - Fix: add ThreadLocal to is_type_specifier match
+
+3. _Generic lvalue support:
+   - _Generic expressions used as lvalues (e.g., _Generic(3.14, double: lvalue) = 2)
+   - lower_lvalue() did not handle GenericSelection, silently dropping assignments
+   - Fix: add GenericSelection case to lower_lvalue that resolves and delegates
