@@ -151,6 +151,13 @@ impl Lowerer {
         self.target == Target::X86_64
     }
 
+    /// Returns true if the target packs _Complex float into a single 8-byte value
+    /// for variadic function calls. On RISC-V, variadic float args go through GP
+    /// registers, so _Complex float (2xF32) must be packed into one I64 GP register.
+    pub(super) fn packs_complex_float_variadic(&self) -> bool {
+        self.target == Target::Riscv64
+    }
+
     /// Returns true if the target decomposes _Complex long double into 2 F128 scalar
     /// components for function argument/parameter passing.
     /// On ARM64 (AAPCS64): _Complex long double is an HFA passed in Q0/Q1 registers,

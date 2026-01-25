@@ -1696,26 +1696,86 @@ impl Lowerer {
         Operand::Value(dest)
     }
 
-    /// Lower va_arg for complex types by decomposing into two component va_arg calls.
-    /// Complex types (_Complex float/double/long double) are passed as two separate
-    /// floating-point values in the variadic arg area. We retrieve each component
-    /// individually and store them into an alloca.
+    /// Lower va_arg for complex types by decomposing into component va_arg calls.
     ///
-    /// This correctly handles _Complex double on all platforms. Edge cases:
-    /// - _Complex float: default argument promotion should promote to _Complex double
-    ///   when passed to variadic functions. The caller side should handle this.
-    /// - _Complex long double on x86-64: passed on stack (MEMORY class), reading as
-    ///   two F128 values from the FP area may not match the x86 ABI exactly.
-    ///   TODO: handle _Complex long double specially on x86-64 if needed.
-    /// - _Complex long double on RISC-V: passed by reference in regular calls, but
-    ///   for variadic args it's passed as two values on the stack.
-    ///   TODO: verify RISC-V _Complex long double variadic ABI.
+    /// Complex float (_Complex float) is special: on x86-64 and RISC-V it's passed
+    /// as two F32 values packed into a single 8-byte slot (one XMM register on x86,
+    /// one integer register on RISC-V). We read one F64/I64 and bitcast-unpack it.
+    /// On ARM64, float _Complex occupies two separate register slots per AAPCS64.
+    ///
+    /// Complex double (_Complex double) is passed as two F64 values on all platforms.
+    ///
+    /// Complex long double on x86-64: passed on stack (MEMORY class), reading as
+    /// two F128 values from the FP area.
+    /// TODO: handle _Complex long double specially on x86-64 if needed.
     fn lower_va_arg_complex(&mut self, ap_expr: &Expr, ctype: &CType) -> Operand {
-        let comp_ir_ty = Self::complex_component_ir_type(ctype);
+        use crate::backend::Target;
 
         // Get va_list pointer using the shared helper (handles target differences)
         let ap_val = self.lower_va_list_pointer(ap_expr);
         let va_list_ptr = self.operand_to_value(ap_val);
+
+        // Handle float _Complex specially: packed into one 8-byte slot on x86-64 and RISC-V.
+        // The two F32 components (real, imag) are packed into a single 8-byte value:
+        // - x86-64: packed in one XMM register, read as F64
+        // - RISC-V: packed in one integer register, read as I64
+        if *ctype == CType::ComplexFloat && (self.target == Target::X86_64 || self.target == Target::Riscv64) {
+            let read_ty = if self.target == Target::X86_64 { IrType::F64 } else { IrType::I64 };
+            let packed = self.fresh_value();
+            self.emit(Instruction::VaArg {
+                dest: packed,
+                va_list_ptr,
+                result_ty: read_ty,
+            });
+
+            // Store the packed 8 bytes to a temp alloca, then read back as 2 x F32
+            let tmp_alloca = self.fresh_value();
+            self.emit(Instruction::Alloca {
+                dest: tmp_alloca,
+                ty: IrType::Ptr,
+                size: 8,
+                align: 0,
+                volatile: false,
+            });
+            self.emit(Instruction::Store {
+                val: Operand::Value(packed),
+                ptr: tmp_alloca,
+                ty: read_ty,
+            });
+
+            // Load real part (first F32 at offset 0)
+            let real_dest = self.fresh_value();
+            self.emit(Instruction::Load {
+                dest: real_dest,
+                ptr: tmp_alloca,
+                ty: IrType::F32,
+            });
+
+            // Load imag part (second F32 at offset +4)
+            let imag_ptr = self.fresh_value();
+            self.emit(Instruction::BinOp {
+                dest: imag_ptr,
+                op: IrBinOp::Add,
+                lhs: Operand::Value(tmp_alloca),
+                rhs: Operand::Const(IrConst::I64(4)),
+                ty: IrType::I64,
+            });
+            let imag_dest = self.fresh_value();
+            self.emit(Instruction::Load {
+                dest: imag_dest,
+                ptr: imag_ptr,
+                ty: IrType::F32,
+            });
+
+            // Allocate and store the complex float value
+            let alloca = self.alloca_complex(ctype);
+            self.store_complex_parts(alloca, Operand::Value(real_dest), Operand::Value(imag_dest), ctype);
+            return Operand::Value(alloca);
+        }
+
+        // For complex double, complex long double, and float complex on ARM64:
+        // read two separate values from the va_list
+        let comp_ir_ty = Self::complex_component_ir_type(ctype);
 
         // Retrieve real part via va_arg
         let real_dest = self.fresh_value();

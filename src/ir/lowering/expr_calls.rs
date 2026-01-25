@@ -82,13 +82,20 @@ impl Lowerer {
         // Lower arguments with implicit casts
         let (mut arg_vals, mut arg_types, mut struct_arg_sizes) = self.lower_call_arguments(func, args);
 
+        // Detect variadic status early (needed for complex arg decomposition)
+        let call_is_variadic = if let Expr::Identifier(name, _) = stripped_func {
+            self.is_function_variadic(name)
+        } else {
+            false
+        };
+
         // Decompose complex double/float arguments into (real, imag) pairs for ABI compliance
         let param_ctypes_for_decompose = if let Expr::Identifier(name, _) = stripped_func {
             self.func_meta.sigs.get(name.as_str()).map(|s| s.param_ctypes.clone()).filter(|v| !v.is_empty())
         } else {
             None
         };
-        self.decompose_complex_call_args(&mut arg_vals, &mut arg_types, &mut struct_arg_sizes, &param_ctypes_for_decompose, args);
+        self.decompose_complex_call_args(&mut arg_vals, &mut arg_types, &mut struct_arg_sizes, &param_ctypes_for_decompose, args, call_is_variadic);
 
         let dest = self.fresh_value();
 
@@ -104,9 +111,9 @@ impl Lowerer {
             None
         };
 
-        // Determine variadic status and number of fixed args
+        // Determine number of fixed args for variadic calls
         let (call_variadic, num_fixed_args) = if let Expr::Identifier(name, _) = stripped_func {
-            let variadic = self.is_function_variadic(name);
+            let variadic = call_is_variadic;
             let n_fixed = if variadic {
                 if let Some(sig) = self.func_meta.sigs.get(name.as_str()) {
                     if !sig.param_ctypes.is_empty() {
@@ -114,6 +121,7 @@ impl Lowerer {
                         sig.param_ctypes.iter().map(|ct| {
                             match ct {
                                 CType::ComplexDouble => 2,
+                                // Fixed ComplexFloat params are always decomposed into 2 FP regs
                                 CType::ComplexFloat if !self.uses_packed_complex_float() => 2,
                                 CType::ComplexLongDouble if decomposes_cld => 2,
                                 _ => 1,

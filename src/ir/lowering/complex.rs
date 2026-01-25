@@ -903,7 +903,9 @@ impl Lowerer {
     /// Replaces complex double/float pointer arguments with (real, imag) pairs.
     /// ABI conventions:
     /// - _Complex float on x86-64: pack two F32 into one F64 (one XMM register)
-    /// - _Complex float on ARM/RISC-V: decompose to 2 separate F32 values
+    /// - _Complex float on RISC-V variadic: pack two F32 into one I64 (one GP register)
+    /// - _Complex float on ARM: decompose to 2 separate F32 values
+    /// - _Complex float on RISC-V non-variadic: decompose to 2 separate F32 values
     /// - _Complex double: decompose to 2 F64 values (all platforms)
     /// - _Complex long double: keep as pointer (passed on stack)
     pub(super) fn decompose_complex_call_args(
@@ -913,6 +915,7 @@ impl Lowerer {
         struct_arg_sizes: &mut Vec<Option<usize>>,
         param_ctypes: &Option<Vec<CType>>,
         args: &[Expr],
+        is_variadic_call: bool,
     ) {
         let pctypes = match param_ctypes {
             Some(ref ct) => ct.clone(),
@@ -921,45 +924,51 @@ impl Lowerer {
                 args.iter().map(|a| self.expr_ctype(a)).collect()
             }
         };
+        let n_fixed_params = param_ctypes.as_ref().map_or(0, |v| v.len());
 
         let uses_packed_cf = self.uses_packed_complex_float();
+        let packs_cf_variadic = self.packs_complex_float_variadic();
         let mut new_vals = Vec::with_capacity(arg_vals.len() * 2);
         let mut new_types = Vec::with_capacity(arg_types.len() * 2);
         let mut new_struct_sizes = Vec::with_capacity(struct_arg_sizes.len() * 2);
 
         for (i, (val, ty)) in arg_vals.iter().zip(arg_types.iter()).enumerate() {
             let ctype = pctypes.get(i);
+            // Is this arg beyond the fixed params (i.e., a variadic argument)?
+            let is_variadic_arg = is_variadic_call && i >= n_fixed_params;
 
-            // Check for ComplexFloat with x86-64 packed convention
-            let is_complex_float_packed = if uses_packed_cf {
-                match ctype {
-                    Some(CType::ComplexFloat) => true,
-                    None => {
-                        if *ty == IrType::Ptr && i < args.len() {
-                            matches!(self.expr_ctype(&args[i]), CType::ComplexFloat)
-                        } else {
-                            false
-                        }
-                    }
-                    _ => false,
+            let is_complex_float = match ctype {
+                Some(CType::ComplexFloat) => true,
+                None => {
+                    *ty == IrType::Ptr && i < args.len() && matches!(self.expr_ctype(&args[i]), CType::ComplexFloat)
                 }
-            } else {
-                false
+                _ => false,
             };
 
-            if is_complex_float_packed {
-                // x86-64 only: Load the 8-byte complex float value as F64 (preserves bit pattern
-                // of two packed F32s) so it passes through one XMM register
+            // Check for ComplexFloat with packed convention:
+            // - x86-64: always pack (2xF32 into 1xF64 in XMM register)
+            // - RISC-V variadic: pack (2xF32 into 1xI64 in GP register)
+            let should_pack = is_complex_float && (uses_packed_cf || (packs_cf_variadic && is_variadic_arg));
+
+            if should_pack {
                 let ptr = self.operand_to_value(val.clone());
                 let packed = self.fresh_value();
-                self.emit(Instruction::Load { dest: packed, ptr, ty: IrType::F64 });
-                new_vals.push(Operand::Value(packed));
-                new_types.push(IrType::F64);
+                if packs_cf_variadic && is_variadic_arg && !uses_packed_cf {
+                    // RISC-V variadic: load as I64 (two packed F32s in one GP register)
+                    self.emit(Instruction::Load { dest: packed, ptr, ty: IrType::I64 });
+                    new_vals.push(Operand::Value(packed));
+                    new_types.push(IrType::I64);
+                } else {
+                    // x86-64: load as F64 (two packed F32s in one XMM register)
+                    self.emit(Instruction::Load { dest: packed, ptr, ty: IrType::F64 });
+                    new_vals.push(Operand::Value(packed));
+                    new_types.push(IrType::F64);
+                }
                 new_struct_sizes.push(None); // packed scalar, not a struct
                 continue;
             }
 
-            // On ARM/RISC-V, ComplexFloat is decomposed like ComplexDouble.
+            // On ARM/RISC-V (non-variadic), ComplexFloat is decomposed like ComplexDouble.
             // ComplexLongDouble is only decomposed on ARM64 (HFA in Q regs);
             // on x86-64 it goes on stack, on RISC-V it goes by reference.
             let decomposes_cld = self.decomposes_complex_long_double();
