@@ -1,0 +1,10 @@
+Fix global initializer constant evaluation for multi-dimensional array element addresses.
+
+Bug: `int a[6][9]; int *c = &a[3][5];` results in c being NULL.
+Root cause: eval_global_addr_expr only handles single-level ArraySubscript
+where base is directly an Identifier. Chained subscripts like a[3][5]
+produce nested ArraySubscript AST nodes which weren't handled.
+
+Fix: Added resolve_chained_array_subscript() that recursively walks
+nested ArraySubscript nodes, accumulating byte offsets using
+array_dim_strides.
