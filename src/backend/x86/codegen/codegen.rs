@@ -1,6 +1,6 @@
 use crate::ir::ir::*;
 use crate::common::types::IrType;
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::backend::common::PtrDirective;
 use crate::backend::state::{CodegenState, StackSlot};
 use crate::backend::traits::ArchCodegen;
@@ -33,6 +33,84 @@ fn callee_saved_name_32(reg: PhysReg) -> &'static str {
         1 => "ebx", 2 => "r12d", 3 => "r13d", 4 => "r14d", 5 => "r15d",
         _ => unreachable!("invalid x86 callee-saved register index"),
     }
+}
+
+/// Scan inline asm instructions in a function and collect any callee-saved
+/// registers that are used via specific constraints or listed in clobbers.
+/// These must be saved/restored in the function prologue/epilogue.
+fn collect_inline_asm_callee_saved_x86(func: &IrFunction, used: &mut Vec<PhysReg>) {
+    // x86-64 callee-saved: rbx (PhysReg(1)), r12-r15 (PhysReg(2)-PhysReg(5))
+    // Map register name -> PhysReg index
+    fn reg_to_phys(name: &str) -> Option<PhysReg> {
+        match name {
+            "rbx" | "ebx" | "bx" | "bl" | "bh" => Some(PhysReg(1)),
+            "r12" | "r12d" | "r12w" | "r12b" => Some(PhysReg(2)),
+            "r13" | "r13d" | "r13w" | "r13b" => Some(PhysReg(3)),
+            "r14" | "r14d" | "r14w" | "r14b" => Some(PhysReg(4)),
+            "r15" | "r15d" | "r15w" | "r15b" => Some(PhysReg(5)),
+            _ => None,
+        }
+    }
+
+    let mut already: FxHashSet<u8> = used.iter().map(|r| r.0).collect();
+
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::InlineAsm { outputs, inputs, clobbers, .. } = inst {
+                // Check output constraints for specific callee-saved registers
+                for (constraint, _, _) in outputs {
+                    let c = constraint.trim_start_matches(|c: char| c == '=' || c == '+' || c == '&');
+                    if let Some(phys) = constraint_to_callee_saved_x86(c) {
+                        if already.insert(phys.0) {
+                            used.push(phys);
+                        }
+                    }
+                }
+                // Check input constraints for specific callee-saved registers
+                for (constraint, _, _) in inputs {
+                    let c = constraint.trim_start_matches(|c: char| c == '=' || c == '+' || c == '&');
+                    if let Some(phys) = constraint_to_callee_saved_x86(c) {
+                        if already.insert(phys.0) {
+                            used.push(phys);
+                        }
+                    }
+                }
+                // Check clobber list for callee-saved register names
+                for clobber in clobbers {
+                    if let Some(phys) = reg_to_phys(clobber.as_str()) {
+                        if already.insert(phys.0) {
+                            used.push(phys);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Check if a constraint string refers to a specific x86-64 callee-saved register.
+fn constraint_to_callee_saved_x86(constraint: &str) -> Option<PhysReg> {
+    // Handle explicit register constraint: {regname}
+    if constraint.starts_with('{') && constraint.ends_with('}') {
+        let reg = &constraint[1..constraint.len()-1];
+        return match reg {
+            "rbx" | "ebx" | "bx" | "bl" | "bh" => Some(PhysReg(1)),
+            "r12" | "r12d" | "r12w" | "r12b" => Some(PhysReg(2)),
+            "r13" | "r13d" | "r13w" | "r13b" => Some(PhysReg(3)),
+            "r14" | "r14d" | "r14w" | "r14b" => Some(PhysReg(4)),
+            "r15" | "r15d" | "r15w" | "r15b" => Some(PhysReg(5)),
+            _ => None,
+        };
+    }
+    // Check single-character constraint letters
+    for ch in constraint.chars() {
+        match ch {
+            'b' => return Some(PhysReg(1)), // rbx
+            // Note: 'a','c','d','S','D' are caller-saved, no save needed
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Map an ALU binary op (Add/Sub/And/Or/Xor) to its x86 mnemonic base.
@@ -576,6 +654,163 @@ impl X86Codegen {
     /// primary accumulator (%rax). Used internally by both `emit_cast_instrs`
     /// (trait method) and the i128 special-case paths in `emit_cast`.
     fn emit_cast_instrs_x86(&mut self, from_ty: IrType, to_ty: IrType) {
+        // Handle F128 (long double) casts specially using x87 FPU instructions.
+        // The generic classify_cast() reduces F128 to F64, losing the extra precision
+        // that x87 80-bit extended precision provides. For integer <-> F128 casts,
+        // we must use x87 FILD/FISTTP to preserve full 64-bit integer precision.
+        if to_ty == IrType::F128 && !from_ty.is_float() {
+            // Integer -> F128: use x87 FILD for exact conversion, then store as f64 in rax.
+            // We use subq/movq/addq instead of push/pop to avoid peephole push/pop elimination.
+            if from_ty.is_signed() || from_ty.size() < 8 {
+                // For signed types (or unsigned types smaller than 8 bytes that fit in signed i64):
+                // Sign/zero-extend to 64-bit first if needed
+                if from_ty.size() < 8 {
+                    if from_ty.is_unsigned() {
+                        match from_ty {
+                            IrType::U8 => self.state.emit("    movzbq %al, %rax"),
+                            IrType::U16 => self.state.emit("    movzwq %ax, %rax"),
+                            IrType::U32 => self.state.emit("    movl %eax, %eax"),
+                            _ => {}
+                        }
+                    } else {
+                        match from_ty {
+                            IrType::I8 => self.state.emit("    movsbq %al, %rax"),
+                            IrType::I16 => self.state.emit("    movswq %ax, %rax"),
+                            IrType::I32 => self.state.emit("    cltq"),
+                            _ => {}
+                        }
+                    }
+                }
+                // Store i64 to stack scratch space, FILD loads it into x87, FSTPL stores as f64
+                self.state.emit("    subq $8, %rsp");
+                self.state.emit("    movq %rax, (%rsp)");
+                self.state.emit("    fildq (%rsp)");
+                self.state.emit("    fstpl (%rsp)");
+                self.state.emit("    movq (%rsp), %rax");
+                self.state.emit("    addq $8, %rsp");
+            } else {
+                // Unsigned 64-bit: FILD treats as signed, so handle high-bit case.
+                // If value < 2^63, FILD works directly. Otherwise, use shift+round trick.
+                let big_label = self.state.fresh_label("u2ld_big");
+                let done_label = self.state.fresh_label("u2ld_done");
+                self.state.emit("    testq %rax, %rax");
+                self.state.emit_fmt(format_args!("    js {}", big_label));
+                // Positive (< 2^63): FILD directly
+                self.state.emit("    subq $8, %rsp");
+                self.state.emit("    movq %rax, (%rsp)");
+                self.state.emit("    fildq (%rsp)");
+                self.state.emit("    fstpl (%rsp)");
+                self.state.emit("    movq (%rsp), %rax");
+                self.state.emit("    addq $8, %rsp");
+                self.state.emit_fmt(format_args!("    jmp {}", done_label));
+                self.state.emit_fmt(format_args!("{}:", big_label));
+                // High bit set: split into halved value + rounding bit, then double
+                self.state.emit("    movq %rax, %rcx");
+                self.state.emit("    shrq $1, %rax");
+                self.state.emit("    andq $1, %rcx");
+                self.state.emit("    orq %rcx, %rax");
+                self.state.emit("    subq $8, %rsp");
+                self.state.emit("    movq %rax, (%rsp)");
+                self.state.emit("    fildq (%rsp)");
+                self.state.emit("    fld %st(0)");          // duplicate ST0
+                self.state.emit("    faddp %st, %st(1)");   // ST0 = ST0 + ST1, pop = doubled value
+                self.state.emit("    fstpl (%rsp)");
+                self.state.emit("    movq (%rsp), %rax");
+                self.state.emit("    addq $8, %rsp");
+                self.state.emit_fmt(format_args!("{}:", done_label));
+            }
+            return;
+        }
+        if from_ty == IrType::F128 && !to_ty.is_float() {
+            // F128 -> Integer: use x87 FISTTP for truncation toward zero.
+            // rax holds f64 bits. Load as f64 into x87, then FISTTP to integer.
+            // We use subq/movq/addq instead of push/pop to avoid peephole elimination.
+            if to_ty.is_signed() || to_ty == IrType::Ptr {
+                self.state.emit("    subq $8, %rsp");
+                self.state.emit("    movq %rax, (%rsp)");
+                self.state.emit("    fldl (%rsp)");
+                self.state.emit("    fisttpq (%rsp)");
+                self.state.emit("    movq (%rsp), %rax");
+                self.state.emit("    addq $8, %rsp");
+                // Narrow if target is smaller than 64-bit
+                if to_ty.size() < 8 && to_ty != IrType::Ptr {
+                    match to_ty {
+                        IrType::I8 => self.state.emit("    movsbq %al, %rax"),
+                        IrType::I16 => self.state.emit("    movswq %ax, %rax"),
+                        IrType::I32 => self.state.emit("    movslq %eax, %rax"),
+                        _ => {}
+                    }
+                }
+            } else {
+                // F128 -> unsigned integer
+                if to_ty == IrType::U64 {
+                    // Handle values >= 2^63 that overflow signed FISTTP
+                    let big_label = self.state.fresh_label("ld2u_big");
+                    let done_label = self.state.fresh_label("ld2u_done");
+                    // Load f64 into x87 and compare with 2^63
+                    self.state.emit("    subq $8, %rsp");
+                    self.state.emit("    movq %rax, (%rsp)");
+                    self.state.emit("    fldl (%rsp)");
+                    // Load 2^63 as f64 for comparison
+                    self.state.emit("    movabsq $4890909195324358656, %rcx"); // 2^63 as f64 bits
+                    self.state.emit("    movq %rcx, (%rsp)");
+                    self.state.emit("    fldl (%rsp)");   // ST0 = 2^63, ST1 = value
+                    self.state.emit("    fcomip %st(1), %st");  // compare and pop 2^63
+                    self.state.emit_fmt(format_args!("    jbe {}", big_label)); // if 2^63 <= value
+                    // Small case: value < 2^63
+                    self.state.emit("    fisttpq (%rsp)");
+                    self.state.emit("    movq (%rsp), %rax");
+                    self.state.emit("    addq $8, %rsp");
+                    self.state.emit_fmt(format_args!("    jmp {}", done_label));
+                    // Big case: value >= 2^63
+                    self.state.emit_fmt(format_args!("{}:", big_label));
+                    self.state.emit("    movabsq $4890909195324358656, %rcx");
+                    self.state.emit("    movq %rcx, (%rsp)");
+                    self.state.emit("    fldl (%rsp)");   // ST0 = 2^63, ST1 = value
+                    self.state.emit("    fsubrp %st, %st(1)"); // ST0 = value - 2^63
+                    self.state.emit("    fisttpq (%rsp)");
+                    self.state.emit("    movq (%rsp), %rax");
+                    self.state.emit("    addq $8, %rsp");
+                    self.state.emit("    movabsq $9223372036854775808, %rcx");
+                    self.state.emit("    addq %rcx, %rax");
+                    self.state.emit_fmt(format_args!("{}:", done_label));
+                } else {
+                    // Smaller unsigned types: FISTTP then truncate
+                    self.state.emit("    subq $8, %rsp");
+                    self.state.emit("    movq %rax, (%rsp)");
+                    self.state.emit("    fldl (%rsp)");
+                    self.state.emit("    fisttpq (%rsp)");
+                    self.state.emit("    movq (%rsp), %rax");
+                    self.state.emit("    addq $8, %rsp");
+                    match to_ty {
+                        IrType::U8 => self.state.emit("    movzbq %al, %rax"),
+                        IrType::U16 => self.state.emit("    movzwq %ax, %rax"),
+                        IrType::U32 => self.state.emit("    movl %eax, %eax"),
+                        _ => {}
+                    }
+                }
+            }
+            return;
+        }
+        if from_ty == IrType::F128 && to_ty == IrType::F32 {
+            // F128 -> F32: load f64 into x87, convert to f32
+            self.state.emit("    subq $8, %rsp");
+            self.state.emit("    movq %rax, (%rsp)");
+            self.state.emit("    fldl (%rsp)");
+            self.state.emit("    fstps (%rsp)");
+            self.state.emit("    movl (%rsp), %eax");
+            self.state.emit("    addq $8, %rsp");
+            return;
+        }
+        if from_ty == IrType::F32 && to_ty == IrType::F128 {
+            // F32 -> F128: widen f32 to f64 (same as F32->F64 since F128 is stored as f64 in regs)
+            self.state.emit("    movd %eax, %xmm0");
+            self.state.emit("    cvtss2sd %xmm0, %xmm0");
+            self.state.emit("    movq %xmm0, %rax");
+            return;
+        }
+        // Note: F64 <-> F128 falls through to classify_cast() which returns Noop,
+        // since F128 is stored as f64 bit-pattern in registers. This is correct.
         match classify_cast(from_ty, to_ty) {
             CastKind::Noop => {}
 
@@ -1052,6 +1287,12 @@ impl ArchCodegen for X86Codegen {
         let alloc_result = regalloc::allocate_registers(func, &config);
         self.reg_assignments = alloc_result.assignments;
         self.used_callee_saved = alloc_result.used_regs;
+
+        // Scan inline asm instructions for callee-saved register usage.
+        // When inline asm uses specific register constraints (e.g., "b" for rbx)
+        // or lists callee-saved registers in clobbers, those registers must be
+        // saved/restored in the function prologue/epilogue to preserve the ABI.
+        collect_inline_asm_callee_saved_x86(func, &mut self.used_callee_saved);
 
         // Add space for saving callee-saved registers.
         // Each callee-saved register needs 8 bytes on the stack.
@@ -2073,7 +2314,9 @@ impl ArchCodegen for X86Codegen {
             self.state.emit_fmt(format_args!("    {}", mov_to_xmm0));
             self.operand_to_rcx(second);
             self.state.emit_fmt(format_args!("    {}", mov_to_xmm1_from_rcx));
-            // F128 uses F64 instructions (long double computed at double precision)
+            // F128 comparisons still use SSE ucomisd on the f64 register values.
+            // TODO: For full 80-bit precision, F128 compares should use x87 fcomip on
+            // memory-stored 80-bit values. This requires changing the F128 register protocol.
             // ucomisd %xmm1, %xmm0 compares xmm0 vs xmm1 (AT&T: src, dst → compares dst to src)
             if ty == IrType::F64 || ty == IrType::F128 {
                 self.state.emit("    ucomisd %xmm1, %xmm0");
@@ -2919,9 +3162,42 @@ impl ArchCodegen for X86Codegen {
     }
 
     /// Override the default trait emit_float_binop to avoid push/pop.
-    /// Instead of push lhs / load rhs / pop lhs, we load lhs to rax -> xmm0,
-    /// then load rhs to rcx -> xmm1, avoiding the stack entirely.
+    /// For F32/F64: loads lhs to rax -> xmm0, rhs to rcx -> xmm1, uses SSE.
+    /// For F128: uses x87 FPU instructions for 80-bit extended precision.
     fn emit_float_binop(&mut self, dest: &Value, op: FloatOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
+        if ty == IrType::F128 {
+            // F128 (long double) arithmetic: use x87 FPU for 80-bit extended precision.
+            // Both operands are f64 bit-patterns in registers. We load them into x87,
+            // perform the operation at 80-bit precision, then store the result as f64.
+            // x87 operand order: we load lhs first, then rhs, giving ST0=rhs, ST1=lhs.
+            // For sub/div, we need lhs op rhs = ST1 op ST0, which requires the
+            // "reverse" variants: fsubrp computes ST1-ST0, fdivrp computes ST1/ST0.
+            // faddp and fmulp are commutative, so order doesn't matter.
+            let x87_op = match op {
+                FloatOp::Add => "faddp",
+                FloatOp::Sub => "fsubrp",   // ST1 - ST0 = lhs - rhs
+                FloatOp::Mul => "fmulp",
+                FloatOp::Div => "fdivrp",   // ST1 / ST0 = lhs / rhs
+            };
+            // Load lhs (f64 in rax) into x87 ST0
+            self.operand_to_rax(lhs);
+            self.state.emit("    subq $8, %rsp");
+            self.state.emit("    movq %rax, (%rsp)");
+            self.state.emit("    fldl (%rsp)");
+            // Load rhs (f64 in rcx) into x87 ST0 (pushes lhs to ST1)
+            self.operand_to_rcx(rhs);
+            self.state.emit("    movq %rcx, (%rsp)");
+            self.state.emit("    fldl (%rsp)");
+            // ST0 = rhs, ST1 = lhs.
+            self.state.emit_fmt(format_args!("    {} %st, %st(1)", x87_op));
+            // Result is now in ST0. Store back as f64 to stack, then to rax.
+            self.state.emit("    fstpl (%rsp)");
+            self.state.emit("    movq (%rsp), %rax");
+            self.state.emit("    addq $8, %rsp");
+            self.state.reg_cache.invalidate_acc();
+            self.emit_store_result(dest);
+            return;
+        }
         let mnemonic = self.emit_float_binop_mnemonic(op);
         let (mov_rax_to_xmm0, mov_rcx_to_xmm1, mov_xmm0_to_rax) = if ty == IrType::F32 {
             ("movd %eax, %xmm0", "movd %ecx, %xmm1", "movd %xmm0, %eax")
@@ -2933,7 +3209,7 @@ impl ArchCodegen for X86Codegen {
         self.state.emit_fmt(format_args!("    {}", mov_rax_to_xmm0));
         self.operand_to_rcx(rhs);
         self.state.emit_fmt(format_args!("    {}", mov_rcx_to_xmm1));
-        let suffix = if ty == IrType::F64 || ty == IrType::F128 { "sd" } else { "ss" };
+        let suffix = if ty == IrType::F64 { "sd" } else { "ss" };
         self.state.emit_fmt(format_args!("    {}{} %xmm1, %xmm0", mnemonic, suffix));
         self.state.emit_fmt(format_args!("    {}", mov_xmm0_to_rax));
         self.state.reg_cache.invalidate_acc();

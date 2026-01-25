@@ -1,6 +1,6 @@
 use crate::ir::ir::*;
 use crate::common::types::IrType;
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::backend::common::PtrDirective;
 use crate::backend::state::{CodegenState, StackSlot};
 use crate::backend::traits::ArchCodegen;
@@ -27,6 +27,78 @@ fn callee_saved_name(reg: PhysReg) -> &'static str {
         6 => "s6", 7 => "s7", 8 => "s8", 9 => "s9", 10 => "s10", 11 => "s11",
         _ => unreachable!("invalid RISC-V callee-saved register index"),
     }
+}
+
+/// Scan inline asm instructions in a function and collect any callee-saved
+/// registers that are used via specific constraints or listed in clobbers.
+/// These must be saved/restored in the function prologue/epilogue.
+fn collect_inline_asm_callee_saved_riscv(func: &IrFunction, used: &mut Vec<PhysReg>) {
+    // RISC-V callee-saved: s0-s11 (x8-x27). s0 is the frame pointer.
+    // All other callee-saved registers (s1-s11) that inline asm might use or
+    // clobber must be saved/restored in the prologue/epilogue.
+    let mut already: FxHashSet<u8> = used.iter().map(|r| r.0).collect();
+
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::InlineAsm { outputs, inputs, clobbers, .. } = inst {
+                // Check output constraints for specific callee-saved registers
+                for (constraint, _, _) in outputs {
+                    let c = constraint.trim_start_matches(|c: char| c == '=' || c == '+' || c == '&');
+                    if let Some(phys) = constraint_to_callee_saved_riscv(c) {
+                        if already.insert(phys.0) {
+                            used.push(phys);
+                        }
+                    }
+                }
+                // Check input constraints for specific callee-saved registers
+                for (constraint, _, _) in inputs {
+                    let c = constraint.trim_start_matches(|c: char| c == '=' || c == '+' || c == '&');
+                    if let Some(phys) = constraint_to_callee_saved_riscv(c) {
+                        if already.insert(phys.0) {
+                            used.push(phys);
+                        }
+                    }
+                }
+                // Check clobber list
+                for clobber in clobbers {
+                    if let Some(phys) = riscv_reg_to_callee_saved(clobber.as_str()) {
+                        if already.insert(phys.0) {
+                            used.push(phys);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Map a RISC-V register name to its PhysReg index, if it is callee-saved.
+fn riscv_reg_to_callee_saved(name: &str) -> Option<PhysReg> {
+    match name {
+        "s1" | "x9" => Some(PhysReg(1)),
+        "s2" | "x18" => Some(PhysReg(2)),
+        "s3" | "x19" => Some(PhysReg(3)),
+        "s4" | "x20" => Some(PhysReg(4)),
+        "s5" | "x21" => Some(PhysReg(5)),
+        "s6" | "x22" => Some(PhysReg(6)),
+        "s7" | "x23" => Some(PhysReg(7)),
+        "s8" | "x24" => Some(PhysReg(8)),
+        "s9" | "x25" => Some(PhysReg(9)),
+        "s10" | "x26" => Some(PhysReg(10)),
+        "s11" | "x27" => Some(PhysReg(11)),
+        _ => None,
+    }
+}
+
+/// Check if a constraint string refers to a specific RISC-V callee-saved register.
+fn constraint_to_callee_saved_riscv(constraint: &str) -> Option<PhysReg> {
+    // Handle explicit register constraint: {regname}
+    if constraint.starts_with('{') && constraint.ends_with('}') {
+        let reg = &constraint[1..constraint.len()-1];
+        return riscv_reg_to_callee_saved(reg);
+    }
+    // Direct register name (e.g., "s1", "x9")
+    riscv_reg_to_callee_saved(constraint)
 }
 
 /// RISC-V 64 code generator. Implements the ArchCodegen trait for the shared framework.
@@ -899,6 +971,9 @@ impl ArchCodegen for RiscvCodegen {
         let alloc_result = regalloc::allocate_registers(func, &config);
         self.reg_assignments = alloc_result.assignments;
         self.used_callee_saved = alloc_result.used_regs;
+
+        // Scan inline asm instructions for callee-saved register usage.
+        collect_inline_asm_callee_saved_riscv(func, &mut self.used_callee_saved);
 
         // Add space for saving callee-saved registers.
         // Each callee-saved register needs 8 bytes on the stack.
