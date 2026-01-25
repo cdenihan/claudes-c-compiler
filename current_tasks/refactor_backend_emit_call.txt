@@ -1,0 +1,19 @@
+Task: Refactor backend emit_call and emit_store_params into shared default implementations
+
+Status: IN PROGRESS
+
+Problem:
+- emit_call is 170-460 lines in each of the 3 backends (x86, ARM, RISC-V)
+- The algorithmic structure is identical across all three: classify args, emit stack args,
+  load register args, emit call instruction, clean up stack, store return value
+- Only the instruction mnemonics and register names differ
+- emit_store_params has the same pattern of duplicated iteration logic
+
+Plan:
+1. Add new small trait methods as arch-specific hooks (e.g. emit_call_instruction,
+   emit_call_store_return, emit_call_push_stack_arg, etc.)
+2. Move the shared algorithmic skeleton into default implementations in traits.rs
+3. Reduce each backend's emit_call from 200-450 lines to ~50-80 lines of arch hooks
+4. Same pattern for emit_store_params
+
+Expected savings: ~800-1000 lines of duplicated code eliminated
