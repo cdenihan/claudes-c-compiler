@@ -556,20 +556,28 @@ impl Lowerer {
     }
 
     /// Evaluate a constant binary operation.
-    /// Uses both operand types for C's usual arithmetic conversions (C11 6.3.1.8).
+    /// Uses both operand types for C's usual arithmetic conversions (C11 6.3.1.8),
+    /// except for shifts where only the LHS type determines the result type (C11 6.5.7).
     /// Delegates arithmetic to the shared implementation in `common::const_arith`.
     fn eval_const_binop(&self, op: &BinOp, lhs: &IrConst, rhs: &IrConst, lhs_ty: IrType, rhs_ty: IrType) -> Option<IrConst> {
-        // Apply usual arithmetic conversions: use the wider of both operand types
         let lhs_size = lhs_ty.size().max(4);
-        let rhs_size = rhs_ty.size().max(4);
-        let result_size = lhs_size.max(rhs_size);
-        let is_32bit = result_size <= 4;
-        let is_unsigned = if lhs_size == rhs_size {
-            lhs_ty.is_unsigned() || rhs_ty.is_unsigned()
-        } else if lhs_size > rhs_size {
-            lhs_ty.is_unsigned()
+        let is_shift = matches!(op, BinOp::Shl | BinOp::Shr);
+
+        // For shifts (C11 6.5.7): result type is the promoted LHS type only.
+        // For other ops: apply usual arithmetic conversions using both operand types.
+        let (is_32bit, is_unsigned) = if is_shift {
+            (lhs_size <= 4, lhs_ty.is_unsigned())
         } else {
-            rhs_ty.is_unsigned()
+            let rhs_size = rhs_ty.size().max(4);
+            let result_size = lhs_size.max(rhs_size);
+            let is_unsigned = if lhs_size == rhs_size {
+                lhs_ty.is_unsigned() || rhs_ty.is_unsigned()
+            } else if lhs_size > rhs_size {
+                lhs_ty.is_unsigned()
+            } else {
+                rhs_ty.is_unsigned()
+            };
+            (result_size <= 4, is_unsigned)
         };
         const_arith::eval_const_binop(op, lhs, rhs, is_32bit, is_unsigned)
     }

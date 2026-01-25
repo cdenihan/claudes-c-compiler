@@ -114,15 +114,18 @@ impl<'a> SemaConstEval<'a> {
             Expr::BinaryOp(op, lhs, rhs, _) => {
                 let l = self.eval_const_expr(lhs)?;
                 let r = self.eval_const_expr(rhs)?;
-                // Derive operand CTypes for usual arithmetic conversions.
-                // First try to derive from the IrConst values themselves (O(1)),
-                // falling back to infer_expr_ctype only when needed.
-                // This avoids O(2^N) blowup on deep expression chains like
-                // enum { NUM = +1+1+1+...+1 } where infer_expr_ctype would
-                // recursively re-evaluate types at every node.
-                let lhs_ctype = Self::ctype_from_ir_const(&l)
+                // Derive operand CTypes for signedness/width determination.
+                // Priority: (1) pre-annotated expr_types from sema (O(1), preserves
+                // unsigned info), (2) ctype_from_ir_const (O(1), but loses unsigned),
+                // (3) infer_expr_ctype (expensive, full type inference).
+                // Using expr_types first is critical for correct signedness on casts
+                // like (unsigned int)(0x80000000) >> 2 -- ctype_from_ir_const would
+                // map the IrConst::I64 to signed Long, losing the unsigned cast.
+                let lhs_ctype = self.lookup_expr_type(lhs)
+                    .or_else(|| Self::ctype_from_ir_const(&l))
                     .or_else(|| self.infer_expr_ctype(lhs));
-                let rhs_ctype = Self::ctype_from_ir_const(&r)
+                let rhs_ctype = self.lookup_expr_type(rhs)
+                    .or_else(|| Self::ctype_from_ir_const(&r))
                     .or_else(|| self.infer_expr_ctype(rhs));
                 self.eval_const_binop(op, &l, &r, lhs_ctype.as_ref(), rhs_ctype.as_ref())
             }
@@ -242,22 +245,31 @@ impl<'a> SemaConstEval<'a> {
     }
 
     /// Evaluate a binary operation on constant operands.
-    /// Uses both LHS and RHS types for C's usual arithmetic conversions (C11 6.3.1.8).
+    /// Uses both LHS and RHS types for C's usual arithmetic conversions (C11 6.3.1.8),
+    /// except for shifts where only the LHS type determines the result type (C11 6.5.7).
     /// Delegates arithmetic to the shared implementation in `common::const_arith`.
     fn eval_const_binop(&self, op: &BinOp, lhs: &IrConst, rhs: &IrConst, lhs_ctype: Option<&CType>, rhs_ctype: Option<&CType>) -> Option<IrConst> {
-        // Apply C's usual arithmetic conversions using both operand types.
         let lhs_size = lhs_ctype.map_or(4, |ct| self.ctype_size(ct).max(4));
-        let rhs_size = rhs_ctype.map_or(4, |ct| self.ctype_size(ct).max(4));
         let lhs_unsigned = lhs_ctype.map_or(false, |ct| ct.is_unsigned());
-        let rhs_unsigned = rhs_ctype.map_or(false, |ct| ct.is_unsigned());
-        let result_size = lhs_size.max(rhs_size);
-        let is_32bit = result_size <= 4;
-        let is_unsigned = if lhs_size == rhs_size {
-            lhs_unsigned || rhs_unsigned
-        } else if lhs_size > rhs_size {
-            lhs_unsigned
+
+        let is_shift = matches!(op, BinOp::Shl | BinOp::Shr);
+
+        // For shifts (C11 6.5.7): result type is the promoted LHS type only.
+        // For other ops: apply C's usual arithmetic conversions using both operand types.
+        let (is_32bit, is_unsigned) = if is_shift {
+            (lhs_size <= 4, lhs_unsigned)
         } else {
-            rhs_unsigned
+            let rhs_size = rhs_ctype.map_or(4, |ct| self.ctype_size(ct).max(4));
+            let rhs_unsigned = rhs_ctype.map_or(false, |ct| ct.is_unsigned());
+            let result_size = lhs_size.max(rhs_size);
+            let is_unsigned = if lhs_size == rhs_size {
+                lhs_unsigned || rhs_unsigned
+            } else if lhs_size > rhs_size {
+                lhs_unsigned
+            } else {
+                rhs_unsigned
+            };
+            (result_size <= 4, is_unsigned)
         };
         const_arith::eval_const_binop(op, lhs, rhs, is_32bit, is_unsigned)
     }
@@ -341,9 +353,17 @@ impl<'a> SemaConstEval<'a> {
 
     // === Type helper methods ===
 
+    /// Look up the pre-annotated CType for an expression from sema's expr_types map.
+    /// This is O(1) and preserves signedness information (e.g. unsigned int from a cast).
+    fn lookup_expr_type(&self, expr: &Expr) -> Option<CType> {
+        let key = expr as *const Expr as usize;
+        self.expr_types.and_then(|m| m.get(&key).cloned())
+    }
+
     /// Derive a CType from an IrConst value.
     /// This is O(1) and avoids the potentially exponential infer_expr_ctype()
     /// when we already have the evaluated constant value.
+    /// Note: This loses signedness info -- IrConst::I64 always maps to signed Long.
     fn ctype_from_ir_const(c: &IrConst) -> Option<CType> {
         match c {
             IrConst::I8(_) => Some(CType::Char),
