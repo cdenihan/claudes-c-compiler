@@ -12,7 +12,7 @@ A C compiler written from scratch in Rust, targeting x86-64, AArch64, and RISC-V
 - Type-aware IR lowering and code generation
 - **SSA construction via mem2reg** (dominator tree, dominance frontiers, phi insertion, variable renaming)
 - Phi elimination for backend codegen (parallel copy lowering)
-- Optimization passes (constant folding, DCE, GVN, algebraic simplification, copy propagation) operating on SSA form
+- Optimization passes (constant folding, DCE, GVN, algebraic simplification, copy propagation, CFG simplification) operating on SSA form
 - x86-64 peephole optimizer (eliminates redundant store/load, push/pop, and jump patterns)
 - Three backend targets with correct ABI handling
 
