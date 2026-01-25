@@ -202,6 +202,10 @@ fn collect_instruction_uses(inst: &Instruction, used: &mut [bool]) {
                 mark_operand_used(arg, used);
             }
         }
+        Instruction::StackSave { .. } => {}
+        Instruction::StackRestore { ptr } => {
+            mark_used(used, ptr.0);
+        }
     }
 }
 
@@ -250,7 +254,10 @@ fn has_side_effects(inst: &Instruction) -> bool {
         Instruction::SetReturnF64Second { .. } |
         Instruction::SetReturnF32Second { .. } |
         Instruction::InlineAsm { .. } |
-        Instruction::Intrinsic { .. }
+        Instruction::Intrinsic { .. } |
+        // StackRestore modifies the stack pointer at runtime - must not be removed.
+        // StackSave is kept alive by its use in StackRestore (normal DCE liveness).
+        Instruction::StackRestore { .. }
     )
 }
 

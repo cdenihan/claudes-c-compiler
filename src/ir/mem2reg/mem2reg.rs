@@ -295,6 +295,10 @@ fn instruction_used_values(inst: &Instruction) -> Vec<u32> {
             add_operand_values(true_val, &mut used);
             add_operand_values(false_val, &mut used);
         }
+        Instruction::StackSave { .. } => {}
+        Instruction::StackRestore { ptr } => {
+            used.push(ptr.0);
+        }
     }
     used
 }

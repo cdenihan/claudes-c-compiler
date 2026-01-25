@@ -176,13 +176,30 @@ impl Lowerer {
             };
 
             let alloca = self.fresh_value();
-            self.emit(Instruction::Alloca {
-                dest: alloca,
-                ty: if da.is_array || da.is_struct || is_complex { IrType::Ptr } else { da.var_ty },
-                size: da.actual_alloc_size,
-                align: decl.alignment.unwrap_or(0),
-                volatile: decl.is_volatile,
-            });
+            if let Some(vla_size_val) = vla_size {
+                // VLA: allocate dynamically on the stack using DynAlloca.
+                // First, save the stack pointer if this is the first VLA in the function.
+                if !self.func().has_vla {
+                    self.func_mut().has_vla = true;
+                    let save_val = self.fresh_value();
+                    self.emit(Instruction::StackSave { dest: save_val });
+                    self.func_mut().vla_stack_save = Some(save_val);
+                }
+                let align = decl.alignment.unwrap_or(16).max(16);
+                self.emit(Instruction::DynAlloca {
+                    dest: alloca,
+                    size: Operand::Value(vla_size_val),
+                    align,
+                });
+            } else {
+                self.emit(Instruction::Alloca {
+                    dest: alloca,
+                    ty: if da.is_array || da.is_struct || is_complex { IrType::Ptr } else { da.var_ty },
+                    size: da.actual_alloc_size,
+                    align: decl.alignment.unwrap_or(0),
+                    volatile: decl.is_volatile,
+                });
+            }
             let mut local_info = LocalInfo::from_analysis(&da, alloca);
             local_info.vla_size = vla_size;
             local_info.asm_register = declarator.asm_register.clone();
@@ -1142,6 +1159,12 @@ impl Lowerer {
     }
 
     fn lower_goto_stmt(&mut self, label: &str) {
+        // If the function has VLA declarations, restore the saved stack pointer before
+        // jumping. This ensures VLA stack space is reclaimed on backward jumps (e.g.,
+        // goto to a label before a VLA declaration in a loop).
+        if let Some(save_val) = self.func().vla_stack_save {
+            self.emit(Instruction::StackRestore { ptr: save_val });
+        }
         let scoped_label = self.get_or_create_user_label(label);
         self.terminate(Terminator::Branch(scoped_label));
         let dead = self.fresh_label();
@@ -1149,6 +1172,11 @@ impl Lowerer {
     }
 
     fn lower_goto_indirect_stmt(&mut self, expr: &Expr) {
+        // If the function has VLA declarations, restore the saved stack pointer before
+        // indirect jumps too (computed gotos).
+        if let Some(save_val) = self.func().vla_stack_save {
+            self.emit(Instruction::StackRestore { ptr: save_val });
+        }
         let target = self.lower_expr(expr);
         let possible_targets: Vec<BlockId> = self.func_mut().user_labels.values().copied().collect();
         self.terminate(Terminator::IndirectBranch { target, possible_targets });

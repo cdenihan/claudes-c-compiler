@@ -336,6 +336,14 @@ pub enum Instruction {
         false_val: Operand,
         ty: IrType,
     },
+
+    /// Save the current stack pointer: %dest = stacksave
+    /// Used to capture the SP before VLA allocations so it can be restored later.
+    StackSave { dest: Value },
+
+    /// Restore the stack pointer: stackrestore %ptr
+    /// Used to reclaim VLA stack space when jumping backward past VLA declarations.
+    StackRestore { ptr: Value },
 }
 
 /// Block terminator.
@@ -914,10 +922,11 @@ impl Instruction {
                 if *returns_bool { Some(IrType::I8) } else { Some(*ty) }
             }
             Instruction::AtomicLoad { ty, .. } => Some(*ty),
-            // Alloca, GEP, GlobalAddr, Copy, DynAlloca, LabelAddr produce pointers or copy types
+            // Alloca, GEP, GlobalAddr, Copy, DynAlloca, LabelAddr, StackSave produce pointers or copy types
             Instruction::Alloca { .. } | Instruction::DynAlloca { .. }
             | Instruction::GetElementPtr { .. } | Instruction::GlobalAddr { .. }
-            | Instruction::LabelAddr { .. } => Some(IrType::Ptr),
+            | Instruction::LabelAddr { .. }
+            | Instruction::StackSave { .. } => Some(IrType::Ptr),
             Instruction::Copy { .. } => None, // unknown without tracking
             Instruction::Phi { ty, .. } => Some(*ty),
             Instruction::Select { ty, .. } => Some(*ty),
@@ -945,7 +954,8 @@ impl Instruction {
             | Instruction::LabelAddr { dest, .. }
             | Instruction::GetReturnF64Second { dest }
             | Instruction::GetReturnF32Second { dest }
-            | Instruction::Select { dest, .. } => Some(*dest),
+            | Instruction::Select { dest, .. }
+            | Instruction::StackSave { dest } => Some(*dest),
             Instruction::Call { dest, .. }
             | Instruction::CallIndirect { dest, .. } => *dest,
             Instruction::Intrinsic { dest, .. } => *dest,
@@ -958,7 +968,8 @@ impl Instruction {
             | Instruction::Fence { .. }
             | Instruction::SetReturnF64Second { .. }
             | Instruction::SetReturnF32Second { .. }
-            | Instruction::InlineAsm { .. } => None,
+            | Instruction::InlineAsm { .. }
+            | Instruction::StackRestore { .. } => None,
         }
     }
 }

@@ -954,7 +954,9 @@ impl Lowerer {
         let struct_size = layout.size;
         // Track the current sequential index for items without designators
         let mut current_idx = 0usize;
-        for item in items {
+        let mut item_idx = 0usize;
+        while item_idx < items.len() {
+            let item = &items[item_idx];
             // Check if this item has an [N] array index designator
             if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
                 if let Some(idx) = self.eval_const_expr_for_designator(idx_expr) {
@@ -964,50 +966,59 @@ impl Lowerer {
             let elem_idx = current_idx;
             if elem_idx >= num_elems {
                 current_idx += 1;
+                item_idx += 1;
                 continue;
             }
             let base_offset = elem_idx * struct_size;
 
-            {
-                match &item.init {
-                    Initializer::List(sub_items) => {
-                        let mut current_field_idx = 0usize;
-                        for sub_item in sub_items {
-                            let desig_name = h::first_field_designator(sub_item);
-                            let field_idx = match layout.resolve_init_field_idx(desig_name, current_field_idx, &self.types) {
-                                Some(idx) => idx,
-                                None => break,
-                            };
-                            let field = &layout.fields[field_idx];
-                            let field_offset = base_offset + field.offset;
+            match &item.init {
+                Initializer::List(sub_items) => {
+                    let mut current_field_idx = 0usize;
+                    for sub_item in sub_items {
+                        let desig_name = h::first_field_designator(sub_item);
+                        let field_idx = match layout.resolve_init_field_idx(desig_name, current_field_idx, &self.types) {
+                            Some(idx) => idx,
+                            None => break,
+                        };
+                        let field = &layout.fields[field_idx];
+                        let field_offset = base_offset + field.offset;
 
-                            if h::has_nested_field_designator(sub_item) {
-                                self.fill_nested_designator_with_ptrs(
-                                    sub_item, &field.ty, field_offset,
-                                    bytes, ptr_ranges,
-                                );
-                                current_field_idx = field_idx + 1;
-                                continue;
-                            }
-
-                            self.emit_struct_field_init_compound(
-                                sub_item, field, field_offset,
+                        if h::has_nested_field_designator(sub_item) {
+                            self.fill_nested_designator_with_ptrs(
+                                sub_item, &field.ty, field_offset,
                                 bytes, ptr_ranges,
                             );
                             current_field_idx = field_idx + 1;
+                            continue;
                         }
+
+                        self.emit_struct_field_init_compound(
+                            sub_item, field, field_offset,
+                            bytes, ptr_ranges,
+                        );
+                        current_field_idx = field_idx + 1;
                     }
-                    Initializer::Expr(expr) => {
-                        // Single expression for first field
-                        if !layout.fields.is_empty() {
-                            let field = &layout.fields[0];
-                            let field_offset = base_offset + field.offset;
-                            self.write_expr_to_bytes_or_ptrs(
-                                expr, &field.ty, field_offset,
-                                field.bit_offset, field.bit_width,
-                                bytes, ptr_ranges,
-                            );
+                    item_idx += 1;
+                }
+                Initializer::Expr(_) => {
+                    // Flat initialization: consume items field-by-field for this struct.
+                    // Each item corresponds to one field, not one struct element.
+                    let mut current_field_idx = 0usize;
+                    while item_idx < items.len() && current_field_idx < layout.fields.len() {
+                        let sub_item = &items[item_idx];
+                        // If this item has an array index designator, it starts a new element
+                        if sub_item.designators.first().is_some() && item_idx != 0 {
+                            break;
                         }
+                        let field = &layout.fields[current_field_idx];
+                        let field_offset = base_offset + field.offset;
+
+                        self.emit_struct_field_init_compound(
+                            sub_item, field, field_offset,
+                            bytes, ptr_ranges,
+                        );
+                        current_field_idx += 1;
+                        item_idx += 1;
                     }
                 }
             }
@@ -1213,6 +1224,14 @@ impl Lowerer {
             let ir_ty = IrType::from_ctype(ty);
             let val = self.eval_init_scalar(&Initializer::Expr(expr.clone()));
             self.write_bitfield_to_bytes(bytes, offset, &val, ir_ty, bo, bw);
+        } else if let Expr::StringLiteral(s, _) = expr {
+            // String literal initializing a char array field (e.g., {"hello", &ptr} in a struct
+            // with pointer members). write_string_to_bytes handles copying the string bytes.
+            if let CType::Array(ref elem, Some(arr_size)) = ty {
+                if matches!(elem.as_ref(), CType::Char | CType::UChar) {
+                    Self::write_string_to_bytes(bytes, offset, s, *arr_size);
+                }
+            }
         } else if let Some(val) = self.eval_const_expr(expr) {
             let ir_ty = IrType::from_ctype(ty);
             self.write_const_to_bytes(bytes, offset, &val, ir_ty);

@@ -1296,6 +1296,10 @@ impl ArchCodegen for ArmCodegen {
         self.state.emit("    mov x0, sp");
     }
 
+    fn emit_mov_acc_to_sp(&mut self) {
+        self.state.emit("    mov sp, x0");
+    }
+
     fn emit_align_acc(&mut self, align: usize) {
         self.state.emit_fmt(format_args!("    add x0, x0, #{}", align - 1));
         self.state.emit_fmt(format_args!("    and x0, x0, #{}", -(align as i64)));

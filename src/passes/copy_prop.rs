@@ -228,6 +228,10 @@ fn replace_operands_in_instruction(inst: &mut Instruction, copy_map: &[Option<Op
             count += replace_operand(true_val, copy_map);
             count += replace_operand(false_val, copy_map);
         }
+        Instruction::StackSave { .. } => {}
+        Instruction::StackRestore { ptr } => {
+            count += replace_value_in_place(ptr, copy_map);
+        }
     }
 
     count

@@ -1383,6 +1383,10 @@ impl ArchCodegen for RiscvCodegen {
         self.state.emit("    mv t0, sp");
     }
 
+    fn emit_mov_acc_to_sp(&mut self) {
+        self.state.emit("    mv sp, t0");
+    }
+
     fn emit_align_acc(&mut self, align: usize) {
         self.state.emit_fmt(format_args!("    addi t0, t0, {}", align - 1));
         self.state.emit_fmt(format_args!("    andi t0, t0, -{}", align));

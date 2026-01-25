@@ -519,6 +519,8 @@ pub(super) fn for_each_operand_in_instruction(inst: &Instruction, mut f: impl Fn
         }
         Instruction::Intrinsic { args, .. } => { for a in args { f(a); } }
         Instruction::Select { cond, true_val, false_val, .. } => { f(cond); f(true_val); f(false_val); }
+        Instruction::StackSave { .. } => {}
+        Instruction::StackRestore { .. } => {}
     }
 }
 
@@ -542,6 +544,7 @@ pub(super) fn for_each_value_use_in_instruction(inst: &Instruction, mut f: impl 
         Instruction::Intrinsic { dest_ptr, .. } => {
             if let Some(dp) = dest_ptr { f(dp); }
         }
+        Instruction::StackRestore { ptr } => f(ptr),
         _ => {}
     }
 }

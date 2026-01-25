@@ -1876,6 +1876,11 @@ impl ArchCodegen for X86Codegen {
         self.state.reg_cache.invalidate_all();
     }
 
+    fn emit_mov_acc_to_sp(&mut self) {
+        self.state.emit("    movq %rax, %rsp");
+        self.state.reg_cache.invalidate_all();
+    }
+
     fn emit_align_acc(&mut self, align: usize) {
         self.state.emit_fmt(format_args!("    addq ${}, %rax", align - 1));
         self.state.emit_fmt(format_args!("    andq ${}, %rax", -(align as i64)));

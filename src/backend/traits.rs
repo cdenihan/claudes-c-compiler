@@ -818,6 +818,24 @@ pub trait ArchCodegen {
         self.emit_store_result(dest);
     }
 
+    /// Emit stack save: store the current stack pointer to dest.
+    /// Used to capture SP before VLA allocations for later restoration.
+    fn emit_stack_save(&mut self, dest: &Value) {
+        self.emit_mov_sp_to_acc();
+        self.emit_store_result(dest);
+    }
+
+    /// Emit stack restore: restore the stack pointer from a saved value.
+    /// Used to reclaim VLA stack space when jumping backward past VLA declarations.
+    fn emit_stack_restore(&mut self, ptr: &Value) {
+        self.emit_load_operand(&Operand::Value(*ptr));
+        self.emit_mov_acc_to_sp();
+    }
+
+    /// Move the accumulator value to the stack pointer.
+    /// Used by emit_stack_restore to reset SP.
+    fn emit_mov_acc_to_sp(&mut self);
+
     /// Emit a 128-bit value copy.
     fn emit_copy_i128(&mut self, dest: &Value, src: &Operand) {
         self.emit_load_operand(src);

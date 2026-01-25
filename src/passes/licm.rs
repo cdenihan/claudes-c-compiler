@@ -347,7 +347,9 @@ fn all_operand_values(inst: &Instruction) -> Vec<u32> {
         | Instruction::LabelAddr { .. }
         | Instruction::GetReturnF64Second { .. }
         | Instruction::GetReturnF32Second { .. }
-        | Instruction::Fence { .. } => {}
+        | Instruction::Fence { .. }
+        | Instruction::StackSave { .. }
+        | Instruction::StackRestore { .. } => {}
     }
 
     vals

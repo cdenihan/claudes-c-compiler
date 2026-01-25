@@ -404,10 +404,10 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction) {
         }
     }
 
-    // Pre-scan for DynAlloca: if present, the epilogue must restore SP from
+    // Pre-scan for DynAlloca/StackRestore: if present, the epilogue must restore SP from
     // the frame pointer instead of adding back the compile-time frame size.
     let has_dyn_alloca = func.blocks.iter().any(|block| {
-        block.instructions.iter().any(|inst| matches!(inst, Instruction::DynAlloca { .. }))
+        block.instructions.iter().any(|inst| matches!(inst, Instruction::DynAlloca { .. } | Instruction::StackRestore { .. }))
     });
     cg.state().has_dyn_alloca = has_dyn_alloca;
 
@@ -629,6 +629,8 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
                 Instruction::InlineAsm { template, outputs, inputs, clobbers, operand_types, goto_labels, input_symbols } =>
                     cg.emit_inline_asm(template, outputs, inputs, clobbers, operand_types, goto_labels, input_symbols),
                 Instruction::Intrinsic { dest, op, dest_ptr, args } => cg.emit_intrinsic(dest, op, dest_ptr, args),
+                Instruction::StackSave { dest } => cg.emit_stack_save(dest),
+                Instruction::StackRestore { ptr } => cg.emit_stack_restore(ptr),
                 Instruction::Alloca { .. } | Instruction::Copy { .. }
                 | Instruction::Load { .. } | Instruction::BinOp { .. }
                 | Instruction::UnaryOp { .. } | Instruction::Cmp { .. }
