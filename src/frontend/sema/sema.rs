@@ -570,154 +570,12 @@ impl SemanticAnalyzer {
     // === Type conversion utilities ===
 
     /// Convert an AST TypeSpecifier to a CType.
-    /// Takes &self (uses Cell for anon_struct_counter, interior mutability for struct_layouts).
+    /// Delegates to the shared `TypeConvertContext::resolve_type_spec_to_ctype` default
+    /// method, which handles all 22 primitive types and delegates struct/union/enum/typedef
+    /// to sema-specific trait methods.
     fn type_spec_to_ctype(&self, spec: &TypeSpecifier) -> CType {
-        match spec {
-            TypeSpecifier::Void => CType::Void,
-            TypeSpecifier::Char => CType::Char,
-            TypeSpecifier::Short => CType::Short,
-            TypeSpecifier::Int => CType::Int,
-            TypeSpecifier::Long => CType::Long,
-            TypeSpecifier::LongLong => CType::LongLong,
-            TypeSpecifier::Float => CType::Float,
-            TypeSpecifier::Double => CType::Double,
-            TypeSpecifier::LongDouble => CType::LongDouble,
-            TypeSpecifier::Signed => CType::Int,
-            TypeSpecifier::Unsigned => CType::UInt,
-            TypeSpecifier::UnsignedChar => CType::UChar,
-            TypeSpecifier::UnsignedShort => CType::UShort,
-            TypeSpecifier::UnsignedInt => CType::UInt,
-            TypeSpecifier::UnsignedLong => CType::ULong,
-            TypeSpecifier::UnsignedLongLong => CType::ULongLong,
-            TypeSpecifier::Int128 => CType::Int128,
-            TypeSpecifier::UnsignedInt128 => CType::UInt128,
-            TypeSpecifier::Bool => CType::Bool,
-            TypeSpecifier::ComplexFloat => CType::ComplexFloat,
-            TypeSpecifier::ComplexDouble => CType::ComplexDouble,
-            TypeSpecifier::ComplexLongDouble => CType::ComplexLongDouble,
-            TypeSpecifier::Pointer(inner) => {
-                let inner_type = self.type_spec_to_ctype(inner);
-                CType::Pointer(Box::new(inner_type))
-            }
-            TypeSpecifier::Array(elem, size_expr) => {
-                let elem_type = self.type_spec_to_ctype(elem);
-                let size = size_expr.as_ref().and_then(|e| self.eval_const_expr(e).map(|v| v as usize));
-                CType::Array(Box::new(elem_type), size)
-            }
-            TypeSpecifier::Struct(name, fields, is_packed, pragma_pack_align, struct_aligned) => {
-                let struct_fields = fields.as_ref().map(|f| self.convert_struct_fields(f)).unwrap_or_default();
-                let max_field_align = if *is_packed {
-                    Some(1)
-                } else {
-                    *pragma_pack_align
-                };
-                let key = if let Some(tag) = name {
-                    format!("struct.{}", tag)
-                } else {
-                    let id = self.anon_struct_counter.get();
-                    self.anon_struct_counter.set(id + 1);
-                    format!("__anon_struct_{}", id)
-                };
-                if !struct_fields.is_empty() {
-                    let mut layout = StructLayout::for_struct_with_packing(
-                        &struct_fields, max_field_align, &self.result.type_context.struct_layouts
-                    );
-                    if let Some(a) = struct_aligned {
-                        if *a > layout.align {
-                            layout.align = *a;
-                            let mask = layout.align - 1;
-                            layout.size = (layout.size + mask) & !mask;
-                        }
-                    }
-                    self.result.type_context.insert_struct_layout_from_ref(&key, layout);
-                } else if self.result.type_context.struct_layouts.get(&key).is_none() {
-                    let layout = StructLayout {
-                        fields: Vec::new(),
-                        size: 0,
-                        align: 1,
-                        is_union: false,
-                        is_transparent_union: false,
-                    };
-                    self.result.type_context.insert_struct_layout_from_ref(&key, layout);
-                }
-                CType::Struct(key)
-            }
-            TypeSpecifier::Union(name, fields, is_packed, pragma_pack_align, struct_aligned) => {
-                let union_fields = fields.as_ref().map(|f| self.convert_struct_fields(f)).unwrap_or_default();
-                let key = if let Some(tag) = name {
-                    format!("union.{}", tag)
-                } else {
-                    let id = self.anon_struct_counter.get();
-                    self.anon_struct_counter.set(id + 1);
-                    format!("__anon_struct_{}", id)
-                };
-                if !union_fields.is_empty() {
-                    let mut layout = StructLayout::for_union(&union_fields, &self.result.type_context.struct_layouts);
-                    if *is_packed {
-                        layout.align = 1;
-                        layout.size = layout.fields.iter().map(|f| f.ty.size_ctx(&self.result.type_context.struct_layouts)).max().unwrap_or(0);
-                    } else if let Some(pack) = pragma_pack_align {
-                        if *pack < layout.align {
-                            layout.align = *pack;
-                            let mask = layout.align - 1;
-                            layout.size = (layout.size + mask) & !mask;
-                        }
-                    }
-                    if let Some(a) = struct_aligned {
-                        if *a > layout.align {
-                            layout.align = *a;
-                            let mask = layout.align - 1;
-                            layout.size = (layout.size + mask) & !mask;
-                        }
-                    }
-                    self.result.type_context.insert_struct_layout_from_ref(&key, layout);
-                } else if self.result.type_context.struct_layouts.get(&key).is_none() {
-                    let layout = StructLayout {
-                        fields: Vec::new(),
-                        size: 0,
-                        align: 1,
-                        is_union: true,
-                        is_transparent_union: false,
-                    };
-                    self.result.type_context.insert_struct_layout_from_ref(&key, layout);
-                }
-                CType::Union(key)
-            }
-            TypeSpecifier::Enum(name, _variants) => {
-                // Note: enum variant processing is done separately via process_enum_variants
-                // which requires &mut self. This method only returns the type.
-                CType::Enum(crate::common::types::EnumType {
-                    name: name.clone(),
-                    variants: Vec::new(), // TODO: carry variant info
-                })
-            }
-            TypeSpecifier::TypedefName(name) => {
-                if let Some(resolved) = self.result.type_context.typedefs.get(name) {
-                    resolved.clone()
-                } else {
-                    CType::Int
-                }
-            }
-            TypeSpecifier::Typeof(_expr) => {
-                // typeof(expr): sema doesn't have full expr type resolution yet
-                CType::Int
-            }
-            TypeSpecifier::TypeofType(inner) => {
-                self.type_spec_to_ctype(inner)
-            }
-            TypeSpecifier::FunctionPointer(return_type, params, variadic) => {
-                // Full function pointer type construction (matches lowering behavior)
-                let ret_ctype = self.type_spec_to_ctype(return_type);
-                let param_ctypes = type_builder::convert_param_decls_to_ctypes(self, params);
-                CType::Pointer(Box::new(CType::Function(Box::new(FunctionType {
-                    return_type: ret_ctype,
-                    params: param_ctypes,
-                    variadic: *variadic,
-                }))))
-            }
-            // AutoType should be resolved from initializer during lowering
-            TypeSpecifier::AutoType => CType::Int,
-        }
+        use crate::common::type_builder::TypeConvertContext;
+        self.resolve_type_spec_to_ctype(spec)
     }
 
     fn convert_struct_fields(&self, fields: &[StructFieldDecl]) -> Vec<crate::common::types::StructField> {
@@ -1070,9 +928,95 @@ impl SemanticAnalyzer {
 
 /// Implement TypeConvertContext so shared type_builder functions can call back
 /// into sema for type resolution and constant expression evaluation.
+///
+/// The 4 divergent methods handle sema-specific behavior:
+/// - typedef: looks up in type_context.typedefs
+/// - struct/union: converts fields and computes layout
+/// - enum: returns CType::Enum with name info (preserves enum identity)
+/// - typeof: returns CType::Int (sema doesn't have full expr type resolution yet)
 impl type_builder::TypeConvertContext for SemanticAnalyzer {
-    fn resolve_type_spec_to_ctype(&self, spec: &TypeSpecifier) -> CType {
-        self.type_spec_to_ctype(spec)
+    fn resolve_typedef(&self, name: &str) -> CType {
+        if let Some(resolved) = self.result.type_context.typedefs.get(name) {
+            resolved.clone()
+        } else {
+            CType::Int
+        }
+    }
+
+    fn resolve_struct_or_union(
+        &self,
+        name: &Option<String>,
+        fields: &Option<Vec<StructFieldDecl>>,
+        is_union: bool,
+        is_packed: bool,
+        pragma_pack: Option<usize>,
+        struct_aligned: Option<usize>,
+    ) -> CType {
+        let prefix = if is_union { "union" } else { "struct" };
+        let struct_fields = fields.as_ref().map(|f| self.convert_struct_fields(f)).unwrap_or_default();
+        let max_field_align = if is_packed { Some(1) } else { pragma_pack };
+        let key = if let Some(tag) = name {
+            format!("{}.{}", prefix, tag)
+        } else {
+            let id = self.anon_struct_counter.get();
+            self.anon_struct_counter.set(id + 1);
+            format!("__anon_struct_{}", id)
+        };
+        if !struct_fields.is_empty() {
+            let mut layout = if is_union {
+                StructLayout::for_union(&struct_fields, &self.result.type_context.struct_layouts)
+            } else {
+                StructLayout::for_struct_with_packing(
+                    &struct_fields, max_field_align, &self.result.type_context.struct_layouts
+                )
+            };
+            if is_packed && is_union {
+                layout.align = 1;
+                layout.size = layout.fields.iter()
+                    .map(|f| f.ty.size_ctx(&self.result.type_context.struct_layouts))
+                    .max().unwrap_or(0);
+            } else if !is_packed && !is_union {
+                // pragma pack for non-packed structs is already handled by for_struct_with_packing
+            } else if let Some(pack) = pragma_pack {
+                if is_union && pack < layout.align {
+                    layout.align = pack;
+                    let mask = layout.align - 1;
+                    layout.size = (layout.size + mask) & !mask;
+                }
+            }
+            if let Some(a) = struct_aligned {
+                if a > layout.align {
+                    layout.align = a;
+                    let mask = layout.align - 1;
+                    layout.size = (layout.size + mask) & !mask;
+                }
+            }
+            self.result.type_context.insert_struct_layout_from_ref(&key, layout);
+        } else if self.result.type_context.struct_layouts.get(&key).is_none() {
+            let layout = StructLayout {
+                fields: Vec::new(),
+                size: 0,
+                align: 1,
+                is_union,
+                is_transparent_union: false,
+            };
+            self.result.type_context.insert_struct_layout_from_ref(&key, layout);
+        }
+        if is_union { CType::Union(key) } else { CType::Struct(key) }
+    }
+
+    fn resolve_enum(&self, name: &Option<String>, _variants: &Option<Vec<EnumVariant>>) -> CType {
+        // Sema preserves enum identity for diagnostics. Variant processing is
+        // done separately via process_enum_variants (requires &mut self).
+        CType::Enum(crate::common::types::EnumType {
+            name: name.clone(),
+            variants: Vec::new(), // TODO: carry variant info
+        })
+    }
+
+    fn resolve_typeof_expr(&self, _expr: &Expr) -> CType {
+        // TODO: typeof(expr): sema doesn't have full expr type resolution yet
+        CType::Int
     }
 
     fn eval_const_expr_as_usize(&self, expr: &Expr) -> Option<usize> {

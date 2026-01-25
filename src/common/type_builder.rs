@@ -2,27 +2,121 @@
 //!
 //! This module contains the canonical implementations of functions that convert
 //! AST type syntax (TypeSpecifier + DerivedDeclarator chains) into CType values.
-//! Previously these were duplicated between sema and lowering, risking silent
-//! divergence on corner cases. Now both phases delegate to these shared functions.
+//!
+//! The core `TypeConvertContext` trait provides a single `resolve_type_spec_to_ctype`
+//! default method that handles all 22 primitive C types, pointers, arrays, and
+//! function pointers identically. Only 4 cases differ between sema and lowering
+//! (typedef names, struct/union, enum, typeof), so implementors provide just those
+//! via required trait methods. This ensures primitive type mapping can never diverge.
 
 use crate::common::types::{CType, FunctionType};
-use crate::frontend::parser::ast::{DerivedDeclarator, ParamDecl};
+use crate::frontend::parser::ast::{
+    DerivedDeclarator, EnumVariant, Expr, ParamDecl, StructFieldDecl, TypeSpecifier,
+};
 
 /// Trait for contexts that can resolve types and evaluate constant expressions.
 ///
-/// Both sema and lowering implement this trait, providing their respective
-/// capabilities for typedef resolution, expression type inference, etc.
-/// The shared `build_full_ctype` and `convert_param_decls_to_ctypes` functions
-/// call back through this trait.
+/// Both sema and lowering implement this trait. The shared `resolve_type_spec_to_ctype`
+/// default method handles all primitive types, pointers, arrays, and function pointers.
+/// Implementors only provide the 4 divergent methods for typedef, struct/union, enum,
+/// and typeof resolution.
 pub trait TypeConvertContext {
-    /// Convert a TypeSpecifier to a CType.
-    /// Each implementor provides its own resolution logic (typedef lookup,
-    /// function pointer typedef expansion, typeof(expr) handling, etc.)
-    fn resolve_type_spec_to_ctype(&self, spec: &crate::frontend::parser::ast::TypeSpecifier) -> CType;
+    /// Resolve a typedef name to its CType.
+    /// Sema: looks up in type_context.typedefs.
+    /// Lowering: also checks function pointer typedefs for richer type info.
+    fn resolve_typedef(&self, name: &str) -> CType;
+
+    /// Resolve a struct or union definition to its CType.
+    /// Both phases compute layout, but lowering has caching and forward-declaration logic.
+    fn resolve_struct_or_union(
+        &self,
+        name: &Option<String>,
+        fields: &Option<Vec<StructFieldDecl>>,
+        is_union: bool,
+        is_packed: bool,
+        pragma_pack: Option<usize>,
+        struct_aligned: Option<usize>,
+    ) -> CType;
+
+    /// Resolve an enum type to its CType.
+    /// Sema: returns CType::Enum with name info.
+    /// Lowering: returns CType::Int (enums are ints at IR level).
+    fn resolve_enum(&self, name: &Option<String>, variants: &Option<Vec<EnumVariant>>) -> CType;
+
+    /// Resolve typeof(expr) to a CType.
+    /// Sema: returns CType::Int (doesn't have full expr type resolution yet).
+    /// Lowering: evaluates the expression's type.
+    fn resolve_typeof_expr(&self, expr: &Expr) -> CType;
 
     /// Try to evaluate a constant expression to a usize (for array sizes).
     /// Returns None if the expression cannot be evaluated at compile time.
-    fn eval_const_expr_as_usize(&self, expr: &crate::frontend::parser::ast::Expr) -> Option<usize>;
+    fn eval_const_expr_as_usize(&self, expr: &Expr) -> Option<usize>;
+
+    /// Convert a TypeSpecifier to a CType.
+    ///
+    /// This default implementation handles all shared cases (22 primitive types,
+    /// Pointer, Array, FunctionPointer, TypeofType, AutoType) and delegates to
+    /// the 4 required trait methods for the divergent cases.
+    fn resolve_type_spec_to_ctype(&self, spec: &TypeSpecifier) -> CType {
+        match spec {
+            // === 22 primitive types (identical in sema and lowering) ===
+            TypeSpecifier::Void => CType::Void,
+            TypeSpecifier::Char => CType::Char,
+            TypeSpecifier::UnsignedChar => CType::UChar,
+            TypeSpecifier::Short => CType::Short,
+            TypeSpecifier::UnsignedShort => CType::UShort,
+            TypeSpecifier::Bool => CType::Bool,
+            TypeSpecifier::Int | TypeSpecifier::Signed => CType::Int,
+            TypeSpecifier::UnsignedInt | TypeSpecifier::Unsigned => CType::UInt,
+            TypeSpecifier::Long => CType::Long,
+            TypeSpecifier::UnsignedLong => CType::ULong,
+            TypeSpecifier::LongLong => CType::LongLong,
+            TypeSpecifier::UnsignedLongLong => CType::ULongLong,
+            TypeSpecifier::Int128 => CType::Int128,
+            TypeSpecifier::UnsignedInt128 => CType::UInt128,
+            TypeSpecifier::Float => CType::Float,
+            TypeSpecifier::Double => CType::Double,
+            TypeSpecifier::LongDouble => CType::LongDouble,
+            TypeSpecifier::ComplexFloat => CType::ComplexFloat,
+            TypeSpecifier::ComplexDouble => CType::ComplexDouble,
+            TypeSpecifier::ComplexLongDouble => CType::ComplexLongDouble,
+
+            // === Compound types (shared logic) ===
+            TypeSpecifier::Pointer(inner) => {
+                CType::Pointer(Box::new(self.resolve_type_spec_to_ctype(inner)))
+            }
+            TypeSpecifier::Array(elem, size_expr) => {
+                let elem_ctype = self.resolve_type_spec_to_ctype(elem);
+                let size = size_expr.as_ref().and_then(|e| self.eval_const_expr_as_usize(e));
+                CType::Array(Box::new(elem_ctype), size)
+            }
+            TypeSpecifier::FunctionPointer(return_type, params, variadic) => {
+                let ret_ctype = self.resolve_type_spec_to_ctype(return_type);
+                let param_ctypes: Vec<(CType, Option<String>)> = params.iter().map(|p| {
+                    let ty = self.resolve_type_spec_to_ctype(&p.type_spec);
+                    (ty, p.name.clone())
+                }).collect();
+                CType::Pointer(Box::new(CType::Function(Box::new(FunctionType {
+                    return_type: ret_ctype,
+                    params: param_ctypes,
+                    variadic: *variadic,
+                }))))
+            }
+            TypeSpecifier::TypeofType(inner) => self.resolve_type_spec_to_ctype(inner),
+            TypeSpecifier::AutoType => CType::Int,
+
+            // === Divergent cases (delegated to implementors) ===
+            TypeSpecifier::TypedefName(name) => self.resolve_typedef(name),
+            TypeSpecifier::Struct(name, fields, is_packed, pragma_pack, struct_aligned) => {
+                self.resolve_struct_or_union(name, fields, false, *is_packed, *pragma_pack, *struct_aligned)
+            }
+            TypeSpecifier::Union(name, fields, is_packed, pragma_pack, struct_aligned) => {
+                self.resolve_struct_or_union(name, fields, true, *is_packed, *pragma_pack, *struct_aligned)
+            }
+            TypeSpecifier::Enum(name, variants) => self.resolve_enum(name, variants),
+            TypeSpecifier::Typeof(expr) => self.resolve_typeof_expr(expr),
+        }
+    }
 }
 
 /// Find the start index of the function pointer core in a derived declarator list.

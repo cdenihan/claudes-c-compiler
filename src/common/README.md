@@ -8,7 +8,7 @@ Shared data types and utilities used across frontend, IR, and backend.
 - **symbol_table.rs** - Scoped symbol table used by sema and lowering. Push/pop scope, insert/lookup symbols by name.
 - **source.rs** - Source location tracking: `Span`, `SourceLocation`, `SourceManager` for mapping byte offsets back to file/line/column.
 - **error.rs** - Diagnostic infrastructure: `Diagnostic` with severity levels, spans, and notes.
-- **type_builder.rs** - Shared `build_full_ctype` and `find_function_pointer_core` functions used by both sema and lowering to convert declarator chains into `CType`. Uses a `TypeConvertContext` trait so both phases can share the same declarator-application logic without diverging.
+- **type_builder.rs** - `TypeConvertContext` trait with a default `resolve_type_spec_to_ctype` method that handles all 22 primitive C type mappings, pointers, arrays, and function pointers. Sema and lowering implement only 4 divergent methods (typedef, struct/union, enum, typeof), ensuring primitive type mapping can never silently diverge. Also provides shared `build_full_ctype` and `find_function_pointer_core` for converting declarator chains into `CType`.
 
 ## Why Types are Split
 

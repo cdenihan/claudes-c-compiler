@@ -1,6 +1,6 @@
 use crate::common::type_builder;
 use crate::frontend::parser::ast::*;
-use crate::common::types::{IrType, StructField, StructLayout, CType, FunctionType};
+use crate::common::types::{IrType, StructField, StructLayout, CType};
 use super::lowering::Lowerer;
 use super::definitions::FuncSig;
 
@@ -1076,74 +1076,12 @@ impl Lowerer {
     }
 
     /// Convert a TypeSpecifier to CType (for struct layout computation).
-    /// TypedefName resolution is now direct: typedefs store CType values.
+    /// Delegates to the shared `TypeConvertContext::resolve_type_spec_to_ctype` default
+    /// method, which handles all 22 primitive types and delegates struct/union/enum/typedef
+    /// to lowering-specific trait methods.
     pub(super) fn type_spec_to_ctype(&self, ts: &TypeSpecifier) -> CType {
-        match ts {
-            // TypedefName: direct CType lookup (typedefs now store CType)
-            TypeSpecifier::TypedefName(tname) => {
-                // Check function pointer typedefs first (they carry richer type info)
-                if let Some(fptr_ctype) = self.build_function_pointer_ctype_from_typedef(tname) {
-                    return fptr_ctype;
-                }
-                // Direct CType lookup from typedef map
-                if let Some(ctype) = self.types.typedefs.get(tname) {
-                    return ctype.clone();
-                }
-                CType::Int // fallback for unresolved typedef
-            }
-            TypeSpecifier::Void => CType::Void,
-            TypeSpecifier::Char => CType::Char,
-            TypeSpecifier::UnsignedChar => CType::UChar,
-            TypeSpecifier::Short => CType::Short,
-            TypeSpecifier::UnsignedShort => CType::UShort,
-            TypeSpecifier::Bool => CType::Bool,
-            TypeSpecifier::Int | TypeSpecifier::Signed => CType::Int,
-            TypeSpecifier::UnsignedInt | TypeSpecifier::Unsigned => CType::UInt,
-            TypeSpecifier::Long => CType::Long,
-            TypeSpecifier::UnsignedLong => CType::ULong,
-            TypeSpecifier::LongLong => CType::LongLong,
-            TypeSpecifier::UnsignedLongLong => CType::ULongLong,
-            TypeSpecifier::Int128 => CType::Int128,
-            TypeSpecifier::UnsignedInt128 => CType::UInt128,
-            TypeSpecifier::Float => CType::Float,
-            TypeSpecifier::Double => CType::Double,
-            TypeSpecifier::LongDouble => CType::LongDouble,
-            TypeSpecifier::ComplexFloat => CType::ComplexFloat,
-            TypeSpecifier::ComplexDouble => CType::ComplexDouble,
-            TypeSpecifier::ComplexLongDouble => CType::ComplexLongDouble,
-            TypeSpecifier::Pointer(inner) => CType::Pointer(Box::new(self.type_spec_to_ctype(inner))),
-            TypeSpecifier::FunctionPointer(return_type, params, variadic) => {
-                let ret_ctype = self.type_spec_to_ctype(return_type);
-                let param_ctypes = self.convert_param_decls_to_ctypes(params);
-                CType::Pointer(Box::new(CType::Function(Box::new(FunctionType {
-                    return_type: ret_ctype,
-                    params: param_ctypes,
-                    variadic: *variadic,
-                }))))
-            }
-            TypeSpecifier::Array(elem, size_expr) => {
-                let elem_ctype = self.type_spec_to_ctype(elem);
-                let size = size_expr.as_ref().and_then(|e| {
-                    self.expr_as_array_size(e).map(|n| n as usize)
-                });
-                CType::Array(Box::new(elem_ctype), size)
-            }
-            TypeSpecifier::Struct(name, fields, is_packed, pragma_pack, struct_aligned) => {
-                self.struct_or_union_to_ctype(name, fields, false, *is_packed, *pragma_pack, *struct_aligned)
-            }
-            TypeSpecifier::Union(name, fields, is_packed, pragma_pack, struct_aligned) => {
-                self.struct_or_union_to_ctype(name, fields, true, *is_packed, *pragma_pack, *struct_aligned)
-            }
-            TypeSpecifier::Enum(_, _) => CType::Int,
-            TypeSpecifier::Typeof(expr) => {
-                self.get_expr_ctype(expr).unwrap_or(CType::Int)
-            }
-            TypeSpecifier::TypeofType(inner_ts) => {
-                self.type_spec_to_ctype(inner_ts)
-            }
-            // AutoType should be resolved before reaching here (in lower_local_decl)
-            TypeSpecifier::AutoType => CType::Int,
-        }
+        use crate::common::type_builder::TypeConvertContext;
+        self.resolve_type_spec_to_ctype(ts)
     }
 
     /// Convert a struct or union TypeSpecifier to CType.
@@ -1282,19 +1220,47 @@ impl Lowerer {
         type_builder::build_full_ctype(self, type_spec, derived)
     }
 
-    /// Convert ParamDecl list to CType list for function types.
-    /// Delegates to the shared type_builder module.
-    fn convert_param_decls_to_ctypes(&self, params: &[ParamDecl]) -> Vec<(CType, Option<String>)> {
-        type_builder::convert_param_decls_to_ctypes(self, params)
-    }
-
 }
 
 /// Implement TypeConvertContext so shared type_builder functions can call back
 /// into the lowerer for type resolution and constant expression evaluation.
+///
+/// The 4 divergent methods handle lowering-specific behavior:
+/// - typedef: also checks function pointer typedefs for richer type info
+/// - struct/union: has caching, forward-declaration handling, enum bitfield fixup
+/// - enum: returns CType::Int (enums are plain ints at IR level)
+/// - typeof: evaluates the expression's actual type
 impl type_builder::TypeConvertContext for Lowerer {
-    fn resolve_type_spec_to_ctype(&self, spec: &TypeSpecifier) -> CType {
-        self.type_spec_to_ctype(spec)
+    fn resolve_typedef(&self, name: &str) -> CType {
+        // Check function pointer typedefs first (they carry richer type info)
+        if let Some(fptr_ctype) = self.build_function_pointer_ctype_from_typedef(name) {
+            return fptr_ctype;
+        }
+        // Direct CType lookup from typedef map
+        if let Some(ctype) = self.types.typedefs.get(name) {
+            return ctype.clone();
+        }
+        CType::Int // fallback for unresolved typedef
+    }
+
+    fn resolve_struct_or_union(
+        &self,
+        name: &Option<String>,
+        fields: &Option<Vec<StructFieldDecl>>,
+        is_union: bool,
+        is_packed: bool,
+        pragma_pack: Option<usize>,
+        struct_aligned: Option<usize>,
+    ) -> CType {
+        self.struct_or_union_to_ctype(name, fields, is_union, is_packed, pragma_pack, struct_aligned)
+    }
+
+    fn resolve_enum(&self, _name: &Option<String>, _variants: &Option<Vec<EnumVariant>>) -> CType {
+        CType::Int
+    }
+
+    fn resolve_typeof_expr(&self, expr: &Expr) -> CType {
+        self.get_expr_ctype(expr).unwrap_or(CType::Int)
     }
 
     fn eval_const_expr_as_usize(&self, expr: &Expr) -> Option<usize> {
