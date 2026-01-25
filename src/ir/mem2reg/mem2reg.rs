@@ -12,6 +12,7 @@
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
 use crate::ir::ir::*;
+use crate::ir::analysis;
 use crate::common::types::IrType;
 
 /// Promote allocas to SSA form with phi insertion.
@@ -52,20 +53,20 @@ fn promote_function(func: &mut IrFunction) {
 
     // Step 2: Build CFG
     let num_blocks = func.blocks.len();
-    let label_to_idx = build_label_map(func);
-    let (preds, succs) = build_cfg(func, &label_to_idx);
+    let label_to_idx = analysis::build_label_map(func);
+    let (preds, succs) = analysis::build_cfg(func, &label_to_idx);
 
     // Step 3: Compute dominator tree
-    let idom = compute_dominators(num_blocks, &preds, &succs);
+    let idom = analysis::compute_dominators(num_blocks, &preds, &succs);
 
     // Step 4: Compute dominance frontiers
-    let df = compute_dominance_frontiers(num_blocks, &preds, &idom);
+    let df = analysis::compute_dominance_frontiers(num_blocks, &preds, &idom);
 
     // Step 5: Insert phi nodes
     let phi_locations = insert_phis(&alloca_infos, &df, num_blocks);
 
     // Step 6: Rename variables
-    let dom_children = build_dom_tree_children(num_blocks, &idom);
+    let dom_children = analysis::build_dom_tree_children(num_blocks, &idom);
     rename_variables(func, &alloca_infos, &phi_locations, &dom_children, &preds, &label_to_idx);
 }
 
@@ -304,192 +305,6 @@ fn add_operand_values(op: &Operand, used: &mut Vec<u32>) {
     }
 }
 
-/// Build a map from block label to block index.
-fn build_label_map(func: &IrFunction) -> FxHashMap<BlockId, usize> {
-    func.blocks
-        .iter()
-        .enumerate()
-        .map(|(i, b)| (b.label, i))
-        .collect()
-}
-
-/// Build predecessor and successor lists from the function's CFG.
-fn build_cfg(
-    func: &IrFunction,
-    label_to_idx: &FxHashMap<BlockId, usize>,
-) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
-    let n = func.blocks.len();
-    let mut preds = vec![Vec::new(); n];
-    let mut succs = vec![Vec::new(); n];
-
-    for (i, block) in func.blocks.iter().enumerate() {
-        match &block.terminator {
-            Terminator::Branch(label) => {
-                if let Some(&target) = label_to_idx.get(label) {
-                    succs[i].push(target);
-                    preds[target].push(i);
-                }
-            }
-            Terminator::CondBranch { true_label, false_label, .. } => {
-                if let Some(&t) = label_to_idx.get(true_label) {
-                    succs[i].push(t);
-                    preds[t].push(i);
-                }
-                if let Some(&f) = label_to_idx.get(false_label) {
-                    if !succs[i].contains(&f) {
-                        succs[i].push(f);
-                    }
-                    preds[f].push(i);
-                }
-            }
-            Terminator::IndirectBranch { possible_targets, .. } => {
-                for label in possible_targets {
-                    if let Some(&t) = label_to_idx.get(label) {
-                        if !succs[i].contains(&t) {
-                            succs[i].push(t);
-                        }
-                        preds[t].push(i);
-                    }
-                }
-            }
-            Terminator::Return(_) | Terminator::Unreachable => {}
-        }
-    }
-
-    (preds, succs)
-}
-
-/// Compute immediate dominators using the Cooper-Harvey-Kennedy algorithm.
-/// Returns idom[i] = immediate dominator of block i (idom[0] = 0 for entry).
-/// Uses usize::MAX as sentinel for undefined.
-fn compute_dominators(
-    num_blocks: usize,
-    preds: &[Vec<usize>],
-    succs: &[Vec<usize>],
-) -> Vec<usize> {
-    const UNDEF: usize = usize::MAX;
-
-    // Compute reverse postorder
-    let rpo = compute_reverse_postorder(num_blocks, succs);
-    let mut rpo_number = vec![UNDEF; num_blocks];
-    for (order, &block) in rpo.iter().enumerate() {
-        rpo_number[block] = order;
-    }
-
-    let mut idom = vec![UNDEF; num_blocks];
-    idom[rpo[0]] = rpo[0]; // Entry dominates itself
-
-    let mut changed = true;
-    while changed {
-        changed = false;
-        // Process in RPO order (skip entry)
-        for &b in rpo.iter().skip(1) {
-            if rpo_number[b] == UNDEF {
-                continue; // unreachable block
-            }
-
-            // Find first predecessor with a computed idom
-            let mut new_idom = UNDEF;
-            for &p in &preds[b] {
-                if idom[p] != UNDEF {
-                    new_idom = p;
-                    break;
-                }
-            }
-
-            if new_idom == UNDEF {
-                continue; // no processed predecessor yet
-            }
-
-            // Intersect with other processed predecessors
-            for &p in &preds[b] {
-                if p == new_idom {
-                    continue;
-                }
-                if idom[p] != UNDEF {
-                    new_idom = intersect(new_idom, p, &idom, &rpo_number);
-                }
-            }
-
-            if idom[b] != new_idom {
-                idom[b] = new_idom;
-                changed = true;
-            }
-        }
-    }
-
-    idom
-}
-
-/// Intersect two dominators using RPO numbering (Cooper-Harvey-Kennedy).
-fn intersect(
-    mut finger1: usize,
-    mut finger2: usize,
-    idom: &[usize],
-    rpo_number: &[usize],
-) -> usize {
-    while finger1 != finger2 {
-        while rpo_number[finger1] > rpo_number[finger2] {
-            finger1 = idom[finger1];
-        }
-        while rpo_number[finger2] > rpo_number[finger1] {
-            finger2 = idom[finger2];
-        }
-    }
-    finger1
-}
-
-/// Compute reverse postorder traversal of the CFG.
-fn compute_reverse_postorder(num_blocks: usize, succs: &[Vec<usize>]) -> Vec<usize> {
-    let mut visited = vec![false; num_blocks];
-    let mut postorder = Vec::with_capacity(num_blocks);
-
-    fn dfs(node: usize, succs: &[Vec<usize>], visited: &mut Vec<bool>, postorder: &mut Vec<usize>) {
-        visited[node] = true;
-        for &succ in &succs[node] {
-            if !visited[succ] {
-                dfs(succ, succs, visited, postorder);
-            }
-        }
-        postorder.push(node);
-    }
-
-    if num_blocks > 0 {
-        dfs(0, succs, &mut visited, &mut postorder);
-    }
-
-    postorder.reverse();
-    postorder
-}
-
-/// Compute dominance frontiers for each block.
-/// DF(b) = set of blocks where b's dominance ends (join points).
-fn compute_dominance_frontiers(
-    num_blocks: usize,
-    preds: &[Vec<usize>],
-    idom: &[usize],
-) -> Vec<FxHashSet<usize>> {
-    let mut df = vec![FxHashSet::default(); num_blocks];
-
-    for b in 0..num_blocks {
-        if preds[b].len() < 2 {
-            continue; // Only join nodes can be in dominance frontiers
-        }
-        for &p in &preds[b] {
-            let mut runner = p;
-            while runner != idom[b] && runner != usize::MAX {
-                df[runner].insert(b);
-                if runner == idom[runner] {
-                    break; // reached entry
-                }
-                runner = idom[runner];
-            }
-        }
-    }
-
-    df
-}
-
 /// Determine where phi nodes need to be inserted.
 /// Returns a map: block_index -> set of alloca indices that need phis there.
 fn insert_phis(
@@ -521,16 +336,6 @@ fn insert_phis(
     phi_locations
 }
 
-/// Build dominator tree children lists from idom array.
-fn build_dom_tree_children(num_blocks: usize, idom: &[usize]) -> Vec<Vec<usize>> {
-    let mut children = vec![Vec::new(); num_blocks];
-    for b in 1..num_blocks {
-        if idom[b] != usize::MAX && idom[b] != b {
-            children[idom[b]].push(b);
-        }
-    }
-    children
-}
 
 /// Rename variables to complete SSA construction.
 /// This traverses the dominator tree, maintaining stacks of current definitions
@@ -1075,7 +880,7 @@ mod tests {
             vec![0],    // 2
             vec![1, 2], // 3
         ];
-        let idom = compute_dominators(4, &preds, &succs);
+        let idom = analysis::compute_dominators(4, &preds, &succs);
         assert_eq!(idom[0], 0); // entry dominates itself
         assert_eq!(idom[1], 0); // 0 dominates 1
         assert_eq!(idom[2], 0); // 0 dominates 2
@@ -1092,7 +897,7 @@ mod tests {
             vec![1, 2], // 3
         ];
         let idom = vec![0, 0, 0, 0];
-        let df = compute_dominance_frontiers(4, &preds, &idom);
+        let df = analysis::compute_dominance_frontiers(4, &preds, &idom);
         // DF(1) = {3}, DF(2) = {3}
         assert!(df[1].contains(&3));
         assert!(df[2].contains(&3));

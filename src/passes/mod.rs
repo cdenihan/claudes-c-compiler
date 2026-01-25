@@ -24,7 +24,8 @@ use crate::ir::ir::IrModule;
 /// 2. Copy propagation (replace uses of copies with original values)
 /// 3. Algebraic simplification (strength reduction)
 /// 4. Constant folding (evaluate const exprs at compile time)
-/// 5. GVN / CSE (local value numbering, O2+)
+/// 5. GVN / CSE (dominator-based value numbering, eliminates redundant
+///    BinOp, UnaryOp, Cmp, Cast, and GetElementPtr across all dominated blocks)
 /// 6. Copy propagation (clean up copies from GVN/simplification)
 /// 7. Dead code elimination (remove dead instructions)
 /// 8. CFG simplification (clean up after DCE may have made blocks dead)
@@ -61,10 +62,9 @@ pub fn run_passes(module: &mut IrModule, opt_level: u32) {
         // Phase 4: Constant folding (evaluate const exprs at compile time)
         changes += constant_fold::run(module);
 
-        // Phase 5: GVN / Common Subexpression Elimination
-        if opt_level >= 2 {
-            changes += gvn::run(module);
-        }
+        // Phase 5: GVN / Common Subexpression Elimination (dominator-based)
+        // Eliminates redundant computations both within and across basic blocks.
+        changes += gvn::run(module);
 
         // Phase 6: Copy propagation again (clean up copies created by GVN/simplify)
         changes += copy_prop::run(module);

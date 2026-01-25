@@ -6,26 +6,30 @@ The following passes are implemented and working:
 - Constant folding (constant_fold.rs)
 - Copy propagation (copy_prop.rs)
 - Dead code elimination (dce.rs)
-- Local value numbering / CSE (gvn.rs)
+- Dominator-based GVN / CSE (gvn.rs) - walks dominator tree with scoped hash
+  tables; value-numbers BinOp, UnaryOp, Cmp, Cast, and GetElementPtr
 - Algebraic simplification + strength reduction (simplify.rs)
   - Includes: mul/div/rem by power-of-2 -> shift/and,
     redundant Cast elimination, GEP zero-offset elimination
+- CFG simplification (cfg_simplify.rs) - dead block removal, jump threading
 - x86-64 peephole optimizer (peephole.rs in backend/x86/codegen/)
+
+Shared infrastructure:
+- ir/analysis.rs: CFG construction, dominator tree (Cooper-Harvey-Kennedy),
+  dominance frontiers, dom tree children. Used by both mem2reg and GVN.
 
 Next passes to add:
 1. LICM (Loop Invariant Code Motion): Move loop-invariant computations out
    of loops. Requires loop detection (natural loops via dominators + back edges).
+   The dominator tree infrastructure is now available via ir/analysis.rs.
 
 2. Function inlining: For small functions, inline the callee body at call sites.
    Start with leaf functions < N instructions.
 
-3. Dominator-based GVN: Extend current local GVN to cross basic block boundaries
-   using a dominator tree. This enables more CSE opportunities.
-
-4. Constant propagation (SCCP): Sparse conditional constant propagation -
+3. Constant propagation (SCCP): Sparse conditional constant propagation -
    propagate constants through the CFG, taking branch conditions into account.
 
-5. Strength reduction in loops: Replace expensive operations (mul) with
+4. Strength reduction in loops: Replace expensive operations (mul) with
    cheaper ones (add) for loop induction variables.
 
 Priority: MEDIUM (existing passes handle the most impactful cases)

@@ -8,7 +8,7 @@ SSA-based optimization passes that improve the IR before code generation.
 - **constant_fold.rs** - Evaluates constant expressions at compile time (e.g., `3 + 4` -> `7`)
 - **copy_prop.rs** - Copy propagation: replaces uses of copies with original values, follows transitive chains
 - **dce.rs** - Dead code elimination: removes instructions whose results are never used
-- **gvn.rs** - Global value numbering: eliminates redundant computations (common subexpression elimination)
+- **gvn.rs** - Dominator-based global value numbering: eliminates redundant BinOp, UnaryOp, Cmp, Cast, and GetElementPtr computations across all dominated blocks
 - **simplify.rs** - Algebraic simplification: identity removal (`x + 0` -> `x`), strength reduction (`x * 2` -> `x << 1`), boolean simplification
 
 ## Pass Pipeline
@@ -16,11 +16,11 @@ SSA-based optimization passes that improve the IR before code generation.
 Passes run in a fixed pipeline with iteration count based on `-O` level:
 
 - `-O0`: No passes run
-- `-O1`: 1 iteration (CFG simplify, copy prop, simplify, constant fold, copy prop, DCE, CFG simplify; no GVN)
-- `-O2`: 2 iterations (adds GVN/CSE)
+- `-O1`: 1 iteration
+- `-O2`: 2 iterations
 - `-O3`: 3 iterations
 
-Each iteration runs: CFG simplify -> copy prop -> simplify -> constant fold -> GVN (O2+) -> copy prop -> DCE -> CFG simplify.
+Each iteration runs: CFG simplify -> copy prop -> simplify -> constant fold -> GVN/CSE -> copy prop -> DCE -> CFG simplify.
 
 ## Architecture
 
