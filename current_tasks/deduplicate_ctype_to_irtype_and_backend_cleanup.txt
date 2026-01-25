@@ -1,0 +1,21 @@
+Task: Deduplicate CType-to-IrType conversions and backend codegen cleanup
+
+Scope:
+1. Unify three duplicate CType-to-IrType conversion functions into single canonical IrType::from_ctype
+   - common/types.rs:813 (IrType::from_ctype)
+   - ir/lowering/types.rs:508 (Lowerer::ctype_to_ir)
+   - ir/lowering/expr.rs:1604 (Lowerer::ctype_to_ir_type)
+   These have divergent behavior for Void, Bool, Enum - bugs waiting to happen.
+
+2. Deduplicate is_type_* methods in ir/lowering/types.rs using a generic helper
+
+3. Add value_addr_to_reg helper to x86/arm/riscv backends to eliminate repeated
+   alloca-check pattern in intrinsic emission
+
+4. Remove dead code (unused methods flagged by compiler warnings)
+
+5. Add subdirectory README.md files
+
+Files modified: common/types.rs, ir/lowering/types.rs, ir/lowering/expr.rs,
+backend/x86/codegen/codegen.rs, backend/arm/codegen/codegen.rs,
+backend/riscv/codegen/codegen.rs
