@@ -1110,6 +1110,7 @@ fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
 
         // Scan for testq %rax, %rax pattern
         let mut test_idx = None;
+        let mut has_store = false;
         let mut scan = 2;
         while scan < seq_count {
             let si = seq_indices[scan];
@@ -1122,6 +1123,7 @@ fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
             }
             // Skip store/load to rbp (pre-parsed fast check)
             if matches!(infos[si].kind, LineKind::StoreRbp { .. }) {
+                has_store = true;
                 scan += 1;
                 continue;
             }
@@ -1140,6 +1142,15 @@ fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
                 break;
             }
             break;
+        }
+
+        // If the sequence includes a store to the stack, the comparison result
+        // is being materialized for use by other blocks.  The codegen-level
+        // fusion already decided NOT to fuse (because the Cmp result has
+        // multiple uses), so the peephole must not undo that decision.
+        if has_store {
+            i += 1;
+            continue;
         }
 
         let test_scan = match test_idx {
@@ -2125,7 +2136,11 @@ mod tests {
     }
 
     #[test]
-    fn test_compare_branch_fusion_full() {
+    fn test_compare_branch_fusion_with_store_preserved() {
+        // When the sequence includes a store to a stack slot, the comparison
+        // result is being materialized for use by other blocks.  The peephole
+        // must NOT fuse in this case, because the store may be the only write
+        // to a slot that another block reads.
         let asm = [
             "    cmpq %rcx, %rax",
             "    setl %al",
@@ -2138,11 +2153,9 @@ mod tests {
         ].join("\n") + "\n";
         let result = peephole_optimize(asm);
         assert!(result.contains("cmpq %rcx, %rax"), "should keep the cmp");
-        assert!(result.contains("jl .L2"), "should fuse to jl: {}", result);
-        assert!(result.contains("jmp .L4"), "should keep the fallthrough jmp");
-        assert!(!result.contains("setl"), "should eliminate setl");
-        assert!(!result.contains("movzbq"), "should eliminate movzbq");
-        assert!(!result.contains("testq"), "should eliminate testq");
+        // The store must be preserved because another block may read -24(%rbp)
+        assert!(result.contains("-24(%rbp)"), "should keep the store: {}", result);
+        assert!(result.contains("setl"), "should keep setl when store present: {}", result);
     }
 
     #[test]
