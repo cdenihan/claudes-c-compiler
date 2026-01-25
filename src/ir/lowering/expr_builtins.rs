@@ -343,6 +343,16 @@ impl Lowerer {
                 let result = if obj_type == 2 || obj_type == 3 { 0i64 } else { -1i64 };
                 Some(Operand::Const(IrConst::I64(result)))
             }
+            // __builtin_classify_type(expr) -> GCC type class integer
+            BuiltinIntrinsic::ClassifyType => {
+                let result = if let Some(arg) = args.first() {
+                    let ctype = self.expr_ctype(arg);
+                    classify_ctype(&ctype)
+                } else {
+                    0i64 // no_type_class
+                };
+                Some(Operand::Const(IrConst::I64(result)))
+            }
             // Nop intrinsic - just evaluate args for side effects and return 0
             BuiltinIntrinsic::Nop => {
                 for arg in args {
@@ -972,5 +982,44 @@ impl Lowerer {
             let direction = s.emit_binop_val(IrBinOp::Sub, Operand::Const(IrConst::I64(1)), Operand::Value(sign_x2), IrType::I64);
             s.emit_binop_val(IrBinOp::Mul, Operand::Value(is_inf), Operand::Value(direction), IrType::I64)
         })
+    }
+}
+
+/// Classify a CType according to GCC's __builtin_classify_type conventions.
+/// Returns the GCC type class integer:
+///   0 = no_type_class (void)
+///   1 = integer_type_class
+///   2 = char_type_class
+///   3 = enumeral_type_class
+///   4 = boolean_type_class
+///   5 = pointer_type_class
+///   6 = reference_type_class (C++ only, not used in C)
+///   8 = real_type_class
+///   9 = complex_type_class
+///  12 = record_type_class (struct)
+///  13 = union_type_class
+///  14 = array_type_class
+///  16 = lang_type_class
+fn classify_ctype(ty: &CType) -> i64 {
+    // GCC __builtin_classify_type returns integer type classes.
+    // GCC treats char, _Bool, and enum as integer_type_class (1) in practice.
+    match ty {
+        CType::Void => 0,            // no_type_class
+        CType::Bool
+        | CType::Char | CType::UChar
+        | CType::Short | CType::UShort
+        | CType::Int | CType::UInt
+        | CType::Long | CType::ULong
+        | CType::LongLong | CType::ULongLong
+        | CType::Int128 | CType::UInt128
+        | CType::Enum(_) => 1,       // integer_type_class
+        CType::Float | CType::Double | CType::LongDouble => 8, // real_type_class
+        CType::ComplexFloat | CType::ComplexDouble
+        | CType::ComplexLongDouble => 9, // complex_type_class
+        CType::Pointer(_) => 5,      // pointer_type_class
+        CType::Array(_, _) => 5,     // GCC decays arrays to pointers
+        CType::Function(_) => 5,     // function decays to pointer
+        CType::Struct(_) => 12,      // record_type_class
+        CType::Union(_) => 13,       // union_type_class
     }
 }
