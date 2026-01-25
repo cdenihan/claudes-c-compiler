@@ -9,7 +9,7 @@ SSA-based optimization passes that improve the IR before code generation.
 - **copy_prop.rs** - Copy propagation: replaces uses of copies with original values, follows transitive chains
 - **dce.rs** - Dead code elimination: removes instructions whose results are never used
 - **gvn.rs** - Dominator-based global value numbering: eliminates redundant BinOp, UnaryOp, Cmp, Cast, and GetElementPtr computations across all dominated blocks
-- **licm.rs** - Loop-invariant code motion: hoists loop-invariant computations to loop preheaders. Load hoisting is currently disabled pending improved alias analysis
+- **licm.rs** - Loop-invariant code motion: hoists loop-invariant computations and safe loads to loop preheaders. Includes load hoisting for non-address-taken alloca-based loads that are not modified within the loop (e.g., function parameter loads). Requires single-entry preheaders for soundness
 - **simplify.rs** - Algebraic simplification: identity removal (`x + 0` -> `x`), strength reduction (`x * 2` -> `x << 1`), boolean simplification
 
 ## Pass Pipeline
