@@ -1,0 +1,14 @@
+Fix ARM64 large offset codegen issues
+
+Two bugs:
+1. access_size_for_instr() doesn't handle float/SIMD register names (s*/d*/q*),
+   causing is_valid_imm_offset() to miscalculate for float stores/loads.
+   s registers are 4 bytes, d registers are 8 bytes, q registers are 16 bytes.
+
+2. Struct-by-value copy loop in call emission (line ~1753) emits
+   `ldr x1, [x0, #offset]` without checking if offset exceeds the ARM64
+   unsigned immediate range (max 32760 for 8-byte access).
+   The store side uses emit_store_to_sp which handles this correctly,
+   but the load from the source pointer doesn't.
+
+Affects: compiler_suite_0016_0136, gcc_torture_pr28982b (at least)
