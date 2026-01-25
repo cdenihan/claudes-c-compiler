@@ -454,7 +454,18 @@ impl Lexer {
             if self.input[self.pos] == b'\\' {
                 self.pos += 1;
                 if self.pos < self.input.len() {
-                    s.push(self.lex_escape_char());
+                    let ch = self.lex_escape_char();
+                    // C narrow strings store raw bytes, so Unicode escapes (\u, \U)
+                    // must be UTF-8 encoded to match GCC/Clang behavior.
+                    if (ch as u32) > 0xFF {
+                        let mut buf = [0u8; 4];
+                        let utf8 = ch.encode_utf8(&mut buf);
+                        for byte in utf8.bytes() {
+                            s.push(byte as char);
+                        }
+                    } else {
+                        s.push(ch);
+                    }
                 }
             } else {
                 s.push(self.input[self.pos] as char);
@@ -474,6 +485,7 @@ impl Lexer {
             if self.input[self.pos] == b'\\' {
                 self.pos += 1;
                 if self.pos < self.input.len() {
+                    // Wide strings store code points directly (no UTF-8 encoding needed)
                     s.push(self.lex_escape_char());
                 }
             } else {
@@ -528,7 +540,7 @@ impl Lexer {
             if self.input[self.pos] == b'\\' {
                 self.pos += 1;
                 let ch = self.lex_escape_char();
-                value = ch as u32;
+                value = ch as u32; // Unicode escapes return code point directly
             } else {
                 // Decode UTF-8 to get Unicode code point
                 let byte = self.input[self.pos];
@@ -580,9 +592,20 @@ impl Lexer {
                 self.pos += 1;
                 c
             };
-            // Multi-character constant: shift previous value and add new byte
-            value = (value << 8) | (ch as u8 as i32);
-            char_count += 1;
+            // C narrow char literals encode Unicode escapes as UTF-8 bytes
+            // combined into a multi-byte int value, matching GCC behavior.
+            if (ch as u32) > 0xFF {
+                let mut buf = [0u8; 4];
+                let utf8 = ch.encode_utf8(&mut buf);
+                for byte in utf8.bytes() {
+                    value = (value << 8) | (byte as i32);
+                    char_count += 1;
+                }
+            } else {
+                // Multi-character constant: shift previous value and add new byte
+                value = (value << 8) | (ch as u8 as i32);
+                char_count += 1;
+            }
         }
         if self.pos < self.input.len() && self.input[self.pos] == b'\'' {
             self.pos += 1; // skip closing '
@@ -627,6 +650,14 @@ impl Lexer {
                 // multi-byte UTF-8 encoding issues with values > 127
                 (val as u8) as char
             }
+            b'u' => {
+                // Universal character name: \uNNNN (exactly 4 hex digits)
+                self.lex_unicode_escape(4)
+            }
+            b'U' => {
+                // Universal character name: \UNNNNNNNN (exactly 8 hex digits)
+                self.lex_unicode_escape(8)
+            }
             b'0'..=b'7' => {
                 // Octal escape: \0 through \377 (1-3 octal digits)
                 // Note: \0 alone produces null; \040 produces space (32), etc.
@@ -644,6 +675,27 @@ impl Lexer {
             }
             _ => ch as char,
         }
+    }
+
+    /// Parse a universal character name (\uNNNN or \UNNNNNNNN).
+    /// `num_digits` is 4 for \u or 8 for \U.
+    /// Returns the Unicode code point as a Rust char.
+    // TODO: C11 requires exactly num_digits hex digits; emit diagnostic if fewer provided.
+    // TODO: C11 §6.4.3 disallows certain code points (below 0x00A0 except 0x24/0x40/0x60,
+    //       and surrogates 0xD800-0xDFFF). Validate and emit diagnostics for these.
+    fn lex_unicode_escape(&mut self, num_digits: usize) -> char {
+        let mut val = 0u32;
+        for _ in 0..num_digits {
+            if self.pos < self.input.len() && self.input[self.pos].is_ascii_hexdigit() {
+                val = val * 16 + hex_digit_val(self.input[self.pos]) as u32;
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        // TODO: Emit a diagnostic for invalid code points (e.g. surrogates) instead of
+        //       silently using the replacement character.
+        char::from_u32(val).unwrap_or('\u{FFFD}')
     }
 
     fn lex_identifier(&mut self, start: usize) -> Token {

@@ -1,8 +1,0 @@
-Implement \u and \U unicode escape sequences in string and character literals.
-
-The lexer currently does not handle \uNNNN (4 hex digit) or \UNNNNNNNN (8 hex digit)
-unicode escape sequences. These are required by C11 for string literals, character literals,
-and u8 string literals.
-
-When \u or \U appears in a string literal, it should produce the UTF-8 encoding of the
-specified Unicode code point.
