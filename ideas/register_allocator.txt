@@ -1,10 +1,12 @@
-Register allocator -- PARTIALLY DONE
+Register allocator -- DONE (all 3 backends)
 
 Linear scan register allocator with callee-saved registers is implemented for:
 - x86-64: rbx, r12-r15 (5 registers)
+- AArch64: x20-x28 (9 registers) -- with register-direct ALU via 3-operand ISA
 - RISC-V: s1, s7-s11 (6 registers)
 
 Liveness analysis uses backward dataflow iteration and supports loops.
+ARM integration skips variadic functions to avoid callee-save/VA-save area conflicts.
 
 Remaining improvements:
 1. Eliminate write-through: currently every store goes to both stack AND register.
@@ -16,6 +18,7 @@ Remaining improvements:
 3. Spill/reload insertion: currently values that don't fit spill to the existing
    stack slot. A proper spill/reload would move values between registers and
    stack at optimal points.
-4. ARM backend integration: port the same pattern to AArch64.
-5. Call-clobber handling: currently functions with inline asm or atomics bail out.
+4. Call-clobber handling: currently functions with inline asm or atomics bail out.
    Should instead insert saves around clobbering instructions.
+5. ARM variadic support: currently skipped; need to handle callee-save area
+   placement relative to VA register save areas.

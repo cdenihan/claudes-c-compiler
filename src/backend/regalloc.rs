@@ -4,7 +4,7 @@
 //! Values with the longest live ranges and most uses get priority for register
 //! assignment. Values that don't fit in available registers remain on the stack.
 //!
-//! Shared by all backends: x86-64 (rbx, r12-r15) and RISC-V (s1, s7-s11).
+//! Shared by all backends: x86-64 (rbx, r12-r15), AArch64 (x20-x28), and RISC-V (s1, s7-s11).
 //! Uses callee-saved registers so no save/restore is needed around calls.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};

@@ -1,5 +1,6 @@
 use crate::ir::ir::*;
 use crate::common::types::IrType;
+use crate::common::fx_hash::FxHashMap;
 use crate::backend::common::PtrDirective;
 use crate::backend::state::{CodegenState, StackSlot};
 use crate::backend::traits::ArchCodegen;
@@ -8,6 +9,43 @@ use crate::backend::call_abi::{CallAbiConfig, CallArgClass, compute_stack_arg_sp
 use crate::backend::call_emit::{ParamClass, classify_params};
 use crate::backend::cast::{CastKind, classify_cast, FloatOp};
 use crate::backend::inline_asm::{InlineAsmEmitter, AsmOperandKind, AsmOperand, emit_inline_asm_common};
+use crate::backend::regalloc::{self, PhysReg, RegAllocConfig};
+
+/// Callee-saved registers available for register allocation: x20-x28.
+/// x19 is reserved (some ABIs use it), x29=fp, x30=lr.
+const ARM_CALLEE_SAVED: [PhysReg; 9] = [
+    PhysReg(20), PhysReg(21), PhysReg(22), PhysReg(23), PhysReg(24),
+    PhysReg(25), PhysReg(26), PhysReg(27), PhysReg(28),
+];
+
+fn callee_saved_name(reg: PhysReg) -> &'static str {
+    match reg.0 {
+        20 => "x20", 21 => "x21", 22 => "x22", 23 => "x23", 24 => "x24",
+        25 => "x25", 26 => "x26", 27 => "x27", 28 => "x28",
+        _ => unreachable!("invalid ARM callee-saved register index"),
+    }
+}
+
+fn callee_saved_name_32(reg: PhysReg) -> &'static str {
+    match reg.0 {
+        20 => "w20", 21 => "w21", 22 => "w22", 23 => "w23", 24 => "w24",
+        25 => "w25", 26 => "w26", 27 => "w27", 28 => "w28",
+        _ => unreachable!("invalid ARM callee-saved register index"),
+    }
+}
+
+/// Map IrBinOp to AArch64 mnemonic for simple ALU ops.
+fn arm_alu_mnemonic(op: IrBinOp) -> &'static str {
+    match op {
+        IrBinOp::Add => "add",
+        IrBinOp::Sub => "sub",
+        IrBinOp::And => "and",
+        IrBinOp::Or => "orr",
+        IrBinOp::Xor => "eor",
+        IrBinOp::Mul => "mul",
+        _ => unreachable!(),
+    }
+}
 
 /// Map an IrCmpOp to its AArch64 integer condition code suffix.
 fn arm_int_cond_code(op: IrCmpOp) -> &'static str {
@@ -44,6 +82,12 @@ pub struct ArmCodegen {
     va_named_stack_gp_count: usize,
     /// Scratch register index for inline asm allocation
     asm_scratch_idx: usize,
+    /// Register allocator: value ID -> physical callee-saved register.
+    reg_assignments: FxHashMap<u32, PhysReg>,
+    /// Which callee-saved registers are actually used (for save/restore).
+    used_callee_saved: Vec<PhysReg>,
+    /// SP offset where callee-saved registers are stored.
+    callee_save_offset: i64,
 }
 
 impl ArmCodegen {
@@ -58,11 +102,92 @@ impl ArmCodegen {
             va_named_fp_count: 0,
             va_named_stack_gp_count: 0,
             asm_scratch_idx: 0,
+            reg_assignments: FxHashMap::default(),
+            used_callee_saved: Vec::new(),
+            callee_save_offset: 0,
         }
     }
 
     pub fn generate(mut self, module: &IrModule) -> String {
         generate_module(&mut self, module)
+    }
+
+    /// Get the physical register assigned to an operand (if it's a Value with a register).
+    fn operand_reg(&self, op: &Operand) -> Option<PhysReg> {
+        match op {
+            Operand::Value(v) => self.reg_assignments.get(&v.0).copied(),
+            _ => None,
+        }
+    }
+
+    /// Get the physical register assigned to a destination value.
+    fn dest_reg(&self, dest: &Value) -> Option<PhysReg> {
+        self.reg_assignments.get(&dest.0).copied()
+    }
+
+    /// Load an operand into a specific callee-saved register.
+    fn operand_to_callee_reg(&mut self, op: &Operand, reg: PhysReg) {
+        let reg_name = callee_saved_name(reg);
+        match op {
+            Operand::Const(_) => {
+                self.operand_to_x0(op);
+                self.state.emit_fmt(format_args!("    mov {}, x0", reg_name));
+            }
+            Operand::Value(v) => {
+                if let Some(&src_reg) = self.reg_assignments.get(&v.0) {
+                    if src_reg.0 != reg.0 {
+                        let src_name = callee_saved_name(src_reg);
+                        self.state.emit_fmt(format_args!("    mov {}, {}", reg_name, src_name));
+                    }
+                } else {
+                    self.operand_to_x0(op);
+                    self.state.emit_fmt(format_args!("    mov {}, x0", reg_name));
+                }
+            }
+        }
+    }
+
+    /// Try to extract an immediate value suitable for ARM imm12 encoding.
+    fn const_as_imm12(op: &Operand) -> Option<i64> {
+        match op {
+            Operand::Const(c) => {
+                let val = match c {
+                    IrConst::I8(v) => *v as i64,
+                    IrConst::I16(v) => *v as i64,
+                    IrConst::I32(v) => *v as i64,
+                    IrConst::I64(v) => *v,
+                    IrConst::Zero => 0,
+                    _ => return None,
+                };
+                // ARM add/sub imm12: 0..4095
+                if val >= 0 && val <= 4095 {
+                    Some(val)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Restore callee-saved registers before epilogue.
+    fn emit_restore_callee_saved(&mut self) {
+        let used_regs = self.used_callee_saved.clone();
+        let base = self.callee_save_offset;
+        let n = used_regs.len();
+        let mut i = 0;
+        while i + 1 < n {
+            let r1 = callee_saved_name(used_regs[i]);
+            let r2 = callee_saved_name(used_regs[i + 1]);
+            let offset = base + (i as i64) * 8;
+            self.emit_ldp_from_sp(r1, r2, offset);
+            i += 2;
+        }
+        if i < n {
+            let r = callee_saved_name(used_regs[i]);
+            let offset = base + (i as i64) * 8;
+            self.emit_load_from_sp(r, offset, "ldr");
+        }
     }
 
     /// Emit the integer comparison preamble: load lhs->x1, rhs->x0, then
@@ -169,6 +294,17 @@ impl ArmCodegen {
             self.load_large_imm("x17", offset);
             self.state.emit_fmt(format_args!("    add x17, {}, x17", base));
             self.state.emit_fmt(format_args!("    stp {}, {}, [x17]", reg1, reg2));
+        }
+    }
+
+    fn emit_ldp_from_sp(&mut self, reg1: &str, reg2: &str, offset: i64) {
+        let base = if self.state.has_dyn_alloca { "x29" } else { "sp" };
+        if offset >= -512 && offset <= 504 {
+            self.state.emit_fmt(format_args!("    ldp {}, {}, [{}, #{}]", reg1, reg2, base, offset));
+        } else {
+            self.load_large_imm("x17", offset);
+            self.state.emit_fmt(format_args!("    add x17, {}, x17", base));
+            self.state.emit_fmt(format_args!("    ldp {}, {}, [x17]", reg1, reg2));
         }
     }
 
@@ -290,6 +426,13 @@ impl ArmCodegen {
                 if self.state.reg_cache.acc_has(v.0, is_alloca) {
                     return; // Cache hit — x0 already holds this value.
                 }
+                // Check for callee-saved register assignment.
+                if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                    let reg_name = callee_saved_name(reg);
+                    self.state.emit_fmt(format_args!("    mov x0, {}", reg_name));
+                    self.state.reg_cache.set_acc(v.0, false);
+                    return;
+                }
                 if let Some(slot) = self.state.get_slot(v.0) {
                     if is_alloca {
                         self.emit_add_sp_offset("x0", slot.0);
@@ -305,12 +448,16 @@ impl ArmCodegen {
         }
     }
 
-    /// Store x0 to a value's stack slot.
+    /// Store x0 to a value's destination (register or stack slot).
     fn store_x0_to(&mut self, dest: &Value) {
-        if let Some(slot) = self.state.get_slot(dest.0) {
+        if let Some(&reg) = self.reg_assignments.get(&dest.0) {
+            // Value has a callee-saved register: store only to register, skip stack.
+            let reg_name = callee_saved_name(reg);
+            self.state.emit_fmt(format_args!("    mov {}, x0", reg_name));
+        } else if let Some(slot) = self.state.get_slot(dest.0) {
             self.emit_store_to_sp("x0", slot.0, "str");
-            self.state.reg_cache.set_acc(dest.0, false);
         }
+        self.state.reg_cache.set_acc(dest.0, false);
     }
 
     // --- 128-bit integer helpers ---
@@ -718,6 +865,23 @@ impl ArchCodegen for ArmCodegen {
             self.va_named_stack_gp_count = named_gp.saturating_sub(8);
         }
 
+        // Run register allocator: assign callee-saved registers to hot values.
+        // Skip variadic functions to avoid callee-save area conflicting with VA save areas.
+        let config = RegAllocConfig {
+            available_regs: if func.is_variadic { Vec::new() } else { ARM_CALLEE_SAVED.to_vec() },
+        };
+        let alloc_result = regalloc::allocate_registers(func, &config);
+        self.reg_assignments = alloc_result.assignments;
+        self.used_callee_saved = alloc_result.used_regs;
+
+        // Reserve space for saving callee-saved registers (8 bytes each).
+        let save_count = self.used_callee_saved.len() as i64;
+        if save_count > 0 {
+            space = (space + 7) & !7;
+            self.callee_save_offset = space;
+            space += save_count * 8;
+        }
+
         space
     }
 
@@ -729,9 +893,28 @@ impl ArchCodegen for ArmCodegen {
         self.current_return_type = func.return_type;
         self.current_frame_size = frame_size;
         self.emit_prologue_arm(frame_size);
+
+        // Save callee-saved registers used by register allocator.
+        let used_regs = self.used_callee_saved.clone();
+        let base = self.callee_save_offset;
+        let n = used_regs.len();
+        let mut i = 0;
+        while i + 1 < n {
+            let r1 = callee_saved_name(used_regs[i]);
+            let r2 = callee_saved_name(used_regs[i + 1]);
+            let offset = base + (i as i64) * 8;
+            self.emit_stp_to_sp(r1, r2, offset);
+            i += 2;
+        }
+        if i < n {
+            let r = callee_saved_name(used_regs[i]);
+            let offset = base + (i as i64) * 8;
+            self.emit_store_to_sp(r, offset, "str");
+        }
     }
 
     fn emit_epilogue(&mut self, frame_size: i64) {
+        self.emit_restore_callee_saved();
         self.emit_epilogue_arm(frame_size);
     }
 
@@ -1016,6 +1199,7 @@ impl ArchCodegen for ArmCodegen {
     }
 
     fn emit_epilogue_and_ret(&mut self, frame_size: i64) {
+        self.emit_restore_callee_saved();
         self.emit_epilogue_arm(frame_size);
         self.state.emit("    ret");
     }
@@ -1054,8 +1238,13 @@ impl ArchCodegen for ArmCodegen {
         self.state.emit("    mov x1, x0");
     }
 
-    fn emit_load_ptr_from_slot(&mut self, slot: StackSlot, _val_id: u32) {
-        self.emit_load_from_sp("x9", slot.0, "ldr");
+    fn emit_load_ptr_from_slot(&mut self, slot: StackSlot, val_id: u32) {
+        if let Some(&reg) = self.reg_assignments.get(&val_id) {
+            let reg_name = callee_saved_name(reg);
+            self.state.emit_fmt(format_args!("    mov x9, {}", reg_name));
+        } else {
+            self.emit_load_from_sp("x9", slot.0, "ldr");
+        }
     }
 
     fn emit_typed_store_indirect(&mut self, instr: &'static str, ty: IrType) {
@@ -1079,9 +1268,12 @@ impl ArchCodegen for ArmCodegen {
         }
     }
 
-    fn emit_slot_addr_to_secondary(&mut self, slot: StackSlot, is_alloca: bool, _val_id: u32) {
+    fn emit_slot_addr_to_secondary(&mut self, slot: StackSlot, is_alloca: bool, val_id: u32) {
         if is_alloca {
             self.emit_add_sp_offset("x1", slot.0);
+        } else if let Some(&reg) = self.reg_assignments.get(&val_id) {
+            let reg_name = callee_saved_name(reg);
+            self.state.emit_fmt(format_args!("    mov x1, {}", reg_name));
         } else {
             self.emit_load_from_sp("x1", slot.0, "ldr");
         }
@@ -1109,17 +1301,23 @@ impl ArchCodegen for ArmCodegen {
         self.state.emit_fmt(format_args!("    and x0, x0, #{}", -(align as i64)));
     }
 
-    fn emit_memcpy_load_dest_addr(&mut self, slot: StackSlot, is_alloca: bool, _val_id: u32) {
+    fn emit_memcpy_load_dest_addr(&mut self, slot: StackSlot, is_alloca: bool, val_id: u32) {
         if is_alloca {
             self.emit_add_sp_offset("x9", slot.0);
+        } else if let Some(&reg) = self.reg_assignments.get(&val_id) {
+            let reg_name = callee_saved_name(reg);
+            self.state.emit_fmt(format_args!("    mov x9, {}", reg_name));
         } else {
             self.emit_load_from_sp("x9", slot.0, "ldr");
         }
     }
 
-    fn emit_memcpy_load_src_addr(&mut self, slot: StackSlot, is_alloca: bool, _val_id: u32) {
+    fn emit_memcpy_load_src_addr(&mut self, slot: StackSlot, is_alloca: bool, val_id: u32) {
         if is_alloca {
             self.emit_add_sp_offset("x10", slot.0);
+        } else if let Some(&reg) = self.reg_assignments.get(&val_id) {
+            let reg_name = callee_saved_name(reg);
+            self.state.emit_fmt(format_args!("    mov x10, {}", reg_name));
         } else {
             self.emit_load_from_sp("x10", slot.0, "ldr");
         }
@@ -1241,15 +1439,97 @@ impl ArchCodegen for ArmCodegen {
 
     // emit_float_binop uses the shared default implementation
 
+    fn emit_copy_value(&mut self, dest: &Value, src: &Operand) {
+        let dest_phys = self.dest_reg(dest);
+        let src_phys = self.operand_reg(src);
+
+        match (dest_phys, src_phys) {
+            (Some(d), Some(s)) => {
+                if d.0 != s.0 {
+                    let d_name = callee_saved_name(d);
+                    let s_name = callee_saved_name(s);
+                    self.state.emit_fmt(format_args!("    mov {}, {}", d_name, s_name));
+                }
+                self.state.reg_cache.invalidate_acc();
+            }
+            (Some(d), None) => {
+                self.operand_to_x0(src);
+                let d_name = callee_saved_name(d);
+                self.state.emit_fmt(format_args!("    mov {}, x0", d_name));
+                self.state.reg_cache.invalidate_acc();
+            }
+            _ => {
+                self.operand_to_x0(src);
+                self.store_x0_to(dest);
+            }
+        }
+    }
+
     fn emit_int_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
         // Note: i128 dispatch is handled by the shared emit_binop default in traits.rs.
+        let use_32bit = ty == IrType::I32 || ty == IrType::U32;
+        let is_unsigned = ty.is_unsigned();
+
+        // Register-direct path: use ARM 3-operand instructions with callee-saved dest.
+        if let Some(dest_phys) = self.dest_reg(dest) {
+            let dest_name = callee_saved_name(dest_phys);
+            let dest_name_32 = callee_saved_name_32(dest_phys);
+
+            let is_simple_alu = matches!(op, IrBinOp::Add | IrBinOp::Sub | IrBinOp::And
+                | IrBinOp::Or | IrBinOp::Xor | IrBinOp::Mul);
+            if is_simple_alu {
+                let mnemonic = arm_alu_mnemonic(op);
+
+                // Immediate form for add/sub: op Xd, Xn, #imm12
+                if matches!(op, IrBinOp::Add | IrBinOp::Sub) {
+                    if let Some(imm) = Self::const_as_imm12(rhs) {
+                        self.operand_to_callee_reg(lhs, dest_phys);
+                        if use_32bit {
+                            self.state.emit_fmt(format_args!("    {} {}, {}, #{}", mnemonic, dest_name_32, dest_name_32, imm));
+                            if !is_unsigned { self.state.emit_fmt(format_args!("    sxtw {}, {}", dest_name, dest_name_32)); }
+                        } else {
+                            self.state.emit_fmt(format_args!("    {} {}, {}, #{}", mnemonic, dest_name, dest_name, imm));
+                        }
+                        self.state.reg_cache.invalidate_acc();
+                        return;
+                    }
+                }
+
+                // Register-register form: op Xd, Xn, Xm
+                let rhs_phys = self.operand_reg(rhs);
+                let rhs_conflicts = rhs_phys.map_or(false, |r| r.0 == dest_phys.0);
+                let rhs_reg: String = if rhs_conflicts {
+                    self.operand_to_x0(rhs);
+                    self.operand_to_callee_reg(lhs, dest_phys);
+                    "x0".to_string()
+                } else {
+                    self.operand_to_callee_reg(lhs, dest_phys);
+                    if let Some(rhs_phys) = rhs_phys {
+                        callee_saved_name(rhs_phys).to_string()
+                    } else {
+                        self.operand_to_x0(rhs);
+                        "x0".to_string()
+                    }
+                };
+                let rhs_32: String = if rhs_reg == "x0" { "w0".to_string() }
+                    else { rhs_reg.replace('x', "w") };
+
+                if use_32bit {
+                    self.state.emit_fmt(format_args!("    {} {}, {}, {}", mnemonic, dest_name_32, dest_name_32, rhs_32));
+                    if !is_unsigned { self.state.emit_fmt(format_args!("    sxtw {}, {}", dest_name, dest_name_32)); }
+                } else {
+                    self.state.emit_fmt(format_args!("    {} {}, {}, {}", mnemonic, dest_name, dest_name, rhs_reg));
+                }
+                self.state.reg_cache.invalidate_acc();
+                return;
+            }
+        }
+
+        // Fallback: accumulator path
         self.operand_to_x0(lhs);
         self.state.emit("    mov x1, x0");
         self.operand_to_x0(rhs);
         self.state.emit("    mov x2, x0");
-
-        let use_32bit = ty == IrType::I32 || ty == IrType::U32;
-        let is_unsigned = ty.is_unsigned();
 
         if use_32bit {
             match op {
@@ -1448,7 +1728,10 @@ impl ArchCodegen for ArmCodegen {
                         let n_dwords = (size + 7) / 8;
                         match arg {
                             Operand::Value(v) => {
-                                if let Some(slot) = self.state.get_slot(v.0) {
+                                if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                                    let reg_name = callee_saved_name(reg);
+                                    self.state.emit_fmt(format_args!("    mov x0, {}", reg_name));
+                                } else if let Some(slot) = self.state.get_slot(v.0) {
                                     let adjusted = slot.0 + stack_arg_space as i64 + fptr_spill as i64;
                                     if self.state.is_alloca(v.0) {
                                         self.emit_add_sp_offset("x0", adjusted);
@@ -1523,7 +1806,10 @@ impl ArchCodegen for ArmCodegen {
                                 self.emit_store_to_sp("x0", stack_offset + 8, "str");
                             }
                             Operand::Value(v) => {
-                                if let Some(slot) = self.state.get_slot(v.0) {
+                                if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                                    let reg_name = callee_saved_name(reg);
+                                    self.state.emit_fmt(format_args!("    mov x0, {}", reg_name));
+                                } else if let Some(slot) = self.state.get_slot(v.0) {
                                     let adjusted = slot.0 + stack_arg_space as i64 + fptr_spill as i64;
                                     if self.state.is_alloca(v.0) {
                                         self.emit_add_sp_offset("x0", adjusted);
@@ -1545,7 +1831,10 @@ impl ArchCodegen for ArmCodegen {
                     CallArgClass::Stack => {
                         match arg {
                             Operand::Value(v) => {
-                                if let Some(slot) = self.state.get_slot(v.0) {
+                                if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                                    let reg_name = callee_saved_name(reg);
+                                    self.state.emit_fmt(format_args!("    mov x0, {}", reg_name));
+                                } else if let Some(slot) = self.state.get_slot(v.0) {
                                     let adjusted = slot.0 + stack_arg_space as i64 + fptr_spill as i64;
                                     if self.state.is_alloca(v.0) {
                                         self.emit_add_sp_offset("x0", adjusted);
@@ -1578,7 +1867,10 @@ impl ArchCodegen for ArmCodegen {
             if total_sp_adjust > 0 {
                 match arg {
                     Operand::Value(v) => {
-                        if let Some(slot) = self.state.get_slot(v.0) {
+                        if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                            let reg_name = callee_saved_name(reg);
+                            self.state.emit_fmt(format_args!("    mov x0, {}", reg_name));
+                        } else if let Some(slot) = self.state.get_slot(v.0) {
                             let adjusted = slot.0 + total_sp_adjust;
                             if self.state.is_alloca(v.0) {
                                 self.emit_add_sp_offset("x0", adjusted);
@@ -1625,7 +1917,10 @@ impl ArchCodegen for ArmCodegen {
             if !matches!(arg_classes[arg_i], CallArgClass::F128Reg { .. }) { continue; }
             if let Operand::Value(v) = &args[arg_i] {
                 if total_sp_adjust > 0 || f128_temp_space_aligned > 0 {
-                    if let Some(slot) = self.state.get_slot(v.0) {
+                    if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                        let reg_name = callee_saved_name(reg);
+                        self.state.emit_fmt(format_args!("    mov x0, {}", reg_name));
+                    } else if let Some(slot) = self.state.get_slot(v.0) {
                         let adjusted = slot.0 + total_sp_adjust + f128_temp_space_aligned as i64;
                         self.emit_load_from_sp("x0", adjusted, "ldr");
                     } else {
@@ -1680,7 +1975,10 @@ impl ArchCodegen for ArmCodegen {
             if total_sp_adjust > 0 {
                 match &args[arg_i] {
                     Operand::Value(v) => {
-                        if let Some(slot) = self.state.get_slot(v.0) {
+                        if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                            let reg_name = callee_saved_name(reg);
+                            self.state.emit_fmt(format_args!("    mov x0, {}", reg_name));
+                        } else if let Some(slot) = self.state.get_slot(v.0) {
                             self.emit_load_from_sp("x0", slot.0 + total_sp_adjust, "ldr");
                         } else {
                             self.state.emit("    mov x0, #0");
