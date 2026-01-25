@@ -1,0 +1,13 @@
+Task: Skip emission of __attribute__((always_inline)) static inline functions
+
+Problem:
+- Functions marked __attribute__((always_inline)) are designed to always be inlined
+- Since we don't have a function inlining pass, we emit them as standalone functions
+- This causes incorrect __jump_table entries in the kernel because inline asm "i" constraints
+  can't be satisfied when the operand is a function parameter (not a compile-time constant)
+- The broken __jump_table entries cause kernel boot failures (NULL key pointers)
+
+Fix:
+1. Parse __attribute__((always_inline)) and store is_always_inline in FunctionDef
+2. Skip emitting always_inline functions as standalone functions (treat as unreferenced)
+3. This prevents broken __jump_table entries and kernel boot failures
