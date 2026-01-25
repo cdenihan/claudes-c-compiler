@@ -1127,6 +1127,8 @@ impl Lowerer {
     }
 
     /// Get the CType of a struct/union field.
+    /// Recursively searches anonymous struct/union members to find the field,
+    /// matching the behavior of StructLayout::field_offset().
     fn get_field_ctype(&self, base_expr: &Expr, field_name: &str, is_pointer_access: bool) -> Option<CType> {
         let base_ctype = if is_pointer_access {
             // For p->field, get CType of p, then dereference
@@ -1142,15 +1144,14 @@ impl Lowerer {
         // Resolve forward-declared (incomplete) struct/union types that may have
         // been cached before the full definition was available.
         let base_ctype = self.resolve_forward_declared_ctype(base_ctype);
-        // Look up field in the struct/union type
+        // Look up field in the struct/union type, recursing into anonymous members
         match &base_ctype {
             CType::Struct(key) | CType::Union(key) => {
-                // Look up the struct/union layout by key
                 if let Some(layout) = self.types.struct_layouts.get(key) {
-                    for field in &layout.fields {
-                        if field.name == field_name {
-                            return Some(field.ty.clone());
-                        }
+                    // Use field_offset which recursively searches anonymous
+                    // struct/union members, returning the correct field type
+                    if let Some((_offset, ctype)) = layout.field_offset(field_name, &self.types.struct_layouts) {
+                        return Some(ctype);
                     }
                 }
                 None

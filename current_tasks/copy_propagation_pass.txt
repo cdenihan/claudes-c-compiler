@@ -1,8 +1,0 @@
-Copy Propagation IR Optimization Pass
-
-Implementing a copy propagation pass to eliminate redundant Copy instructions in the IR.
-This replaces uses of Copy destinations with the original source operand, collapsing
-chains of copies and reducing stack traffic in the generated code.
-
-Expected impact: significant runtime improvement for all backends since every Copy
-currently becomes a load-from-stack -> accumulator -> store-to-stack sequence.

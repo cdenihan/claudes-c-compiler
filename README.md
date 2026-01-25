@@ -12,7 +12,8 @@ A C compiler written from scratch in Rust, targeting x86-64, AArch64, and RISC-V
 - Type-aware IR lowering and code generation
 - **SSA construction via mem2reg** (dominator tree, dominance frontiers, phi insertion, variable renaming)
 - Phi elimination for backend codegen (parallel copy lowering)
-- Optimization passes (constant folding, DCE, GVN, algebraic simplification) operating on SSA form
+- Optimization passes (constant folding, DCE, GVN, algebraic simplification, copy propagation) operating on SSA form
+- x86-64 peephole optimizer (eliminates redundant store/load, push/pop, and jump patterns)
 - Three backend targets with correct ABI handling
 
 ### Test Results (full suite)
@@ -259,7 +260,7 @@ A C compiler written from scratch in Rust, targeting x86-64, AArch64, and RISC-V
   phi insertion at join points, variable renaming via dominator tree DFS, and phi elimination
   (lowering to parallel copies) before backend codegen. The IR now has a Phi instruction variant.
   All optimization passes operate on proper SSA form. Unlocks future SSA-based optimizations
-  (SCCP, dominator-based GVN, copy propagation, LICM, etc.).
+  (SCCP, dominator-based GVN, LICM, etc.).
 - **Integer promotion for unary operators and switch**: Unary operators (`-`, `~`, `+`) now
   correctly apply C99 integer promotion rules, promoting `char`/`short` operands to `int` before
   the operation. Also fixed switch statement controlling expression promotion. Fixed binary op
@@ -372,7 +373,7 @@ src/
     lowering/            AST → alloca-based IR (split into expr/stmt/lvalue/types/structs)
     mem2reg/             SSA promotion (stub)
 
-  passes/                Optimization: constant_fold, dce, gvn, simplify
+  passes/                Optimization: constant_fold, copy_prop, dce, gvn, simplify
 
   backend/               IR → assembly → object → executable
     common.rs            Shared data emission, assembler/linker invocation

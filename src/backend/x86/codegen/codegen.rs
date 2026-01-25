@@ -49,7 +49,8 @@ impl X86Codegen {
     }
 
     pub fn generate(mut self, module: &IrModule) -> String {
-        generate_module(&mut self, module)
+        let raw = generate_module(&mut self, module);
+        super::peephole::peephole_optimize(raw)
     }
 
     // --- x86 helper methods ---
