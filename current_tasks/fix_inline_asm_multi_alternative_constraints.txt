@@ -1,0 +1,17 @@
+Fix inline asm multi-alternative constraint handling
+
+Problem:
+- x86 inline asm constraints like "Ir", "ri", "rm", "qm" are multi-alternative
+  (GCC allows multiple constraint letters meaning "try first, fall back to second")
+- Currently classify_constraint treats these as catch-all GpReg
+- The IR lowering only checks for exact "I"/"i"/"n" matches, so "Ir" isn't
+  recognized as having an immediate component
+- Result: operands that should be immediates ($0) get allocated registers,
+  and the register sizes don't match instruction suffixes (e.g., %rdx with btcl)
+
+Fix:
+1. IR lowering: detect "I"/"i"/"n" within multi-character constraints, try const eval
+2. x86 classify_constraint: parse multi-character alternatives properly
+3. Both: prefer Immediate when the constraint allows it and value is constant
+
+Tests affected: asm-btc, asm-bts, asm-bsf-constraint, asm-cmovz, and several others
