@@ -621,7 +621,15 @@ impl MacroTable {
                     } else if let Some(idx) = params.iter().position(|p| p == &right_ident) {
                         // Substitute parameter with raw argument
                         let arg = args.get(idx).map(|s| s.as_str()).unwrap_or("");
-                        result.push_str(arg);
+                        if arg.is_empty() {
+                            // Empty right side: add space to prevent token merging
+                            // with subsequent macro body tokens
+                            if i < len && !result.is_empty() {
+                                result.push(' ');
+                            }
+                        } else {
+                            result.push_str(arg);
+                        }
                     } else {
                         // Not a parameter, paste as-is
                         result.push_str(&right_ident);
@@ -804,16 +812,96 @@ fn extract_trailing_ident(s: &str) -> Option<String> {
     }
 }
 
-/// Escape a string for stringification.
+/// Stringify a macro argument per C11 6.10.3.2:
+/// - Leading and trailing whitespace is removed
+/// - Each sequence of whitespace between tokens becomes a single space
+/// - `"` and `\` characters in string/char literals are escaped with `\`
 fn stringify_arg(arg: &str) -> String {
+    let trimmed = arg.trim();
     let mut result = String::new();
-    for ch in arg.chars() {
-        match ch {
-            '"' => result.push_str("\\\""),
-            '\\' => result.push_str("\\\\"),
-            _ => result.push(ch),
+    let chars: Vec<char> = trimmed.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        // Collapse whitespace sequences to a single space
+        if chars[i] == ' ' || chars[i] == '\t' || chars[i] == '\n' {
+            if !result.is_empty() {
+                result.push(' ');
+            }
+            while i < len && (chars[i] == ' ' || chars[i] == '\t' || chars[i] == '\n') {
+                i += 1;
+            }
+            continue;
         }
+
+        // Handle string literals - escape " and \ inside them
+        if chars[i] == '"' {
+            result.push_str("\\\"");
+            i += 1;
+            while i < len && chars[i] != '"' {
+                if chars[i] == '\\' {
+                    result.push_str("\\\\");
+                    i += 1;
+                    if i < len {
+                        if chars[i] == '"' {
+                            result.push_str("\\\"");
+                        } else if chars[i] == '\\' {
+                            result.push_str("\\\\");
+                        } else {
+                            result.push(chars[i]);
+                        }
+                        i += 1;
+                    }
+                } else {
+                    result.push(chars[i]);
+                    i += 1;
+                }
+            }
+            if i < len {
+                result.push_str("\\\"");
+                i += 1;
+            }
+            continue;
+        }
+
+        // Handle char literals - escape \ inside them
+        if chars[i] == '\'' {
+            result.push('\'');
+            i += 1;
+            while i < len && chars[i] != '\'' {
+                if chars[i] == '\\' {
+                    result.push_str("\\\\");
+                    i += 1;
+                    if i < len {
+                        if chars[i] == '\\' {
+                            result.push_str("\\\\");
+                        } else {
+                            result.push(chars[i]);
+                        }
+                        i += 1;
+                    }
+                } else {
+                    result.push(chars[i]);
+                    i += 1;
+                }
+            }
+            if i < len {
+                result.push('\'');
+                i += 1;
+            }
+            continue;
+        }
+
+        result.push(chars[i]);
+        i += 1;
     }
+
+    // Trim trailing space that might have been added
+    if result.ends_with(' ') {
+        result.pop();
+    }
+
     result
 }
 

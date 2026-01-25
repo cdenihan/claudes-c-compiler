@@ -256,6 +256,7 @@ impl Preprocessor {
             // Bit manipulation
             "__builtin_clz" | "__builtin_clzl" | "__builtin_clzll" |
             "__builtin_ctz" | "__builtin_ctzl" | "__builtin_ctzll" |
+            "__builtin_clrsb" | "__builtin_clrsbl" | "__builtin_clrsbll" |
             "__builtin_popcount" | "__builtin_popcountl" | "__builtin_popcountll" |
             "__builtin_parity" | "__builtin_parityl" | "__builtin_parityll" |
             "__builtin_ffs" | "__builtin_ffsl" | "__builtin_ffsll" |

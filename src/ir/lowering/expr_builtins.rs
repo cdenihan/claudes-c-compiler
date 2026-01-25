@@ -211,6 +211,7 @@ impl Lowerer {
             BuiltinIntrinsic::MulOverflow => self.lower_overflow_builtin(name, args, IrBinOp::Mul),
             BuiltinIntrinsic::Clz => self.lower_unary_intrinsic(name, args, IrUnaryOp::Clz),
             BuiltinIntrinsic::Ctz => self.lower_unary_intrinsic(name, args, IrUnaryOp::Ctz),
+            BuiltinIntrinsic::Clrsb => self.lower_clrsb_intrinsic(name, args),
             BuiltinIntrinsic::Bswap => self.lower_bswap_intrinsic(name, args),
             BuiltinIntrinsic::Popcount => self.lower_unary_intrinsic(name, args, IrUnaryOp::Popcount),
             BuiltinIntrinsic::Parity => self.lower_parity_intrinsic(name, args),
@@ -506,6 +507,67 @@ impl Lowerer {
         self.emit(Instruction::UnaryOp { dest: pop, op: IrUnaryOp::Popcount, src: arg, ty });
         let dest = self.emit_binop_val(IrBinOp::And, Operand::Value(pop), Operand::Const(IrConst::I64(1)), ty);
         Some(Operand::Value(dest))
+    }
+
+    /// Lower __builtin_clrsb{,l,ll}(x) - count leading redundant sign bits.
+    /// Computes: clz(x ^ negate(x >>> (bits-1))) - 1
+    /// Uses logical shift + negate to create sign mask (avoids AShr 32-bit backend issues).
+    fn lower_clrsb_intrinsic(&mut self, name: &str, args: &[Expr]) -> Option<Operand> {
+        if args.is_empty() {
+            return Some(Operand::Const(IrConst::I64(0)));
+        }
+        let arg = self.lower_expr(&args[0]);
+        let ty = Self::intrinsic_type_from_suffix(name);
+        let bits = if ty == IrType::I64 { 63i64 } else { 31i64 };
+
+        // Extract sign bit using logical shift right: sign_bit = x >>> (bits)
+        // This gives 0 for positive, 1 for negative
+        let sign_bit = self.fresh_value();
+        self.emit(Instruction::BinOp {
+            dest: sign_bit,
+            op: IrBinOp::LShr,
+            lhs: arg.clone(),
+            rhs: Operand::Const(IrConst::I64(bits)),
+            ty,
+        });
+
+        // Negate sign bit to get mask: 0 -> 0, 1 -> -1 (all ones)
+        let sign_mask = self.fresh_value();
+        self.emit(Instruction::UnaryOp {
+            dest: sign_mask,
+            op: IrUnaryOp::Neg,
+            src: Operand::Value(sign_bit),
+            ty,
+        });
+
+        // XOR x with sign_mask: positive unchanged, negative gets ~x
+        let xored = self.fresh_value();
+        self.emit(Instruction::BinOp {
+            dest: xored,
+            op: IrBinOp::Xor,
+            lhs: arg,
+            rhs: Operand::Value(sign_mask),
+            ty,
+        });
+
+        // CLZ of the XOR result
+        let clz_val = self.fresh_value();
+        self.emit(Instruction::UnaryOp {
+            dest: clz_val,
+            op: IrUnaryOp::Clz,
+            src: Operand::Value(xored),
+            ty,
+        });
+
+        // Subtract 1 (the sign bit itself is not counted)
+        let result = self.emit_binop_val(
+            IrBinOp::Sub,
+            Operand::Value(clz_val),
+            Operand::Const(IrConst::I64(1)),
+            IrType::I32,
+        );
+
+        Some(Operand::Value(result))
     }
 
     // =========================================================================

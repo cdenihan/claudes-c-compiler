@@ -142,6 +142,9 @@ static BUILTIN_MAP: LazyLock<HashMap<&'static str, BuiltinInfo>> = LazyLock::new
     m.insert("__builtin_parity", BuiltinInfo::intrinsic(BuiltinIntrinsic::Parity));
     m.insert("__builtin_parityl", BuiltinInfo::intrinsic(BuiltinIntrinsic::Parity));
     m.insert("__builtin_parityll", BuiltinInfo::intrinsic(BuiltinIntrinsic::Parity));
+    m.insert("__builtin_clrsb", BuiltinInfo::intrinsic(BuiltinIntrinsic::Clrsb));
+    m.insert("__builtin_clrsbl", BuiltinInfo::intrinsic(BuiltinIntrinsic::Clrsb));
+    m.insert("__builtin_clrsbll", BuiltinInfo::intrinsic(BuiltinIntrinsic::Clrsb));
 
     // Overflow-checking arithmetic builtins
     // Generic (type-deduced from arguments):
@@ -294,6 +297,7 @@ pub enum BuiltinKind {
 pub enum BuiltinIntrinsic {
     Clz,
     Ctz,
+    Clrsb,
     Popcount,
     Bswap,
     Fence,
