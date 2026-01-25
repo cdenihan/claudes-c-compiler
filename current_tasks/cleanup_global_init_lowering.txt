@@ -1,0 +1,10 @@
+Cleanup and deduplication of IR lowering global_init subsystem
+
+Focus areas:
+1. Deduplicate the resolve-expr-to-GlobalInit chain that appears 6 times
+   in global_init_compound.rs (the StringLiteral -> eval_string_literal_addr_expr
+   -> eval_global_addr_expr -> eval_const_expr -> zero cascade)
+2. Extract shared bytes-with-ptr-relocations finalization helper
+3. Unify 1D and multidim struct array with ptrs lowering paths
+4. Clean up parallel patterns between global_init_compound.rs and global_init_bytes.rs
+5. Add README documentation for the lowering subsystem
