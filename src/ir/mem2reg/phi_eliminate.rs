@@ -142,6 +142,15 @@ fn eliminate_phis_in_function(func: &mut IrFunction, next_block_id: &mut u32) {
         .map(|b| successor_count(&b.terminator) > 1)
         .collect();
 
+    // Identify blocks that end with an IndirectBranch (computed goto).
+    // These CANNOT use trampoline blocks because the runtime jump target is a
+    // computed address that bypasses any CFG retargeting of possible_targets.
+    // Phi copies for IndirectBranch predecessors must go before the terminator
+    // in the predecessor block itself.
+    let is_indirect_branch: Vec<bool> = func.blocks.iter()
+        .map(|b| matches!(&b.terminator, Terminator::IndirectBranch { .. }))
+        .collect();
+
     // Collect phi information from all blocks.
     struct PhiInfo {
         dest: Value,
@@ -199,8 +208,10 @@ fn eliminate_phis_in_function(func: &mut IrFunction, next_block_id: &mut u32) {
                             src: src.clone(),
                         };
 
-                        if multi_succ[pred_idx] {
-                            // Critical edge: place copy in a trampoline block
+                        if multi_succ[pred_idx] && !is_indirect_branch[pred_idx] {
+                            // Critical edge: place copy in a trampoline block.
+                            // (Cannot use trampolines for IndirectBranch since
+                            // the runtime jump bypasses CFG metadata.)
                             let tramp_idx = get_or_create_trampoline(
                                 &mut trampoline_map, &mut trampolines,
                                 pred_idx, target_block_id, next_block_id,
@@ -225,8 +236,10 @@ fn eliminate_phis_in_function(func: &mut IrFunction, next_block_id: &mut u32) {
                             src: src.clone(),
                         };
 
-                        if multi_succ[pred_idx] {
-                            // Critical edge: place copy in a trampoline block
+                        if multi_succ[pred_idx] && !is_indirect_branch[pred_idx] {
+                            // Critical edge: place copy in a trampoline block.
+                            // (Cannot use trampolines for IndirectBranch since
+                            // the runtime jump bypasses CFG metadata.)
                             let tramp_idx = get_or_create_trampoline(
                                 &mut trampoline_map, &mut trampolines,
                                 pred_idx, target_block_id, next_block_id,
