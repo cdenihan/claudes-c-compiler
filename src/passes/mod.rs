@@ -13,6 +13,7 @@ pub mod constant_fold;
 pub mod copy_prop;
 pub mod dce;
 pub mod gvn;
+pub mod licm;
 pub mod simplify;
 
 use crate::ir::ir::IrModule;
@@ -26,9 +27,10 @@ use crate::ir::ir::IrModule;
 /// 4. Constant folding (evaluate const exprs at compile time)
 /// 5. GVN / CSE (dominator-based value numbering, eliminates redundant
 ///    BinOp, UnaryOp, Cmp, Cast, and GetElementPtr across all dominated blocks)
-/// 6. Copy propagation (clean up copies from GVN/simplification)
-/// 7. Dead code elimination (remove dead instructions)
-/// 8. CFG simplification (clean up after DCE may have made blocks dead)
+/// 6. LICM (hoist loop-invariant code to preheaders, at -O2 and above)
+/// 7. Copy propagation (clean up copies from GVN/simplify/LICM)
+/// 8. Dead code elimination (remove dead instructions)
+/// 9. CFG simplification (clean up after DCE may have made blocks dead)
 ///
 /// Higher optimization levels run more iterations of this pipeline.
 pub fn run_passes(module: &mut IrModule, opt_level: u32) {
@@ -66,13 +68,21 @@ pub fn run_passes(module: &mut IrModule, opt_level: u32) {
         // Eliminates redundant computations both within and across basic blocks.
         changes += gvn::run(module);
 
-        // Phase 6: Copy propagation again (clean up copies created by GVN/simplify)
+        // Phase 6: LICM - hoist loop-invariant code to preheaders.
+        // Runs after scalar opts have simplified expressions, so we can
+        // identify more invariants. Particularly helps inner loops with
+        // redundant index computations (e.g., i*n in matrix multiply).
+        if opt_level >= 2 {
+            changes += licm::run(module);
+        }
+
+        // Phase 7: Copy propagation again (clean up copies created by GVN/simplify)
         changes += copy_prop::run(module);
 
-        // Phase 7: Dead code elimination (clean up dead instructions including dead copies)
+        // Phase 8: Dead code elimination (clean up dead instructions including dead copies)
         changes += dce::run(module);
 
-        // Phase 8: CFG simplification again (DCE + constant folding may have
+        // Phase 9: CFG simplification again (DCE + constant folding may have
         // simplified conditions, creating dead blocks or redundant branches)
         changes += cfg_simplify::run(module);
 

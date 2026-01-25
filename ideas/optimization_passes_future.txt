@@ -12,6 +12,9 @@ The following passes are implemented and working:
   - Includes: mul/div/rem by power-of-2 -> shift/and,
     redundant Cast elimination, GEP zero-offset elimination
 - CFG simplification (cfg_simplify.rs) - dead block removal, jump threading
+- LICM (licm.rs) - loop-invariant code motion, hoists pure computations
+  to loop preheaders. Uses natural loop detection via back edges + dominators.
+  Runs at -O2 and above.
 - x86-64 peephole optimizer (peephole.rs in backend/x86/codegen/)
 
 Shared infrastructure:
@@ -19,17 +22,14 @@ Shared infrastructure:
   dominance frontiers, dom tree children. Used by both mem2reg and GVN.
 
 Next passes to add:
-1. LICM (Loop Invariant Code Motion): Move loop-invariant computations out
-   of loops. Requires loop detection (natural loops via dominators + back edges).
-   The dominator tree infrastructure is now available via ir/analysis.rs.
-
-2. Function inlining: For small functions, inline the callee body at call sites.
+1. Function inlining: For small functions, inline the callee body at call sites.
    Start with leaf functions < N instructions.
 
-3. Constant propagation (SCCP): Sparse conditional constant propagation -
+2. Constant propagation (SCCP): Sparse conditional constant propagation -
    propagate constants through the CFG, taking branch conditions into account.
 
-4. Strength reduction in loops: Replace expensive operations (mul) with
-   cheaper ones (add) for loop induction variables.
+3. Strength reduction in loops: Replace expensive operations (mul) with
+   cheaper ones (add) for loop induction variables. LICM is now done;
+   strength reduction would further help loop performance.
 
 Priority: MEDIUM (existing passes handle the most impactful cases)
