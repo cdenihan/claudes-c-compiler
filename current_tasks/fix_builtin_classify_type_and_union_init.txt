@@ -1,0 +1,17 @@
+Task: Fix __builtin_classify_type and union zero-initialization
+
+1. Implement __builtin_classify_type as a compile-time constant
+   - GCC returns: 0=void, 1=integer, 2=char, 5=pointer, 8=real(float/double),
+     9=complex, 12=struct, 13=union, 14=array, 15=function
+   - Currently recognized in type_checker but not lowered - causes link error
+   - Needs to be evaluated at compile time based on argument type
+
+2. Fix union zero-initialization for remaining bytes
+   - When a union is initialized with {expr}, bytes beyond the first member
+     should be zero-initialized per C standard
+   - Currently only initializes the first member, leaves rest as stack garbage
+   - Test: compiler_suite_0011_0161
+
+3. Fix global pointer to interior of 2D array element
+   - int a[6][9] = {}, *c = &a[3][5]; produces wrong address
+   - Test: gcc_torture_pr57568
