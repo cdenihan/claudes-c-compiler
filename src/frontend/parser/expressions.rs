@@ -579,15 +579,9 @@ impl Parser {
                 self.advance();
                 None
             } else {
-                if let Some(mut ts) = self.parse_type_specifier() {
-                    while matches!(self.peek(), TokenKind::Star) {
-                        self.advance();
-                        while matches!(self.peek(), TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict) {
-                            self.advance();
-                        }
-                        ts = TypeSpecifier::Pointer(Box::new(ts));
-                    }
-                    Some(ts)
+                if let Some(ts) = self.parse_type_specifier() {
+                    let full_type = self.parse_abstract_declarator_suffix(ts);
+                    Some(full_type)
                 } else {
                     None
                 }

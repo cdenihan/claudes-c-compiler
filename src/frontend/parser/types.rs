@@ -730,22 +730,24 @@ impl Parser {
             result_type = TypeSpecifier::Pointer(Box::new(result_type));
             self.skip_cv_qualifiers();
         }
-        // Handle parenthesized abstract declarators: (*), (*)(params), (*)[N]
+        // Handle parenthesized abstract declarators: (*), (*)(params), (*)[N], (*[3][4])
         if matches!(self.peek(), TokenKind::LParen) {
             let save = self.pos;
-            if let Some(ptr_depth) = self.try_parse_paren_abstract_declarator() {
+            if let Some((ptr_depth, inner_array_dims)) = self.try_parse_paren_abstract_declarator() {
                 if matches!(self.peek(), TokenKind::LParen) {
                     // Function pointer cast: (*)(params)
                     let (params, variadic) = self.parse_param_list();
-                    // result_type is the return type; wrap it as a function pointer
-                    // ptr_depth-1 pointers wrap the return type (for ptr-to-ptr-to-func etc.),
-                    // and one pointer level is the function pointer itself
                     for _ in 0..ptr_depth.saturating_sub(1) {
                         result_type = TypeSpecifier::Pointer(Box::new(result_type));
                     }
                     result_type = TypeSpecifier::FunctionPointer(Box::new(result_type), params, variadic);
-                } else if matches!(self.peek(), TokenKind::LBracket) {
-                    // Pointer to array: (*)[N]
+                    // Wrap with inner array dims (for array of function pointers)
+                    for dim in inner_array_dims.into_iter().rev() {
+                        result_type = TypeSpecifier::Array(Box::new(result_type), dim);
+                    }
+                } else if matches!(self.peek(), TokenKind::LBracket) || !inner_array_dims.is_empty() {
+                    // Pointer to array: (*)[N] or (*[3][4])[2]
+                    // First apply outer array dims (after ')') to the base type
                     while matches!(self.peek(), TokenKind::LBracket) {
                         self.advance();
                         let size = if matches!(self.peek(), TokenKind::RBracket) {
@@ -756,8 +758,13 @@ impl Parser {
                         self.expect(&TokenKind::RBracket);
                         result_type = TypeSpecifier::Array(Box::new(result_type), size);
                     }
+                    // Then wrap with pointer(s)
                     for _ in 0..ptr_depth {
                         result_type = TypeSpecifier::Pointer(Box::new(result_type));
+                    }
+                    // Then wrap with inner array dims (outermost arrays)
+                    for dim in inner_array_dims.into_iter().rev() {
+                        result_type = TypeSpecifier::Array(Box::new(result_type), dim);
                     }
                 } else {
                     for _ in 0..ptr_depth {

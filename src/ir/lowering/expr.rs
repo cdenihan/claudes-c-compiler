@@ -979,14 +979,11 @@ impl Lowerer {
     }
 
     pub(super) fn ctype_matches_generic(&self, controlling: &CType, assoc: &CType) -> bool {
-        if controlling == assoc { return true; }
-        match (controlling, assoc) {
-            (CType::Char, CType::Char) => true,
-            (CType::Long, CType::Long) => true,
-            (CType::LongLong, CType::LongLong) => true,
-            (CType::Pointer(a), CType::Pointer(b)) => a == b,
-            _ => false,
-        }
+        // For _Generic, types must match exactly per C11 6.5.1.1.
+        // CType derives PartialEq so direct comparison handles most cases.
+        // Note: CType does not track const/volatile qualifiers, so qualified
+        // pointer types (e.g. const int * vs int *) are not yet distinguished.
+        controlling == assoc
     }
 
     // -----------------------------------------------------------------------

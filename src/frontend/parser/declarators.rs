@@ -554,9 +554,12 @@ impl Parser {
         name
     }
 
-    /// Try to parse a parenthesized abstract declarator: (*), ((*)), (**)
-    /// Returns pointer depth if successful, None otherwise. Restores position on failure.
-    pub(super) fn try_parse_paren_abstract_declarator(&mut self) -> Option<u32> {
+    /// Try to parse a parenthesized abstract declarator: (*), ((*)), (**), (*[3][4])
+    /// Returns (pointer_depth, inner_array_dims) if successful, None otherwise.
+    /// Inner array dims are array sizes parsed inside the parens after the pointer(s),
+    /// e.g. (*[3][4]) returns (1, vec![Some(3), Some(4)]).
+    /// Restores position on failure.
+    pub(super) fn try_parse_paren_abstract_declarator(&mut self) -> Option<(u32, Vec<Option<Box<Expr>>>)> {
         if !matches!(self.peek(), TokenKind::LParen) {
             return None;
         }
@@ -572,17 +575,48 @@ impl Parser {
 
         // Check for nested: (* (...))
         if matches!(self.peek(), TokenKind::LParen) {
-            if let Some(inner_ptrs) = self.try_parse_paren_abstract_declarator() {
+            if let Some((inner_ptrs, inner_dims)) = self.try_parse_paren_abstract_declarator() {
                 total_ptrs += inner_ptrs;
+                // Parse any array dims after the nested group but before ')'
+                let mut array_dims = inner_dims;
+                while matches!(self.peek(), TokenKind::LBracket) {
+                    self.advance();
+                    let size = if matches!(self.peek(), TokenKind::RBracket) {
+                        None
+                    } else {
+                        Some(Box::new(self.parse_expr()))
+                    };
+                    self.expect(&TokenKind::RBracket);
+                    array_dims.push(size);
+                }
+                if self.consume_if(&TokenKind::RParen) {
+                    return Some((total_ptrs, array_dims));
+                } else {
+                    self.pos = save;
+                    return None;
+                }
             } else {
                 self.pos = save;
                 return None;
             }
         }
 
+        // Parse array dimensions after pointer(s): (*[3][4])
+        let mut array_dims = Vec::new();
+        while matches!(self.peek(), TokenKind::LBracket) {
+            self.advance();
+            let size = if matches!(self.peek(), TokenKind::RBracket) {
+                None
+            } else {
+                Some(Box::new(self.parse_expr()))
+            };
+            self.expect(&TokenKind::RBracket);
+            array_dims.push(size);
+        }
+
         if self.consume_if(&TokenKind::RParen) {
-            if total_ptrs > 0 {
-                Some(total_ptrs)
+            if total_ptrs > 0 || !array_dims.is_empty() {
+                Some((total_ptrs, array_dims))
             } else {
                 self.pos = save;
                 None

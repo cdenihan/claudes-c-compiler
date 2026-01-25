@@ -39,4 +39,4 @@ Recursive descent parser for C, producing a spanned AST.
 
 - `_Atomic(type)` is parsed but treated as the underlying type (marked with TODO)
 - GCC computed gotos (`goto *expr`) parse correctly but codegen support is partial
-- `_Generic` selection always evaluates all associations (no actual type matching)
+- `_Generic` selection does not distinguish const-qualified types (CType lacks qualifiers)
