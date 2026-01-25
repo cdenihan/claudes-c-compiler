@@ -114,18 +114,20 @@ designator chains. These are extracted into free functions to avoid duplication:
 - `drill_designators(designators, start_ty)` — Walks a chain of field/index designators
   to resolve the target type and byte offset. Used by both paths for nested designators
   like `.u.keyword` or `[3].field.subfield`.
-- `resolve_struct_init_field_idx()` — Maps a positional or designated initializer to its
-  target struct field index.
+- `fill_scalar_list_to_bytes(items, elem_ty, max_size, bytes)` — Fills a byte buffer from
+  a list of scalar initializer items. Used by the compound path for non-pointer fields.
 - `write_const_to_bytes()`, `write_bitfield_to_bytes()` — Low-level byte buffer operations.
 
-The **compound path** (`global_init_compound.rs`) also handles struct arrays with pointer
-fields via a hybrid approach: serializes scalar fields to bytes, collects pointer relocations
+The **compound path** (`global_init_compound.rs`) handles struct arrays with pointer fields
+via a hybrid approach: serializes scalar fields to bytes, collects pointer relocations
 separately, then merges them into a single `GlobalInit::Compound` vector. Key helpers:
-- `emit_expr_as_compound_element()` — Resolves an expression to a compound element: tries
-  string literal interning, string addr expr, global addr, const eval, then zero-fill.
-  Consolidates the resolve-to-GlobalInit cascade that previously appeared inline in 5+ places.
-- `emit_scalar_or_addr_field()` — Like the above but tries const eval first (with type coercion
-  for `_Bool` normalization), then falls back to address expressions.
+- `emit_expr_to_compound(elements, expr, size, coerce_ty)` — Unified expression-to-compound
+  emission. When `coerce_ty` is Some, tries const eval with type coercion first (scalar
+  fields, _Bool normalization). When None, tries address resolution first (pointer fields).
+  Consolidates the resolve-to-GlobalInit cascade that previously appeared in 5+ places.
+- `emit_field_inits_compound(elements, inits, field, field_size)` — Dispatches all initializer
+  items for a single struct/union field: anonymous members, nested designators, flat array
+  init, and single expressions. Shared between union and non-union struct paths.
 - `build_compound_from_bytes_and_ptrs()` — Merges a byte buffer and sorted pointer relocation
   list into a `GlobalInit::Compound`. Used by both 1D and multidim struct array paths.
 - `write_expr_to_bytes_or_ptrs()` — Writes a scalar expression to either the byte buffer
@@ -134,6 +136,12 @@ separately, then merges them into a single `GlobalInit::Compound` vector. Key he
 - `fill_composite_or_array_with_ptrs()` — Routes a braced init list through either the
   pointer-aware path (`fill_nested_struct_with_ptrs`) or the plain byte path
   (`fill_struct_global_bytes`) based on `StructLayout::has_pointer_fields()`.
+
+**Conversion helpers** (in `global_init_helpers.rs`):
+- `push_bytes_as_elements(elements, bytes)` — Converts a byte buffer to I8 compound elements.
+  Used ~10 places in the compound path to convert byte-serialized data to GlobalInit elements.
+- `push_string_as_elements(elements, s, size)` — Converts a string literal to I8 elements
+  with null terminator and zero padding for char array fields.
 
 ## Design Decisions
 

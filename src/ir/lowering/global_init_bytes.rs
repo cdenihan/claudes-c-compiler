@@ -1121,6 +1121,32 @@ impl Lowerer {
             })
     }
 
+    /// Fill a byte buffer from a list of scalar initializer items.
+    /// Used by the compound path when serializing non-pointer array/scalar fields to bytes.
+    /// Each item is evaluated as a constant expression, coerced to the element type,
+    /// and written at the appropriate byte offset.
+    pub(super) fn fill_scalar_list_to_bytes(
+        &self,
+        items: &[InitializerItem],
+        elem_ty: &CType,
+        max_size: usize,
+        bytes: &mut [u8],
+    ) {
+        let elem_ir_ty = IrType::from_ctype(elem_ty);
+        let elem_size = elem_ir_ty.size().max(1);
+        for (idx, item) in items.iter().enumerate() {
+            let byte_offset = idx * elem_size;
+            if byte_offset >= max_size { break; }
+            if let Initializer::Expr(ref e) = item.init {
+                if let Some(val) = self.eval_const_expr(e) {
+                    let e_ty = self.get_expr_type(e);
+                    let val = self.coerce_const_to_type_with_src(val, elem_ir_ty, e_ty);
+                    self.write_const_to_bytes(bytes, byte_offset, &val, elem_ir_ty);
+                }
+            }
+        }
+    }
+
     /// Push a constant value as individual bytes into a compound init element list.
     pub(super) fn push_const_as_bytes(&self, elements: &mut Vec<GlobalInit>, val: &IrConst, size: usize) {
         let mut bytes = Vec::with_capacity(size);
