@@ -1,0 +1,17 @@
+Optimize: Eliminate StructLayout deep cloning via Rc<StructLayout>
+
+TASK:
+Replace StructLayout with Rc<StructLayout> throughout the lowering code to eliminate
+expensive deep clones. Currently every struct member access, variable declaration,
+and pointer-to-struct dereference clones the entire StructLayout including all
+field names (String), field types (CType), and offsets.
+
+SCOPE:
+- Change TypeContext::struct_layouts to store Rc<StructLayout>
+- Change VarInfo::struct_layout to Option<Rc<StructLayout>>
+- Update all call sites that currently clone StructLayout to use Rc::clone instead
+- Also add a field name -> index HashMap for O(1) field lookup on large structs
+
+EXPECTED IMPACT:
+- Save 30-50ms on sqlite3.c lowering (from ~0.35s to ~0.30s)
+- Reduces heap allocation pressure from malloc/free overhead (7-8% of total profile)
