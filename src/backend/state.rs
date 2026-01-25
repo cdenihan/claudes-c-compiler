@@ -40,6 +40,12 @@ pub struct CodegenState {
     /// When true, the epilogue must restore SP from the frame pointer instead of
     /// adding back the compile-time frame size.
     pub has_dyn_alloca: bool,
+    /// Register value cache: tracks which IR value is currently in the accumulator
+    /// register (rax on x86, x0 on ARM, t0 on RISC-V). When set, operand loads can
+    /// skip the memory read if the value is already in the register.
+    /// Set to None at any point that clobbers the accumulator (calls, inline asm,
+    /// block boundaries, push/pop sequences).
+    pub reg_cache_acc: Option<u32>,
 }
 
 impl CodegenState {
@@ -56,6 +62,7 @@ impl CodegenState {
             pic_mode: false,
             local_symbols: FxHashSet::default(),
             has_dyn_alloca: false,
+            reg_cache_acc: None,
         }
     }
 
@@ -89,6 +96,14 @@ impl CodegenState {
         self.alloca_alignments.clear();
         self.i128_values.clear();
         self.has_dyn_alloca = false;
+        self.reg_cache_acc = None;
+    }
+
+    /// Invalidate the register value cache. Call this whenever the accumulator
+    /// register is clobbered (calls, inline asm, block boundaries, etc.).
+    #[inline]
+    pub fn invalidate_reg_cache(&mut self) {
+        self.reg_cache_acc = None;
     }
 
     /// Get the over-alignment requirement for an alloca (> 16 bytes), or None.

@@ -103,6 +103,9 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction) {
     let entry_label = func.blocks.first().map(|b| b.label);
     for block in &func.blocks {
         if Some(block.label) != entry_label {
+            // Invalidate register cache at block boundaries — we cannot assume
+            // which path reached this label, so no register contents are known.
+            cg.state().invalidate_reg_cache();
             cg.state().emit_fmt(format_args!("{}:", block.label));
         }
         for inst in &block.instructions {
