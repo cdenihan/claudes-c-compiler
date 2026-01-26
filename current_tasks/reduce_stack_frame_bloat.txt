@@ -1,0 +1,13 @@
+Task: Reduce stack frame bloat by lowering Tier 2 packing threshold and enabling single-block coalescing
+Status: in_progress
+
+The compiler generates larger stack frames than GCC because:
+1. Tier 2 liveness-based packing is only enabled for functions with >= 8 blocks AND >= 64 instructions
+2. Single-block functions get no coalescing at all (coalesce requires >= 2 blocks)
+
+This causes postgres plpgsql recursion tests to fail with "stack depth exceeded".
+
+Fix:
+- Lower or remove the Tier 2 threshold so medium-sized functions get liveness-based packing
+- Enable coalescing for single-block functions
+- Verify postgres plpgsql tests pass after the fix
