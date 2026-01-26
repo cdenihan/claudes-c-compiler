@@ -1,5 +1,5 @@
 Task: fix_asm_goto_i_constraint_dropped
-Status: in_progress
+Status: completed
 Description:
   asm goto body is silently dropped when "i" constraints contain pointer or
   address values.  When an asm goto statement uses an "i" (immediate) input

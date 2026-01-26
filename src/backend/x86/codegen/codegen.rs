@@ -4479,4 +4479,8 @@ impl InlineAsmEmitter for X86Codegen {
         self.asm_scratch_idx = 0;
         self.asm_xmm_scratch_idx = 0;
     }
+
+    fn emit_jump_to_block(&mut self, block_id: BlockId) {
+        self.state.out.emit_jmp_block(block_id.0);
+    }
 }

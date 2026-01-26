@@ -139,6 +139,11 @@ pub trait InlineAsmEmitter {
 
     /// Reset scratch register allocation state (called at start of each inline asm).
     fn reset_scratch_state(&mut self);
+
+    /// Emit an unconditional jump to a block label (e.g., `jmp .L42` on x86,
+    /// `b .L42` on ARM, `j .L42` on RISC-V). Used when the asm body is skipped
+    /// but asm goto requires a branch to a goto label.
+    fn emit_jump_to_block(&mut self, block_id: BlockId);
 }
 
 /// Check whether a constraint string contains an immediate alternative character.
@@ -388,16 +393,24 @@ pub fn emit_inline_asm_common_impl(
     }
 
     // If we have unsatisfiable immediate constraints AND the template creates
-    // section data (via .pushsection), skip the entire inline asm block.
+    // section data (via .pushsection), skip the inline asm template.
     // This prevents emitting corrupt metadata (e.g., __jump_table entries with
     // null key pointers) that would crash the kernel during boot.
-    // The function will still be emitted but won't execute the inline asm,
-    // falling through to the default code path (e.g., `return false` for
-    // arch_static_branch).
     // TODO: Replace this heuristic with proper function inlining support.
     // Once always_inline functions are inlined at call sites, the "i" constraints
     // will be evaluable and this skip path will no longer be needed.
     if has_unsatisfiable_imm && template.contains(".pushsection") {
+        // For asm goto, we must emit a jump to a goto label instead of silently
+        // returning. Without a jump, execution falls through to the first goto
+        // label (typically the "true" path), which is incorrect. The last goto
+        // label is the safe default — in the kernel's _static_cpu_has /
+        // ALTERNATIVE_TERNARY pattern, the last label is the "false" / "no" path,
+        // matching the default behavior when CPU feature alternatives are not
+        // yet patched.
+        if !goto_labels.is_empty() {
+            let last_label = &goto_labels[goto_labels.len() - 1];
+            emitter.emit_jump_to_block(last_label.1);
+        }
         return;
     }
 

@@ -3426,4 +3426,11 @@ impl InlineAsmEmitter for ArmCodegen {
         self.asm_scratch_idx = 0;
         self.asm_fp_scratch_idx = 0;
     }
+
+    fn emit_jump_to_block(&mut self, block_id: BlockId) {
+        let out = &mut self.state.out;
+        out.write_str("    b .L");
+        out.write_u64(block_id.0 as u64);
+        out.newline();
+    }
 }
