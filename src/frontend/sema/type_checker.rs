@@ -532,23 +532,28 @@ impl<'a> ExprTypeChecker<'a> {
                 }
             }
             TypeSpecifier::Enum(_, _, _) => CType::Int, // default enum underlying type
-            TypeSpecifier::Struct(tag, _, _, _, _) => {
+            TypeSpecifier::Struct(tag, fields, is_packed, pragma_pack, struct_aligned) => {
                 if let Some(tag) = tag {
                     CType::Struct(format!("struct.{}", tag).into())
+                } else if let Some(fs) = fields {
+                    // Without a tag name but with fields, register the anonymous
+                    // struct layout so member access resolution works correctly
+                    // (e.g., kernel get_unaligned() macro pattern with packed structs
+                    // inside statement expressions).
+                    self.resolve_anon_struct_or_union(fs, false, *is_packed, *pragma_pack, *struct_aligned)
                 } else {
-                    // TODO: anonymous structs get unique keys via anon_struct_counter
-                    // in sema.rs, but we don't have access to the counter here.
-                    // This means typeof(anon_struct_expr) may not resolve correctly.
-                    // Fix by threading the anonymous key through the AST.
+                    // Anonymous forward declaration (no tag, no fields)
                     CType::Int
                 }
             }
-            TypeSpecifier::Union(tag, _, _, _, _) => {
+            TypeSpecifier::Union(tag, fields, is_packed, pragma_pack, struct_aligned) => {
                 if let Some(tag) = tag {
                     CType::Union(format!("union.{}", tag).into())
+                } else if let Some(fs) = fields {
+                    // Same as struct: register anonymous union layout for member access
+                    self.resolve_anon_struct_or_union(fs, true, *is_packed, *pragma_pack, *struct_aligned)
                 } else {
-                    // TODO: anonymous unions get unique keys via anon_struct_counter
-                    // in sema.rs, but we don't have access to the counter here.
+                    // Anonymous forward declaration (no tag, no fields)
                     CType::Int
                 }
             }
@@ -585,6 +590,86 @@ impl<'a> ExprTypeChecker<'a> {
             expr_types: self.expr_types,
         };
         evaluator.eval_const_expr(expr)?.to_i64()
+    }
+
+    /// Resolve an anonymous struct or union with inline field declarations.
+    /// Generates a unique key, computes the layout, registers it in TypeContext,
+    /// and returns the CType (Struct or Union).
+    fn resolve_anon_struct_or_union(
+        &self,
+        fields: &[StructFieldDecl],
+        is_union: bool,
+        is_packed: bool,
+        pragma_pack: Option<usize>,
+        struct_aligned: Option<usize>,
+    ) -> CType {
+        use crate::common::types::{StructField, StructLayout};
+
+        let struct_fields: Vec<StructField> = fields.iter().map(|f| {
+            let mut ty = self.resolve_field_ctype(f);
+            // GCC treats enum bitfields as unsigned
+            if f.bit_width.is_some() {
+                if matches!(&f.type_spec, TypeSpecifier::Enum(..)) {
+                    if ty == CType::Int {
+                        ty = CType::UInt;
+                    }
+                }
+            }
+            StructField {
+                name: f.name.clone().unwrap_or_default(),
+                ty,
+                bit_width: f.bit_width.as_ref().and_then(|bw| {
+                    self.eval_const_expr(bw).map(|v| v as u32)
+                }),
+                alignment: f.alignment,
+            }
+        }).collect();
+
+        let max_field_align = if is_packed { Some(1) } else { pragma_pack };
+        let mut layout = if is_union {
+            StructLayout::for_union(&struct_fields, &self.types.struct_layouts)
+        } else {
+            StructLayout::for_struct_with_packing(&struct_fields, max_field_align, &self.types.struct_layouts)
+        };
+
+        // Apply struct-level __attribute__((aligned(N)))
+        if let Some(a) = struct_aligned {
+            if a > layout.align {
+                layout.align = a;
+                let mask = layout.align - 1;
+                layout.size = (layout.size + mask) & !mask;
+            }
+        }
+
+        let id = self.types.next_anon_struct_id();
+        let key = format!("__anon_struct_{}", id);
+        self.types.insert_struct_layout_scoped_from_ref(&key, layout);
+        if is_union {
+            CType::Union(key.into())
+        } else {
+            CType::Struct(key.into())
+        }
+    }
+
+    /// Get the CType for a struct field declaration, accounting for derived declarators.
+    fn resolve_field_ctype(&self, f: &StructFieldDecl) -> CType {
+        let mut ctype = self.resolve_type_spec(&f.type_spec);
+        for derived in &f.derived {
+            match derived {
+                DerivedDeclarator::Pointer => {
+                    ctype = CType::Pointer(Box::new(ctype), AddressSpace::Default);
+                }
+                DerivedDeclarator::Array(Some(size_expr)) => {
+                    let size = self.eval_const_expr(size_expr).unwrap_or(0) as usize;
+                    ctype = CType::Array(Box::new(ctype), Some(size));
+                }
+                DerivedDeclarator::Array(None) => {
+                    ctype = CType::Array(Box::new(ctype), None);
+                }
+                _ => {} // Function/FunctionPointer not expected in struct fields
+            }
+        }
+        ctype
     }
 
     /// Return CType for known builtins.

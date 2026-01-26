@@ -639,7 +639,13 @@ impl Lowerer {
                 bitfield_promoted_type(field_ty, bf_info)
             }
             Expr::StmtExpr(compound, _) => {
-                // Statement expression: type is the type of the last expression statement
+                // Statement expression: type is the type of the last expression statement.
+                // Try CType-based resolution first (includes sema annotations), which
+                // correctly handles anonymous struct member access inside stmt exprs
+                // where the inner variable hasn't been lowered yet.
+                if let Some(ctype) = self.get_expr_ctype(expr) {
+                    return IrType::from_ctype(&ctype);
+                }
                 if let Some(last) = compound.items.last() {
                     if let BlockItem::Statement(Stmt::Expr(Some(expr))) = last {
                         return self.get_expr_type(expr);
