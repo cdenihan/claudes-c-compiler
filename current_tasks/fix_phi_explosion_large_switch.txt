@@ -1,0 +1,22 @@
+Fix phi explosion in mem2reg causing stack overflow for large switch functions.
+
+Problem:
+- In functions with large switch/computed-goto patterns (e.g., Lua's luaV_execute
+  with 84 opcodes), mem2reg promotes all scalar allocas to SSA registers.
+- Each case body's local variables get phi nodes at the loop header, where the
+  switch dispatch point has ~81 predecessors.
+- With ~339 promoted allocas × 81 predecessors per phi, phi elimination generates
+  ~27K copy instructions per dispatch edge, totaling ~2.2M instructions.
+- Each instruction gets an 8-byte stack slot, creating an ~18MB stack frame.
+- This overflows the default 8MB thread stack, causing SIGSEGV.
+
+Solution:
+- Add phi cost estimation in mem2reg: compute the total number of phi copies
+  that would be generated (sum of predecessor counts at all phi sites).
+- If total cost exceeds 50K, remove the most expensive allocas (those with
+  the most predecessors at their phi sites) from promotion.
+- These allocas remain as stack variables, avoiding the copy explosion.
+- Also fix RISC-V emit_branch_to_block and fused cmp-branch false label
+  to use `jump` pseudo (±2GB) instead of `j` (±1MB) for large functions.
+
+This fixes Lua build/runtime on all architectures.
