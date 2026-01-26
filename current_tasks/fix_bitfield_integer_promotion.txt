@@ -1,0 +1,13 @@
+Task: Fix bitfield integer promotion (C11 6.3.1.1p2)
+
+Bug: An unsigned bitfield narrower than int should promote to int (signed),
+not unsigned int, because int can represent all values of the bitfield.
+Currently the compiler promotes unsigned bitfields to unsigned int, which
+changes the semantics of arithmetic operations (e.g., signed % unsigned
+gives unsigned result instead of signed).
+
+Test case: tests/bitfield-integer-promotion/main.c
+
+Fix location: Frontend type checker / semantic analysis where bitfield
+promotion is computed. The usual arithmetic conversion needs to consider
+the bitfield width, not just the declared type's signedness.
