@@ -1,0 +1,7 @@
+Task: Fix miscompilation of mm/mremap.c causing kernel boot failure
+
+Problem: mm/mremap.c is miscompiled by ccc, causing the kernel to fail to boot.
+This file handles memory remapping (mremap syscall). A miscompilation here breaks
+critical memory management functionality.
+
+Status: investigating root cause by comparing ccc output with GCC output

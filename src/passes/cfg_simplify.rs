@@ -11,6 +11,7 @@
 //! This pass runs to a fixpoint, since one simplification can enable others.
 //! Phi nodes in successor blocks are updated when edges are redirected.
 
+use crate::common::asm_constraints::constraint_is_immediate_only;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::ir::*;
 
@@ -622,7 +623,7 @@ fn asm_goto_will_be_skipped(
     // Note: Only inputs are checked because output constraints have "=" prefix and are never
     // classified as Immediate by the backend, so they can't trigger the skip condition.
     for (i, (constraint, operand, _name)) in inputs.iter().enumerate() {
-        if is_immediate_only_constraint(constraint) {
+        if constraint_is_immediate_only(constraint) {
             let is_const = matches!(operand, Operand::Const(_));
             let has_symbol = input_symbols.get(i).map_or(false, |s| s.is_some());
             if !is_const && !has_symbol {
@@ -632,36 +633,6 @@ fn asm_goto_will_be_skipped(
     }
 
     false
-}
-
-/// Check whether a constraint string is purely immediate (no register or memory alternatives).
-/// This mirrors the logic in `backend::inline_asm::constraint_is_immediate_only`.
-/// TODO: Deduplicate with backend::inline_asm::constraint_is_immediate_only by moving
-/// to a shared module (e.g., common/) that both passes/ and backend/ can import.
-fn is_immediate_only_constraint(constraint: &str) -> bool {
-    let stripped = constraint.trim_start_matches(|c: char| c == '=' || c == '+' || c == '&');
-    if stripped.is_empty() {
-        return false;
-    }
-    if stripped.starts_with('[') && stripped.ends_with(']') {
-        return false;
-    }
-    // Must have at least one immediate letter
-    let has_imm = stripped.chars().any(|c| matches!(c,
-        'i' | 'I' | 'n' | 'N' | 'e' | 'E' | 'K' | 'M' | 'G' | 'H' | 'J' | 'L' | 'O'
-    ));
-    if !has_imm {
-        return false;
-    }
-    // Must NOT have any register or memory alternative
-    let has_reg_or_mem = stripped.chars().any(|c| matches!(c,
-        'r' | 'q' | 'R' | 'l' |           // GP register
-        'g' |                              // general (reg + mem + imm)
-        'x' | 'v' | 'Y' |                 // FP register
-        'a' | 'b' | 'c' | 'd' | 'S' | 'D' | // specific register
-        'm' | 'o' | 'V' | 'p' | 'Q'       // memory
-    ));
-    !has_reg_or_mem && !stripped.chars().any(|c| c.is_ascii_digit())
 }
 
 #[cfg(test)]

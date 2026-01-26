@@ -10,8 +10,10 @@
 //! the inlined code and eliminate dead branches.
 
 use crate::ir::ir::{
-    BasicBlock, BlockId, IrFunction, IrModule, Instruction, Operand, Terminator, Value,
+    BasicBlock, BlockId, IrFunction, IrModule, Instruction, Operand, Terminator, Value, IrConst,
+    IrBinOp, IrCmpOp,
 };
+use crate::common::asm_constraints::constraint_is_immediate_only;
 use crate::common::types::{IrType, AddressSpace};
 use std::collections::HashMap;
 
@@ -40,6 +42,14 @@ const MAX_ALWAYS_INLINE_BLOCKS: usize = 200;
 
 /// Budget for always_inline callees per caller.
 const MAX_ALWAYS_INLINE_BUDGET_PER_CALLER: usize = 20000;
+
+/// Maximum iterations when tracing IR value chains (Load->Store->Copy->GEP->...)
+/// to resolve inline asm operands back to GlobalAddr or constant values.
+const MAX_TRACE_CHAIN_LENGTH: usize = 20;
+
+/// Maximum recursion depth for trace_operand_to_const when evaluating BinOp/Cmp
+/// trees where both operands themselves need recursive tracing.
+const MAX_TRACE_RECURSION_DEPTH: u32 = 10;
 
 /// Run the inlining pass on the module.
 /// Returns the number of call sites inlined.
@@ -155,9 +165,329 @@ pub fn run(module: &mut IrModule) -> usize {
                 break;
             }
         }
+
+    }
+
+    // After ALL inlining is complete, resolve input_symbols for InlineAsm instructions.
+    // This must run after the entire inlining pass because multi-level inline chains
+    // (e.g., arch_static_branch → static_key_false → trace_tlb_flush) need all levels
+    // to be inlined before we can trace values back to their original GlobalAddr/Const.
+    // Running resolution per-function would fail for intermediate functions whose
+    // parameters haven't been replaced with concrete values yet.
+    for func_idx in 0..module.functions.len() {
+        if module.functions[func_idx].has_inlined_calls {
+            resolve_inline_asm_symbols(&mut module.functions[func_idx]);
+        }
     }
 
     total_inlined
+}
+
+/// After inlining, resolve input_symbols for InlineAsm instructions by tracing
+/// Value operands back to their definitions. When an always_inline function
+/// containing asm goto with "i" constraints is inlined, the constraint operands
+/// become IR Values (loaded from parameter allocas) rather than compile-time constants.
+/// This function traces those values back through Load/Copy/Store chains to find
+/// the original GlobalAddr instruction, recovering the symbol name.
+///
+/// Without this, the backend sees an "unsatisfiable immediate" and skips the
+/// entire asm body (including .pushsection __jump_table entries), breaking the
+/// kernel's static branch mechanism and causing boot failures.
+fn resolve_inline_asm_symbols(func: &mut IrFunction) {
+    // Build a map from Value -> defining instruction for the whole function.
+    // We store the instruction itself (cloned) for lookup.
+    let mut value_defs: HashMap<u32, Instruction> = HashMap::new();
+    // Also track Store instructions: alloca_ptr -> stored value
+    // This lets us trace: Load(alloca) -> Store(val, alloca) -> val
+    let mut alloca_stores: HashMap<u32, Operand> = HashMap::new();
+
+    for block in func.blocks.iter() {
+        for inst in &block.instructions {
+            // Record value definitions
+            if let Some(v) = inst.dest() {
+                value_defs.insert(v.0, inst.clone());
+            }
+            // Record stores to alloca pointers (the last store wins; for inlined
+            // parameter allocas there's typically exactly one store at the top)
+            if let Instruction::Store { val, ptr, .. } = inst {
+                alloca_stores.insert(ptr.0, val.clone());
+            }
+        }
+    }
+
+    // Helper: trace a Value back to find a GlobalAddr name + accumulated offset.
+    let trace_to_global = |start_val: u32| -> Option<String> {
+        trace_value_to_global(start_val, &value_defs, &alloca_stores)
+    };
+
+    // Helper: trace a Value or Const operand to find a constant integer value.
+    // Delegates to the standalone recursive function.
+    let trace_to_const = |op: &Operand| -> Option<i64> {
+        trace_operand_to_const(op, &value_defs, &alloca_stores, 0)
+    };
+
+    // Now scan all blocks for InlineAsm instructions and fix up input_symbols
+    let debug_resolve = std::env::var("CCC_INLINE_DEBUG").is_ok();
+    for block in func.blocks.iter_mut() {
+        for inst in block.instructions.iter_mut() {
+            if let Instruction::InlineAsm { inputs, input_symbols, template, .. } = inst {
+                if debug_resolve && template.contains(".pushsection") {
+                    eprintln!("[RESOLVE_ASM] Found InlineAsm with .pushsection in func '{}'", func.name);
+                    eprintln!("[RESOLVE_ASM]   inputs: {:?}", inputs.iter().map(|(c, o, n)| (c.clone(), format!("{:?}", o), n.clone())).collect::<Vec<_>>());
+                    eprintln!("[RESOLVE_ASM]   input_symbols: {:?}", input_symbols);
+                }
+                let num_outputs_in_sym = if input_symbols.len() > inputs.len() {
+                    input_symbols.len() - inputs.len()
+                } else {
+                    0
+                };
+                for (i, (constraint, operand, _name)) in inputs.iter_mut().enumerate() {
+                    let sym_idx = num_outputs_in_sym + i;
+                    if sym_idx >= input_symbols.len() {
+                        if debug_resolve { eprintln!("[RESOLVE_ASM]   input[{}]: sym_idx {} >= input_symbols.len() {}, skip", i, sym_idx, input_symbols.len()); }
+                        continue;
+                    }
+                    // Only fix up entries that are currently None
+                    if input_symbols[sym_idx].is_some() {
+                        if debug_resolve { eprintln!("[RESOLVE_ASM]   input[{}]: already has symbol {:?}, skip", i, input_symbols[sym_idx]); }
+                        continue;
+                    }
+                    // Only care about immediate-only constraints ("i", "n", etc.)
+                    if !constraint_is_immediate_only(constraint) {
+                        if debug_resolve { eprintln!("[RESOLVE_ASM]   input[{}]: constraint '{}' not imm-only, skip", i, constraint); }
+                        continue;
+                    }
+                    if debug_resolve { eprintln!("[RESOLVE_ASM]   input[{}]: constraint '{}', operand={:?}", i, constraint, operand); }
+                    match operand {
+                        Operand::Value(v) => {
+                            // Try to trace this value back to a GlobalAddr
+                            if let Some(sym_name) = trace_to_global(v.0) {
+                                if debug_resolve { eprintln!("[RESOLVE_ASM]   -> resolved to symbol '{}'", sym_name); }
+                                input_symbols[sym_idx] = Some(sym_name);
+                            }
+                            // Also try to resolve to a constant and convert the operand
+                            else if let Some(const_val) = trace_to_const(&Operand::Value(*v)) {
+                                if debug_resolve { eprintln!("[RESOLVE_ASM]   -> resolved to const {}", const_val); }
+                                *operand = Operand::Const(IrConst::I64(const_val));
+                            } else {
+                                if debug_resolve { eprintln!("[RESOLVE_ASM]   -> FAILED to resolve Value({})", v.0); }
+                            }
+                        }
+                        Operand::Const(_) => {
+                            // Already a constant - nothing to fix
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Trace a Value back to find a GlobalAddr name + accumulated offset.
+/// Follow chains of: Copy(src) -> trace src, Load(ptr) -> Store(val, ptr) -> trace val
+/// GEP offsets are accumulated so e.g. GEP(GlobalAddr("foo"), 8) yields "foo+8".
+/// GEP with Value offsets are resolved via trace_operand_to_const.
+fn trace_value_to_global(
+    start_val: u32,
+    value_defs: &HashMap<u32, Instruction>,
+    alloca_stores: &HashMap<u32, Operand>,
+) -> Option<String> {
+    let mut current = start_val;
+    let mut accumulated_offset: i64 = 0;
+    for _ in 0..MAX_TRACE_CHAIN_LENGTH {
+        if let Some(inst) = value_defs.get(&current) {
+            match inst {
+                Instruction::GlobalAddr { name, .. } => {
+                    if accumulated_offset > 0 {
+                        return Some(format!("{}+{}", name, accumulated_offset));
+                    } else if accumulated_offset < 0 {
+                        return Some(format!("{}{}", name, accumulated_offset));
+                    }
+                    return Some(name.clone());
+                }
+                Instruction::Copy { src: Operand::Value(v), .. } => {
+                    current = v.0;
+                    continue;
+                }
+                Instruction::Copy { src: Operand::Const(_), .. } => {
+                    return None;
+                }
+                Instruction::Load { ptr, .. } => {
+                    if let Some(stored_val) = alloca_stores.get(&ptr.0) {
+                        match stored_val {
+                            Operand::Value(v) => {
+                                current = v.0;
+                                continue;
+                            }
+                            Operand::Const(_) => return None,
+                        }
+                    }
+                    return None;
+                }
+                // GEP: accumulate offset (constant or resolvable Value)
+                Instruction::GetElementPtr { base, offset, .. } => {
+                    let off = match offset {
+                        Operand::Const(c) => c.to_i64(),
+                        Operand::Value(_) => {
+                            trace_operand_to_const(offset, value_defs, alloca_stores, 0)
+                        }
+                    };
+                    if let Some(off) = off {
+                        accumulated_offset += off;
+                        current = base.0;
+                        continue;
+                    }
+                    return None;
+                }
+                // Cast preserves pointer identity for address calculations
+                Instruction::Cast { src: Operand::Value(v), .. } => {
+                    current = v.0;
+                    continue;
+                }
+                // BinOp on pointer: handle Add with constant (pointer arithmetic)
+                Instruction::BinOp { op: IrBinOp::Add, lhs, rhs, .. } => {
+                    // Try: one operand is a traceable pointer, other is a constant offset
+                    if let Some(rhs_val) = trace_operand_to_const(rhs, value_defs, alloca_stores, 0) {
+                        if let Operand::Value(v) = lhs {
+                            accumulated_offset += rhs_val;
+                            current = v.0;
+                            continue;
+                        }
+                    }
+                    if let Some(lhs_val) = trace_operand_to_const(lhs, value_defs, alloca_stores, 0) {
+                        if let Operand::Value(v) = rhs {
+                            accumulated_offset += lhs_val;
+                            current = v.0;
+                            continue;
+                        }
+                    }
+                    return None;
+                }
+                _ => return None,
+            }
+        } else {
+            return None;
+        }
+    }
+    None
+}
+
+/// Recursively trace an operand to find a compile-time constant integer value.
+/// Handles Load/Store/Copy/Cast chains as well as BinOp and Cmp with constant operands.
+/// `depth` limits recursion for BinOp/Cmp where both sides need tracing.
+fn trace_operand_to_const(
+    op: &Operand,
+    value_defs: &HashMap<u32, Instruction>,
+    alloca_stores: &HashMap<u32, Operand>,
+    depth: u32,
+) -> Option<i64> {
+    if depth > MAX_TRACE_RECURSION_DEPTH {
+        return None;
+    }
+    match op {
+        Operand::Const(c) => c.to_i64(),
+        Operand::Value(v) => {
+            let mut current = v.0;
+            for _ in 0..MAX_TRACE_CHAIN_LENGTH {
+                if let Some(inst) = value_defs.get(&current) {
+                    match inst {
+                        Instruction::Copy { src: Operand::Const(c), .. } => {
+                            return c.to_i64();
+                        }
+                        Instruction::Copy { src: Operand::Value(v2), .. } => {
+                            current = v2.0;
+                            continue;
+                        }
+                        Instruction::Load { ptr, .. } => {
+                            if let Some(stored_val) = alloca_stores.get(&ptr.0) {
+                                match stored_val {
+                                    Operand::Const(c) => return c.to_i64(),
+                                    Operand::Value(v2) => {
+                                        current = v2.0;
+                                        continue;
+                                    }
+                                }
+                            }
+                            return None;
+                        }
+                        Instruction::Cast { src, .. } => {
+                            match src {
+                                Operand::Const(c) => return c.to_i64(),
+                                Operand::Value(v2) => {
+                                    current = v2.0;
+                                    continue;
+                                }
+                            }
+                        }
+                        // Binary operations: try to evaluate both sides
+                        Instruction::BinOp { op: bin_op, lhs, rhs, .. } => {
+                            let l = trace_operand_to_const(lhs, value_defs, alloca_stores, depth + 1)?;
+                            let r = trace_operand_to_const(rhs, value_defs, alloca_stores, depth + 1)?;
+                            return eval_binop(*bin_op, l, r);
+                        }
+                        // Comparisons: try to evaluate both sides
+                        Instruction::Cmp { op: cmp_op, lhs, rhs, .. } => {
+                            let l = trace_operand_to_const(lhs, value_defs, alloca_stores, depth + 1)?;
+                            let r = trace_operand_to_const(rhs, value_defs, alloca_stores, depth + 1)?;
+                            return Some(eval_cmpop(*cmp_op, l, r));
+                        }
+                        _ => return None,
+                    }
+                } else {
+                    return None;
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Evaluate a binary operation on two constant i64 values.
+fn eval_binop(op: IrBinOp, l: i64, r: i64) -> Option<i64> {
+    Some(match op {
+        IrBinOp::Add => l.wrapping_add(r),
+        IrBinOp::Sub => l.wrapping_sub(r),
+        IrBinOp::Mul => l.wrapping_mul(r),
+        IrBinOp::And => l & r,
+        IrBinOp::Or => l | r,
+        IrBinOp::Xor => l ^ r,
+        IrBinOp::Shl => l.wrapping_shl(r as u32),
+        IrBinOp::AShr => l.wrapping_shr(r as u32),
+        IrBinOp::LShr => (l as u64).wrapping_shr(r as u32) as i64,
+        IrBinOp::SDiv => {
+            if r == 0 { return None; }
+            l.wrapping_div(r)
+        }
+        IrBinOp::UDiv => {
+            if r == 0 { return None; }
+            ((l as u64).wrapping_div(r as u64)) as i64
+        }
+        IrBinOp::SRem => {
+            if r == 0 { return None; }
+            l.wrapping_rem(r)
+        }
+        IrBinOp::URem => {
+            if r == 0 { return None; }
+            ((l as u64).wrapping_rem(r as u64)) as i64
+        }
+    })
+}
+
+/// Evaluate a comparison operation, returning 1 (true) or 0 (false).
+fn eval_cmpop(op: IrCmpOp, l: i64, r: i64) -> i64 {
+    let result = match op {
+        IrCmpOp::Eq => l == r,
+        IrCmpOp::Ne => l != r,
+        IrCmpOp::Slt => l < r,
+        IrCmpOp::Sle => l <= r,
+        IrCmpOp::Sgt => l > r,
+        IrCmpOp::Sge => l >= r,
+        IrCmpOp::Ult => (l as u64) < (r as u64),
+        IrCmpOp::Ule => (l as u64) <= (r as u64),
+        IrCmpOp::Ugt => (l as u64) > (r as u64),
+        IrCmpOp::Uge => (l as u64) >= (r as u64),
+    };
+    if result { 1 } else { 0 }
 }
 
 /// Debug validation: check that every Value used as an operand is defined by some instruction.

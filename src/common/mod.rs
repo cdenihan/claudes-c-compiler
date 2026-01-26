@@ -1,3 +1,4 @@
+pub mod asm_constraints;
 pub mod const_arith;
 pub mod fx_hash;
 pub mod long_double;

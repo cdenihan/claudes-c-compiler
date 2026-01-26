@@ -173,6 +173,11 @@ impl Lowerer {
             if ct.is_complex() {
                 return Operand::Value(addr);
             }
+            // Function names in expression context decay to function pointers (addresses).
+            // Don't load from the function's address - just return the address itself.
+            if matches!(ct, CType::Function(_)) {
+                return Operand::Value(addr);
+            }
         }
         let dest = self.fresh_value();
         self.emit(Instruction::Load { dest, ptr: addr, ty: ginfo.ty, seg_override: ginfo.address_space });

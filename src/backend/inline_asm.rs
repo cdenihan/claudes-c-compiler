@@ -12,6 +12,7 @@
 
 use crate::ir::ir::{BlockId, Operand, Value};
 use crate::common::types::{AddressSpace, IrType};
+pub use crate::common::asm_constraints::constraint_is_immediate_only;
 use super::state::CodegenState;
 
 /// Operand classification for inline asm. Each backend classifies its constraints
@@ -157,39 +158,6 @@ pub fn constraint_has_immediate_alt(constraint: &str) -> bool {
         return false;
     }
     stripped.chars().any(|c| matches!(c, 'I' | 'i' | 'n'))
-}
-
-/// Check whether a constraint is purely immediate (only "i", "I", "n", or similar
-/// immediate letters, with no register or memory alternatives). When such a constraint
-/// can't be resolved at compile time, we must still emit a dummy immediate to produce
-/// valid assembly (e.g., `testb $0, mem` instead of `testb %edx, mem`).
-/// This occurs in static inline functions whose "i" constraint expressions depend on
-/// parameters — the standalone function body can't evaluate them, but the function
-/// is only ever called with constant arguments at call sites.
-pub fn constraint_is_immediate_only(constraint: &str) -> bool {
-    let stripped = constraint.trim_start_matches(|c: char| c == '=' || c == '+' || c == '&');
-    if stripped.is_empty() {
-        return false;
-    }
-    if stripped.starts_with('[') && stripped.ends_with(']') {
-        return false;
-    }
-    // Must have at least one immediate letter
-    let has_imm = stripped.chars().any(|c| matches!(c,
-        'i' | 'I' | 'n' | 'N' | 'e' | 'E' | 'K' | 'M' | 'G' | 'H' | 'J' | 'L' | 'O'
-    ));
-    if !has_imm {
-        return false;
-    }
-    // Must NOT have any register or memory alternative
-    let has_reg_or_mem = stripped.chars().any(|c| matches!(c,
-        'r' | 'q' | 'R' | 'l' |           // GP register
-        'g' |                              // general (reg + mem + imm)
-        'x' | 'v' | 'Y' |                 // FP register
-        'a' | 'b' | 'c' | 'd' | 'S' | 'D' | // specific register
-        'm' | 'o' | 'V' | 'p' | 'Q'       // memory (Q = AArch64 base-register memory)
-    ));
-    !has_reg_or_mem && !stripped.chars().any(|c| c.is_ascii_digit())
 }
 
 /// Check whether a constraint string contains a memory alternative character.

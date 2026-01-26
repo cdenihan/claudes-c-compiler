@@ -1,7 +1,0 @@
-Fix miscompilation of net/ethernet/eth.c causing kernel boot failure
-
-Problem: net/ethernet/eth.c is miscompiled by ccc, causing the kernel to fail to boot.
-This file is the Ethernet device support module containing functions like ether_setup(),
-eth_header(), eth_type_trans() etc. A miscompilation here breaks networking initialization.
-
-Status: Investigating root cause by comparing ccc output with GCC output.
