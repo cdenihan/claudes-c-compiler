@@ -1,0 +1,12 @@
+Fix enum constants to support values beyond 32-bit range.
+
+Problem: When an enum constant value exceeds INT_MAX (e.g. 4294967296LL),
+the compiler truncates it to 32-bit int, losing the high bits.
+GCC/Clang promote the underlying enum type to long long in this case.
+
+This causes test failures on all architectures:
+- compiler_suite_0048_0286: Tests 11-14 fail because enum values > 2^32
+  are truncated to int instead of being promoted to long long.
+
+Fix: Update sema to detect when enum values overflow int/unsigned int range
+and promote the underlying type to long long / unsigned long long.
