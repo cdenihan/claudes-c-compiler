@@ -221,9 +221,17 @@ impl Lowerer {
                 Some(result)
             }
             Expr::Identifier(name, _) => {
-                // Look up enum constants first
-                if let Some(&val) = self.types.enum_constants.get(name) {
-                    return Some(IrConst::I64(val));
+                // If a local variable exists with this name, it shadows any enum constant.
+                // A non-const local is not a compile-time constant, so return None.
+                // A const local's value is checked below.
+                let is_local = self.func_state.as_ref()
+                    .map_or(false, |fs| fs.locals.contains_key(name));
+
+                if !is_local {
+                    // Look up enum constants (only when not shadowed by a local variable)
+                    if let Some(&val) = self.types.enum_constants.get(name) {
+                        return Some(IrConst::I64(val));
+                    }
                 }
                 // Look up const-qualified local variable values
                 // (e.g., const int len = 5000; int arr[len];)

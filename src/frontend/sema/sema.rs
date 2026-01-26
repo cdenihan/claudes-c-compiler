@@ -581,7 +581,11 @@ impl SemanticAnalyzer {
                     self.enum_counter = val;
                 }
             }
-            self.result.type_context.enum_constants.insert(variant.name.clone(), self.enum_counter);
+            // Use insert_enum_scoped so that enum constants defined inside
+            // function bodies are properly removed when the scope exits.
+            // At global scope the scope stack is empty, so insert_enum_scoped
+            // behaves identically to a direct insert.
+            self.result.type_context.insert_enum_scoped(variant.name.clone(), self.enum_counter);
             self.symbol_table.declare(Symbol {
                 name: variant.name.clone(),
                 ty: CType::Int,
