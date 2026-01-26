@@ -597,7 +597,14 @@ impl Parser {
         if found_string && matches!(self.peek(), TokenKind::RParen) {
             self.advance(); // consume ')'
             if !combined.is_empty() {
-                return Some(combined);
+                // Strip leading '%' prefix from register names.
+                // In C source, register names in asm() may use the GCC inline asm
+                // convention with a '%' prefix (e.g., asm("%rdx") or asm("%" "rdx")),
+                // but the actual register name used internally should be just "rdx".
+                let combined = combined.trim_start_matches('%').to_string();
+                if !combined.is_empty() {
+                    return Some(combined);
+                }
             }
             return None;
         }

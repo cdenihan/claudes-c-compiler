@@ -1421,6 +1421,33 @@ impl Lowerer {
     // -----------------------------------------------------------------------
 
     fn lower_short_circuit(&mut self, lhs: &Expr, rhs: &Expr, is_and: bool) -> Operand {
+        // Constant-fold the LHS to eliminate dead code at lowering time.
+        // This is critical for constructs like IS_ENABLED(CONFIG_X) && func()
+        // where CONFIG_X is not set: without this, the compiler would emit a
+        // reference to func() even though it's never called, causing link errors.
+        if let Some(lhs_const) = self.eval_const_expr(lhs) {
+            let lhs_is_true = lhs_const.is_nonzero();
+            if is_and {
+                if !lhs_is_true {
+                    // 0 && rhs => always 0, skip RHS entirely
+                    return Operand::Const(IrConst::I64(0));
+                }
+                // nonzero && rhs => result is bool(rhs)
+                let rhs_val = self.lower_condition_expr(rhs);
+                let rhs_bool = self.emit_cmp_val(IrCmpOp::Ne, rhs_val, Operand::Const(IrConst::I64(0)), IrType::I64);
+                return Operand::Value(rhs_bool);
+            } else {
+                if lhs_is_true {
+                    // nonzero || rhs => always 1, skip RHS entirely
+                    return Operand::Const(IrConst::I64(1));
+                }
+                // 0 || rhs => result is bool(rhs)
+                let rhs_val = self.lower_condition_expr(rhs);
+                let rhs_bool = self.emit_cmp_val(IrCmpOp::Ne, rhs_val, Operand::Const(IrConst::I64(0)), IrType::I64);
+                return Operand::Value(rhs_bool);
+            }
+        }
+
         let result_alloca = self.fresh_value();
         self.emit(Instruction::Alloca { dest: result_alloca, ty: IrType::I64, size: 8, align: 0, volatile: false });
 
