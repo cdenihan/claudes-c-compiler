@@ -1,0 +1,13 @@
+Fix implicit _Complex to _Bool conversion in all contexts.
+
+Currently:
+- Condition contexts (if, while, for, ?:, &&, ||, !) test the stack pointer
+  address of the complex value, which is always non-null, making conditions
+  always true and ! always false.
+- Implicit bool conversion (assignment, init, return, call args) only checks
+  the real part, ignoring the imaginary part.
+
+The fix:
+- In lower_condition_expr: detect complex type and emit (real != 0) || (imag != 0)
+- In assignment/init/return/call: when target is _Bool, check both real and imag
+  parts, matching the explicit (_Bool) cast path that already works correctly.
