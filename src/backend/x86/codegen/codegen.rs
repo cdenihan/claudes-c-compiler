@@ -507,7 +507,16 @@ impl X86Codegen {
         }
         if let Some(slot) = self.state.get_slot(val.0) {
             if self.state.is_alloca(val.0) {
-                self.state.out.emit_instr_rbp_reg("    leaq", slot.0, reg);
+                if let Some(align) = self.state.alloca_over_align(val.0) {
+                    // Over-aligned alloca: compute aligned address within the
+                    // oversized stack slot. The slot has (align - 1) extra bytes
+                    // to guarantee we can find an aligned address within it.
+                    self.state.out.emit_instr_rbp_reg("    leaq", slot.0, reg);
+                    self.state.out.emit_instr_imm_reg("    addq", (align - 1) as i64, reg);
+                    self.state.out.emit_instr_imm_reg("    andq", -(align as i64), reg);
+                } else {
+                    self.state.out.emit_instr_rbp_reg("    leaq", slot.0, reg);
+                }
             } else {
                 self.state.out.emit_instr_rbp_reg("    movq", slot.0, reg);
             }

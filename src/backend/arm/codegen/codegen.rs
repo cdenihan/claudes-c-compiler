@@ -470,7 +470,17 @@ impl ArmCodegen {
                 }
                 if let Some(slot) = self.state.get_slot(v.0) {
                     if is_alloca {
-                        self.emit_add_sp_offset("x0", slot.0);
+                        if let Some(align) = self.state.alloca_over_align(v.0) {
+                            // Over-aligned alloca: compute aligned address.
+                            // x0 = (slot_addr + align-1) & -align
+                            self.emit_add_sp_offset("x0", slot.0);
+                            self.load_large_imm("x17", (align - 1) as i64);
+                            self.state.emit("    add x0, x0, x17");
+                            self.load_large_imm("x17", -(align as i64));
+                            self.state.emit("    and x0, x0, x17");
+                        } else {
+                            self.emit_add_sp_offset("x0", slot.0);
+                        }
                     } else {
                         self.emit_load_from_sp("x0", slot.0, "ldr");
                     }

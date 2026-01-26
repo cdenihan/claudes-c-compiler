@@ -344,7 +344,17 @@ impl RiscvCodegen {
                     self.state.reg_cache.set_acc(v.0, false);
                 } else if let Some(slot) = self.state.get_slot(v.0) {
                     if is_alloca {
-                        self.emit_addi_s0("t0", slot.0);
+                        if let Some(align) = self.state.alloca_over_align(v.0) {
+                            // Over-aligned alloca: compute aligned address.
+                            // t0 = (slot_addr + align-1) & -align
+                            self.emit_addi_s0("t0", slot.0);
+                            self.state.emit_fmt(format_args!("    li t6, {}", align - 1));
+                            self.state.emit("    add t0, t0, t6");
+                            self.state.emit_fmt(format_args!("    li t6, -{}", align));
+                            self.state.emit("    and t0, t0, t6");
+                        } else {
+                            self.emit_addi_s0("t0", slot.0);
+                        }
                     } else {
                         self.emit_load_from_s0("t0", slot.0, "ld");
                     }
