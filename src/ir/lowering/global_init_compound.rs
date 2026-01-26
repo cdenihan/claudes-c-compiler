@@ -341,6 +341,9 @@ impl Lowerer {
                     } else {
                         push_zero_bytes(elements, field_size);
                     }
+                } else if let Expr::CompoundLiteral(_, ref cl_init, _) = expr {
+                    // Non-pointer compound literal: unwrap and use inner initializer
+                    self.emit_compound_field_init(elements, cl_init, field_ty, field_size, field_is_pointer);
                 } else {
                     // Scalar constant, string literal addr, global addr, or zero fallback
                     self.emit_expr_to_compound(elements, expr, field_size, Some(field_ty));

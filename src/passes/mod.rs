@@ -46,6 +46,14 @@ use crate::ir::ir::{Instruction, IrModule, GlobalInit};
 // TODO: Restore per-level optimization tiers once the compiler is stable enough
 // to warrant differentiated behavior (e.g., -O0 skipping passes for faster builds).
 pub fn run_passes(module: &mut IrModule, _opt_level: u32) {
+    // Debug support: set CCC_DISABLE_PASSES=pass1,pass2,... to skip specific passes.
+    // Useful for bisecting miscompilation bugs to a specific pass.
+    // Pass names: cfg, copyprop, simplify, constfold, gvn, licm, ifconv, dce, all
+    let disabled = std::env::var("CCC_DISABLE_PASSES").unwrap_or_default();
+    if disabled.contains("all") {
+        return;
+    }
+
     // Always run 2 iterations of the full pipeline. The early-exit check below
     // will skip the second iteration if the first made no changes.
     let iterations = 2;
@@ -56,42 +64,62 @@ pub fn run_passes(module: &mut IrModule, _opt_level: u32) {
         // Phase 1: CFG simplification (remove dead blocks, thread jump chains,
         // simplify redundant conditional branches). Running early eliminates
         // dead code before other passes waste time analyzing it.
-        changes += cfg_simplify::run(module);
+        if !disabled.contains("cfg") {
+            changes += cfg_simplify::run(module);
+        }
 
         // Phase 2: Copy propagation (early - propagate copies from phi elimination
         // and lowering so subsequent passes see through them)
-        changes += copy_prop::run(module);
+        if !disabled.contains("copyprop") {
+            changes += copy_prop::run(module);
+        }
 
         // Phase 3: Algebraic simplification (x+0 => x, x*1 => x, etc.)
-        changes += simplify::run(module);
+        if !disabled.contains("simplify") {
+            changes += simplify::run(module);
+        }
 
         // Phase 4: Constant folding (evaluate const exprs at compile time)
-        changes += constant_fold::run(module);
+        if !disabled.contains("constfold") {
+            changes += constant_fold::run(module);
+        }
 
         // Phase 5: GVN / Common Subexpression Elimination (dominator-based)
         // Eliminates redundant computations both within and across basic blocks.
-        changes += gvn::run(module);
+        if !disabled.contains("gvn") {
+            changes += gvn::run(module);
+        }
 
         // Phase 6: LICM - hoist loop-invariant code to preheaders.
         // Runs after scalar opts have simplified expressions, so we can
         // identify more invariants. Particularly helps inner loops with
         // redundant index computations (e.g., i*n in matrix multiply).
-        changes += licm::run(module);
+        if !disabled.contains("licm") {
+            changes += licm::run(module);
+        }
 
         // Phase 7: If-conversion - convert simple branch+phi diamonds to Select
         // instructions. Runs after scalar optimizations have simplified the CFG,
         // enabling cmov/csel emission instead of branches for simple conditionals.
-        changes += if_convert::run(module);
+        if !disabled.contains("ifconv") {
+            changes += if_convert::run(module);
+        }
 
         // Phase 8: Copy propagation again (clean up copies created by GVN/simplify)
-        changes += copy_prop::run(module);
+        if !disabled.contains("copyprop") {
+            changes += copy_prop::run(module);
+        }
 
         // Phase 9: Dead code elimination (clean up dead instructions including dead copies)
-        changes += dce::run(module);
+        if !disabled.contains("dce") {
+            changes += dce::run(module);
+        }
 
         // Phase 10: CFG simplification again (DCE + constant folding may have
         // simplified conditions, creating dead blocks or redundant branches)
-        changes += cfg_simplify::run(module);
+        if !disabled.contains("cfg") {
+            changes += cfg_simplify::run(module);
+        }
 
         // Early exit: if no passes changed anything, additional iterations are useless
         if changes == 0 {

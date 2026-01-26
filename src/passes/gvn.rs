@@ -28,7 +28,7 @@ enum ExprKey {
     UnaryOp { op: IrUnaryOp, src: VNOperand },
     Cmp { op: IrCmpOp, lhs: VNOperand, rhs: VNOperand },
     Cast { src: VNOperand, from_ty: IrType, to_ty: IrType },
-    Gep { base: VNOperand, offset: VNOperand },
+    Gep { base: VNOperand, offset: VNOperand, ty: IrType },
 }
 
 /// A value-numbered operand: either a constant or a value number.
@@ -267,10 +267,10 @@ fn make_expr_key(
             let src_vn = operand_to_vn(src, value_numbers, next_vn, vn_log);
             Some((ExprKey::Cast { src: src_vn, from_ty: *from_ty, to_ty: *to_ty }, *dest))
         }
-        Instruction::GetElementPtr { dest, base, offset, .. } => {
+        Instruction::GetElementPtr { dest, base, offset, ty } => {
             let base_vn = operand_to_vn(&Operand::Value(*base), value_numbers, next_vn, vn_log);
             let offset_vn = operand_to_vn(offset, value_numbers, next_vn, vn_log);
-            Some((ExprKey::Gep { base: base_vn, offset: offset_vn }, *dest))
+            Some((ExprKey::Gep { base: base_vn, offset: offset_vn, ty: *ty }, *dest))
         }
         // Other instructions are not eligible for value numbering
         _ => None,

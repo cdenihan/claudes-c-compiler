@@ -46,7 +46,7 @@ fn promote_function(func: &mut IrFunction) {
     }
 
     // Step 1: Identify promotable allocas
-    let alloca_infos = find_promotable_allocas(func);
+    let mut alloca_infos = find_promotable_allocas(func);
     if alloca_infos.is_empty() {
         return;
     }
@@ -62,7 +62,66 @@ fn promote_function(func: &mut IrFunction) {
     // Step 4: Compute dominance frontiers
     let df = analysis::compute_dominance_frontiers(num_blocks, &preds, &idom);
 
-    // Step 5: Insert phi nodes
+    // Step 5: Insert phi nodes with cost limiting.
+    //
+    // Phi cost limiting: each phi with P predecessors generates ~P copies during
+    // phi elimination. For functions with large switch/computed-goto patterns
+    // (e.g. Lua's VM dispatch with 84 opcodes), promoting many allocas creates
+    // O(cases * allocas) copies. We estimate the total copy cost and exclude
+    // expensive allocas from promotion, leaving them as stack variables.
+    //
+    // 50K copies * 8 bytes per stack slot = ~400KB, well under the typical 8MB
+    // stack limit while accommodating moderately complex functions.
+    const MAX_PHI_COPY_COST: usize = 50_000;
+
+    let phi_locations = insert_phis(&alloca_infos, &df, num_blocks);
+
+    // Compute per-alloca phi cost: sum of predecessor counts at all phi sites
+    let total_phi_cost: usize = alloca_infos.iter().enumerate()
+        .map(|(alloca_idx, _)| {
+            phi_locations.iter().enumerate()
+                .filter(|(_, phi_set)| phi_set.contains(&alloca_idx))
+                .map(|(block_idx, _)| preds[block_idx].len())
+                .sum::<usize>()
+        })
+        .sum();
+
+    if total_phi_cost > MAX_PHI_COPY_COST {
+        // Compute per-alloca costs and remove the most expensive first
+        let mut alloca_phi_costs: Vec<(usize, usize)> = alloca_infos.iter().enumerate()
+            .map(|(alloca_idx, _)| {
+                let cost: usize = phi_locations.iter().enumerate()
+                    .filter(|(_, phi_set)| phi_set.contains(&alloca_idx))
+                    .map(|(block_idx, _)| preds[block_idx].len())
+                    .sum();
+                (alloca_idx, cost)
+            })
+            .collect();
+        alloca_phi_costs.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let mut remaining_cost = total_phi_cost;
+        let mut remove_set: FxHashSet<usize> = FxHashSet::default();
+        for &(alloca_idx, cost) in &alloca_phi_costs {
+            if remaining_cost <= MAX_PHI_COPY_COST {
+                break;
+            }
+            remove_set.insert(alloca_idx);
+            remaining_cost -= cost;
+        }
+
+        if !remove_set.is_empty() {
+            alloca_infos = alloca_infos.into_iter().enumerate()
+                .filter(|(idx, _)| !remove_set.contains(idx))
+                .map(|(_, info)| info)
+                .collect();
+        }
+    }
+
+    if alloca_infos.is_empty() {
+        return;
+    }
+
+    // Recompute phi locations after any cost-based filtering
     let phi_locations = insert_phis(&alloca_infos, &df, num_blocks);
 
     // Step 6: Rename variables

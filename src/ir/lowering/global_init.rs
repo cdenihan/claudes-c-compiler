@@ -98,12 +98,32 @@ impl Lowerer {
                         return self.create_compound_literal_global(cl_type_spec, cl_init);
                     }
                 }
-                // Handle (compound_literal) used as struct initializer value
+                // Handle (compound_literal) used as initializer value
                 if let Expr::CompoundLiteral(ref cl_type_spec, ref cl_init, _) = expr {
-                    if base_ty == IrType::Ptr {
-                        // Pointer: create anonymous global and return address
+                    let cl_ctype = self.type_spec_to_ctype(cl_type_spec);
+                    let is_aggregate = matches!(
+                        cl_ctype,
+                        CType::Struct(..) | CType::Union(..) | CType::Array(..)
+                    );
+                    if !is_aggregate {
+                        // Scalar or pointer compound literal: create anonymous global
                         return self.create_compound_literal_global(cl_type_spec, cl_init);
                     }
+                    // Aggregate compound literal (struct/union/array): recursively
+                    // lower using the compound literal's own type info.
+                    // e.g. .mask = (cpumask_t){ { [0] = ~0UL } }
+                    let cl_base_ty = self.type_spec_to_ir(cl_type_spec);
+                    let cl_layout = self.get_struct_layout_for_type(cl_type_spec);
+                    let cl_size = if let Some(ref layout) = cl_layout {
+                        layout.size
+                    } else {
+                        self.sizeof_type(cl_type_spec)
+                    };
+                    let cl_is_array = matches!(cl_ctype, CType::Array(..));
+                    return self.lower_global_init(
+                        cl_init, cl_type_spec, cl_base_ty, cl_is_array,
+                        0, cl_size, &cl_layout, &[],
+                    );
                 }
                 // Handle string literal with constant offset: "str" + N or "str" - N
                 if let Some(addr_init) = self.eval_string_literal_addr_expr(expr) {
@@ -565,6 +585,10 @@ impl Lowerer {
                     if matches!(inner.as_ref(), Expr::CompoundLiteral(..)) {
                         return true;
                     }
+                }
+                // Non-pointer compound literal: check its inner initializer
+                if let Expr::CompoundLiteral(_, ref cl_init, _) = expr {
+                    return self.init_has_addr_exprs(cl_init);
                 }
                 self.eval_const_expr(expr).is_none() && self.eval_global_addr_expr(expr).is_some()
             }

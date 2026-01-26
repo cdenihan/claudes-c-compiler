@@ -971,12 +971,23 @@ impl ArchCodegen for RiscvCodegen {
 
     /// Override emit_branch to use `jump <label>, t6` instead of `j <label>`.
     /// The `j` pseudo (JAL with rd=x0) has only ±1MB range. For large functions
-    /// (e.g., oniguruma's match_at), intra-function branches can exceed this.
-    /// The `jump` pseudo generates `auipc t6, ... ; jr t6` with ±2GB range.
-    /// t6 is safe to clobber here because emit_branch is only called at block
-    /// terminators where all scratch registers are dead.
+    /// (e.g., Lua's luaV_execute, oniguruma's match_at), intra-function branches
+    /// can exceed this. The `jump` pseudo generates `auipc t6, ... ; jr t6`
+    /// with ±2GB range. t6 is safe to clobber here because emit_branch is only
+    /// called at block terminators where all scratch registers are dead.
     fn emit_branch(&mut self, label: &str) {
         self.state.emit_fmt(format_args!("    jump {}, t6", label));
+    }
+
+    /// Override emit_branch_to_block to use `jump` pseudo for ±2GB range,
+    /// matching emit_branch. Without this, the default trait implementation
+    /// uses `j` which can't reach labels >1MB away.
+    fn emit_branch_to_block(&mut self, block: BlockId) {
+        let out = &mut self.state.out;
+        out.write_str("    jump .L");
+        out.write_u64(block.0 as u64);
+        out.write_str(", t6");
+        out.newline();
     }
 
     fn emit_branch_nonzero(&mut self, label: &str) {
@@ -1681,8 +1692,12 @@ impl ArchCodegen for RiscvCodegen {
             IrCmpOp::Ugt => ("bltu", "t2", "t1"),  // a > b  ≡  b < a (unsigned)
             IrCmpOp::Ule => ("bgeu", "t2", "t1"),  // a <= b ≡  b >= a (unsigned)
         };
+        // TODO: The conditional branch (beq/bne/etc.) has ±4KB range. For very
+        // large functions, we may need to relax to: inverted-cond .Lskip; jump target, t6; .Lskip:
         self.state.emit_fmt(format_args!("    {} {}, {}, {}", branch_instr, r1, r2, true_label));
-        self.state.emit_fmt(format_args!("    j {}", false_label));
+        // Use `jump` pseudo for ±2GB range instead of `j` (±1MB) to handle
+        // large functions where the false branch target may be far away.
+        self.state.emit_fmt(format_args!("    jump {}, t6", false_label));
         self.state.reg_cache.invalidate_all();
     }
 

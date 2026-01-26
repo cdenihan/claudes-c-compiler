@@ -475,7 +475,14 @@ impl Lowerer {
                 self.fill_struct_global_bytes(sub_items, sub_layout, bytes, field_offset);
                 1
             }
-            Initializer::Expr(_) => {
+            Initializer::Expr(expr) => {
+                // Unwrap compound literal: (type){ init_list } -> use inner init_list
+                if let Expr::CompoundLiteral(_, ref cl_init, _) = expr {
+                    if let Initializer::List(sub_items) = cl_init.as_ref() {
+                        self.fill_struct_global_bytes(sub_items, sub_layout, bytes, field_offset);
+                        return 1;
+                    }
+                }
                 let consumed = self.fill_struct_global_bytes(items, sub_layout, bytes, field_offset);
                 if consumed == 0 { 1 } else { consumed }
             }

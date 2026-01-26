@@ -67,7 +67,8 @@ See `git log` for full history. Key milestones:
 - Position-independent code (`-fPIC`) for x86-64 shared libraries
 - Inline assembly support for x86, ARM, and RISC-V
 - Transparent union ABI, `__int128`, `_Complex` arithmetic
-- Has compiled Lua, zlib, mbedtls, libpng, jq, SQLite, libjpeg-turbo (some currently regressed; see build status table)
+- Has compiled Lua, zlib, mbedtls, libpng, jq, SQLite, libjpeg-turbo
+- Phi cost limiting in mem2reg prevents stack overflow from phi explosion in large switch/computed-goto functions
 - GCC-compatible query flags (-dumpmachine, -dumpversion) for autoconf support
 - Assembly file (.S/.s) passthrough to target assembler
 - XMM register "x" constraint support for x86 inline assembly
