@@ -14,11 +14,73 @@ pub fn run(module: &mut IrModule) -> usize {
 }
 
 /// Fold constants within a single function.
-/// Iterates until no more folding is possible (fixpoint).
+///
+/// Builds a const-value map from Copy instructions so that operands referencing
+/// values defined by `Copy { src: Const(c) }` can be resolved without waiting
+/// for a separate copy propagation pass. This is critical for deeply nested
+/// constant expressions like `-(unsigned short)(-1)` where each sub-expression
+/// folds to a Copy of a constant, and outer expressions need to see through
+/// the chain within a single pass invocation.
+///
+/// The const map tracks both the constant value and the defining Cast's target
+/// type (if any), so that sub-int constants (I8/I16) can be correctly zero-
+/// extended (for U8/U16 targets) or sign-extended (for I8/I16 targets) when
+/// used as operands of UnaryOp/BitNot instructions.
 fn fold_function(func: &mut IrFunction) -> usize {
+    let max_id = func.max_value_id() as usize;
     let mut total = 0;
+
     loop {
-        let folded = fold_function_once(func);
+        // Build a map of Value -> (IrConst, defining_cast_target_type).
+        // The defining_cast_target_type is the `to_ty` of the Cast instruction
+        // that was folded to produce this constant, or None for non-Cast sources.
+        let mut const_map: Vec<Option<ConstMapEntry>> = vec![None; max_id + 1];
+
+        // First pass: record Cast target types for all Cast instructions.
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Cast { dest, to_ty, .. } = inst {
+                    let id = dest.0 as usize;
+                    if id <= max_id {
+                        const_map[id] = Some(ConstMapEntry { konst: None, cast_to_ty: Some(*to_ty) });
+                    }
+                }
+            }
+        }
+
+        // Second pass: record constants from Copy instructions, preserving
+        // any Cast target type already recorded for this value.
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Copy { dest, src: Operand::Const(c) } = inst {
+                    let id = dest.0 as usize;
+                    if id <= max_id {
+                        let cast_ty = const_map[id].and_then(|e| e.cast_to_ty);
+                        const_map[id] = Some(ConstMapEntry { konst: Some(*c), cast_to_ty: cast_ty });
+                    }
+                }
+            }
+        }
+
+        let mut folded = 0;
+        for block in &mut func.blocks {
+            for inst in &mut block.instructions {
+                if let Some(folded_inst) = try_fold_with_map(inst, &const_map) {
+                    // Update the const map immediately so later instructions in
+                    // the same block can see through newly-folded constants.
+                    if let Instruction::Copy { dest, src: Operand::Const(c) } = &folded_inst {
+                        let id = dest.0 as usize;
+                        if id <= max_id {
+                            let cast_ty = const_map[id].and_then(|e| e.cast_to_ty);
+                            const_map[id] = Some(ConstMapEntry { konst: Some(*c), cast_to_ty: cast_ty });
+                        }
+                    }
+                    *inst = folded_inst;
+                    folded += 1;
+                }
+            }
+        }
+
         if folded == 0 {
             break;
         }
@@ -27,25 +89,28 @@ fn fold_function(func: &mut IrFunction) -> usize {
     total
 }
 
-/// Single pass of constant folding over a function.
-/// Edits instructions in-place to avoid allocating a new Vec per block.
-fn fold_function_once(func: &mut IrFunction) -> usize {
-    let mut folded = 0;
-
-    for block in &mut func.blocks {
-        for inst in &mut block.instructions {
-            if let Some(folded_inst) = try_fold(inst) {
-                *inst = folded_inst;
-                folded += 1;
-            }
-        }
-    }
-
-    folded
+/// Entry in the constant value map, tracking both the constant value and the
+/// defining Cast's target type for correct sign/zero extension of sub-int types.
+#[derive(Clone, Copy)]
+struct ConstMapEntry {
+    /// The constant value, if known (from a Copy { src: Const(c) } instruction).
+    konst: Option<IrConst>,
+    /// The target type of the Cast instruction that defined this value, if any.
+    /// Used to determine whether I8/I16 constants represent unsigned (U8/U16)
+    /// or signed (I8/I16) sub-int values for correct extension in UnaryOp folding.
+    cast_to_ty: Option<IrType>,
 }
 
-/// Try to fold a single instruction. Returns Some(replacement) if foldable.
+/// Try to fold a single instruction without const map lookup (for tests and
+/// simple cases where all operands are already Operand::Const).
+#[cfg(test)]
 fn try_fold(inst: &Instruction) -> Option<Instruction> {
+    try_fold_with_map(inst, &[])
+}
+
+/// Try to fold a single instruction, using the const map to resolve Value
+/// operands that are known to be constants (from prior Copy instructions).
+fn try_fold_with_map(inst: &Instruction, const_map: &[Option<ConstMapEntry>]) -> Option<Instruction> {
     match inst {
         Instruction::BinOp { dest, op, lhs, rhs, ty } => {
             // Skip 128-bit types: our fold_binop uses i64, which would truncate
@@ -54,16 +119,16 @@ fn try_fold(inst: &Instruction) -> Option<Instruction> {
             }
             // Try float folding first
             if ty.is_float() {
-                let l = as_f64_const(lhs)?;
-                let r = as_f64_const(rhs)?;
+                let l = as_f64_const_mapped(lhs, const_map)?;
+                let r = as_f64_const_mapped(rhs, const_map)?;
                 let result = fold_float_binop(*op, l, r)?;
                 return Some(Instruction::Copy {
                     dest: *dest,
                     src: Operand::Const(make_float_const(result, *ty)),
                 });
             }
-            let lhs_const = as_i64_const(lhs)?;
-            let rhs_const = as_i64_const(rhs)?;
+            let lhs_const = as_i64_const_mapped(lhs, const_map)?;
+            let rhs_const = as_i64_const_mapped(rhs, const_map)?;
             let result = fold_binop(*op, lhs_const, rhs_const)?;
             Some(Instruction::Copy {
                 dest: *dest,
@@ -77,17 +142,17 @@ fn try_fold(inst: &Instruction) -> Option<Instruction> {
             }
             // Try float unary folding
             if ty.is_float() {
-                let s = as_f64_const(src)?;
+                let s = as_f64_const_mapped(src, const_map)?;
                 let result = fold_float_unaryop(*op, s)?;
                 return Some(Instruction::Copy {
                     dest: *dest,
                     src: Operand::Const(make_float_const(result, *ty)),
                 });
             }
-            // Zero-extend sub-int constants (I8/I16) for C11 integer promotion.
-            // Any I8/I16 remaining at this IR stage are unsigned sub-int values
-            // (signed ones were already promoted to I32 by sema/lowerer).
-            let src_const = as_i64_zero_extended(src)?;
+            // Promote sub-int constants (I8/I16) for C11 integer promotion.
+            // Zero-extend unsigned sub-int (U8/U16 cast targets) and sign-extend
+            // signed sub-int (I8/I16 cast targets) to match the C promotion rules.
+            let src_const = as_i64_promoted_mapped(src, const_map)?;
             let result = fold_unaryop(*op, src_const, *ty)?;
             Some(Instruction::Copy {
                 dest: *dest,
@@ -101,16 +166,16 @@ fn try_fold(inst: &Instruction) -> Option<Instruction> {
             }
             // Try float comparison folding
             if ty.is_float() {
-                let l = as_f64_const(lhs)?;
-                let r = as_f64_const(rhs)?;
+                let l = as_f64_const_mapped(lhs, const_map)?;
+                let r = as_f64_const_mapped(rhs, const_map)?;
                 let result = fold_float_cmp(*op, l, r);
                 return Some(Instruction::Copy {
                     dest: *dest,
                     src: Operand::Const(IrConst::I32(result as i32)),
                 });
             }
-            let lhs_const = as_i64_const(lhs)?;
-            let rhs_const = as_i64_const(rhs)?;
+            let lhs_const = as_i64_const_mapped(lhs, const_map)?;
+            let rhs_const = as_i64_const_mapped(rhs, const_map)?;
             let result = fold_cmp(*op, lhs_const, rhs_const);
             Some(Instruction::Copy {
                 dest: *dest,
@@ -124,9 +189,9 @@ fn try_fold(inst: &Instruction) -> Option<Instruction> {
             }
             // Handle float-to-int and int-to-float casts
             if from_ty.is_float() || to_ty.is_float() {
-                return try_fold_float_cast(*dest, src, *from_ty, *to_ty);
+                return try_fold_float_cast_mapped(*dest, src, *from_ty, *to_ty, const_map);
             }
-            let src_const = as_i64_const(src)?;
+            let src_const = as_i64_const_mapped(src, const_map)?;
             let result = fold_cast(src_const, *from_ty, *to_ty);
             Some(Instruction::Copy {
                 dest: *dest,
@@ -135,7 +200,7 @@ fn try_fold(inst: &Instruction) -> Option<Instruction> {
         }
         Instruction::Select { dest, cond, true_val, false_val, .. } => {
             // If the condition is a known constant, fold to the appropriate value
-            let cond_const = as_i64_const(cond)?;
+            let cond_const = as_i64_const_mapped(cond, const_map)?;
             let result = if cond_const != 0 { *true_val } else { *false_val };
             Some(Instruction::Copy {
                 dest: *dest,
@@ -146,41 +211,81 @@ fn try_fold(inst: &Instruction) -> Option<Instruction> {
     }
 }
 
-/// Extract a constant integer value from an operand.
-fn as_i64_const(op: &Operand) -> Option<i64> {
+/// Resolve an operand to its constant value, looking through the const map
+/// for Value operands that are defined by Copy instructions with const sources.
+fn resolve_const(op: &Operand, const_map: &[Option<ConstMapEntry>]) -> Option<IrConst> {
     match op {
-        Operand::Const(c) => c.to_i64(),
-        Operand::Value(_) => None,
+        Operand::Const(c) => Some(*c),
+        Operand::Value(v) => {
+            let id = v.0 as usize;
+            if id < const_map.len() {
+                const_map[id].as_ref()?.konst
+            } else {
+                None
+            }
+        }
     }
 }
 
-/// Extract a constant integer value with zero-extension for sub-int types (I8, I16).
+/// Extract a constant integer value from an operand, resolving through const map.
+fn as_i64_const_mapped(op: &Operand, const_map: &[Option<ConstMapEntry>]) -> Option<i64> {
+    resolve_const(op, const_map)?.to_i64()
+}
+
+/// Extract a constant integer with proper extension for sub-int types (I8/I16),
+/// resolving through the const map.
 ///
-/// C11 integer promotion (6.3.1.1) promotes unsigned char/short to int before
-/// unary operations. In the IR, both signed and unsigned sub-int values are stored
-/// as I8/I16 (e.g., unsigned char 255 is stored as I8(-1)). Zero-extension is
-/// unconditionally correct here because signed sub-int operands that reach this
-/// IR pass have already been sign-extended to I32 by the sema/lowerer const_eval
-/// paths, so any remaining I8/I16 constants represent unsigned sub-int values
-/// that need zero-extension.
-///
-/// Without this, I8(-1) (unsigned byte 255) would be sign-extended to -1,
-/// causing -(unsigned char)(255) to be folded as -(-1) = 1 instead of -(255) = -255.
-fn as_i64_zero_extended(op: &Operand) -> Option<i64> {
-    match op {
-        Operand::Const(IrConst::I8(v)) => Some(*v as u8 as i64),
-        Operand::Const(IrConst::I16(v)) => Some(*v as u16 as i64),
-        Operand::Const(c) => c.to_i64(),
-        Operand::Value(_) => None,
+/// For sub-int constants, we need to determine whether to zero-extend (unsigned)
+/// or sign-extend (signed) based on the Cast target type that produced the value:
+/// - Constants from Cast to U8/U16 are zero-extended (e.g., (unsigned short)(-1) = 65535)
+/// - Constants from Cast to I8/I16 are sign-extended (e.g., (signed char)(-1) = -1)
+/// - Literal I8/I16 constants (not from a Cast) are zero-extended per the original
+///   invariant: the lowerer promotes signed sub-int to I32, so remaining I8/I16 are unsigned
+fn as_i64_promoted_mapped(op: &Operand, const_map: &[Option<ConstMapEntry>]) -> Option<i64> {
+    let c = resolve_const(op, const_map)?;
+    match &c {
+        IrConst::I8(v) => {
+            // Check if the value came from a Cast to a signed type
+            if let Operand::Value(val) = op {
+                let id = val.0 as usize;
+                if id < const_map.len() {
+                    if let Some(entry) = &const_map[id] {
+                        if entry.cast_to_ty == Some(IrType::I8) {
+                            // Signed char: sign-extend
+                            return Some(*v as i64);
+                        }
+                    }
+                }
+            }
+            // Default: zero-extend (unsigned char or literal)
+            Some(*v as u8 as i64)
+        }
+        IrConst::I16(v) => {
+            // Check if the value came from a Cast to a signed type
+            if let Operand::Value(val) = op {
+                let id = val.0 as usize;
+                if id < const_map.len() {
+                    if let Some(entry) = &const_map[id] {
+                        if entry.cast_to_ty == Some(IrType::I16) {
+                            // Signed short: sign-extend
+                            return Some(*v as i64);
+                        }
+                    }
+                }
+            }
+            // Default: zero-extend (unsigned short or literal)
+            Some(*v as u16 as i64)
+        }
+        _ => c.to_i64(),
     }
 }
 
-/// Extract a constant floating-point value from an operand.
-fn as_f64_const(op: &Operand) -> Option<f64> {
-    match op {
-        Operand::Const(IrConst::F32(v)) => Some(*v as f64),
-        Operand::Const(IrConst::F64(v)) => Some(*v),
-        Operand::Const(IrConst::LongDouble(v)) => Some(*v),
+/// Extract a constant floating-point value, resolving through const map.
+fn as_f64_const_mapped(op: &Operand, const_map: &[Option<ConstMapEntry>]) -> Option<f64> {
+    match resolve_const(op, const_map)? {
+        IrConst::F32(v) => Some(v as f64),
+        IrConst::F64(v) => Some(v),
+        IrConst::LongDouble(v) => Some(v),
         _ => None,
     }
 }
@@ -235,20 +340,17 @@ fn fold_float_cmp(op: IrCmpOp, lhs: f64, rhs: f64) -> bool {
 /// Try to fold a cast involving float types.
 // TODO: simplify.rs also has float cast folding via IrConst::cast_float_to_target
 // which doesn't check for NaN/Inf. These should be unified eventually.
-fn try_fold_float_cast(dest: Value, src: &Operand, from_ty: IrType, to_ty: IrType) -> Option<Instruction> {
-    let src_const = match src {
-        Operand::Const(c) => c,
-        _ => return None,
-    };
+fn try_fold_float_cast_mapped(dest: Value, src: &Operand, from_ty: IrType, to_ty: IrType, const_map: &[Option<ConstMapEntry>]) -> Option<Instruction> {
+    let src_const = resolve_const(src, const_map)?;
     let result = match (from_ty.is_float(), to_ty.is_float()) {
         (true, true) => {
             // float-to-float conversion
-            let val = as_f64_const(src)?;
+            let val = as_f64_const_mapped(src, const_map)?;
             make_float_const(val, to_ty)
         }
         (true, false) => {
             // float-to-int conversion
-            let val = as_f64_const(src)?;
+            let val = as_f64_const_mapped(src, const_map)?;
             // Don't fold if value can't be represented as i64
             if !val.is_finite() || val < i64::MIN as f64 || val > i64::MAX as f64 {
                 return None;
