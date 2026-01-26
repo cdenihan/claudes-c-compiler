@@ -1,0 +1,13 @@
+Fix bitfield packing for mixed declared types (bool/enum/int)
+
+Two bugs:
+1. Bitfields of different declared types (e.g., unsigned int + _Bool + unsigned int)
+   were not packing into the same storage unit, producing incorrect struct sizes.
+   Example: struct { unsigned int a:4; _Bool b:1; } was 8 bytes instead of 4.
+
+2. Typedef'd enum bitfields (e.g., typedef enum EPos EPos; EPos x:2;) were being
+   sign-extended on read, because the typedef lost the enum-ness and was treated
+   as signed int.
+
+Fix: Implement SysV ABI straddle rule for bitfield packing, and track enum typedefs
+to correctly zero-extend their bitfield values.
