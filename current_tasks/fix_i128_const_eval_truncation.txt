@@ -1,0 +1,14 @@
+Fix __int128 constant expression evaluation truncation
+=====================================================
+
+Problem: When constant-folding expressions like `S c = (U)1 << 127` where
+S = __int128 and U = unsigned __int128, the upper 64 bits are lost because
+the Cast path in eval_const_expr goes through eval_const_expr_as_bits which
+returns (u64, bool), truncating 128-bit values.
+
+Files to fix:
+- src/frontend/sema/const_eval.rs: Cast handler and eval_const_expr_as_bits
+- src/ir/lowering/const_eval.rs: Same Cast handler and eval_const_expr_as_bits
+
+Test: gcc_torture_pr85582_2 aborts at runtime due to this bug.
+Also affects: Any __int128 constant expression with values > 64 bits.
