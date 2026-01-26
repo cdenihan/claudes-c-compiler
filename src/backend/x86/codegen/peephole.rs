@@ -272,8 +272,12 @@ fn classify_line(raw: &str) -> LineInfo {
     if first == b'j' {
         if sb.len() >= 4 && sb[1] == b'm' && sb[2] == b'p' {
             if sb[3] == b' ' {
-                // `jmp label` or `jmp __x86_indirect_thunk_rax`
+                // `jmp label` or `jmp __x86_indirect_thunk_rax` or `jmp *%reg`
                 if s.contains("indirect_thunk") {
+                    return line_info(LineKind::JmpIndirect, ts);
+                }
+                // `jmp *%rcx` / `jmp *%rax` – indirect jump through register
+                if sb.len() > 4 && sb[4] == b'*' {
                     return line_info(LineKind::JmpIndirect, ts);
                 }
                 return line_info(LineKind::Jmp, ts);
@@ -2824,5 +2828,38 @@ mod tests {
         // setCC and movzbq must also survive since the store needs the boolean value.
         assert!(result.contains("sete"),
             "must preserve sete for cross-block store: {}", result);
+    }
+
+    #[test]
+    fn test_jmp_star_reg_classified_as_indirect() {
+        // `jmp *%rcx` is an indirect jump (used by switch jump tables).
+        // All labels must be treated as jump targets when indirect jumps exist,
+        // because the jump table in .rodata references labels that the peephole
+        // scanner cannot see.
+        let asm = [
+            "    movq %rax, -40(%rbp)",
+            "    jmp *%rcx",                   // indirect jump via register
+            ".L21:",                            // jump table target
+            "    movq -40(%rbp), %rax",        // MUST NOT be eliminated
+            "    movq %rax, -160(%rbp)",
+        ].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(result.contains("-40(%rbp), %rax"),
+            "must NOT eliminate load after indirect jump target label: {}", result);
+    }
+
+    #[test]
+    fn test_jmpq_star_reg_classified_as_indirect() {
+        // `jmpq *%rax` is also an indirect jump (AT&T syntax with size suffix)
+        let asm = [
+            "    movq %rax, -40(%rbp)",
+            "    jmpq *%rax",
+            ".L5:",
+            "    movq -40(%rbp), %rax",
+            "    ret",
+        ].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(result.contains("-40(%rbp), %rax"),
+            "must NOT eliminate load after jmpq* indirect jump target: {}", result);
     }
 }
