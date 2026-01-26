@@ -1,0 +1,38 @@
+Fix ARM64 Long Double to Use Full IEEE Binary128 Precision
+==========================================================
+
+Problem:
+The ARM64 backend stores long double values internally as f64 approximations
+in 8-byte stack slots. This loses precision (f64 has 52-bit mantissa vs f128's
+112-bit mantissa). The RISC-V backend already stores full 16-byte f128.
+
+Current ARM64 approach:
+1. Incoming f128 params: truncated to f64 via __trunctfdf2 on entry
+2. Stack slots: 8-byte ldr/str (only f64 bits)
+3. Arithmetic: convert f64->f128, do operation in quad, truncate back to f64
+4. Outgoing f128: re-expand from f64 via __extenddftf2
+5. Global data: emits f64 approximation + 8 zero bytes
+
+This means all intermediate long double values are double-precision, not quad.
+Static/global data currently uses the f64 format to match what codegen loads.
+
+Fix approach (follow RISC-V pattern):
+1. Store full 16-byte f128 in allocas (increase slot sizes for F128 type)
+2. Track f128_load_sources like RISC-V does for full-precision reloads
+3. Load full 16 bytes from memory for long double values
+4. Update global data emission to use binary128 (already done for RISC-V)
+5. Keep soft-float libcalls for arithmetic but store results as f128
+
+This would fix several ARM test failures related to long double precision,
+and make the ARM backend consistent with RISC-V.
+
+Affected tests (long double related ARM failures):
+- compiler_suite_0010_0039 (long double multiply/compare)
+- compiler_suite_0010_0041 (same pattern)
+- compiler_suite_0030_0027, 0030_0055 (complex long double)
+- compiler_suite_0031_0097, 0031_0106 (complex long double)
+- compiler_suite_0121_0103, 0121_0200 (long double math)
+- compiler_suite_0147_0051, 0147_0068 (long double conversion)
+- compiler_suite_0151_0089 (long double precision test)
+
+Priority: Medium - would fix ~10 ARM test failures but is a substantial refactor.
