@@ -1,0 +1,14 @@
+Fix struct rvalue temporaries in member access expressions.
+
+When a struct-valued expression (ternary or assignment) is used as the base of a
+member access like `(cond ? s1 : s2).field` or `(s1 = s2).field`, the C standard
+requires the expression to produce an rvalue (temporary copy). Currently, the
+compiler's get_struct_base_addr falls through to the generic handler which returns
+the address of the original struct, treating it as an lvalue. This means writes
+to members of these expressions incorrectly modify the originals.
+
+Fix: Add explicit Conditional and Assign handling in get_struct_base_addr that
+materializes a temporary copy of the struct via memcpy, so subsequent member
+access operates on the copy (which is discarded at the end of the statement).
+
+Affected tests: compiler_suite_0044_0007 (func04, func05)
