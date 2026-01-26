@@ -575,6 +575,23 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
             // Space already allocated in prologue; does not touch registers
         }
         Instruction::Copy { dest, src } => {
+            // Skip Copy when dest and src share the same stack slot (from copy coalescing).
+            // The Copy is a no-op since both refer to the same memory location.
+            if let Operand::Value(src_val) = src {
+                let dest_slot = cg.state_ref().get_slot(dest.0);
+                let src_slot = cg.state_ref().get_slot(src_val.0);
+                if let (Some(ds), Some(ss)) = (dest_slot, src_slot) {
+                    if ds.0 == ss.0 {
+                        // Same slot: skip the copy entirely. Update reg cache so that
+                        // if src was cached in the accumulator, dest is too.
+                        if cg.state_ref().reg_cache.acc_has(src_val.0, false) {
+                            cg.state().reg_cache.set_acc(dest.0, false);
+                        }
+                        return;
+                    }
+                }
+            }
+
             let is_i128_copy = match src {
                 Operand::Value(v) => cg.state_ref().is_i128_value(v.0),
                 Operand::Const(IrConst::I128(_)) => true,
@@ -830,13 +847,350 @@ fn compute_value_use_blocks(func: &IrFunction) -> FxHashMap<u32, Vec<usize>> {
     uses
 }
 
+/// Result of alloca coalescability analysis.
+struct CoalescableAllocas {
+    /// Single-block allocas: alloca ID -> the single block index where it's used.
+    /// These can use block-local coalescing (Tier 3).
+    single_block: FxHashMap<u32, usize>,
+    /// Dead non-param allocas: alloca IDs with no uses at all.
+    /// These can be skipped entirely (no stack slot needed).
+    dead: FxHashSet<u32>,
+}
+
+/// Compute which allocas can be coalesced (either block-locally or via liveness packing).
+///
+/// An alloca is coalescable if:
+/// 1. It is not a parameter alloca and not dead
+/// 2. Its address never "escapes" — it's never stored as a value,
+///    used in casts/binops/phi/select, or used in terminators
+/// 3. No GEP derived from it escapes either (transitive check)
+///
+/// Single-block allocas (all uses in one block) use block-local coalescing.
+/// Multi-block allocas (uses span multiple blocks) use liveness-based packing
+/// based on their [min_use_block, max_use_block] range.
+fn compute_coalescable_allocas(
+    func: &IrFunction,
+    dead_param_allocas: &FxHashSet<u32>,
+    param_alloca_values: &[Value],
+) -> CoalescableAllocas {
+    // Collect all alloca value IDs (excluding dead params and param allocas).
+    let param_set: FxHashSet<u32> = param_alloca_values.iter().map(|v| v.0).collect();
+    let mut alloca_set: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Alloca { dest, .. } = inst {
+                if !dead_param_allocas.contains(&dest.0) && !param_set.contains(&dest.0) {
+                    alloca_set.insert(dest.0);
+                }
+            }
+        }
+    }
+
+    if alloca_set.is_empty() {
+        return CoalescableAllocas { single_block: FxHashMap::default(), dead: FxHashSet::default() };
+    }
+
+    // Track which allocas are "escaped" (address leaked to a call, stored, etc.)
+    let mut escaped: FxHashSet<u32> = FxHashSet::default();
+
+    // Track GEP chains: map from GEP result -> the root alloca it was derived from.
+    // This allows us to transitively mark an alloca as escaped if a GEP derived from
+    // it escapes.
+    let mut gep_to_alloca: FxHashMap<u32, u32> = FxHashMap::default();
+
+    // Track use blocks for each alloca: alloca_id -> set of block indices where used.
+    let mut alloca_use_blocks: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
+
+    // First pass: build GEP chain map and detect escapes.
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            // Build GEP -> root alloca mapping
+            if let Instruction::GetElementPtr { dest, base, .. } = inst {
+                // Check if the base is an alloca or a GEP derived from an alloca
+                let root = if alloca_set.contains(&base.0) {
+                    Some(base.0)
+                } else {
+                    gep_to_alloca.get(&base.0).copied()
+                };
+                if let Some(root_alloca) = root {
+                    gep_to_alloca.insert(dest.0, root_alloca);
+                    // Record this use of the alloca
+                    let blocks = alloca_use_blocks.entry(root_alloca).or_insert_with(Vec::new);
+                    if blocks.last() != Some(&block_idx) {
+                        blocks.push(block_idx);
+                    }
+                }
+            }
+
+            // Check for alloca/GEP-derived values used in various instructions.
+            // Alloca pointers passed to calls are marked as escaped since the
+            // callee may store the pointer in a data structure that outlives the call.
+            match inst {
+                Instruction::Call { args, .. } | Instruction::CallIndirect { args, .. } => {
+                    // Mark allocas passed as call arguments as escaped.
+                    // The callee may store the pointer in a data structure that
+                    // outlives the call (e.g. Lua GC roots, linked lists, callbacks).
+                    // Coalescing such allocas with others can cause memory corruption.
+                    for arg in args {
+                        if let Operand::Value(v) = arg {
+                            if alloca_set.contains(&v.0) {
+                                escaped.insert(v.0);
+                                let blocks = alloca_use_blocks.entry(v.0).or_insert_with(Vec::new);
+                                if blocks.last() != Some(&block_idx) { blocks.push(block_idx); }
+                            } else if let Some(&root) = gep_to_alloca.get(&v.0) {
+                                escaped.insert(root);
+                                let blocks = alloca_use_blocks.entry(root).or_insert_with(Vec::new);
+                                if blocks.last() != Some(&block_idx) { blocks.push(block_idx); }
+                            }
+                        }
+                    }
+                }
+                // Store: if the alloca's VALUE is stored (not as ptr), address escapes
+                Instruction::Store { val, ptr, .. } => {
+                    if let Operand::Value(v) = val {
+                        if alloca_set.contains(&v.0) {
+                            escaped.insert(v.0);
+                        } else if let Some(&root) = gep_to_alloca.get(&v.0) {
+                            escaped.insert(root);
+                        }
+                    }
+                    // Record use of alloca as ptr (non-escaping use)
+                    if alloca_set.contains(&ptr.0) {
+                        let blocks = alloca_use_blocks.entry(ptr.0).or_insert_with(Vec::new);
+                        if blocks.last() != Some(&block_idx) {
+                            blocks.push(block_idx);
+                        }
+                    } else if let Some(&root) = gep_to_alloca.get(&ptr.0) {
+                        let blocks = alloca_use_blocks.entry(root).or_insert_with(Vec::new);
+                        if blocks.last() != Some(&block_idx) {
+                            blocks.push(block_idx);
+                        }
+                    }
+                }
+                // Load: record use of alloca as ptr (non-escaping use)
+                Instruction::Load { ptr, .. } => {
+                    if alloca_set.contains(&ptr.0) {
+                        let blocks = alloca_use_blocks.entry(ptr.0).or_insert_with(Vec::new);
+                        if blocks.last() != Some(&block_idx) {
+                            blocks.push(block_idx);
+                        }
+                    } else if let Some(&root) = gep_to_alloca.get(&ptr.0) {
+                        let blocks = alloca_use_blocks.entry(root).or_insert_with(Vec::new);
+                        if blocks.last() != Some(&block_idx) {
+                            blocks.push(block_idx);
+                        }
+                    }
+                }
+                // Memcpy: record use of alloca as dest/src (non-escaping use)
+                Instruction::Memcpy { dest, src, .. } => {
+                    for v in [dest, src] {
+                        if alloca_set.contains(&v.0) {
+                            let blocks = alloca_use_blocks.entry(v.0).or_insert_with(Vec::new);
+                            if blocks.last() != Some(&block_idx) {
+                                blocks.push(block_idx);
+                            }
+                        } else if let Some(&root) = gep_to_alloca.get(&v.0) {
+                            let blocks = alloca_use_blocks.entry(root).or_insert_with(Vec::new);
+                            if blocks.last() != Some(&block_idx) {
+                                blocks.push(block_idx);
+                            }
+                        }
+                    }
+                }
+                // InlineAsm: outputs and memory-constraint inputs are uses of the alloca.
+                // The asm block reads/writes through the pointer during execution.
+                // However, if an alloca's address is used as an immediate/"i"
+                // constraint input, it could theoretically be embedded in code, but
+                // this is extremely rare for local allocas and we still coalesce
+                // only across blocks that never execute simultaneously.
+                Instruction::InlineAsm { outputs, inputs, .. } => {
+                    for (_, v, _) in outputs {
+                        if alloca_set.contains(&v.0) {
+                            let blocks = alloca_use_blocks.entry(v.0).or_insert_with(Vec::new);
+                            if blocks.last() != Some(&block_idx) { blocks.push(block_idx); }
+                        } else if let Some(&root) = gep_to_alloca.get(&v.0) {
+                            let blocks = alloca_use_blocks.entry(root).or_insert_with(Vec::new);
+                            if blocks.last() != Some(&block_idx) { blocks.push(block_idx); }
+                        }
+                    }
+                    for (_, op, _) in inputs {
+                        if let Operand::Value(v) = op {
+                            if alloca_set.contains(&v.0) {
+                                let blocks = alloca_use_blocks.entry(v.0).or_insert_with(Vec::new);
+                                if blocks.last() != Some(&block_idx) { blocks.push(block_idx); }
+                            } else if let Some(&root) = gep_to_alloca.get(&v.0) {
+                                let blocks = alloca_use_blocks.entry(root).or_insert_with(Vec::new);
+                                if blocks.last() != Some(&block_idx) { blocks.push(block_idx); }
+                            }
+                        }
+                    }
+                }
+                // Intrinsic: record uses (intrinsics like memset/memcpy just operate
+                // on the pointer during execution, they don't store it)
+                Instruction::Intrinsic { dest_ptr, args, .. } => {
+                    if let Some(dp) = dest_ptr {
+                        if alloca_set.contains(&dp.0) {
+                            let blocks = alloca_use_blocks.entry(dp.0).or_insert_with(Vec::new);
+                            if blocks.last() != Some(&block_idx) { blocks.push(block_idx); }
+                        } else if let Some(&root) = gep_to_alloca.get(&dp.0) {
+                            let blocks = alloca_use_blocks.entry(root).or_insert_with(Vec::new);
+                            if blocks.last() != Some(&block_idx) { blocks.push(block_idx); }
+                        }
+                    }
+                    for arg in args {
+                        if let Operand::Value(v) = arg {
+                            if alloca_set.contains(&v.0) {
+                                let blocks = alloca_use_blocks.entry(v.0).or_insert_with(Vec::new);
+                                if blocks.last() != Some(&block_idx) { blocks.push(block_idx); }
+                            } else if let Some(&root) = gep_to_alloca.get(&v.0) {
+                                let blocks = alloca_use_blocks.entry(root).or_insert_with(Vec::new);
+                                if blocks.last() != Some(&block_idx) { blocks.push(block_idx); }
+                            }
+                        }
+                    }
+                }
+                // Atomic ops: if alloca is used as ptr, record use. If used as val, it escapes.
+                Instruction::AtomicRmw { ptr, val, .. } => {
+                    if let Operand::Value(v) = val {
+                        if alloca_set.contains(&v.0) { escaped.insert(v.0); }
+                        else if let Some(&root) = gep_to_alloca.get(&v.0) { escaped.insert(root); }
+                    }
+                    if let Operand::Value(v) = ptr {
+                        if alloca_set.contains(&v.0) {
+                            let blocks = alloca_use_blocks.entry(v.0).or_insert_with(Vec::new);
+                            if blocks.last() != Some(&block_idx) { blocks.push(block_idx); }
+                        }
+                    }
+                }
+                Instruction::AtomicCmpxchg { ptr, expected, desired, .. } => {
+                    for op in [expected, desired] {
+                        if let Operand::Value(v) = op {
+                            if alloca_set.contains(&v.0) { escaped.insert(v.0); }
+                            else if let Some(&root) = gep_to_alloca.get(&v.0) { escaped.insert(root); }
+                        }
+                    }
+                    if let Operand::Value(v) = ptr {
+                        if alloca_set.contains(&v.0) {
+                            let blocks = alloca_use_blocks.entry(v.0).or_insert_with(Vec::new);
+                            if blocks.last() != Some(&block_idx) { blocks.push(block_idx); }
+                        }
+                    }
+                }
+                Instruction::AtomicLoad { ptr, .. } => {
+                    if let Operand::Value(v) = ptr {
+                        if alloca_set.contains(&v.0) {
+                            let blocks = alloca_use_blocks.entry(v.0).or_insert_with(Vec::new);
+                            if blocks.last() != Some(&block_idx) { blocks.push(block_idx); }
+                        } else if let Some(&root) = gep_to_alloca.get(&v.0) {
+                            let blocks = alloca_use_blocks.entry(root).or_insert_with(Vec::new);
+                            if blocks.last() != Some(&block_idx) { blocks.push(block_idx); }
+                        }
+                    }
+                }
+                Instruction::AtomicStore { ptr, val, .. } => {
+                    if let Operand::Value(v) = val {
+                        if alloca_set.contains(&v.0) { escaped.insert(v.0); }
+                        else if let Some(&root) = gep_to_alloca.get(&v.0) { escaped.insert(root); }
+                    }
+                    if let Operand::Value(v) = ptr {
+                        if alloca_set.contains(&v.0) {
+                            let blocks = alloca_use_blocks.entry(v.0).or_insert_with(Vec::new);
+                            if blocks.last() != Some(&block_idx) { blocks.push(block_idx); }
+                        }
+                    }
+                }
+                // VaStart/VaEnd/VaCopy/VaArg: conservatively escape
+                Instruction::VaStart { va_list_ptr } | Instruction::VaEnd { va_list_ptr } | Instruction::VaArg { va_list_ptr, .. } => {
+                    if alloca_set.contains(&va_list_ptr.0) {
+                        escaped.insert(va_list_ptr.0);
+                    }
+                }
+                Instruction::VaCopy { dest_ptr, src_ptr } => {
+                    if alloca_set.contains(&dest_ptr.0) { escaped.insert(dest_ptr.0); }
+                    if alloca_set.contains(&src_ptr.0) { escaped.insert(src_ptr.0); }
+                }
+                // Cast/Copy/BinOp/Cmp/Select/UnaryOp: if alloca value used as operand, it escapes
+                // (these compute on the address value, which means it could be stored later)
+                Instruction::Cast { src, .. } | Instruction::Copy { src, .. } | Instruction::UnaryOp { src, .. } => {
+                    if let Operand::Value(v) = src {
+                        if alloca_set.contains(&v.0) { escaped.insert(v.0); }
+                        else if let Some(&root) = gep_to_alloca.get(&v.0) { escaped.insert(root); }
+                    }
+                }
+                Instruction::BinOp { lhs, rhs, .. } | Instruction::Cmp { lhs, rhs, .. } => {
+                    for op in [lhs, rhs] {
+                        if let Operand::Value(v) = op {
+                            if alloca_set.contains(&v.0) { escaped.insert(v.0); }
+                            else if let Some(&root) = gep_to_alloca.get(&v.0) { escaped.insert(root); }
+                        }
+                    }
+                }
+                Instruction::Select { cond, true_val, false_val, .. } => {
+                    for op in [cond, true_val, false_val] {
+                        if let Operand::Value(v) = op {
+                            if alloca_set.contains(&v.0) { escaped.insert(v.0); }
+                            else if let Some(&root) = gep_to_alloca.get(&v.0) { escaped.insert(root); }
+                        }
+                    }
+                }
+                Instruction::Phi { incoming, .. } => {
+                    for (op, _) in incoming {
+                        if let Operand::Value(v) = op {
+                            if alloca_set.contains(&v.0) { escaped.insert(v.0); }
+                            else if let Some(&root) = gep_to_alloca.get(&v.0) { escaped.insert(root); }
+                        }
+                    }
+                }
+                // Other instructions that don't use allocas
+                _ => {}
+            }
+        }
+
+        // Check terminators for alloca/GEP-derived value uses
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                if alloca_set.contains(&v.0) {
+                    escaped.insert(v.0);
+                } else if let Some(&root) = gep_to_alloca.get(&v.0) {
+                    escaped.insert(root);
+                }
+            }
+        });
+    }
+
+    // Build result: separate non-escaped allocas into single-block and dead.
+    // Multi-block non-escaping allocas are not coalesced (they get permanent slots)
+    // because block-index-based interval packing is unsound with loops.
+    let mut single_block: FxHashMap<u32, usize> = FxHashMap::default();
+    let mut dead: FxHashSet<u32> = FxHashSet::default();
+    for &alloca_id in &alloca_set {
+        if escaped.contains(&alloca_id) {
+            continue;
+        }
+        if let Some(blocks) = alloca_use_blocks.get(&alloca_id) {
+            let mut unique: Vec<usize> = blocks.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            if unique.len() == 1 {
+                single_block.insert(alloca_id, unique[0]);
+            }
+            // Multi-block allocas fall through: not coalesced, get permanent slots.
+        } else {
+            // Alloca with no uses at all - completely dead, skip allocation.
+            dead.insert(alloca_id);
+        }
+    }
+
+    CoalescableAllocas { single_block, dead }
+}
+
 /// Shared stack space calculation: iterates over all instructions, assigns stack
 /// slots for allocas and value results. Arch-specific offset direction is handled
 /// by the `assign_slot` closure.
 ///
-/// Allocas always get permanent (non-coalesced) slots because they represent
-/// addressable memory accessed via derived GEP pointers that may span multiple
-/// basic blocks.
+/// Allocas may be coalesced if their address never escapes and all uses are in a
+/// single basic block. Non-escaping single-block allocas share stack space with
+/// allocas from other blocks (block-local coalescing).
 ///
 /// Non-alloca SSA temporaries may be coalesced: values defined and used only
 /// within a single basic block (including the entry block) share stack space
@@ -1005,6 +1359,115 @@ pub fn calculate_stack_space_common(
     // resolve_slot_addr can return a dummy Indirect slot for them.
     state.reg_assigned_values = reg_assigned.clone();
 
+    // Alloca coalescing: identify allocas whose address never escapes and whose
+    // uses are confined to a single basic block. These can share stack space with
+    // allocas from other blocks (block-local coalescing), dramatically reducing
+    // frame size for functions with many inlined helper calls.
+    //
+    // An alloca is "non-escaping" if:
+    // - Its Value is never used as a call/callindirect argument
+    // - Its Value is never stored as a value (only used as ptr in load/store/gep/memcpy)
+    // - Its Value is never used in inline asm inputs
+    // - Its Value is never returned or used in terminators
+    // - No GEP derived from it has any of the above escape conditions
+    //
+    // A non-escaping alloca is "single-block" if all uses of it (and all GEPs
+    // derived from it) are in the same basic block.
+    let coalescable_allocas: CoalescableAllocas = if coalesce {
+        compute_coalescable_allocas(func, &dead_param_allocas, &func.param_alloca_values)
+    } else {
+        CoalescableAllocas { single_block: FxHashMap::default(), dead: FxHashSet::default() }
+    };
+
+    // ── Copy coalescing ──────────────────────────────────────────────
+    // When we see `dest = Copy src_value`, dest and src can share the same
+    // stack slot if their live ranges don't interfere. This eliminates a
+    // separate slot allocation and makes the Copy a harmless self-move.
+    //
+    // Safety: we only coalesce when the Copy is the SOLE use of the source
+    // value. This guarantees the source is dead after the Copy, so sharing
+    // the slot cannot corrupt any other reader of the source. This avoids
+    // the "lost copy" problem in phi parallel copy groups (e.g., swap patterns).
+    let mut copy_alias: FxHashMap<u32, u32> = FxHashMap::default();
+    {
+        // Count uses of each value across all instructions (as operands).
+        let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                super::liveness::for_each_operand_in_instruction(inst, |op| {
+                    if let Operand::Value(v) = op {
+                        *use_count.entry(v.0).or_insert(0) += 1;
+                    }
+                });
+                super::liveness::for_each_value_use_in_instruction(inst, |v| {
+                    *use_count.entry(v.0).or_insert(0) += 1;
+                });
+            }
+            // Also count uses in terminators.
+            super::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
+                if let Operand::Value(v) = op {
+                    *use_count.entry(v.0).or_insert(0) += 1;
+                }
+            });
+        }
+
+        // Collect all Copy instructions where src is a Value (not a constant)
+        // and the Copy is the sole use of the source.
+        let mut raw_aliases: Vec<(u32, u32)> = Vec::new();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Copy { dest, src: Operand::Value(src_val) } = inst {
+                    let d = dest.0;
+                    let s = src_val.0;
+                    // Exclude values that cannot safely share a slot:
+                    // - multi-def values (defined in multiple blocks by phi elimination)
+                    // - register-assigned values (no stack slot)
+                    if multi_def_values.contains(&d) || multi_def_values.contains(&s) {
+                        continue;
+                    }
+                    if reg_assigned.contains(&d) || reg_assigned.contains(&s) {
+                        continue;
+                    }
+                    // Only coalesce if Copy is the sole use of the source.
+                    // This guarantees source is dead after Copy, preventing
+                    // the lost-copy problem in phi parallel copy groups.
+                    if use_count.get(&s).copied().unwrap_or(0) != 1 {
+                        continue;
+                    }
+                    raw_aliases.push((d, s));
+                }
+            }
+        }
+        // Build alias map with transitive resolution: follow chains to find root.
+        // E.g., if A copies B and B copies C, both A and B alias to C.
+        for (dest_id, src_id) in raw_aliases {
+            // Find root of src.
+            let mut root = src_id;
+            let mut depth = 0;
+            while let Some(&parent) = copy_alias.get(&root) {
+                root = parent;
+                depth += 1;
+                if depth > 100 { break; } // safety limit
+            }
+            // Don't alias to self.
+            if root != dest_id {
+                copy_alias.insert(dest_id, root);
+            }
+        }
+        // Remove aliases where the root is an alloca (alloca slots are special).
+        // We must check this after chain resolution since the root might be an alloca
+        // even if the direct src isn't.
+        let alloca_ids: FxHashSet<u32> = func.blocks.iter()
+            .flat_map(|b| b.instructions.iter())
+            .filter_map(|inst| {
+                if let Instruction::Alloca { dest, .. } = inst { Some(dest.0) } else { None }
+            })
+            .collect();
+        copy_alias.retain(|dest_id, root_id| {
+            !alloca_ids.contains(root_id) && !alloca_ids.contains(dest_id)
+        });
+    }
+
     let mut non_local_space = initial_offset;
     let mut deferred_slots: Vec<DeferredSlot> = Vec::new();
     let mut multi_block_values: Vec<MultiBlockValue> = Vec::new();
@@ -1036,9 +1499,41 @@ pub fn calculate_stack_space_common(
                     continue;
                 }
 
-                // Allocas always get permanent (non-coalesced) slots because they
-                // represent addressable memory accessed via derived GEP pointers
-                // that may span multiple basic blocks.
+                // Skip stack slot allocation for dead non-param allocas.
+                // These are allocas from inlined functions whose variables are
+                // never actually used. No code references them, so no slot needed.
+                if coalescable_allocas.dead.contains(&dest.0) {
+                    continue;
+                }
+
+                // Check if this alloca can be coalesced.
+                // Over-aligned allocas (> 16) are excluded because their
+                // alignment padding complicates coalescing.
+                if effective_align <= 16 {
+                    // Single-block allocas: use block-local coalescing (Tier 3).
+                    if let Some(&use_block) = coalescable_allocas.single_block.get(&dest.0) {
+                        let alloca_size = raw_size + extra as i64;
+                        let alloca_align = *align as i64;
+                        let bs = block_space.entry(use_block).or_insert(0);
+                        let before = *bs;
+                        let (_, new_space) = assign_slot(*bs, alloca_size, alloca_align);
+                        *bs = new_space;
+                        if new_space > max_block_local_space {
+                            max_block_local_space = new_space;
+                        }
+                        deferred_slots.push(DeferredSlot {
+                            dest_id: dest.0, size: alloca_size, align: alloca_align,
+                            block_offset: before,
+                        });
+                        continue;
+                    }
+                    // Multi-block non-escaping allocas get permanent slots.
+                    // Note: liveness-based interval packing using [min_block, max_block]
+                    // ranges is unsound because block index order does not correspond to
+                    // execution order in the presence of loops.
+                }
+
+                // Non-coalescable allocas get permanent slots.
                 let (slot, new_space) = assign_slot(non_local_space, raw_size + extra as i64, *align as i64);
                 state.value_locations.insert(dest.0, StackSlot(slot));
                 non_local_space = new_space;
@@ -1069,6 +1564,13 @@ pub fn calculate_stack_space_common(
                 // The instruction still executes (preserving side effects for
                 // calls), but the result simply isn't persisted to the stack.
                 if !used_values.contains(&dest.0) {
+                    continue;
+                }
+
+                // Skip slot allocation for copy-aliased values.
+                // These will get the same slot as their root after all slots are assigned.
+                // Don't alias i128/f128 values (16-byte slots) to avoid size mismatches.
+                if !is_i128 && !is_f128 && copy_alias.contains_key(&dest.0) {
                     continue;
                 }
 
@@ -1195,12 +1697,13 @@ pub fn calculate_stack_space_common(
         }
     }
 
+    // Pack multi-block non-escaping allocas using liveness-based interval packing.
     // Assign final offsets for deferred block-local values.
     // All deferred values share a pool starting at non_local_space.
     // Each value's final slot is computed by calling assign_slot with
     // the global base plus the value's block-local offset.
 
-    if !deferred_slots.is_empty() && max_block_local_space > 0 {
+    let total_space = if !deferred_slots.is_empty() && max_block_local_space > 0 {
         for ds in &deferred_slots {
             let (slot, _) = assign_slot(non_local_space + ds.block_offset, ds.size, ds.align);
             state.value_locations.insert(ds.dest_id, StackSlot(slot));
@@ -1208,7 +1711,22 @@ pub fn calculate_stack_space_common(
         non_local_space + max_block_local_space
     } else {
         non_local_space
+    };
+
+    // ── Copy alias resolution ──────────────────────────────────────────
+    // Propagate stack slots from root values to their copy aliases.
+    // Each aliased value gets the same StackSlot as its root, eliminating
+    // a separate slot allocation and making the Copy a harmless self-move.
+    for (&dest_id, &root_id) in &copy_alias {
+        if let Some(&slot) = state.value_locations.get(&root_id) {
+            state.value_locations.insert(dest_id, slot);
+        }
+        // If root has no slot (e.g., it was optimized away or reg-assigned),
+        // the aliased value also gets no slot. The Copy will still work via
+        // the accumulator path since operand_to_rax handles missing slots.
     }
+
+    total_space
 }
 
 /// Find the nth alloca instruction in the entry block (used for parameter storage).

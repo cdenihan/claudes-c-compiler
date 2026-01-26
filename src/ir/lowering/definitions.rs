@@ -46,6 +46,10 @@ pub(super) struct VarInfo {
     /// E.g., `extern struct pcpu_hot __seg_gs const_pcpu_hot` has SegGs.
     /// Used to emit %gs:/%fs: segment prefixes on member access loads/stores.
     pub address_space: AddressSpace,
+    /// Explicit alignment from _Alignas or __attribute__((aligned(N))) on the
+    /// variable declaration. When set, _Alignof(var) returns this value (or the
+    /// natural type alignment, whichever is larger) per C11 6.2.8p3.
+    pub explicit_alignment: Option<usize>,
 }
 
 /// Information about a local variable stored in an alloca.
@@ -306,6 +310,7 @@ impl VarInfo {
             c_type: da.c_type.clone(),
             is_ptr_to_func_ptr: da.is_ptr_to_func_ptr,
             address_space: AddressSpace::Default,
+            explicit_alignment: None,
         }
     }
 }

@@ -247,8 +247,20 @@ impl<'a> SemaConstEval<'a> {
                 Some(IrConst::I64(align as i64))
             }
 
-            // __alignof__(expr) - GCC extension: alignment of expression's type
+            // __alignof__(expr) - GCC extension: alignment of expression's type.
+            // Per C11 6.2.8p3, if the expression names a variable declared with
+            // _Alignas or __attribute__((aligned(N))), the result reflects the
+            // declared alignment (max of natural and explicit).
             Expr::AlignofExpr(ref inner_expr, _) => {
+                // Check for explicit alignment on a variable identifier
+                if let Expr::Identifier(name, _) = inner_expr.as_ref() {
+                    if let Some(sym) = self.symbols.lookup(name) {
+                        if let Some(explicit_align) = sym.explicit_alignment {
+                            let natural = sym.ty.align_ctx(&self.types.struct_layouts);
+                            return Some(IrConst::I64(natural.max(explicit_align) as i64));
+                        }
+                    }
+                }
                 let ctype = self.infer_expr_ctype(inner_expr)?;
                 let align = ctype.align_ctx(&self.types.struct_layouts);
                 Some(IrConst::I64(align as i64))

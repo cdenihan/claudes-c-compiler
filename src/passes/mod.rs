@@ -198,97 +198,215 @@ pub fn run_passes(module: &mut IrModule, _opt_level: u32) {
     eliminate_dead_static_functions(module);
 }
 
-/// Remove internal-linkage (static) functions that have no callers in the module.
+/// Remove internal-linkage (static) functions and globals that are unreachable.
 ///
 /// After optimization passes eliminate dead code paths, some static inline functions
-/// from headers may no longer be called. Keeping them would waste code size and may
-/// cause linker errors if they reference symbols that don't exist (because the
-/// calling path was dead code that GCC would have inlined away).
+/// and static const globals from headers may no longer be referenced. Keeping them
+/// would waste code size and may cause linker errors if they reference symbols that
+/// don't exist in this translation unit.
+///
+/// Uses reachability analysis from roots (non-static symbols) to find all live symbols,
+/// then removes unreachable static functions and globals.
 fn eliminate_dead_static_functions(module: &mut IrModule) {
-    // Collect all function names referenced from any function body or global initializer.
-    let mut referenced: FxHashSet<String> = FxHashSet::default();
+    // Build a map of symbol -> references for reachability analysis.
+    // We need to do a proper reachability walk because:
+    // - An unused static global may reference a static function (via function pointer init)
+    // - Removing that global should also allow removing the function
+    // - Simply collecting all references from all globals/functions over-approximates
 
+    // First, collect references per function
+    let mut func_refs: FxHashMap<String, Vec<String>> = FxHashMap::default();
     for func in &module.functions {
         if func.is_declaration {
             continue;
         }
+        let mut refs = Vec::new();
         for block in &func.blocks {
             for inst in &block.instructions {
                 match inst {
                     Instruction::Call { func: callee, .. } => {
-                        referenced.insert(callee.clone());
+                        refs.push(callee.clone());
                     }
                     Instruction::GlobalAddr { name, .. } => {
-                        // Function pointer taken
-                        referenced.insert(name.clone());
+                        refs.push(name.clone());
                     }
-                    Instruction::InlineAsm { .. } => {
-                        // Inline asm may reference symbols we can't analyze,
-                        // but function references in inline asm use GlobalAddr
+                    Instruction::InlineAsm { input_symbols, .. } => {
+                        // Inline asm input_symbols reference globals/functions
+                        for sym in input_symbols {
+                            if let Some(s) = sym {
+                                // The symbol may be "name+offset", extract just the name
+                                let base = s.split('+').next().unwrap_or(s);
+                                refs.push(base.to_string());
+                            }
+                        }
                     }
                     _ => {}
                 }
             }
         }
+        func_refs.insert(func.name.clone(), refs);
     }
 
-    // Also check global initializers for function references
+    // Collect references per global (from initializers)
+    let mut global_refs: FxHashMap<String, Vec<String>> = FxHashMap::default();
     for global in &module.globals {
-        collect_global_init_refs(&global.init, &mut referenced);
+        let mut refs = Vec::new();
+        collect_global_init_refs_vec(&global.init, &mut refs);
+        global_refs.insert(global.name.clone(), refs);
     }
 
-    // Also check aliases (alias targets must be kept)
+    // Identify root symbols (always reachable):
+    // - Non-static functions (external linkage, callable from other TUs)
+    // - Non-static globals (external linkage, visible to other TUs)
+    // - Alias targets
+    // - Constructors and destructors
+    let mut reachable: FxHashSet<String> = FxHashSet::default();
+    let mut worklist: Vec<String> = Vec::new();
+
+    for func in &module.functions {
+        if func.is_declaration {
+            continue;
+        }
+        if !func.is_static {
+            reachable.insert(func.name.clone());
+            worklist.push(func.name.clone());
+        }
+    }
+
+    for global in &module.globals {
+        if global.is_extern {
+            continue;
+        }
+        if !global.is_static || global.is_common {
+            reachable.insert(global.name.clone());
+            worklist.push(global.name.clone());
+        }
+    }
+
     for (_, target, _) in &module.aliases {
-        referenced.insert(target.clone());
+        if reachable.insert(target.clone()) {
+            worklist.push(target.clone());
+        }
+    }
+    // Alias names themselves are roots (they have external linkage)
+    for (alias_name, _, _) in &module.aliases {
+        if reachable.insert(alias_name.clone()) {
+            worklist.push(alias_name.clone());
+        }
     }
 
-    // Also check constructors and destructors
     for ctor in &module.constructors {
-        referenced.insert(ctor.clone());
+        if reachable.insert(ctor.clone()) {
+            worklist.push(ctor.clone());
+        }
     }
     for dtor in &module.destructors {
-        referenced.insert(dtor.clone());
+        if reachable.insert(dtor.clone()) {
+            worklist.push(dtor.clone());
+        }
     }
 
-    // Remove static (internal linkage) functions that are unreferenced.
-    // Non-static functions must be kept because they have external linkage
-    // and may be called from other translation units.
+    // If there's toplevel asm, scan for potential symbol references.
+    // Top-level asm may reference symbols by name, so we conservatively mark
+    // any static symbol whose name appears in the asm strings as reachable.
+    // Non-static symbols are already roots and don't need this treatment.
+    if !module.toplevel_asm.is_empty() {
+        // Collect all static symbol names for lookup
+        let mut static_names: FxHashSet<String> = FxHashSet::default();
+        for func in &module.functions {
+            if func.is_static && !func.is_declaration {
+                static_names.insert(func.name.clone());
+            }
+        }
+        for global in &module.globals {
+            if global.is_static && !global.is_extern {
+                static_names.insert(global.name.clone());
+            }
+        }
+        // Check each asm string for references to static symbols
+        for asm_str in &module.toplevel_asm {
+            for name in &static_names {
+                if asm_str.contains(name.as_str()) {
+                    if reachable.insert(name.clone()) {
+                        worklist.push(name.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // BFS/worklist reachability: walk from roots following references
+    while let Some(sym) = worklist.pop() {
+        // If this symbol is a function, add its references
+        if let Some(refs) = func_refs.get(&sym) {
+            for r in refs {
+                if reachable.insert(r.clone()) {
+                    worklist.push(r.clone());
+                }
+            }
+        }
+        // If this symbol is a global, add its initializer references
+        if let Some(refs) = global_refs.get(&sym) {
+            for r in refs {
+                if reachable.insert(r.clone()) {
+                    worklist.push(r.clone());
+                }
+            }
+        }
+    }
+
+    // Remove unreachable static functions
     module.functions.retain(|func| {
-        // Keep declarations (extern prototypes)
         if func.is_declaration {
             return true;
         }
-        // Keep non-static functions (external linkage)
         if !func.is_static {
             return true;
         }
-        // Keep referenced static functions
-        if referenced.contains(&func.name) {
-            return true;
-        }
-        // This is an unreferenced static function - remove it
-        false
+        reachable.contains(&func.name)
     });
 
-    // Filter symbol_attrs to only include symbols that are actually referenced
+    // Remove unreachable static globals
+    module.globals.retain(|global| {
+        // Keep extern declarations
+        if global.is_extern {
+            return true;
+        }
+        // Keep non-static globals (external linkage)
+        if !global.is_static {
+            return true;
+        }
+        // Keep common globals (linker-merged)
+        if global.is_common {
+            return true;
+        }
+        // Keep reachable static globals
+        reachable.contains(&global.name)
+    });
+
+    // Filter symbol_attrs to only include symbols that are actually reachable
     // by the emitted code. Without this, unused extern declarations (e.g. from
     // headers) with visibility attributes (e.g. from #pragma GCC visibility
     // push(hidden)) generate .hidden directives that create undefined hidden
     // symbol entries in the object file, causing linker errors.
     module.symbol_attrs.retain(|(name, _, _)| {
-        referenced.contains(name)
+        reachable.contains(name)
     });
 }
 
-/// Collect function name references from a global initializer.
-fn collect_global_init_refs(init: &GlobalInit, refs: &mut FxHashSet<String>) {
+/// Collect symbol references from a global initializer into a Vec.
+fn collect_global_init_refs_vec(init: &GlobalInit, refs: &mut Vec<String>) {
     match init {
         GlobalInit::GlobalAddr(name) | GlobalInit::GlobalAddrOffset(name, _) => {
-            refs.insert(name.clone());
+            refs.push(name.clone());
+        }
+        GlobalInit::GlobalLabelDiff(label1, label2, _) => {
+            refs.push(label1.clone());
+            refs.push(label2.clone());
         }
         GlobalInit::Compound(fields) => {
             for field in fields {
-                collect_global_init_refs(field, refs);
+                collect_global_init_refs_vec(field, refs);
             }
         }
         _ => {}

@@ -52,8 +52,11 @@ fn propagate_copies(func: &mut IrFunction) -> usize {
 /// Build a flat lookup table from Copy destinations to their ultimate sources.
 /// Follows chains: if %a = Copy %b and %b = Copy %c, resolves %a -> %c.
 fn build_copy_map(func: &IrFunction, max_id: usize) -> Vec<Option<Operand>> {
-    // First pass: collect direct copy relationships into flat table
+    // First pass: collect direct copy relationships into flat table.
+    // If a Value has multiple Copy definitions (e.g. from single-phi elimination),
+    // we skip it to avoid propagating the wrong source.
     let mut direct: Vec<Option<Operand>> = vec![None; max_id + 1];
+    let mut multi_def: Vec<bool> = vec![false; max_id + 1];
     let mut has_copies = false;
 
     for block in &func.blocks {
@@ -61,10 +64,21 @@ fn build_copy_map(func: &IrFunction, max_id: usize) -> Vec<Option<Operand>> {
             if let Instruction::Copy { dest, src } = inst {
                 let id = dest.0 as usize;
                 if id < direct.len() {
-                    direct[id] = Some(*src);
-                    has_copies = true;
+                    if direct[id].is_some() {
+                        multi_def[id] = true;
+                    } else {
+                        direct[id] = Some(*src);
+                        has_copies = true;
+                    }
                 }
             }
+        }
+    }
+
+    // Clear multi-def entries - not safe to propagate
+    for i in 0..=max_id {
+        if multi_def[i] {
+            direct[i] = None;
         }
     }
 

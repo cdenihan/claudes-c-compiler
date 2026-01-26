@@ -664,6 +664,13 @@ impl Driver {
         eliminate_phis(&mut module);
         if time_phases { eprintln!("[TIME] phi elimination: {:.3}s", t7.elapsed().as_secs_f64()); }
 
+        // Note: we intentionally do NOT run copy_prop after phi elimination.
+        // The IR is no longer in SSA form at this point - Copy instructions from
+        // phi elimination represent moves at specific program points. Propagating
+        // through them can change semantics (reading a value before it's defined
+        // in the current iteration of a loop). Stack size reduction is handled
+        // by copy coalescing in codegen instead.
+
         // Generate assembly using target-specific codegen
         let t8 = std::time::Instant::now();
         let opts = crate::backend::CodegenOptions {

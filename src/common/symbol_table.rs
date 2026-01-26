@@ -20,6 +20,9 @@ pub struct Symbol {
     pub storage_class: StorageClass,
     pub span: Span,
     pub is_defined: bool,
+    /// Explicit alignment from _Alignas or __attribute__((aligned(N))).
+    /// Used by _Alignof(var) to return the correct alignment per C11 6.2.8p3.
+    pub explicit_alignment: Option<usize>,
 }
 
 /// A scope in the symbol table.

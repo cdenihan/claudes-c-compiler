@@ -1036,7 +1036,28 @@ impl Lowerer {
 
     /// Compute alignof for an expression by inferring its type and returning
     /// the type's alignment. This implements GCC's __alignof__(expr) semantics.
+    ///
+    /// Per C11 6.2.8p3, if the expression names a variable declared with
+    /// _Alignas or __attribute__((aligned(N))), the result reflects that
+    /// explicit alignment (taking the max of the natural alignment and the
+    /// declared alignment).
     pub(super) fn alignof_expr(&self, expr: &Expr) -> usize {
+        // Check if the expression is a variable with an explicit alignment override.
+        // _Alignof on an identifier should return the variable's declared alignment,
+        // not just its natural type alignment.
+        if let Expr::Identifier(name, _) = expr {
+            if let Some(vi) = self.lookup_var_info(name) {
+                if let Some(explicit_align) = vi.explicit_alignment {
+                    // Return max of natural type alignment and explicit alignment
+                    let natural = if let Some(ref ctype) = vi.c_type {
+                        self.ctype_align(ctype)
+                    } else {
+                        vi.ty.align()
+                    };
+                    return natural.max(explicit_align);
+                }
+            }
+        }
         // Try to get the CType of the expression for accurate alignment
         if let Some(ctype) = self.get_expr_ctype(expr) {
             return self.ctype_align(&ctype);

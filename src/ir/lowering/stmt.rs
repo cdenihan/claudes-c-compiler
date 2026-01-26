@@ -194,6 +194,23 @@ impl Lowerer {
                 None
             };
 
+            // Compute explicit alignment from _Alignas / __attribute__((aligned(N)))
+            // once, used both for alloca emission and for _Alignof(var) per C11 6.2.8p3.
+            let explicit_align = {
+                let mut ea = if let Some(ref alignas_ts) = decl.alignas_type {
+                    self.alignof_type(alignas_ts)
+                } else {
+                    decl.alignment.unwrap_or(0)
+                };
+                if let Some(ref sizeof_ts) = decl.alignment_sizeof_type {
+                    ea = ea.max(self.sizeof_type(sizeof_ts));
+                }
+                if let Some(&td_align) = self.typedef_alignment_for_type_spec(&decl.type_spec) {
+                    ea = ea.max(td_align);
+                }
+                ea
+            };
+
             let alloca;
             if let Some(vla_size_val) = vla_size {
                 // VLA: allocate dynamically on the stack using DynAlloca.
@@ -217,46 +234,17 @@ impl Lowerer {
                         self.func_mut().scope_stack.last_mut().unwrap().scope_stack_save = Some(scope_save);
                     }
                 }
-                // Resolve _Alignas alignment for VLAs: prefer the lowerer's resolved
-                // type alignment over the parser's pre-computed numeric alignment.
-                let align = {
-                    let mut a = if let Some(ref alignas_ts) = decl.alignas_type {
-                        self.alignof_type(alignas_ts)
-                    } else {
-                        decl.alignment.unwrap_or(16)
-                    };
-                    if let Some(ref sizeof_ts) = decl.alignment_sizeof_type {
-                        a = a.max(self.sizeof_type(sizeof_ts));
-                    }
-                    if let Some(&td_align) = self.typedef_alignment_for_type_spec(&decl.type_spec) {
-                        a = a.max(td_align);
-                    }
-                    a.max(16)
-                };
+                // Use the explicit alignment (with a minimum of 16 for VLAs).
+                let vla_align = explicit_align.max(16);
                 self.emit(Instruction::DynAlloca {
                     dest: alloca,
                     size: Operand::Value(vla_size_val),
-                    align,
+                    align: vla_align,
                 });
             } else {
                 // Hoist static-size allocas to the entry block so that variables
                 // whose declarations are skipped by `goto` still have valid
                 // stack slots at runtime.
-                // Resolve _Alignas alignment: prefer the lowerer's resolved type alignment
-                // over the parser's pre-computed numeric alignment (which can't resolve typedefs).
-                let mut explicit_align = if let Some(ref alignas_ts) = decl.alignas_type {
-                    self.alignof_type(alignas_ts)
-                } else {
-                    decl.alignment.unwrap_or(0)
-                };
-                // Recompute sizeof for aligned(sizeof(type)) with full layout info
-                if let Some(ref sizeof_ts) = decl.alignment_sizeof_type {
-                    explicit_align = explicit_align.max(self.sizeof_type(sizeof_ts));
-                }
-                // Also incorporate alignment from typedef (e.g., typedef int aligned_int __aligned__(16))
-                if let Some(&td_align) = self.typedef_alignment_for_type_spec(&decl.type_spec) {
-                    explicit_align = explicit_align.max(td_align);
-                }
                 alloca = self.emit_entry_alloca(
                     if da.is_array || da.is_struct || is_complex { IrType::Ptr } else { da.var_ty },
                     da.actual_alloc_size,
@@ -266,6 +254,11 @@ impl Lowerer {
             }
             let mut local_info = LocalInfo::from_analysis(&da, alloca, decl.is_const);
             local_info.var.address_space = decl.address_space;
+            // Store explicit alignment so _Alignof(var) returns the correct
+            // alignment per C11 6.2.8p3.
+            if explicit_align > 0 {
+                local_info.var.explicit_alignment = Some(explicit_align);
+            }
             local_info.vla_size = vla_size;
             // For local VLAs with multiple dimensions, compute runtime strides
             // so that subscript operations use the correct element sizes.
@@ -402,11 +395,19 @@ impl Lowerer {
         });
 
         // Track as a global for access via GlobalAddr
-        self.globals.insert(static_name.clone(), GlobalInfo::from_analysis(da));
+        let mut ginfo = GlobalInfo::from_analysis(da);
+        if let Some(ea) = explicit_align {
+            ginfo.var.explicit_alignment = Some(ea);
+        }
+        self.globals.insert(static_name.clone(), ginfo);
 
         // Store type info in locals (with static_global_name set so each use site
         // emits a fresh GlobalAddr in its own basic block, avoiding unreachable-block issues).
-        self.insert_local_scoped(declarator.name.clone(), LocalInfo::for_static(da, static_name, decl.is_const));
+        let mut local_info = LocalInfo::for_static(da, static_name, decl.is_const);
+        if let Some(ea) = explicit_align {
+            local_info.var.explicit_alignment = Some(ea);
+        }
+        self.insert_local_scoped(declarator.name.clone(), local_info);
         self.next_static_local += 1;
 
         // Track function pointer return and param types for static locals too,

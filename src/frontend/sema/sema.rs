@@ -187,6 +187,7 @@ impl SemanticAnalyzer {
             storage_class,
             span: func.span,
             is_defined: true,
+            explicit_alignment: None,
         });
 
         // Push scope for function body (both symbol table and type context,
@@ -204,6 +205,7 @@ impl SemanticAnalyzer {
                     storage_class: StorageClass::Auto,
                     span: param.span,
                     is_defined: true,
+                    explicit_alignment: None,
                 });
             }
         }
@@ -362,12 +364,24 @@ impl SemanticAnalyzer {
                     .or_insert(func_info);
             }
 
+            // Resolve explicit alignment from _Alignas or __attribute__((aligned(N))).
+            // For _Alignas(type), resolve the type alignment via sema's type resolution.
+            // For _Alignas(N) or __attribute__((aligned(N))), use the parsed numeric value.
+            let explicit_alignment = if let Some(ref alignas_ts) = decl.alignas_type {
+                let ct = self.type_spec_to_ctype(alignas_ts);
+                let a = ct.align_ctx(&self.result.type_context.struct_layouts);
+                if a > 0 { Some(a) } else { None }
+            } else {
+                decl.alignment
+            };
+
             self.symbol_table.declare(Symbol {
                 name: init_decl.name.clone(),
                 ty: full_type,
                 storage_class: storage,
                 span: init_decl.span,
                 is_defined: init_decl.init.is_some(),
+                explicit_alignment,
             });
 
             // Analyze initializer expressions
@@ -574,6 +588,7 @@ impl SemanticAnalyzer {
                 storage_class: StorageClass::Auto, // enum constants are like const int
                 span: Span::dummy(),
                 is_defined: true,
+                explicit_alignment: None,
             });
             self.enum_counter += 1;
         }
