@@ -323,7 +323,11 @@ fn all_operand_values(inst: &Instruction) -> Vec<u32> {
         }
         Instruction::AtomicLoad { ptr, .. } => collect(ptr, &mut vals),
         Instruction::AtomicStore { ptr, val, .. } => { collect(ptr, &mut vals); collect(val, &mut vals); }
-        Instruction::InlineAsm { inputs, .. } => {
+        Instruction::InlineAsm { outputs, inputs, .. } => {
+            // Output pointers are alloca Values that the backend stores asm results into.
+            // They must be tracked as address-taken to prevent LICM from hoisting loads
+            // of those allocas out of loops containing inline asm.
+            for (_, ptr, _) in outputs { vals.push(ptr.0); }
             for (_, op, _) in inputs { collect(op, &mut vals); }
         }
         Instruction::Intrinsic { args, .. } => { for a in args { collect(a, &mut vals); } }
@@ -456,6 +460,14 @@ fn analyze_loop_memory(
                 }
                 Instruction::Memcpy { dest, .. } => {
                     stored_allocas.insert(dest.0);
+                }
+                // InlineAsm output operands are pointers (allocas) that the backend
+                // stores results into. Track them as stores to prevent LICM from
+                // hoisting loads of those allocas out of loops with inline asm.
+                Instruction::InlineAsm { outputs, .. } => {
+                    for (_, ptr, _) in outputs {
+                        stored_allocas.insert(ptr.0);
+                    }
                 }
                 _ => {}
             }
@@ -1107,5 +1119,107 @@ mod tests {
 
         // Nothing should be hoisted because the alloca is stored to in the loop
         assert_eq!(hoisted, 0);
+    }
+
+    #[test]
+    fn test_licm_does_not_hoist_load_from_inline_asm_output_alloca() {
+        // Test: load from an alloca that is written by InlineAsm in the loop
+        // should NOT be hoisted. This is the pattern from CAS loops like:
+        //   do { asm("cmpxchg8b" : "=r"(succeeded) : ...); } while (!succeeded);
+        //
+        // entry:
+        //   %0 = alloca i32       (succeeded alloca)
+        //   br loop_header
+        //
+        // loop_header (body):
+        //   inline_asm outputs=[%0]  (writes to succeeded alloca)
+        //   br cond_block
+        //
+        // cond_block:
+        //   %1 = load %0          (load succeeded - must NOT be hoisted)
+        //   %2 = cmp eq %1, 0     (check !succeeded)
+        //   br %2, loop_header, exit
+        //
+        // exit:
+        //   ret 0
+        let mut func = IrFunction::new("test_asm_output".to_string(), IrType::I32, vec![], false);
+
+        // Block 0 (entry): alloca for succeeded
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 4,
+                    volatile: false,
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+        });
+
+        // Block 1 (loop body): inline asm that writes to the alloca
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::InlineAsm {
+                    template: "nop".to_string(),
+                    outputs: vec![("=r".to_string(), Value(0), None)],
+                    inputs: vec![],
+                    clobbers: vec![],
+                    operand_types: vec![IrType::I32],
+                    goto_labels: vec![],
+                    input_symbols: vec![],
+                    seg_overrides: vec![AddressSpace::Default],
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(2)),
+        });
+
+        // Block 2 (cond): load succeeded, check if zero, branch back or exit
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                Instruction::Load { dest: Value(1), ptr: Value(0), ty: IrType::I32,
+                seg_override: AddressSpace::Default },
+                Instruction::Cmp {
+                    dest: Value(2),
+                    op: IrCmpOp::Eq,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(0)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(2)),
+                true_label: BlockId(1),  // loop back
+                false_label: BlockId(3), // exit
+            },
+        });
+
+        // Block 3 (exit)
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+        });
+
+        func.next_value_id = 3;
+
+        let alloca_info = analyze_allocas(&func);
+        let label_to_idx = analysis::build_label_map(&func);
+        let (preds, succs) = analysis::build_cfg(&func, &label_to_idx);
+        let idom = analysis::compute_dominators(func.blocks.len(), &preds, &succs);
+        let loops = find_natural_loops(func.blocks.len(), &preds, &succs, &idom);
+
+        assert_eq!(loops.len(), 1);
+        let hoisted = hoist_loop_invariants(&mut func, &loops[0], &preds, &alloca_info);
+
+        // Nothing should be hoisted: the alloca is written by inline asm in the loop
+        assert_eq!(hoisted, 0);
+
+        // The cond block should still have its load + cmp
+        assert_eq!(func.blocks[2].instructions.len(), 2);
     }
 }
