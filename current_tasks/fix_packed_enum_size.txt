@@ -1,0 +1,12 @@
+Fix __attribute__((packed)) on enum declarations
+
+The compiler ignores __packed__ on enum type declarations, always sizing
+enums as 4 bytes (int). GCC/Clang packed enums use the smallest integer
+type that fits all variant values (e.g., 1 byte for values 0-5).
+
+This causes struct layout mismatches for any struct containing a packed
+enum field (e.g., Linux kernel's struct inode with enum rw_hint), leading
+to kernel boot failures.
+
+Fix touches: parser, AST, EnumType, CType size/align/IR, type builder
+trait, sema resolve_enum, lowering resolve_enum, const_eval sizeof/alignof.
