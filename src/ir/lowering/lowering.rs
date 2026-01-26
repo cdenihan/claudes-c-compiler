@@ -250,6 +250,7 @@ impl Lowerer {
                 is_variadic: false,
                 num_fixed_args: 1,
                 struct_arg_sizes: vec![None],
+                struct_arg_classes: Vec::new(),
             });
         }
     }
@@ -649,6 +650,19 @@ impl Lowerer {
             }
         }).collect();
 
+        // Compute per-eightbyte SysV ABI classification for struct params
+        let param_struct_classes: Vec<Vec<crate::common::types::EightbyteClass>> = params.iter().enumerate().map(|(i, p)| {
+            if param_struct_sizes.get(i).copied().flatten().is_some() {
+                if let Some(layout) = self.get_struct_layout_for_type(&p.type_spec) {
+                    layout.classify_sysv_eightbytes(&self.types)
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            }
+        }).collect();
+
         let sig = if !variadic || !param_tys.is_empty() {
             FuncSig {
                 return_type: ret_ty,
@@ -660,6 +674,7 @@ impl Lowerer {
                 sret_size,
                 two_reg_ret_size,
                 param_struct_sizes,
+                param_struct_classes,
             }
         } else {
             FuncSig {
@@ -672,6 +687,7 @@ impl Lowerer {
                 sret_size,
                 two_reg_ret_size,
                 param_struct_sizes: Vec::new(),
+                param_struct_classes: Vec::new(),
             }
         };
         self.func_meta.sigs.insert(name.to_string(), sig);
@@ -900,7 +916,7 @@ impl Lowerer {
         // Check if function returns a large struct via sret
         if let Some(sig) = self.func_meta.sigs.get(&func.name) {
             if let Some(sret_size) = sig.sret_size {
-                params.push(IrParam { name: String::new(), ty: IrType::Ptr, struct_size: None });
+                params.push(IrParam { name: String::new(), ty: IrType::Ptr, struct_size: None, struct_eightbyte_classes: Vec::new() });
                 uses_sret = true;
                 let _ = sret_size; // used for alloca sizing in allocate_function_params
             }
@@ -920,7 +936,7 @@ impl Lowerer {
                 } else if matches!(param_ctype, CType::ComplexFloat) && self.uses_packed_complex_float() {
                     // x86-64: _Complex float packed into single F64
                     let ir_idx = params.len();
-                    params.push(IrParam { name: param_name, ty: IrType::F64, struct_size: None });
+                    params.push(IrParam { name: param_name, ty: IrType::F64, struct_size: None, struct_eightbyte_classes: Vec::new() });
                     param_kinds.push(ParamKind::ComplexFloatPacked(ir_idx));
                     continue;
                 } else {
@@ -928,9 +944,9 @@ impl Lowerer {
                     // ComplexLongDouble on ARM64 only)
                     let comp_ty = Self::complex_component_ir_type(&param_ctype);
                     let real_idx = params.len();
-                    params.push(IrParam { name: format!("{}.real", param_name), ty: comp_ty, struct_size: None });
+                    params.push(IrParam { name: format!("{}.real", param_name), ty: comp_ty, struct_size: None, struct_eightbyte_classes: Vec::new() });
                     let imag_idx = params.len();
-                    params.push(IrParam { name: format!("{}.imag", param_name), ty: comp_ty, struct_size: None });
+                    params.push(IrParam { name: format!("{}.imag", param_name), ty: comp_ty, struct_size: None, struct_eightbyte_classes: Vec::new() });
                     param_kinds.push(ParamKind::ComplexDecomposed(real_idx, imag_idx));
                     continue;
                 }
@@ -949,7 +965,17 @@ impl Lowerer {
                 } else {
                     Some(self.sizeof_type(&param.type_spec))
                 };
-                params.push(IrParam { name: param_name, ty: IrType::Ptr, struct_size });
+                // Compute per-eightbyte SysV ABI classification for x86-64 struct params
+                let struct_eightbyte_classes = if struct_size.is_some() {
+                    if let Some(layout) = self.get_struct_layout_for_type(&param.type_spec) {
+                        layout.classify_sysv_eightbytes(&self.types)
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                };
+                params.push(IrParam { name: param_name, ty: IrType::Ptr, struct_size, struct_eightbyte_classes });
                 param_kinds.push(ParamKind::Struct(ir_idx));
                 continue;
             }
@@ -965,7 +991,7 @@ impl Lowerer {
                     other => other,
                 };
             }
-            params.push(IrParam { name: param_name, ty, struct_size: None });
+            params.push(IrParam { name: param_name, ty, struct_size: None, struct_eightbyte_classes: Vec::new() });
             param_kinds.push(ParamKind::Normal(ir_idx));
         }
 

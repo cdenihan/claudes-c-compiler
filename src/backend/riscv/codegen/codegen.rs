@@ -1641,9 +1641,10 @@ impl ArchCodegen for RiscvCodegen {
                         self.emit_store_to_s0("t0", dst_off, "sd");
                     }
                 }
-                // F128 in FP reg doesn't happen on RISC-V. By-ref structs don't happen on RISC-V.
+                // F128 in FP reg doesn't happen on RISC-V. By-ref structs and SysV SSE-class structs don't happen on RISC-V.
                 ParamClass::F128FpReg { .. } |
-                ParamClass::LargeStructByRefReg { .. } | ParamClass::LargeStructByRefStack { .. } => {}
+                ParamClass::LargeStructByRefReg { .. } | ParamClass::LargeStructByRefStack { .. } |
+                ParamClass::StructSseReg { .. } | ParamClass::StructMixedIntSseReg { .. } | ParamClass::StructMixedSseIntReg { .. } => {}
             }
         }
 
@@ -2342,6 +2343,7 @@ impl ArchCodegen for RiscvCodegen {
             f128_in_fp_regs: false, f128_in_gp_pairs: true,
             variadic_floats_in_gp: true,
             large_struct_by_ref: false, // RISC-V: large structs passed on stack by value
+            use_sysv_struct_classification: false, // RISC-V uses its own ABI, not SysV
         }
     }
 

@@ -197,6 +197,19 @@ impl Lowerer {
             }
         }).collect();
 
+        // Compute per-eightbyte SysV ABI classification for struct params
+        let param_struct_classes: Vec<Vec<crate::common::types::EightbyteClass>> = params.iter().enumerate().map(|(i, p)| {
+            if param_struct_sizes.get(i).copied().flatten().is_some() {
+                if let Some(layout) = self.get_struct_layout_for_type(&p.type_spec) {
+                    layout.classify_sysv_eightbytes(&self.types)
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            }
+        }).collect();
+
         let sig = if !variadic || !param_tys.is_empty() {
             FuncSig {
                 return_type: ret_ty,
@@ -208,6 +221,7 @@ impl Lowerer {
                 sret_size,
                 two_reg_ret_size,
                 param_struct_sizes,
+                param_struct_classes,
             }
         } else {
             FuncSig {
@@ -220,6 +234,7 @@ impl Lowerer {
                 sret_size,
                 two_reg_ret_size,
                 param_struct_sizes: Vec::new(),
+                param_struct_classes: Vec::new(),
             }
         };
         // Don't overwrite an existing, more complete sig from the first pass

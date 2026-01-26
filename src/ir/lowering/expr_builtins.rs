@@ -183,6 +183,7 @@ impl Lowerer {
                     dest: Some(dest), func: libc_name.clone(),
                     args: arg_vals, arg_types, return_type, is_variadic: variadic, num_fixed_args: n_fixed,
                     struct_arg_sizes,
+                    struct_arg_classes: Vec::new(),
                 });
                 Some(Operand::Value(dest))
             }
@@ -1079,6 +1080,7 @@ impl Lowerer {
             is_variadic: false,
             num_fixed_args: 1,
             struct_arg_sizes: vec![None],
+            struct_arg_classes: Vec::new(),
         });
         dest
     }

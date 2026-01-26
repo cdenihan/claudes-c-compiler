@@ -1882,6 +1882,23 @@ impl ArchCodegen for X86Codegen {
                         self.state.emit_fmt(format_args!("    movq %{}, {}(%rbp)", X86_ARG_REGS[base_reg_idx + 1], slot.0 + 8));
                     }
                 }
+                ParamClass::StructSseReg { lo_fp_idx, hi_fp_idx, .. } => {
+                    // SSE-class struct: eightbytes arrive in xmm registers
+                    self.state.emit_fmt(format_args!("    movq %{}, {}(%rbp)", xmm_regs[lo_fp_idx], slot.0));
+                    if let Some(hi) = hi_fp_idx {
+                        self.state.emit_fmt(format_args!("    movq %{}, {}(%rbp)", xmm_regs[hi], slot.0 + 8));
+                    }
+                }
+                ParamClass::StructMixedIntSseReg { int_reg_idx, fp_reg_idx, .. } => {
+                    // First eightbyte INTEGER, second SSE
+                    self.state.emit_fmt(format_args!("    movq %{}, {}(%rbp)", X86_ARG_REGS[int_reg_idx], slot.0));
+                    self.state.emit_fmt(format_args!("    movq %{}, {}(%rbp)", xmm_regs[fp_reg_idx], slot.0 + 8));
+                }
+                ParamClass::StructMixedSseIntReg { fp_reg_idx, int_reg_idx, .. } => {
+                    // First eightbyte SSE, second INTEGER
+                    self.state.emit_fmt(format_args!("    movq %{}, {}(%rbp)", xmm_regs[fp_reg_idx], slot.0));
+                    self.state.emit_fmt(format_args!("    movq %{}, {}(%rbp)", X86_ARG_REGS[int_reg_idx], slot.0 + 8));
+                }
                 ParamClass::F128AlwaysStack { offset } => {
                     // x86: F128 (long double) always passes on stack via x87.
                     // Load the 80-bit extended value from caller's stack and store
@@ -3352,6 +3369,7 @@ impl ArchCodegen for X86Codegen {
             f128_in_fp_regs: false, f128_in_gp_pairs: false,
             variadic_floats_in_gp: false,
             large_struct_by_ref: false, // x86-64 SysV: large structs passed on stack by value
+            use_sysv_struct_classification: true, // x86-64 SysV: per-eightbyte SSE/INTEGER classification
         }
     }
 
@@ -3499,6 +3517,30 @@ impl ArchCodegen for X86Codegen {
                         let hi_reg = X86_ARG_REGS[base_reg_idx + 1];
                         self.state.emit_fmt(format_args!("    movq 8(%rax), %{}", hi_reg));
                     }
+                }
+                CallArgClass::StructSseReg { lo_fp_idx, hi_fp_idx, .. } => {
+                    // SSE-class struct: load eightbytes into xmm registers
+                    self.operand_to_rax(arg);
+                    self.state.emit_fmt(format_args!("    movq (%rax), %{}", xmm_regs[lo_fp_idx]));
+                    float_count += 1;
+                    if let Some(hi) = hi_fp_idx {
+                        self.state.emit_fmt(format_args!("    movq 8(%rax), %{}", xmm_regs[hi]));
+                        float_count += 1;
+                    }
+                }
+                CallArgClass::StructMixedIntSseReg { int_reg_idx, fp_reg_idx, .. } => {
+                    // First eightbyte INTEGER, second SSE
+                    self.operand_to_rax(arg);
+                    self.state.emit_fmt(format_args!("    movq 8(%rax), %{}", xmm_regs[fp_reg_idx]));
+                    float_count += 1;
+                    self.state.emit_fmt(format_args!("    movq (%rax), %{}", X86_ARG_REGS[int_reg_idx]));
+                }
+                CallArgClass::StructMixedSseIntReg { fp_reg_idx, int_reg_idx, .. } => {
+                    // First eightbyte SSE, second INTEGER
+                    self.operand_to_rax(arg);
+                    self.state.emit_fmt(format_args!("    movq 8(%rax), %{}", X86_ARG_REGS[int_reg_idx]));
+                    self.state.emit_fmt(format_args!("    movq (%rax), %{}", xmm_regs[fp_reg_idx]));
+                    float_count += 1;
                 }
                 CallArgClass::FloatReg { reg_idx } => {
                     self.operand_to_rax(arg);

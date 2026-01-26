@@ -127,7 +127,7 @@ impl Lowerer {
         };
 
         // Lower arguments with implicit casts
-        let (mut arg_vals, mut arg_types, mut struct_arg_sizes) = self.lower_call_arguments(effective_func, args);
+        let (mut arg_vals, mut arg_types, mut struct_arg_sizes, mut struct_arg_classes) = self.lower_call_arguments(effective_func, args);
 
         // Detect variadic status early (needed for complex arg decomposition)
         let call_is_variadic = if let Expr::Identifier(name, _) = stripped_func {
@@ -153,6 +153,7 @@ impl Lowerer {
             arg_vals.insert(0, Operand::Value(alloca));
             arg_types.insert(0, IrType::Ptr);
             struct_arg_sizes.insert(0, None); // sret pointer is not a struct arg
+            struct_arg_classes.insert(0, Vec::new()); // sret pointer has no eightbyte classes
             Some(alloca)
         } else {
             None
@@ -191,7 +192,7 @@ impl Lowerer {
         };
 
         // Dispatch: direct call, function pointer call, or indirect call
-        let call_ret_ty = self.emit_call_instruction(effective_func, dest, arg_vals, arg_types, struct_arg_sizes, call_variadic, num_fixed_args, two_reg_size, sret_size);
+        let call_ret_ty = self.emit_call_instruction(effective_func, dest, arg_vals, arg_types, struct_arg_sizes, struct_arg_classes, call_variadic, num_fixed_args, two_reg_size, sret_size);
 
         // After call to noreturn function, emit unreachable and start dead block.
         // Unlike error_functions (which skip the call entirely), noreturn functions
@@ -311,7 +312,7 @@ impl Lowerer {
     /// and default argument promotions for variadic args.
     /// Returns (arg_vals, arg_types, struct_arg_sizes) where struct_arg_sizes[i] is
     /// Some(size) if the ith argument is a struct/union passed by value.
-    pub(super) fn lower_call_arguments(&mut self, func: &Expr, args: &[Expr]) -> (Vec<Operand>, Vec<IrType>, Vec<Option<usize>>) {
+    pub(super) fn lower_call_arguments(&mut self, func: &Expr, args: &[Expr]) -> (Vec<Operand>, Vec<IrType>, Vec<Option<usize>>, Vec<Vec<crate::common::types::EightbyteClass>>) {
         // Extract function name from direct calls, or the underlying variable name
         // from indirect calls through function pointers (e.g., (*afp)(args) -> "afp").
         let func_name = match func {
@@ -467,7 +468,20 @@ impl Lowerer {
             }).collect()
         };
 
-        (arg_vals, arg_types, struct_arg_sizes)
+        // Build struct_arg_classes: propagate per-eightbyte SysV ABI classification from FuncSig
+        let struct_arg_classes: Vec<Vec<crate::common::types::EightbyteClass>> = if let Some(ref classes) = func_name.and_then(|n| self.func_meta.sigs.get(n).map(|s| s.param_struct_classes.clone())) {
+            args.iter().enumerate().map(|(i, _a)| {
+                if i < classes.len() {
+                    classes[i].clone()
+                } else {
+                    Vec::new()
+                }
+            }).collect()
+        } else {
+            vec![Vec::new(); args.len()]
+        };
+
+        (arg_vals, arg_types, struct_arg_sizes, struct_arg_classes)
     }
 
     /// Emit the actual call instruction (direct, indirect via fptr, or general indirect).
@@ -479,6 +493,7 @@ impl Lowerer {
         arg_vals: Vec<Operand>,
         arg_types: Vec<IrType>,
         struct_arg_sizes: Vec<Option<usize>>,
+        struct_arg_classes: Vec<Vec<crate::common::types::EightbyteClass>>,
         is_variadic: bool,
         num_fixed_args: usize,
         two_reg_size: Option<usize>,
@@ -498,6 +513,7 @@ impl Lowerer {
                         dest: Some(dest), func_ptr: Operand::Value(func_ptr),
                         args: arg_vals, arg_types, return_type: indirect_ret_ty, is_variadic, num_fixed_args,
                         struct_arg_sizes,
+                        struct_arg_classes,
                     });
                     indirect_ret_ty
                 } else {
@@ -514,6 +530,7 @@ impl Lowerer {
                         dest: Some(dest), func: call_name,
                         args: arg_vals, arg_types, return_type: ret_ty, is_variadic, num_fixed_args,
                         struct_arg_sizes,
+                        struct_arg_classes,
                     });
                     ret_ty
                 }
@@ -527,6 +544,7 @@ impl Lowerer {
                 let is_noop_deref = self.is_function_pointer_deref(inner);
                 let n = arg_vals.len();
                 let sas = struct_arg_sizes;
+                let sac = struct_arg_classes;
                 let func_ptr = if is_noop_deref {
                     // No-op dereference: (*fp)() == fp()
                     self.lower_expr(inner)
@@ -538,17 +556,20 @@ impl Lowerer {
                     dest: Some(dest), func_ptr, args: arg_vals, arg_types,
                     return_type: indirect_ret_ty, is_variadic: false, num_fixed_args: n,
                     struct_arg_sizes: sas,
+                    struct_arg_classes: sac,
                 });
                 indirect_ret_ty
             }
             _ => {
                 let _n = arg_vals.len();
                 let sas = struct_arg_sizes;
+                let sac = struct_arg_classes;
                 let func_ptr = self.lower_expr(func);
                 self.emit(Instruction::CallIndirect {
                     dest: Some(dest), func_ptr, args: arg_vals, arg_types,
                     return_type: indirect_ret_ty, is_variadic, num_fixed_args,
                     struct_arg_sizes: sas,
+                    struct_arg_classes: sac,
                 });
                 indirect_ret_ty
             }

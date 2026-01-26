@@ -26,6 +26,32 @@ impl StructLayoutProvider for FxHashMap<String, RcLayout> {
     }
 }
 
+/// System V AMD64 ABI classification for a single 8-byte "eightbyte" of a struct.
+/// Used to determine whether a struct field group should be passed in GP or SSE registers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EightbyteClass {
+    /// No fields occupy this eightbyte yet (initial state during classification).
+    NoClass,
+    /// All fields in this eightbyte are float/double -> pass in xmm register.
+    Sse,
+    /// At least one non-float field in this eightbyte -> pass in GP register.
+    Integer,
+}
+
+impl EightbyteClass {
+    /// Merge two eightbyte classifications per SysV ABI rules:
+    /// - NoClass + X = X
+    /// - Integer + anything = Integer
+    /// - SSE + SSE = SSE
+    pub fn merge(self, other: EightbyteClass) -> EightbyteClass {
+        match (self, other) {
+            (EightbyteClass::NoClass, x) | (x, EightbyteClass::NoClass) => x,
+            (EightbyteClass::Integer, _) | (_, EightbyteClass::Integer) => EightbyteClass::Integer,
+            (EightbyteClass::Sse, EightbyteClass::Sse) => EightbyteClass::Sse,
+        }
+    }
+}
+
 /// Address space for pointer types (GCC named address space extension).
 /// Used for x86 segment-relative memory access (%gs: / %fs: prefix).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -544,6 +570,122 @@ impl StructLayout {
                 }
             }
             _ => false,
+        }
+    }
+
+    /// Classify each 8-byte "eightbyte" of this struct/union per the System V AMD64 ABI.
+    ///
+    /// Returns a vector with one entry per eightbyte (so 1 entry for size <= 8, 2 for size <= 16).
+    /// Each entry is `EightbyteClass::Sse` if all fields in that eightbyte are float/double,
+    /// or `EightbyteClass::Integer` otherwise.
+    ///
+    /// Structs > 16 bytes get MEMORY class (empty vec, meaning pass on stack).
+    /// Structs containing unaligned fields or bitfields spanning eightbyte boundaries
+    /// are conservatively classified as INTEGER.
+    pub fn classify_sysv_eightbytes(&self, ctx: &dyn StructLayoutProvider) -> Vec<EightbyteClass> {
+        // Structs > 16 bytes -> MEMORY class
+        if self.size > 16 || self.size == 0 {
+            return Vec::new();
+        }
+
+        let n_eightbytes = if self.size <= 8 { 1 } else { 2 };
+        // Start with NO_CLASS (uninitialized), then merge field classifications
+        let mut classes = vec![EightbyteClass::NoClass; n_eightbytes];
+
+        for field in &self.fields {
+            // Skip zero-width bitfields (padding only)
+            if field.bit_width == Some(0) {
+                continue;
+            }
+            // Bitfields complicate classification -- conservatively treat as INTEGER
+            if field.bit_width.is_some() {
+                let eb_idx = field.offset / 8;
+                if eb_idx < n_eightbytes {
+                    classes[eb_idx] = classes[eb_idx].merge(EightbyteClass::Integer);
+                }
+                continue;
+            }
+
+            Self::classify_field_type(&field.ty, field.offset, &mut classes, n_eightbytes, ctx);
+        }
+
+        // Replace any remaining NoClass with Integer (e.g., padding-only eightbytes)
+        for c in &mut classes {
+            if *c == EightbyteClass::NoClass {
+                *c = EightbyteClass::Integer;
+            }
+        }
+
+        classes
+    }
+
+    /// Recursively classify a field's type into the eightbyte slots it occupies.
+    fn classify_field_type(
+        ty: &CType,
+        base_offset: usize,
+        classes: &mut [EightbyteClass],
+        n_eightbytes: usize,
+        ctx: &dyn StructLayoutProvider,
+    ) {
+        match ty {
+            CType::Float => {
+                let eb_idx = base_offset / 8;
+                if eb_idx < n_eightbytes {
+                    classes[eb_idx] = classes[eb_idx].merge(EightbyteClass::Sse);
+                }
+            }
+            CType::Double => {
+                let eb_idx = base_offset / 8;
+                if eb_idx < n_eightbytes {
+                    classes[eb_idx] = classes[eb_idx].merge(EightbyteClass::Sse);
+                }
+            }
+            // Array: classify each element
+            CType::Array(elem_ty, Some(count)) => {
+                let elem_size = elem_ty.size();
+                if elem_size > 0 {
+                    for i in 0..*count {
+                        Self::classify_field_type(elem_ty, base_offset + i * elem_size, classes, n_eightbytes, ctx);
+                    }
+                }
+            }
+            // Nested struct/union: classify each of its fields
+            CType::Struct(key) | CType::Union(key) => {
+                if let Some(layout) = ctx.get_struct_layout(key) {
+                    for inner_field in &layout.fields {
+                        if inner_field.bit_width == Some(0) {
+                            continue;
+                        }
+                        if inner_field.bit_width.is_some() {
+                            let eb_idx = (base_offset + inner_field.offset) / 8;
+                            if eb_idx < n_eightbytes {
+                                classes[eb_idx] = classes[eb_idx].merge(EightbyteClass::Integer);
+                            }
+                            continue;
+                        }
+                        Self::classify_field_type(
+                            &inner_field.ty,
+                            base_offset + inner_field.offset,
+                            classes,
+                            n_eightbytes,
+                            ctx,
+                        );
+                    }
+                } else {
+                    // Unknown layout: treat conservatively as INTEGER
+                    let eb_idx = base_offset / 8;
+                    if eb_idx < n_eightbytes {
+                        classes[eb_idx] = classes[eb_idx].merge(EightbyteClass::Integer);
+                    }
+                }
+            }
+            // All other types (integers, pointers, enums, etc.) -> INTEGER
+            _ => {
+                let eb_idx = base_offset / 8;
+                if eb_idx < n_eightbytes {
+                    classes[eb_idx] = classes[eb_idx].merge(EightbyteClass::Integer);
+                }
+            }
         }
     }
 

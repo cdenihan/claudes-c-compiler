@@ -28,6 +28,12 @@ pub enum ParamClass {
     I128RegPair { base_reg_idx: usize },
     /// Small struct (<=16 bytes) by value in 1-2 GP registers.
     StructByValReg { base_reg_idx: usize, size: usize },
+    /// Small struct where all eightbytes are SSE class -> 1-2 XMM registers.
+    StructSseReg { lo_fp_idx: usize, hi_fp_idx: Option<usize>, size: usize },
+    /// Small struct: first eightbyte INTEGER, second SSE.
+    StructMixedIntSseReg { int_reg_idx: usize, fp_reg_idx: usize, size: usize },
+    /// Small struct: first eightbyte SSE, second INTEGER.
+    StructMixedSseIntReg { fp_reg_idx: usize, int_reg_idx: usize, size: usize },
     /// F128 (long double) in FP register (ARM: Q-reg).
     F128FpReg { reg_idx: usize },
     /// F128 in GP register pair (RISC-V).
@@ -68,7 +74,8 @@ impl ParamClass {
         matches!(self,
             ParamClass::IntReg { .. } | ParamClass::I128RegPair { .. } |
             ParamClass::StructByValReg { .. } | ParamClass::F128GpPair { .. } |
-            ParamClass::LargeStructByRefReg { .. }
+            ParamClass::LargeStructByRefReg { .. } |
+            ParamClass::StructMixedIntSseReg { .. } | ParamClass::StructMixedSseIntReg { .. }
         )
     }
 
@@ -84,6 +91,8 @@ impl ParamClass {
                 if *size <= 8 { 1 } else { 2 }
             }
             ParamClass::F128GpPair { .. } => 2,
+            ParamClass::StructMixedIntSseReg { .. } | ParamClass::StructMixedSseIntReg { .. } => 1,
+            ParamClass::StructSseReg { .. } => 0, // all SSE, no GP regs
             _ => 0, // FP regs and stack don't consume GP regs
         }
     }
@@ -107,7 +116,51 @@ pub fn classify_params(func: &IrFunction, config: &CallAbiConfig) -> Vec<ParamCl
 
         // Struct-by-value parameters.
         if let Some(size) = struct_size {
-            if size <= 16 {
+            let eb_classes = &param.struct_eightbyte_classes;
+
+            if size <= 16 && config.use_sysv_struct_classification && !eb_classes.is_empty() {
+                use crate::common::types::EightbyteClass;
+                let n_eightbytes = eb_classes.len();
+                let eb0_is_sse = eb_classes.get(0) == Some(&EightbyteClass::Sse);
+                let eb1_is_sse = if n_eightbytes > 1 { eb_classes.get(1) == Some(&EightbyteClass::Sse) } else { false };
+                let eb0_is_int = !eb0_is_sse;
+                let eb1_is_int = if n_eightbytes > 1 { !eb1_is_sse } else { false };
+
+                let gp_needed = (if eb0_is_int { 1 } else { 0 }) + (if n_eightbytes > 1 && eb1_is_int { 1 } else { 0 });
+                let fp_needed = (if eb0_is_sse { 1 } else { 0 }) + (if n_eightbytes > 1 && eb1_is_sse { 1 } else { 0 });
+
+                if int_reg_idx + gp_needed <= config.max_int_regs && float_reg_idx + fp_needed <= config.max_float_regs {
+                    if n_eightbytes == 1 {
+                        if eb0_is_sse {
+                            result.push(ParamClass::StructSseReg { lo_fp_idx: float_reg_idx, hi_fp_idx: None, size });
+                            float_reg_idx += 1;
+                        } else {
+                            result.push(ParamClass::StructByValReg { base_reg_idx: int_reg_idx, size });
+                            int_reg_idx += 1;
+                        }
+                    } else {
+                        if eb0_is_sse && eb1_is_sse {
+                            result.push(ParamClass::StructSseReg { lo_fp_idx: float_reg_idx, hi_fp_idx: Some(float_reg_idx + 1), size });
+                            float_reg_idx += 2;
+                        } else if eb0_is_int && eb1_is_sse {
+                            result.push(ParamClass::StructMixedIntSseReg { int_reg_idx, fp_reg_idx: float_reg_idx, size });
+                            int_reg_idx += 1;
+                            float_reg_idx += 1;
+                        } else if eb0_is_sse && eb1_is_int {
+                            result.push(ParamClass::StructMixedSseIntReg { fp_reg_idx: float_reg_idx, int_reg_idx, size });
+                            float_reg_idx += 1;
+                            int_reg_idx += 1;
+                        } else {
+                            result.push(ParamClass::StructByValReg { base_reg_idx: int_reg_idx, size });
+                            int_reg_idx += 2;
+                        }
+                    }
+                } else {
+                    result.push(ParamClass::StructStack { offset: stack_offset, size });
+                    stack_offset += ((size + 7) & !7) as i64;
+                    int_reg_idx = config.max_int_regs;
+                }
+            } else if size <= 16 {
                 let regs_needed = if size <= 8 { 1 } else { 2 };
                 if int_reg_idx + regs_needed <= config.max_int_regs {
                     result.push(ParamClass::StructByValReg {

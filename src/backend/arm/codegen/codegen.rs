@@ -2588,6 +2588,7 @@ impl ArchCodegen for ArmCodegen {
             f128_in_fp_regs: true, f128_in_gp_pairs: false,
             variadic_floats_in_gp: false,
             large_struct_by_ref: true, // AAPCS64: composites > 16 bytes passed by reference
+            use_sysv_struct_classification: false, // ARM uses AAPCS64, not SysV
         }
     }
 

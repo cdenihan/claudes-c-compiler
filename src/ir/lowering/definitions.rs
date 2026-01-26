@@ -218,6 +218,9 @@ pub(super) struct FuncSig {
     /// Per-parameter struct sizes for by-value struct passing ABI.
     /// Each entry is Some(size) if that parameter is a struct/union, None otherwise.
     pub param_struct_sizes: Vec<Option<usize>>,
+    /// Per-parameter SysV ABI eightbyte classification for struct params.
+    /// Each entry is the classification for that parameter (empty vec for non-struct params).
+    pub param_struct_classes: Vec<Vec<crate::common::types::EightbyteClass>>,
 }
 
 impl FuncSig {
@@ -234,6 +237,7 @@ impl FuncSig {
             sret_size: None,
             two_reg_ret_size: None,
             param_struct_sizes: Vec::new(),
+            param_struct_classes: Vec::new(),
         }
     }
 }

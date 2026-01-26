@@ -22,6 +22,14 @@ pub enum CallArgClass {
     F128Reg { reg_idx: usize },
     /// Small struct (<=16 bytes) passed by value in 1-2 GP registers.
     StructByValReg { base_reg_idx: usize, size: usize },
+    /// Small struct (<=16 bytes) where all fields are float/double (SSE class per SysV ABI).
+    /// Passed in 1-2 XMM registers instead of GP registers.
+    /// `lo_fp_idx` is the FP register for the first eightbyte, `hi_fp_idx` for the second (if size > 8).
+    StructSseReg { lo_fp_idx: usize, hi_fp_idx: Option<usize>, size: usize },
+    /// Small struct where first eightbyte is INTEGER and second is SSE (mixed).
+    StructMixedIntSseReg { int_reg_idx: usize, fp_reg_idx: usize, size: usize },
+    /// Small struct where first eightbyte is SSE and second is INTEGER (mixed).
+    StructMixedSseIntReg { fp_reg_idx: usize, int_reg_idx: usize, size: usize },
     /// Small struct (<=16 bytes) that overflows to the stack.
     StructByValStack { size: usize },
     /// Large struct (>16 bytes) passed on the stack (MEMORY class).
@@ -73,19 +81,26 @@ pub struct CallAbiConfig {
     /// Whether large structs (>16 bytes) are passed by reference (pointer in GP reg) per AAPCS64.
     /// ARM: true (caller passes pointer in x0-x7 or on stack), x86/RISC-V: false (copy to stack).
     pub large_struct_by_ref: bool,
+    /// Whether to use SysV per-eightbyte struct classification (x86-64 only).
+    /// When true, struct eightbytes classified as SSE are passed in xmm registers.
+    pub use_sysv_struct_classification: bool,
 }
 
 /// Classify all arguments for a function call, returning a `CallArgClass` per argument.
 /// This captures the shared classification logic used identically by all three backends.
 /// `struct_arg_sizes` indicates which args are struct/union by-value: Some(size) for struct
 /// args, None otherwise.
+/// `struct_arg_classes` provides per-eightbyte SysV ABI classification for struct args
+/// (used when `config.use_sysv_struct_classification` is true, i.e. x86-64).
 pub fn classify_call_args(
     args: &[Operand],
     arg_types: &[IrType],
     struct_arg_sizes: &[Option<usize>],
+    struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
     is_variadic: bool,
     config: &CallAbiConfig,
 ) -> Vec<CallArgClass> {
+    use crate::common::types::EightbyteClass;
     let mut result = Vec::with_capacity(args.len());
     let mut int_idx = 0usize;
     let mut float_idx = 0usize;
@@ -103,7 +118,57 @@ pub fn classify_call_args(
         let force_gp = is_variadic && config.variadic_floats_in_gp && is_float && !is_long_double;
 
         if let Some(size) = struct_size {
-            if size <= 16 {
+            // Get per-eightbyte classification for this struct arg (if available)
+            let eb_classes = struct_arg_classes.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
+
+            if size <= 16 && config.use_sysv_struct_classification && !eb_classes.is_empty() {
+                // SysV AMD64 ABI: classify per-eightbyte and assign to GP or SSE registers
+                let n_eightbytes = eb_classes.len();
+                let eb0_is_sse = eb_classes.get(0) == Some(&EightbyteClass::Sse);
+                let eb1_is_sse = if n_eightbytes > 1 { eb_classes.get(1) == Some(&EightbyteClass::Sse) } else { false };
+                let eb0_is_int = !eb0_is_sse;
+                let eb1_is_int = if n_eightbytes > 1 { !eb1_is_sse } else { false };
+
+                // Count how many GP and FP regs we need
+                let gp_needed = (if eb0_is_int { 1 } else { 0 }) + (if n_eightbytes > 1 && eb1_is_int { 1 } else { 0 });
+                let fp_needed = (if eb0_is_sse { 1 } else { 0 }) + (if n_eightbytes > 1 && eb1_is_sse { 1 } else { 0 });
+
+                // Check if we have enough registers
+                if int_idx + gp_needed <= config.max_int_regs && float_idx + fp_needed <= config.max_float_regs {
+                    if n_eightbytes == 1 {
+                        if eb0_is_sse {
+                            result.push(CallArgClass::StructSseReg { lo_fp_idx: float_idx, hi_fp_idx: None, size });
+                            float_idx += 1;
+                        } else {
+                            result.push(CallArgClass::StructByValReg { base_reg_idx: int_idx, size });
+                            int_idx += 1;
+                        }
+                    } else {
+                        // 2 eightbytes
+                        if eb0_is_sse && eb1_is_sse {
+                            result.push(CallArgClass::StructSseReg { lo_fp_idx: float_idx, hi_fp_idx: Some(float_idx + 1), size });
+                            float_idx += 2;
+                        } else if eb0_is_int && eb1_is_sse {
+                            result.push(CallArgClass::StructMixedIntSseReg { int_reg_idx: int_idx, fp_reg_idx: float_idx, size });
+                            int_idx += 1;
+                            float_idx += 1;
+                        } else if eb0_is_sse && eb1_is_int {
+                            result.push(CallArgClass::StructMixedSseIntReg { fp_reg_idx: float_idx, int_reg_idx: int_idx, size });
+                            float_idx += 1;
+                            int_idx += 1;
+                        } else {
+                            // Both INTEGER
+                            result.push(CallArgClass::StructByValReg { base_reg_idx: int_idx, size });
+                            int_idx += 2;
+                        }
+                    }
+                } else {
+                    // Not enough registers -> stack
+                    result.push(CallArgClass::StructByValStack { size });
+                    int_idx = config.max_int_regs;
+                }
+            } else if size <= 16 {
+                // Non-SysV path (ARM, RISC-V): always use GP registers for small structs
                 let regs_needed = if size <= 8 { 1 } else { 2 };
                 if int_idx + regs_needed <= config.max_int_regs {
                     result.push(CallArgClass::StructByValReg { base_reg_idx: int_idx, size });

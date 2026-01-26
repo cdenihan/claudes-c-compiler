@@ -193,6 +193,10 @@ pub struct IrParam {
     pub ty: IrType,
     /// If this param is a struct/union passed by value, its byte size. None for non-struct params.
     pub struct_size: Option<usize>,
+    /// Per-eightbyte SysV ABI classification for struct params (x86-64 only).
+    /// Empty for non-struct params or when classification is not applicable.
+    /// Each entry indicates whether that eightbyte should use SSE or GP registers.
+    pub struct_eightbyte_classes: Vec<crate::common::types::EightbyteClass>,
 }
 
 /// A basic block in the CFG.
@@ -242,11 +246,13 @@ pub enum Instruction {
     /// For non-variadic calls, this equals args.len(). For variadic calls, args beyond num_fixed_args
     /// are variadic and may need different calling convention handling (e.g., floats in GP regs on AArch64).
     /// `struct_arg_sizes` indicates which args are struct/union by-value: Some(size) for struct args, None otherwise.
-    Call { dest: Option<Value>, func: String, args: Vec<Operand>, arg_types: Vec<IrType>, return_type: IrType, is_variadic: bool, num_fixed_args: usize, struct_arg_sizes: Vec<Option<usize>> },
+    /// `struct_arg_classes` carries per-eightbyte SysV ABI classification for struct args (for x86-64 SSE-class struct passing).
+    Call { dest: Option<Value>, func: String, args: Vec<Operand>, arg_types: Vec<IrType>, return_type: IrType, is_variadic: bool, num_fixed_args: usize, struct_arg_sizes: Vec<Option<usize>>, struct_arg_classes: Vec<Vec<crate::common::types::EightbyteClass>> },
 
     /// Indirect function call through a pointer: %dest = call_indirect ptr(args...)
     /// `struct_arg_sizes` indicates which args are struct/union by-value: Some(size) for struct args, None otherwise.
-    CallIndirect { dest: Option<Value>, func_ptr: Operand, args: Vec<Operand>, arg_types: Vec<IrType>, return_type: IrType, is_variadic: bool, num_fixed_args: usize, struct_arg_sizes: Vec<Option<usize>> },
+    /// `struct_arg_classes` carries per-eightbyte SysV ABI classification for struct args (for x86-64 SSE-class struct passing).
+    CallIndirect { dest: Option<Value>, func_ptr: Operand, args: Vec<Operand>, arg_types: Vec<IrType>, return_type: IrType, is_variadic: bool, num_fixed_args: usize, struct_arg_sizes: Vec<Option<usize>>, struct_arg_classes: Vec<Vec<crate::common::types::EightbyteClass>> },
 
     /// Get element pointer (for arrays/structs)
     GetElementPtr { dest: Value, base: Value, offset: Operand, ty: IrType },
