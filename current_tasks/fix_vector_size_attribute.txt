@@ -1,0 +1,17 @@
+Task: Implement __attribute__((vector_size(N))) support for GCC vector extensions
+Status: in_progress
+
+Problem: The vector_size attribute is parsed but silently ignored. Types declared with
+__attribute__((vector_size(8))) like `typedef unsigned short v4hi __attribute__((vector_size(8)))`
+are treated as plain scalars instead of vector types. Vector arithmetic (+=, +, -, *, /)
+operates on only the first element, leaving other elements uninitialized.
+
+This causes test failures in gcc_torture_20050604_1, gcc_torture_pr53645, and potentially
+kernel miscompilations for code using GCC vector extensions.
+
+Fix plan:
+1. Add Vector variant to CType that stores (element_type, num_elements, total_size)
+2. Parse vector_size attribute and create Vector CType
+3. Lower vector operations to element-wise scalar operations in IR
+4. Handle vector initialization, assignment, indexing
+5. Ensure ABI compatibility (vectors passed/returned like same-sized integers or in memory)
