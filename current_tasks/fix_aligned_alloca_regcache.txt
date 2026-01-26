@@ -1,0 +1,21 @@
+Task: Fix missing reg_cache invalidation in emit_alloca_aligned_addr_to_acc for ARM and RISC-V
+Status: in_progress
+
+Problem:
+In ARM and RISC-V backends, emit_alloca_aligned_addr_to_acc() modifies the accumulator (x0/t0)
+to compute an aligned stack address, but does NOT call reg_cache.invalidate_acc(). This causes
+subsequent emit_load_operand() calls to incorrectly skip loading a value into the accumulator
+when the reg cache thinks x0/t0 still holds a previous value.
+
+The x86 backend correctly invalidates the cache (line 2727 of x86/codegen.rs).
+
+This bug causes crashes (SIGSEGV) when accessing variables with __attribute__((aligned(N)))
+where N > 16, because the GEP offset is lost and the computed address is wrong.
+
+Affected tests:
+- compiler_suite_0069_0088 (ARM, RISC-V) - __attribute__((aligned(32))) local arrays
+- Potentially other tests involving over-aligned stack variables
+
+Fix:
+Add self.state.reg_cache.invalidate_acc() at the end of emit_alloca_aligned_addr_to_acc()
+in both ARM and RISC-V backends.
