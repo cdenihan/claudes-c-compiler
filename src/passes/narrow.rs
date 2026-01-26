@@ -530,10 +530,12 @@ fn try_narrow_const(c: &IrConst, target_ty: IrType) -> Option<IrConst> {
         }
         IrType::U32 => {
             // For bit-preserving ops, only the low 32 bits matter.
-            // Any i64 value that fits in 32 bits (signed range) can be
-            // safely truncated, since the low bits are identical.
+            // Accept any i64 value whose low 32 bits are meaningful.
+            // Use IrConst::from_i64 which stores U32 as I64 with zero-extension,
+            // matching the rest of the codebase's convention and ensuring
+            // correct behavior when the constant is later read via to_i64().
             if val >= i32::MIN as i64 && val <= u32::MAX as i64 {
-                Some(IrConst::I32(val as i32))
+                Some(IrConst::from_i64(val, IrType::U32))
             } else {
                 None
             }

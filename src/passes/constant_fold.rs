@@ -129,7 +129,14 @@ fn try_fold_with_map(inst: &Instruction, const_map: &[Option<ConstMapEntry>]) ->
             }
             let lhs_const = as_i64_const_mapped(lhs, const_map)?;
             let rhs_const = as_i64_const_mapped(rhs, const_map)?;
-            let result = fold_binop(*op, lhs_const, rhs_const)?;
+            // Truncate operands to the BinOp's type width before folding.
+            // This is needed because constants may be stored in wider IrConst
+            // variants (e.g., a U32 value stored as IrConst::I32) and to_i64()
+            // sign-extends them. Operations like LShr and UDiv are sensitive
+            // to upper bits, so we must normalize first.
+            let lhs_trunc = truncate_to_type(lhs_const, *ty);
+            let rhs_trunc = truncate_to_type(rhs_const, *ty);
+            let result = fold_binop(*op, lhs_trunc, rhs_trunc)?;
             Some(Instruction::Copy {
                 dest: *dest,
                 src: Operand::Const(IrConst::from_i64(result, *ty)),
@@ -176,7 +183,14 @@ fn try_fold_with_map(inst: &Instruction, const_map: &[Option<ConstMapEntry>]) ->
             }
             let lhs_const = as_i64_const_mapped(lhs, const_map)?;
             let rhs_const = as_i64_const_mapped(rhs, const_map)?;
-            let result = fold_cmp(*op, lhs_const, rhs_const);
+            // Truncate operands to the comparison type's width before comparing.
+            // This is needed because constants may be stored in wider IrConst
+            // variants (e.g., a U32 value stored as IrConst::I32) and to_i64()
+            // sign-extends them. By truncating to the comparison type, we ensure
+            // bit-level equality is correct regardless of storage representation.
+            let lhs_trunc = truncate_to_type(lhs_const, *ty);
+            let rhs_trunc = truncate_to_type(rhs_const, *ty);
+            let result = fold_cmp(*op, lhs_trunc, rhs_trunc);
             Some(Instruction::Copy {
                 dest: *dest,
                 src: Operand::Const(IrConst::I32(result as i32)),
@@ -447,6 +461,26 @@ fn fold_unaryop(op: IrUnaryOp, src: i64, ty: IrType) -> Option<i64> {
             }
         }
     })
+}
+
+/// Truncate an i64 value to the width of the given type, with proper
+/// sign/zero extension back to i64. This ensures that constants stored
+/// in wider IrConst variants are properly normalized before comparison.
+///
+/// For unsigned types, the value is masked to the type's bit width and
+/// zero-extended. For signed types, the value is truncated and sign-extended.
+/// This matches the semantics of `fold_cast` for same-width reinterpretation.
+fn truncate_to_type(val: i64, ty: IrType) -> i64 {
+    match ty {
+        IrType::I8 => val as i8 as i64,
+        IrType::U8 => val as u8 as i64,
+        IrType::I16 => val as i16 as i64,
+        IrType::U16 => val as u16 as i64,
+        IrType::I32 => val as i32 as i64,
+        IrType::U32 => val as u32 as i64,
+        // I64/U64/Ptr: no truncation needed, value is already 64-bit
+        _ => val,
+    }
 }
 
 /// Evaluate a comparison on two constant integers.

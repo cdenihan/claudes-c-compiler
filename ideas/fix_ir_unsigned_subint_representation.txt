@@ -55,6 +55,19 @@ Option C: Always store sub-int constants as I32 (matching C's integer promotion)
 and update all codegen/IR paths that expect I8/I16 for sub-int operations.
 This is what was attempted and failed due to widespread assumptions.
 
+ADDITIONAL MITIGATION (2026-01-26)
+----------------------------------
+The constant_fold.rs pass now truncates BinOp and Cmp operands to the
+instruction's type width before folding (via truncate_to_type()). This handles
+the case where the narrow pass narrows operations from I64 to U32 and stores
+constants as IrConst::I32 — the truncation re-normalizes them before use.
+Additionally, try_narrow_const in narrow.rs now uses IrConst::from_i64() for
+U32 constants, which stores them as IrConst::I64 with zero-extension.
+
+These fixes handle the most common manifestation: U32 constants after narrowing.
+The U8/U16 latent issue remains but is lower risk since sub-int operations
+are promoted to I32 by the frontend (C integer promotion rules).
+
 RECOMMENDATION: Option A is the cleanest but high effort. Option B is practical
 and minimally invasive. Do this only when a concrete bug is triggered by the
 optimization passes (not just the sema layer which is now fixed).
