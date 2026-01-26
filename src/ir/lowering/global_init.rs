@@ -315,6 +315,15 @@ impl Lowerer {
                                 let mut elem_parts = Vec::new();
                                 self.collect_compound_init_element(&item.init, &mut elem_parts, elem_size);
                                 if let Some(elem) = elem_parts.into_iter().next() {
+                                    // Coerce scalar constants to the array's element type so
+                                    // that e.g. IrConst::I32(100) in a uint64_t[] array becomes
+                                    // IrConst::I64(100), ensuring correct element width in output.
+                                    let elem = match elem {
+                                        GlobalInit::Scalar(val) => {
+                                            GlobalInit::Scalar(val.coerce_to(base_ty))
+                                        }
+                                        other => other,
+                                    };
                                     elements[current_idx] = elem;
                                 }
                             }
@@ -403,18 +412,17 @@ impl Lowerer {
                     }
                 }
 
-                // Fallback: try to emit as an array of I32 constants
-                // (handles cases like plain `{1, 2, 3}` without type info)
+                // Fallback: try to emit as an array of constants coerced to base_ty
                 let mut values = Vec::new();
                 for item in items {
                     if let Initializer::Expr(expr) = &item.init {
                         if let Some(val) = self.eval_const_expr(expr) {
-                            values.push(val);
+                            values.push(val.coerce_to(base_ty));
                         } else {
-                            values.push(IrConst::I32(0));
+                            values.push(self.zero_const(base_ty));
                         }
                     } else {
-                        values.push(IrConst::I32(0));
+                        values.push(self.zero_const(base_ty));
                     }
                 }
                 if !values.is_empty() {
