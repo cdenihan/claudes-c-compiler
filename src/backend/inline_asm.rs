@@ -235,11 +235,12 @@ pub fn emit_inline_asm_common(
     template: &str,
     outputs: &[(String, Value, Option<String>)],
     inputs: &[(String, Operand, Option<String>)],
+    clobbers: &[String],
     operand_types: &[IrType],
     goto_labels: &[(String, BlockId)],
     input_symbols: &[Option<String>],
 ) {
-    emit_inline_asm_common_impl(emitter, template, outputs, inputs, operand_types, goto_labels, input_symbols, &[]);
+    emit_inline_asm_common_impl(emitter, template, outputs, inputs, clobbers, operand_types, goto_labels, input_symbols, &[]);
 }
 
 pub fn emit_inline_asm_common_impl(
@@ -247,6 +248,7 @@ pub fn emit_inline_asm_common_impl(
     template: &str,
     outputs: &[(String, Value, Option<String>)],
     inputs: &[(String, Operand, Option<String>)],
+    clobbers: &[String],
     operand_types: &[IrType],
     goto_labels: &[(String, BlockId)],
     input_symbols: &[Option<String>],
@@ -372,11 +374,33 @@ pub fn emit_inline_asm_common_impl(
     }
 
     // Collect registers claimed by specific-register constraints (e.g., "c" -> rcx)
-    // so the scratch allocator can skip them and avoid conflicts.
-    let specific_regs: Vec<String> = operands.iter()
+    // and explicit clobber registers so the scratch allocator avoids them.
+    let mut specific_regs: Vec<String> = operands.iter()
         .filter(|op| matches!(op.kind, AsmOperandKind::Specific(_)))
         .map(|op| op.reg.clone())
         .collect();
+    // Also exclude registers listed in the clobber list (e.g., "x9", "t0", "rcx").
+    // Without this, the scratch allocator might assign a clobbered register to an
+    // operand, causing the inline asm to corrupt operand values.
+    for clobber in clobbers {
+        // Skip non-register clobbers like "cc" and "memory"
+        if clobber == "cc" || clobber == "memory" {
+            continue;
+        }
+        specific_regs.push(clobber.clone());
+        // On ARM64, wN and xN refer to the same physical register (32-bit vs 64-bit view).
+        // The scratch allocator uses xN notation, so also exclude xN when wN is clobbered
+        // and vice versa, to prevent register conflicts.
+        if let Some(suffix) = clobber.strip_prefix('w') {
+            if suffix.chars().all(|c| c.is_ascii_digit()) {
+                specific_regs.push(format!("x{}", suffix));
+            }
+        } else if let Some(suffix) = clobber.strip_prefix('x') {
+            if suffix.chars().all(|c| c.is_ascii_digit()) {
+                specific_regs.push(format!("w{}", suffix));
+            }
+        }
+    }
 
     // Assign scratch registers to operands that need them
     for i in 0..total_operands {

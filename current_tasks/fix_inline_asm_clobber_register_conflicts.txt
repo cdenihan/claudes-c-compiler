@@ -1,0 +1,12 @@
+Task: Fix inline asm clobber register conflicts causing execution timeouts
+
+The inline asm scratch register allocator was not respecting clobber lists,
+which could assign the same physical register to both an operand and a clobber,
+causing infinite loops in asm blocks with loop+cbnz/bnez patterns.
+
+Also handles ARM64 w/x register aliasing (wN and xN are the same physical register).
+
+Affected tests:
+- asm-cmp-branch-arm-004-run1 (ARM)
+- asm-neon-sub-arm-006-run1 (ARM)
+- asm-bnez-riscv-001f-run2 (RISC-V)

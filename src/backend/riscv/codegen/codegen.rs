@@ -2559,8 +2559,8 @@ impl ArchCodegen for RiscvCodegen {
         }
     }
 
-    fn emit_inline_asm(&mut self, template: &str, outputs: &[(String, Value, Option<String>)], inputs: &[(String, Operand, Option<String>)], _clobbers: &[String], operand_types: &[IrType], goto_labels: &[(String, BlockId)], input_symbols: &[Option<String>]) {
-        emit_inline_asm_common(self, template, outputs, inputs, operand_types, goto_labels, input_symbols);
+    fn emit_inline_asm(&mut self, template: &str, outputs: &[(String, Value, Option<String>)], inputs: &[(String, Operand, Option<String>)], clobbers: &[String], operand_types: &[IrType], goto_labels: &[(String, BlockId)], input_symbols: &[Option<String>]) {
+        emit_inline_asm_common(self, template, outputs, inputs, clobbers, operand_types, goto_labels, input_symbols);
     }
 
     fn emit_copy_i128(&mut self, dest: &Value, src: &Operand) {
