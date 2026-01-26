@@ -211,9 +211,16 @@ impl Lowerer {
 
     /// Pop the top scope frame from both TypeContext and FunctionBuildState,
     /// undoing all scoped changes made in that scope.
+    /// If the scope contained VLA declarations, emits StackRestore to reclaim
+    /// VLA stack space, preventing stack leaks in loops.
     pub(super) fn pop_scope(&mut self) {
-        self.func_mut().pop_scope();
+        let scope_stack_save = self.func_mut().pop_scope();
         self.types.pop_scope();
+        // If this scope contained VLA declarations, restore the stack pointer
+        // to reclaim the dynamically-allocated stack space.
+        if let Some(save_val) = scope_stack_save {
+            self.emit(Instruction::StackRestore { ptr: save_val });
+        }
     }
 
     /// Remove a local variable, tracking the removal in the current scope frame.

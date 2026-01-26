@@ -41,6 +41,9 @@ pub(super) struct FuncScopeFrame {
     pub vla_typedef_sizes_added: Vec<String>,
     /// Keys that were overwritten in `vla_typedef_sizes`: (key, previous_value).
     pub vla_typedef_sizes_shadowed: Vec<(String, Value)>,
+    /// Saved stack pointer before the first VLA in this scope.
+    /// When set, StackRestore is emitted at scope exit to reclaim VLA stack space.
+    pub scope_stack_save: Option<Value>,
 }
 
 impl FuncScopeFrame {
@@ -56,6 +59,7 @@ impl FuncScopeFrame {
             var_ctypes_shadowed: Vec::new(),
             vla_typedef_sizes_added: Vec::new(),
             vla_typedef_sizes_shadowed: Vec::new(),
+            scope_stack_save: None,
         }
     }
 }
@@ -151,8 +155,10 @@ impl FunctionBuildState {
 
     /// Pop the top function-local scope frame and undo changes to locals,
     /// static_local_names, const_local_values, and var_ctypes.
-    pub fn pop_scope(&mut self) {
+    /// Returns the scope's saved stack pointer value if VLAs were declared in this scope.
+    pub fn pop_scope(&mut self) -> Option<Value> {
         if let Some(frame) = self.scope_stack.pop() {
+            let scope_stack_save = frame.scope_stack_save;
             for key in frame.locals_added {
                 self.locals.remove(&key);
             }
@@ -183,6 +189,9 @@ impl FunctionBuildState {
             for (key, val) in frame.vla_typedef_sizes_shadowed {
                 self.vla_typedef_sizes.insert(key, val);
             }
+            scope_stack_save
+        } else {
+            None
         }
     }
 

@@ -181,12 +181,22 @@ impl Lowerer {
                 // VLAs must stay at the declaration point (not hoisted) because
                 // their size is computed at runtime.
                 alloca = self.fresh_value();
-                // First, save the stack pointer if this is the first VLA in the function.
+                // Save the stack pointer at function level (for goto) if this is the first VLA.
                 if !self.func().has_vla {
                     self.func_mut().has_vla = true;
                     let save_val = self.fresh_value();
                     self.emit(Instruction::StackSave { dest: save_val });
                     self.func_mut().vla_stack_save = Some(save_val);
+                }
+                // Save the stack pointer at scope level if this is the first VLA in the
+                // current scope. This allows StackRestore at scope exit to reclaim VLA
+                // stack space, preventing stack leaks when VLAs are declared in loops.
+                if let Some(frame) = self.func().scope_stack.last() {
+                    if frame.scope_stack_save.is_none() {
+                        let scope_save = self.fresh_value();
+                        self.emit(Instruction::StackSave { dest: scope_save });
+                        self.func_mut().scope_stack.last_mut().unwrap().scope_stack_save = Some(scope_save);
+                    }
                 }
                 let align = decl.alignment.unwrap_or(16).max(16);
                 self.emit(Instruction::DynAlloca {
