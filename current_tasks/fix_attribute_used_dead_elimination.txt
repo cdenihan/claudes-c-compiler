@@ -1,0 +1,19 @@
+Task: Fix __attribute__((used)) not preventing dead static elimination
+Status: in_progress
+Started: 2026-01-26
+
+Problem:
+- __attribute__((used)) is recognized by the preprocessor (__has_attribute) but is
+  not parsed, stored, or respected by the compiler pipeline
+- The dead static elimination pass (eliminate_dead_static_functions) removes static
+  symbols marked with __attribute__((used)) if they are not otherwise referenced
+- This causes the kernel to lose .modinfo sections (MODULE_LICENSE, MODULE_AUTHOR, etc.),
+  __param sections (module_param), __modver sections, and any other data that relies on
+  __used__ to survive dead code elimination
+- Confirmed: causes boot hang when compiling drivers/ata/ata_piix.c
+
+Fix:
+- Parse "used"/"__used__" attribute in the parser
+- Add is_used field to AST (FunctionDef, InitDeclarator), IR (IrGlobal, IrFunction)
+- Propagate through lowering
+- Treat is_used symbols as roots in eliminate_dead_static_functions

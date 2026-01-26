@@ -858,7 +858,106 @@ impl Lowerer {
                 // pointee type determines the element size for subscript strides.
                 self.resolve_cast_array_subscript(type_spec, inner, &subscripts)
             }
+            Expr::MemberAccess(_, _, _) => {
+                // Handle patterns like global_struct.array_member[i]
+                // e.g., rcu_state.node[0] where node is an array field inside a global struct.
+                // Resolve the member access chain to get base global + field offset,
+                // then apply array subscript offsets using the member's array element size.
+                self.resolve_member_array_subscript(current, &subscripts)
+            }
             _ => None,
+        }
+    }
+
+    /// Resolve an array subscript where the base is a member access on a global struct.
+    /// For example: `rcu_state.node[0]` resolves to `rcu_state + offsetof(node) + 0 * sizeof(node[0])`.
+    fn resolve_member_array_subscript(
+        &self,
+        member_expr: &Expr,
+        subscripts: &[&Expr],
+    ) -> Option<GlobalInit> {
+        // Walk the member access chain to collect field names and find the base identifier
+        let mut fields: Vec<String> = Vec::new();
+        let mut cur = member_expr;
+        loop {
+            match cur {
+                Expr::MemberAccess(base, field, _) => {
+                    fields.push(field.clone());
+                    cur = base.as_ref();
+                }
+                Expr::Identifier(name, _) => {
+                    let global_name = self.resolve_to_global_name(name)?;
+                    let ginfo = self.globals.get(&global_name)?;
+                    let start_layout = ginfo.struct_layout.clone()?;
+
+                    // Walk field chain (in reverse, since we collected outer-to-inner)
+                    // to compute the member offset and find the final field type
+                    let mut member_offset: i64 = 0;
+                    let mut current_layout = start_layout;
+                    let mut final_field_ty: Option<CType> = None;
+                    for field_name in fields.iter().rev() {
+                        if let Some((foff, fty)) = current_layout.field_offset(field_name, &self.types) {
+                            member_offset += foff as i64;
+                            final_field_ty = Some(fty.clone());
+                            current_layout = match &fty {
+                                CType::Struct(key) | CType::Union(key) => {
+                                    self.types.struct_layouts.get(&**key).cloned()
+                                        .unwrap_or_else(StructLayout::empty_rc)
+                                }
+                                _ => StructLayout::empty_rc(),
+                            };
+                        } else {
+                            return None;
+                        }
+                    }
+
+                    // The final field type should be an array for subscript access
+                    let elem_size = match &final_field_ty {
+                        Some(CType::Array(elem_ty, _)) => self.ctype_size(elem_ty) as i64,
+                        _ => return None,
+                    };
+                    if elem_size == 0 {
+                        return None;
+                    }
+
+                    // Apply subscript offsets (subscripts are in reverse order: outer first)
+                    let mut total_offset = member_offset;
+                    let mut subs = subscripts.to_vec();
+                    subs.reverse();
+
+                    // For the first dimension, use elem_size.
+                    // For additional dimensions, we need to drill into the element type's
+                    // array dimensions. Handle multi-dimensional arrays like node[i][j].
+                    let mut current_elem_ty = match &final_field_ty {
+                        Some(CType::Array(elem_ty, _)) => elem_ty.as_ref().clone(),
+                        _ => return None,
+                    };
+
+                    for (dim, idx_expr) in subs.iter().enumerate() {
+                        let idx_val = self.eval_const_expr(idx_expr)?;
+                        let idx = self.const_to_i64(&idx_val)?;
+                        let stride = if dim == 0 {
+                            elem_size
+                        } else {
+                            // For deeper dimensions, get the size of the current element type
+                            self.ctype_size(&current_elem_ty) as i64
+                        };
+                        total_offset += idx * stride;
+                        // Drill into the next array dimension's element type
+                        current_elem_ty = match &current_elem_ty {
+                            CType::Array(inner, _) => inner.as_ref().clone(),
+                            _ => current_elem_ty.clone(),
+                        };
+                    }
+
+                    return if total_offset == 0 {
+                        Some(GlobalInit::GlobalAddr(global_name))
+                    } else {
+                        Some(GlobalInit::GlobalAddrOffset(global_name, total_offset))
+                    };
+                }
+                _ => return None,
+            }
         }
     }
 
