@@ -1,0 +1,9 @@
+Fix short-circuit dead code elimination and asm register % prefix stripping
+
+1. Short-circuit constant folding: When LHS of && is constant 0 or LHS of || is
+   constant nonzero, skip RHS code generation entirely. This is critical for kernel
+   IS_ENABLED() patterns like `0 && some_undefined_function()`.
+
+2. Asm register % prefix: Strip leading '%' from register names in
+   `register int x asm("%rdx")` declarations. The kernel uses `asm("%" _ASM_DX)`
+   which expands to `asm("%rdx")`, and codegen adds its own % prefix causing `%%rdx`.
