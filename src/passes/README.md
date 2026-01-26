@@ -4,7 +4,7 @@ SSA-based optimization passes that improve the IR before code generation.
 
 ## Available Passes
 
-- **cfg_simplify.rs** - CFG simplification: dead block elimination, jump chain threading, redundant branch simplification
+- **cfg_simplify.rs** - CFG simplification: dead block elimination, jump chain threading, redundant branch simplification, trivial phi simplification (single-entry phi to Copy)
 - **constant_fold.rs** - Evaluates constant expressions at compile time for both integers and floats (e.g., `3 + 4` -> `7`, `-0.0 + 0.0` -> `+0.0`)
 - **copy_prop.rs** - Copy propagation: replaces uses of copies with original values, follows transitive chains
 - **dce.rs** - Dead code elimination: removes instructions whose results are never used

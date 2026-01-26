@@ -6,6 +6,7 @@
 //! 3. Threading jump chains: if block A branches to empty block B which just
 //!    branches to C, redirect A to branch directly to C (only when safe)
 //! 4. Removing dead (unreachable) blocks that have no predecessors
+//! 5. Simplifying trivial phi nodes (single-entry or all-same-value) to Copy
 //!
 //! This pass runs to a fixpoint, since one simplification can enable others.
 //! Phi nodes in successor blocks are updated when edges are redirected.
@@ -877,6 +878,112 @@ mod tests {
             assert!(has_const_1, "Phi must still have the Const(1) incoming value");
         } else {
             panic!("Expected Phi instruction in merge block");
+        }
+    }
+
+    #[test]
+    fn test_trivial_phi_simplification() {
+        // Simulates the pattern from __builtin_constant_p(v) && expr:
+        //
+        // Block 0: CondBranch { cond: Const(0), true: Block 1, false: Block 2 }
+        // Block 1: (RHS of &&)
+        //   %1 = Cmp ...
+        //   Branch(Block 2)
+        // Block 2: (merge)
+        //   %2 = Phi [(Const(0), Block 0), (%1, Block 1)]
+        //   CondBranch { cond: %2, true: Block 3, false: Block 4 }
+        //
+        // After fold_constant_cond_branches folds Block 0's CondBranch (cond=0)
+        // to Branch(Block 2) and removes Block 1's phi edge, then
+        // remove_dead_blocks eliminates Block 1, the phi becomes:
+        //   %2 = Phi [(Const(0), Block 0)]
+        //
+        // simplify_trivial_phis converts this to:
+        //   %2 = Copy Const(0)
+        //
+        // Note: cfg_simplify alone cannot fold the outer CondBranch in Block 2
+        // because fold_constant_cond_branches only matches Operand::Const, not
+        // Values defined by Copy. The full pipeline (cfg_simplify -> copy_prop ->
+        // cfg_simplify) is needed to complete the elimination. This test verifies
+        // only what cfg_simplify accomplishes: the phi-to-Copy conversion and
+        // dead block removal.
+        let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
+
+        // Block 0: constant false condition
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Const(IrConst::I64(0)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+        });
+
+        // Block 1: RHS of && (will become dead)
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::Cmp {
+                    dest: Value(1),
+                    op: IrCmpOp::Ne,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I64(0)),
+                    ty: IrType::I64,
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(2)),
+        });
+
+        // Block 2: merge with phi
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: Value(2),
+                    ty: IrType::I64,
+                    incoming: vec![
+                        (Operand::Const(IrConst::I64(0)), BlockId(0)),
+                        (Operand::Value(Value(1)), BlockId(1)),
+                    ],
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(2)),
+                true_label: BlockId(3),
+                false_label: BlockId(4),
+            },
+        });
+
+        // Block 3: dead branch (e.g., __field_overflow call)
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(1)))),
+        });
+
+        // Block 4: continuation
+        func.blocks.push(BasicBlock {
+            label: BlockId(4),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+        });
+
+        let _count = simplify_cfg(&mut func);
+
+        // Verify Block 1 (the RHS of &&) is eliminated as unreachable
+        let has_block_1 = func.blocks.iter().any(|b| b.label == BlockId(1));
+        assert!(!has_block_1, "Dead block 1 (RHS of &&) should be eliminated");
+
+        // Verify the phi in Block 2 was converted to a Copy
+        let block_2 = func.blocks.iter().find(|b| b.label == BlockId(2)).unwrap();
+        match &block_2.instructions[0] {
+            Instruction::Copy { dest, src } => {
+                assert_eq!(dest.0, 2);
+                assert!(matches!(src, Operand::Const(IrConst::I64(0))),
+                    "Copy source should be Const(0)");
+            }
+            other => panic!("Expected Copy instruction, got {:?}", other),
         }
     }
 }
