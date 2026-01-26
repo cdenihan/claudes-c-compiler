@@ -433,9 +433,9 @@ impl<'a> SemaConstEval<'a> {
             CType::Double => IrConst::F64(fv),
             CType::LongDouble => IrConst::LongDouble(fv),
             CType::Char => IrConst::I8(fv as i8),
-            CType::UChar => IrConst::I8(fv as u8 as i8),
+            CType::UChar => IrConst::I32(fv as u8 as i32),
             CType::Short => IrConst::I16(fv as i16),
-            CType::UShort => IrConst::I16(fv as u16 as i16),
+            CType::UShort => IrConst::I32(fv as u16 as i32),
             CType::Int => IrConst::I32(fv as i32),
             CType::UInt => IrConst::I32(fv as u32 as i32),
             CType::Long | CType::LongLong => IrConst::I64(fv as i64),
@@ -446,11 +446,34 @@ impl<'a> SemaConstEval<'a> {
     }
 
     /// Convert raw bits to an IrConst based on target CType.
+    ///
+    /// For unsigned sub-int types (UChar, UShort, Bool), we store the value
+    /// as IrConst::I32 with zero-extension rather than I8/I16, because IrConst
+    /// only has signed I8/I16 variants. Without this, `(unsigned short)(-1)` would
+    /// be stored as `I16(-1)`, and `to_i64()` would sign-extend to -1 instead of
+    /// 65535 -- causing `(unsigned short)(-1) << 1` to evaluate as -2 instead of
+    /// 131070. This matches C's integer promotion (sub-int → int).
     fn bits_to_irconst(&self, bits: u64, target: &CType, target_signed: bool) -> Option<IrConst> {
         let size = self.ctype_size(target);
         Some(match size {
-            1 => IrConst::I8(bits as i8),
-            2 => IrConst::I16(bits as i16),
+            1 => {
+                if !target_signed {
+                    // Unsigned char/bool: store as I32 to preserve unsigned value
+                    // through integer promotion (e.g., (unsigned char)255 → I32(255), not I8(-1))
+                    IrConst::I32(bits as u8 as i32)
+                } else {
+                    IrConst::I8(bits as i8)
+                }
+            }
+            2 => {
+                if !target_signed {
+                    // Unsigned short: store as I32 to preserve unsigned value
+                    // through integer promotion (e.g., (unsigned short)65535 → I32(65535), not I16(-1))
+                    IrConst::I32(bits as u16 as i32)
+                } else {
+                    IrConst::I16(bits as i16)
+                }
+            }
             4 => {
                 if matches!(target, CType::Float) {
                     let int_val = if target_signed { bits as i64 as f32 } else { bits as u64 as f32 };

@@ -686,6 +686,12 @@ impl IrConst {
     }
 
     /// Construct an IrConst of the given type from an i64 value.
+    ///
+    /// Note: U8 and U16 are stored as I8 and I16 respectively. The caller must
+    /// be aware that to_i64() will sign-extend these values. When unsigned semantics
+    /// are needed, the caller should use the IrType to determine proper zero-extension.
+    /// U32 is stored as I64 with zero-extension since 32-bit unsigned values don't
+    /// fit in I32's signed range.
     pub fn from_i64(val: i64, ty: IrType) -> Self {
         match ty {
             IrType::I8 | IrType::U8 => IrConst::I8(val as i8),
