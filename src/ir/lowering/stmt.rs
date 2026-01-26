@@ -1461,6 +1461,16 @@ impl Lowerer {
             let val = if constraint_has_immediate_alt(&constraint) {
                 if let Some(const_val) = self.eval_const_expr(&inp.expr) {
                     Operand::Const(const_val)
+                } else if let Expr::StringLiteral(ref s, _) = inp.expr {
+                    // String literals have assembly-time-constant addresses (their
+                    // .rodata label), so they are valid "i" constraint immediates.
+                    // Intern the string once and use its label as both the symbol
+                    // name and the GlobalAddr operand.
+                    let label = self.intern_string_literal(s);
+                    sym_name = Some(label.clone());
+                    let dest = self.fresh_value();
+                    self.emit(Instruction::GlobalAddr { dest, name: label });
+                    Operand::Value(dest)
                 } else {
                     sym_name = self.extract_symbol_name(&inp.expr);
                     self.lower_expr(&inp.expr)

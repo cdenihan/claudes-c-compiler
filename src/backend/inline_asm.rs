@@ -369,6 +369,10 @@ pub fn emit_inline_asm_common_impl(
     //   - _static_cpu_has: fallthrough → `t_yes: return true` (matches GCC's
     //     behavior with an un-patched NOP5, which also falls through to t_yes)
     //
+    // For non-goto asm (e.g., BUG_ON's ud2 + __bug_table), we also drop the
+    // entire block because emitting the trap instruction without its metadata
+    // table entry causes worse crashes than omitting both.
+    //
     // TODO: Replace this heuristic with proper function inlining support.
     // Once always_inline functions are inlined at call sites, the "i" constraints
     // will be evaluable and this skip path will no longer be needed.
