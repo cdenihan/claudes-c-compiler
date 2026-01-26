@@ -1,0 +1,16 @@
+Fix %P modifier for complex global address expressions in inline asm.
+
+The %P modifier with "i" constraint operands involving complex global address
+expressions (like &((const char *)boot_cpu_data.x86_capability)[12 >> 3]) was
+emitting "0" instead of the correct "symbol+offset" (e.g., "boot_cpu_data+9").
+
+Root cause: extract_symbol_name() only handled simple Identifier, &Identifier,
+and Cast patterns. Complex expressions like AddressOf(ArraySubscript(Cast(
+MemberAccess(...)))) were not recognized.
+
+Fix:
+1. Extended extract_symbol_name() to fall back to eval_global_addr_expr() for
+   complex AddressOf expressions, formatting GlobalAddrOffset as "symbol+offset".
+2. Extended resolve_chained_array_subscript() to handle Cast(MemberAccess(...))
+   as the base of array subscripts, computing element size from the cast's
+   pointee type and resolving the member's byte offset.
