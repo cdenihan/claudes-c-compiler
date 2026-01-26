@@ -190,11 +190,15 @@ fn compute_loop_body(
 }
 
 /// Check if an instruction is safe to hoist (pure, no side effects, not a phi).
+/// Division and remainder can trap with SIGFPE on divide-by-zero, so they must
+/// not be speculatively hoisted past a guard condition.
 fn is_hoistable(inst: &Instruction) -> bool {
     matches!(
         inst,
-        Instruction::BinOp { .. }
-            | Instruction::UnaryOp { .. }
+        Instruction::BinOp { op, .. } if !op.can_trap()
+    ) || matches!(
+        inst,
+        Instruction::UnaryOp { .. }
             | Instruction::Cmp { .. }
             | Instruction::Cast { .. }
             | Instruction::GetElementPtr { .. }
