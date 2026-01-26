@@ -1,0 +1,17 @@
+Fix asm goto dead block removal causing objtool "unreachable instruction" errors
+
+Problem: When the backend skips an asm goto template (because of unsatisfiable immediate
+constraints + .pushsection), the goto label target blocks become unreachable dead code.
+But the CFG dead block elimination pass treats asm goto labels as reachable successors
+(regardless of whether the asm will actually be emitted), so these blocks survive to
+codegen. objtool then detects them as unreachable instructions and errors out, causing
+kernel relink failures for files like drivers/md/dm.c.
+
+Fix: In the CFG simplify pass's dead block removal, check whether an asm goto instruction
+will be skipped at codegen time (has unsatisfiable immediate-only constraints AND template
+uses .pushsection). If so, don't mark the goto label blocks as reachable, allowing the
+dead block elimination to remove them.
+
+Files changed:
+- src/passes/cfg_simplify.rs: Added asm_goto_will_be_skipped() helper and
+  is_immediate_only_constraint() helper; modified remove_dead_blocks() to use them.
