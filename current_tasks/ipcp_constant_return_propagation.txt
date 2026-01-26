@@ -1,0 +1,22 @@
+Implement interprocedural constant return propagation (ICRP) optimization pass
+
+Problem: The compiler doesn't inline functions, so when a static inline function
+always returns a constant (e.g., `static inline int always_false(void) { return 0; }`),
+callers can't see through the call to eliminate dead branches. This causes linker errors
+when dead branches reference undefined symbols.
+
+Example: In the Linux kernel, `bio_has_crypt_ctx()` returns `false` when
+CONFIG_BLK_INLINE_ENCRYPTION is not set. `bio_crypt_clone()` checks `if (bio_has_crypt_ctx(src))`
+and calls `__bio_crypt_clone` in the true branch. GCC inlines and eliminates the dead branch.
+Our compiler keeps the call to `__bio_crypt_clone`, causing a link error.
+
+Fix: Add a new pass (src/passes/ipcp.rs) that:
+1. Scans all static functions to find those that always return the same constant
+   (all Return terminators use the same constant operand)
+2. Replaces Call instructions to those functions with the constant value
+3. Runs before the main optimization pipeline so constant folding + DCE can
+   eliminate the newly-dead branches
+
+This is complementary to (not a replacement for) full function inlining.
+ICRP handles the critical kernel case (constant-returning inline stubs) without
+the complexity of full inlining.
