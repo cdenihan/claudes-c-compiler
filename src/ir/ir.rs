@@ -582,7 +582,7 @@ impl IrConst {
             IrType::I16 => IrConst::I16(fv as i16),
             IrType::U16 => IrConst::I16(fv as u16 as i16),
             IrType::I32 => IrConst::I32(fv as i32),
-            IrType::U32 => IrConst::I32(fv as u32 as i32),
+            IrType::U32 => IrConst::I64(fv as u32 as i64),
             IrType::I64 | IrType::Ptr => IrConst::I64(fv as i64),
             IrType::U64 => IrConst::I64(fv as u64 as i64),
             IrType::I128 => IrConst::I128(fv as i128),
@@ -684,7 +684,11 @@ impl IrConst {
         match ty {
             IrType::I8 | IrType::U8 => IrConst::I8(val as i8),
             IrType::I16 | IrType::U16 => IrConst::I16(val as i16),
-            IrType::I32 | IrType::U32 => IrConst::I32(val as i32),
+            IrType::I32 => IrConst::I32(val as i32),
+            // U32: store as I64 with zero-extended value to preserve unsigned semantics.
+            // Using I32 would sign-extend when loaded as a 64-bit immediate (e.g.,
+            // I32(-2147483648) becomes 0xFFFFFFFF80000000 instead of 0x0000000080000000).
+            IrType::U32 => IrConst::I64(val as u32 as i64),
             IrType::I128 | IrType::U128 => IrConst::I128(val as i128),
             IrType::F32 => IrConst::F32(val as f32),
             IrType::F64 => IrConst::F64(val as f64),
@@ -699,7 +703,9 @@ impl IrConst {
         match (self, target_ty) {
             (IrConst::I8(_), IrType::I8 | IrType::U8) => return self.clone(),
             (IrConst::I16(_), IrType::I16 | IrType::U16) => return self.clone(),
-            (IrConst::I32(_), IrType::I32 | IrType::U32) => return self.clone(),
+            (IrConst::I32(_), IrType::I32) => return self.clone(),
+            // U32 is stored as I64 (zero-extended), so I32 must be converted
+            (IrConst::I64(_), IrType::U32) => return self.clone(),
             (IrConst::I64(_), IrType::I64 | IrType::U64 | IrType::Ptr) => return self.clone(),
             (IrConst::I128(_), IrType::I128 | IrType::U128) => return self.clone(),
             (IrConst::F32(_), IrType::F32) => return self.clone(),
@@ -710,8 +716,8 @@ impl IrConst {
         // Convert integer types via from_i64, with unsigned-aware paths
         if let Some(int_val) = self.to_i64() {
             // When the source type is unsigned, we need to zero-extend (not sign-extend)
-            // when widening to a larger type. E.g., (unsigned)-8 = 0xFFFFFFF8 stored as
-            // IrConst::I32(-8) must become IrConst::I64(4294967288), not IrConst::I64(-8).
+            // when widening to a larger type. Mask to the source width to get the correct
+            // unsigned value (e.g., U32 0xFFFFFFF8 = 4294967288, not -8).
             if src_ty.map_or(false, |t| t.is_unsigned()) {
                 // Mask to the source type's width to get the correct unsigned value
                 let src_size = src_ty.unwrap().size();
@@ -761,7 +767,8 @@ impl IrConst {
         match ty {
             IrType::I8 | IrType::U8 => IrConst::I8(0),
             IrType::I16 | IrType::U16 => IrConst::I16(0),
-            IrType::I32 | IrType::U32 => IrConst::I32(0),
+            IrType::I32 => IrConst::I32(0),
+            IrType::U32 => IrConst::I64(0),
             IrType::F32 => IrConst::F32(0.0),
             IrType::F64 => IrConst::F64(0.0),
             IrType::F128 => IrConst::LongDouble(0.0),
@@ -774,7 +781,8 @@ impl IrConst {
         match ty {
             IrType::I8 | IrType::U8 => IrConst::I8(1),
             IrType::I16 | IrType::U16 => IrConst::I16(1),
-            IrType::I32 | IrType::U32 => IrConst::I32(1),
+            IrType::I32 => IrConst::I32(1),
+            IrType::U32 => IrConst::I64(1),
             IrType::F32 => IrConst::F32(1.0),
             IrType::F64 => IrConst::F64(1.0),
             IrType::F128 => IrConst::LongDouble(1.0),

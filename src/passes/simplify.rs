@@ -249,7 +249,13 @@ fn fold_const_cast(c: &IrConst, from_ty: IrType, to_ty: IrType) -> Option<IrCons
         return Some(match to_ty {
             IrType::I8 | IrType::U8 => IrConst::I8(val as i8),
             IrType::I16 | IrType::U16 => IrConst::I16(val as i16),
-            IrType::I32 | IrType::U32 => IrConst::I32(val as i32),
+            IrType::I32 => IrConst::I32(val as i32),
+            // U32: keep as I64 with zero-extended value so that loading into
+            // a 64-bit register preserves the unsigned 32-bit value. If we
+            // stored as I32(val as i32), the constant load would sign-extend
+            // (e.g. -13 → 0xFFFFFFFFFFFFFFF3) which corrupts 64-bit unsigned
+            // operations like divq.
+            IrType::U32 => IrConst::I64(val as u32 as i64),
             IrType::I64 | IrType::U64 | IrType::Ptr => IrConst::I64(val),
             IrType::I128 | IrType::U128 => {
                 if from_ty.is_unsigned() {

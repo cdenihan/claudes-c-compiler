@@ -388,11 +388,16 @@ impl Lowerer {
             let mut lhs_val = self.lower_expr_with_type(lhs, op_ty);
             let mut rhs_val = self.lower_expr_with_type(rhs, op_ty);
             if common_ty == IrType::U32 {
-                if lhs_ty == IrType::I32 || lhs_ty == IrType::I16 || lhs_ty == IrType::I8 {
+                // Zero-extend both operands to ensure correct 64-bit unsigned semantics.
+                // All operand types (signed or unsigned, any width <= 32) need truncation
+                // to U32 so that 64-bit operations (like divq) see the correct 32-bit
+                // unsigned values. For example, -13U is stored as 0xFFFFFFFFFFFFFFF3
+                // in a 64-bit register; truncating to U32 gives 0x00000000FFFFFFF3.
+                if lhs_ty.size() <= 4 {
                     let masked = self.emit_cast_val(lhs_val, IrType::I64, IrType::U32);
                     lhs_val = Operand::Value(masked);
                 }
-                if rhs_ty == IrType::I32 || rhs_ty == IrType::I16 || rhs_ty == IrType::I8 {
+                if rhs_ty.size() <= 4 {
                     let masked = self.emit_cast_val(rhs_val, IrType::I64, IrType::U32);
                     rhs_val = Operand::Value(masked);
                 }
