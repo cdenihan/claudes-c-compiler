@@ -459,10 +459,17 @@ impl Lowerer {
     fn resolve_generic_selection_ctype(&self, controlling: &Expr, associations: &[GenericAssociation]) -> Option<CType> {
         let controlling_ctype = self.get_expr_ctype(controlling);
         let controlling_ir_type = self.get_expr_type(controlling);
-        let ctrl_is_const = self.expr_is_const_qualified(controlling);
+        // Per C11 6.5.1.1p2: lvalue conversion strips top-level qualifiers.
+        // Only use ctrl_is_const for pointer types (where it reflects pointee constness).
+        let ctrl_is_const = if let Some(ref ct) = controlling_ctype {
+            matches!(ct, CType::Pointer(_, _)) && self.expr_is_const_qualified(controlling)
+        } else {
+            false
+        };
         let has_const_diff = {
             let non_default: Vec<_> = associations.iter().filter(|a| a.type_spec.is_some()).collect();
-            non_default.iter().any(|a| a.is_const) && non_default.iter().any(|a| !a.is_const)
+            let assocs_differ = non_default.iter().any(|a| a.is_const) && non_default.iter().any(|a| !a.is_const);
+            assocs_differ || ctrl_is_const
         };
         let mut default_expr: Option<&Expr> = None;
         for assoc in associations.iter() {
@@ -499,10 +506,17 @@ impl Lowerer {
     fn resolve_generic_selection_type(&self, controlling: &Expr, associations: &[GenericAssociation]) -> IrType {
         let controlling_ctype = self.get_expr_ctype(controlling);
         let controlling_ir_type = self.get_expr_type(controlling);
-        let ctrl_is_const = self.expr_is_const_qualified(controlling);
+        // Per C11 6.5.1.1p2: lvalue conversion strips top-level qualifiers.
+        // Only use ctrl_is_const for pointer types (where it reflects pointee constness).
+        let ctrl_is_const = if let Some(ref ct) = controlling_ctype {
+            matches!(ct, CType::Pointer(_, _)) && self.expr_is_const_qualified(controlling)
+        } else {
+            false
+        };
         let has_const_diff = {
             let non_default: Vec<_> = associations.iter().filter(|a| a.type_spec.is_some()).collect();
-            non_default.iter().any(|a| a.is_const) && non_default.iter().any(|a| !a.is_const)
+            let assocs_differ = non_default.iter().any(|a| a.is_const) && non_default.iter().any(|a| !a.is_const);
+            assocs_differ || ctrl_is_const
         };
         let mut default_expr: Option<&Expr> = None;
         for assoc in associations.iter() {

@@ -1057,6 +1057,21 @@ impl Lowerer {
                 let param_tys: Vec<IrType> = fptr_params.iter().map(|fp| self.type_spec_to_ir(&fp.type_spec)).collect();
                 self.func_meta.ptr_sigs.insert(name.clone(), FuncSig::for_ptr(ret_ty, param_tys));
             }
+        } else if let Some(ref name) = orig_param.name {
+            // Fallback: check if the parameter type is a bare function typedef
+            // (e.g., `typedef int filler_t(void*, void*); void foo(filler_t filler)`).
+            // Per C11 6.7.6.3p8, function-type parameters decay to pointer-to-function.
+            // The parser doesn't set fptr_params for typedef-based function types, so
+            // we must register the ptr_sig from the function typedef info here.
+            if let TypeSpecifier::TypedefName(tname) = &orig_param.type_spec {
+                if let Some(fti) = self.types.function_typedefs.get(tname).cloned() {
+                    let ret_ty = self.type_spec_to_ir(&fti.return_type);
+                    let param_tys: Vec<IrType> = fti.params.iter()
+                        .map(|fp| self.type_spec_to_ir(&fp.type_spec))
+                        .collect();
+                    self.func_meta.ptr_sigs.insert(name.clone(), FuncSig::for_ptr(ret_ty, param_tys));
+                }
+            }
         }
     }
 

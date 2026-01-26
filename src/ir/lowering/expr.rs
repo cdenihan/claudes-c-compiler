@@ -1074,20 +1074,29 @@ impl Lowerer {
     pub(super) fn resolve_generic_selection<'a>(&mut self, controlling: &Expr, associations: &'a [GenericAssociation]) -> &'a Expr {
         let controlling_ctype = self.get_expr_ctype(controlling);
         let controlling_ir_type = self.get_expr_type(controlling);
-        // Determine if the controlling expression's type has a const-qualified base type.
-        // For pointer types like `const int *p`, this checks if the pointee is const.
-        // For non-pointer types like `const int x`, this checks if the value is const.
-        let ctrl_is_const = self.expr_is_const_qualified(controlling);
+        // Determine if the controlling expression's type has a const-qualified pointee.
+        // Per C11 6.5.1.1p2, the controlling expression undergoes lvalue conversion,
+        // which strips top-level qualifiers. So for non-pointer types like `const int x`,
+        // the type becomes `int` (ctrl_is_const = false).
+        // For pointer types like `const int *p`, lvalue conversion strips the top-level
+        // pointer const but preserves the pointee const, so ctrl_is_const reflects
+        // whether the pointee is const.
+        let ctrl_is_const = if let Some(ref ct) = controlling_ctype {
+            matches!(ct, CType::Pointer(_, _)) && self.expr_is_const_qualified(controlling)
+        } else {
+            false
+        };
 
-        // Check if any associations differ only in const-ness (i.e., there exist
-        // associations with the same CType but different is_const flags).
-        // Only use const-aware matching when this is the case, to avoid breaking
-        // existing code that doesn't use const-qualified _Generic associations.
+        // Check if const-aware matching is needed. This is the case when:
+        // (a) associations differ in const-ness (some have is_const=true, others false), OR
+        // (b) the controlling expression is a pointer with const pointee (ctrl_is_const=true),
+        //     which means non-const pointer associations should not match.
         let has_const_differentiated_assocs = {
             let non_default: Vec<_> = associations.iter()
                 .filter(|a| a.type_spec.is_some())
                 .collect();
-            non_default.iter().any(|a| a.is_const) && non_default.iter().any(|a| !a.is_const)
+            let assocs_differ = non_default.iter().any(|a| a.is_const) && non_default.iter().any(|a| !a.is_const);
+            assocs_differ || ctrl_is_const
         };
 
         let mut default_expr: Option<&Expr> = None;
@@ -1100,7 +1109,7 @@ impl Lowerer {
                     let assoc_ctype = self.type_spec_to_ctype(type_spec);
                     if let Some(ref ctrl_ct) = controlling_ctype {
                         if self.ctype_matches_generic(ctrl_ct, &assoc_ctype) {
-                            // When associations differ by const-ness, also check
+                            // When const-aware matching is active, also check
                             // that the const qualification matches.
                             if has_const_differentiated_assocs && assoc.is_const != ctrl_is_const {
                                 continue;

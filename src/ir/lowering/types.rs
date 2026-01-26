@@ -1090,6 +1090,22 @@ impl Lowerer {
                     return fptr_ctype;
                 }
             }
+
+            // Case 3: bare function typedef (e.g., `typedef int filler_t(void*, void*);`
+            // used as parameter `filler_t filler`). Per C11 6.7.6.3p8, a parameter of
+            // function type is adjusted to pointer-to-function type.
+            if let Some(fti) = self.types.function_typedefs.get(tname).cloned() {
+                let return_ctype = self.type_spec_to_ctype(&fti.return_type);
+                let param_types: Vec<(CType, Option<String>)> = fti.params.iter()
+                    .map(|p| (self.param_ctype(p), p.name.clone()))
+                    .collect();
+                let func_type = CType::Function(Box::new(crate::common::types::FunctionType {
+                    return_type: return_ctype,
+                    params: param_types,
+                    variadic: fti.variadic,
+                }));
+                return CType::Pointer(Box::new(func_type), AddressSpace::Default);
+            }
         }
 
         // Default: use the standard type_spec_to_ctype
