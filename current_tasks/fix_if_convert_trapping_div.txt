@@ -1,0 +1,14 @@
+Fix if-conversion pass speculating trapping div/mod operations
+
+Bug: The if-conversion pass (if_convert.rs) converts diamond/triangle CFG patterns
+into Select (cmov) instructions. The is_side_effect_free() function allows all BinOp
+variants, but SDiv/UDiv/SRem/URem can trap with SIGFPE on divide-by-zero.
+
+This causes code like:
+    if (x != 0) { result = y / x; } else { result = 0; }
+to crash because the division is hoisted out and executed unconditionally.
+
+Failing test: wacc_chapter_19_whole_pipeline_int_only_extra_credit_compound_assign_exceptions
+(divides/mods by zero in dead branch, if-converted to unconditional idiv)
+
+Fix: Check the BinOp op field in is_side_effect_free() and reject SDiv/UDiv/SRem/URem.
