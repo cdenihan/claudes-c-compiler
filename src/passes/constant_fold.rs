@@ -463,7 +463,15 @@ fn try_fold_float_cast_mapped(dest: Value, src: &Operand, from_ty: IrType, to_ty
         (false, true) => {
             // int-to-float conversion
             let val = src_const.to_i64()?;
-            if from_ty.is_unsigned() {
+            if to_ty == IrType::F128 {
+                // For long double, use direct integer-to-x87 conversion to preserve
+                // full 64-bit precision (x87 has 64-bit mantissa, unlike f64's 52-bit).
+                if from_ty.is_unsigned() {
+                    IrConst::long_double_from_u64(val as u64)
+                } else {
+                    IrConst::long_double_from_i64(val)
+                }
+            } else if from_ty.is_unsigned() {
                 make_float_const(val as u64 as f64, to_ty)
             } else {
                 make_float_const(val as f64, to_ty)

@@ -787,6 +787,57 @@ pub fn f64_to_x87_bytes_simple(val: f64) -> [u8; 16] {
     bytes
 }
 
+/// Convert a signed i64 to x87 80-bit bytes with full precision.
+/// x87 has a 64-bit mantissa, so all i64 values are representable exactly.
+pub fn i64_to_x87_bytes(val: i64) -> [u8; 16] {
+    if val == 0 {
+        return make_x87_zero(false);
+    }
+    let negative = val < 0;
+    // For i64::MIN (-2^63), abs would overflow, handle specially
+    let abs_val: u64 = if val == i64::MIN {
+        1u64 << 63
+    } else if negative {
+        (-val) as u64
+    } else {
+        val as u64
+    };
+    u64_to_x87_bytes_with_sign(abs_val, negative)
+}
+
+/// Convert an unsigned u64 to x87 80-bit bytes with full precision.
+/// x87 has a 64-bit mantissa, so all u64 values are representable exactly.
+pub fn u64_to_x87_bytes(val: u64) -> [u8; 16] {
+    if val == 0 {
+        return make_x87_zero(false);
+    }
+    u64_to_x87_bytes_with_sign(val, false)
+}
+
+/// Internal helper: convert a nonzero u64 magnitude + sign to x87 bytes.
+fn u64_to_x87_bytes_with_sign(val: u64, negative: bool) -> [u8; 16] {
+    // Find the position of the highest set bit
+    let leading_zeros = val.leading_zeros();
+    let msb_pos = 63 - leading_zeros; // 0-indexed position of highest set bit
+
+    // x87 format: mantissa has explicit integer bit at bit 63
+    // Shift the value so the MSB is at bit 63
+    let mantissa64 = val << leading_zeros;
+
+    // Exponent: the value is mantissa64 * 2^(exp - 16383 - 63)
+    // We want mantissa64 * 2^(exp - 16383 - 63) = val
+    // Since mantissa64 = val << leading_zeros = val * 2^leading_zeros,
+    // we need: val * 2^leading_zeros * 2^(exp - 16383 - 63) = val
+    // So: exp = 16383 + 63 - leading_zeros = 16383 + msb_pos
+    let exp15 = (16383 + msb_pos) as u16;
+
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&mantissa64.to_le_bytes());
+    bytes[8] = (exp15 & 0xFF) as u8;
+    bytes[9] = ((exp15 >> 8) as u8) | (if negative { 0x80 } else { 0 });
+    bytes
+}
+
 /// Convert x87 80-bit bytes to i64 with truncation toward zero.
 /// This preserves the full 64-bit mantissa precision, unlike going through f64 first.
 /// Returns None for infinity, NaN, or values out of i64 range.

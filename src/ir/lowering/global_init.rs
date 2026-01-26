@@ -56,12 +56,12 @@ impl Lowerer {
                             IrConst::F32(v) => IrConst::long_double(v as f64),
                             IrConst::I64(v) => {
                                 if src_ty.is_unsigned() {
-                                    IrConst::long_double((v as u64) as f64)
+                                    IrConst::long_double_from_u64(v as u64)
                                 } else {
-                                    IrConst::long_double(v as f64)
+                                    IrConst::long_double_from_i64(v)
                                 }
                             }
-                            IrConst::I32(v) => IrConst::long_double(v as f64),
+                            IrConst::I32(v) => IrConst::long_double_from_i64(v as i64),
                             other => other, // LongDouble already, or other type
                         }
                     } else {
@@ -646,10 +646,10 @@ impl Lowerer {
         match val {
             IrConst::F64(v) => IrConst::long_double(v),
             IrConst::F32(v) => IrConst::long_double(v as f64),
-            IrConst::I64(v) => IrConst::long_double(v as f64),
-            IrConst::I32(v) => IrConst::long_double(v as f64),
-            IrConst::I16(v) => IrConst::long_double(v as f64),
-            IrConst::I8(v) => IrConst::long_double(v as f64),
+            IrConst::I64(v) => IrConst::long_double_from_i64(v),
+            IrConst::I32(v) => IrConst::long_double_from_i64(v as i64),
+            IrConst::I16(v) => IrConst::long_double_from_i64(v as i64),
+            IrConst::I8(v) => IrConst::long_double_from_i64(v as i64),
             other => other, // LongDouble already or Zero
         }
     }

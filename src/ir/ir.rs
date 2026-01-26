@@ -619,6 +619,20 @@ impl IrConst {
         IrConst::LongDouble(v, bytes)
     }
 
+    /// Create a LongDouble constant from a signed i64 with full precision.
+    /// Uses direct integer-to-x87 conversion to preserve all 64 bits of precision.
+    pub fn long_double_from_i64(val: i64) -> IrConst {
+        let bytes = crate::common::long_double::i64_to_x87_bytes(val);
+        IrConst::LongDouble(val as f64, bytes)
+    }
+
+    /// Create a LongDouble constant from an unsigned u64 with full precision.
+    /// Uses direct integer-to-x87 conversion to preserve all 64 bits of precision.
+    pub fn long_double_from_u64(val: u64) -> IrConst {
+        let bytes = crate::common::long_double::u64_to_x87_bytes(val);
+        IrConst::LongDouble(val as f64, bytes)
+    }
+
     /// Get the raw x87 bytes from a LongDouble constant.
     pub fn long_double_bytes(&self) -> Option<&[u8; 16]> {
         match self {
@@ -855,7 +869,7 @@ impl IrConst {
             IrType::I128 | IrType::U128 => IrConst::I128(val as i128),
             IrType::F32 => IrConst::F32(val as f32),
             IrType::F64 => IrConst::F64(val as f64),
-            IrType::F128 => IrConst::long_double(val as f64),
+            IrType::F128 => IrConst::long_double_from_i64(val),
             _ => IrConst::I64(val),
         }
     }
@@ -895,7 +909,7 @@ impl IrConst {
                     return match target_ty {
                         IrType::F32 => IrConst::F32(uint_val as f32),
                         IrType::F64 => IrConst::F64(uint_val as f64),
-                        IrType::F128 => IrConst::long_double(uint_val as f64),
+                        IrType::F128 => IrConst::long_double_from_u64(uint_val),
                         _ => IrConst::I64(uint_val as i64),
                     };
                 }

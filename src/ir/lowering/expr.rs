@@ -16,9 +16,19 @@ use super::definitions::GlobalInfo;
 impl Lowerer {
     /// Mask off the sign bit of a float value for truthiness testing.
     /// This ensures -0.0 is treated as falsy (same as +0.0) while NaN remains truthy.
+    /// For F128 (long double), uses a proper float comparison against zero instead of
+    /// bit-masking, because x87 80-bit values can't be reliably tested via integer AND.
     fn mask_float_sign_for_truthiness(&mut self, val: Operand, float_ty: IrType) -> Operand {
         if !matches!(float_ty, IrType::F32 | IrType::F64 | IrType::F128) {
             return val;
+        }
+        if float_ty == IrType::F128 {
+            // For F128 (long double), we cannot use bit-masking because the value
+            // is stored as 80-bit x87 and the low 8 bytes are the mantissa (not f64 bits).
+            // Instead, emit a proper F128 comparison against zero which uses x87 fucomip.
+            let zero = Operand::Const(IrConst::long_double(0.0));
+            let result = self.emit_cmp_val(IrCmpOp::Ne, val, zero, IrType::F128);
+            return Operand::Value(result);
         }
         let (abs_mask, _, _, _, _) = Self::fp_masks(float_ty);
         let result = self.emit_binop_val(IrBinOp::And, val, Operand::Const(IrConst::I64(abs_mask)), IrType::I64);
@@ -796,6 +806,7 @@ impl Lowerer {
                 let zero = match from_ty {
                     IrType::F32 => Operand::Const(IrConst::F32(0.0)),
                     IrType::F64 => Operand::Const(IrConst::F64(0.0)),
+                    IrType::F128 => Operand::Const(IrConst::long_double(0.0)),
                     _ => Operand::Const(IrConst::F64(0.0)),
                 };
                 let dest = self.emit_cmp_val(IrCmpOp::Ne, src, zero, from_ty);
@@ -1860,6 +1871,7 @@ impl Lowerer {
         let zero = match src_ty {
             IrType::F32 => Operand::Const(IrConst::F32(0.0)),
             IrType::F64 => Operand::Const(IrConst::F64(0.0)),
+            IrType::F128 => Operand::Const(IrConst::long_double(0.0)),
             _ => Operand::Const(IrConst::I64(0)),
         };
         let dest = self.emit_cmp_val(IrCmpOp::Ne, val, zero, src_ty);

@@ -3578,15 +3578,43 @@ impl ArchCodegen for X86Codegen {
                     self.state.emit("    fildq (%rsp)");
                     self.state.emit("    addq $8, %rsp");
                 } else {
-                    // Unsigned integer to F128: load operand, convert to f64 first via
-                    // the standard cast path, then fldl
+                    // Unsigned integer to F128: use fildq directly for full precision.
+                    // fildq treats the value as signed, so we need special handling
+                    // when bit 63 is set (value >= 2^63).
                     self.operand_to_rax(src);
-                    self.emit_cast_instrs_x86(from_ty, IrType::F64);
-                    self.state.emit("    movq %rax, %xmm0");
+                    // Zero-extend sub-64-bit unsigned types to 64-bit
+                    if from_ty.size() < 8 {
+                        self.emit_cast_instrs_x86(from_ty, IrType::I64);
+                    }
+                    let big_label = self.state.fresh_label("u2f128_big");
+                    let done_label = self.state.fresh_label("u2f128_done");
+                    self.state.emit("    testq %rax, %rax");
+                    self.state.emit_fmt(format_args!("    js {}", big_label));
+                    // Positive (< 2^63): fildq works directly
                     self.state.emit("    subq $8, %rsp");
-                    self.state.emit("    movsd %xmm0, (%rsp)");
-                    self.state.emit("    fldl (%rsp)");
+                    self.state.emit("    movq %rax, (%rsp)");
+                    self.state.emit("    fildq (%rsp)");
                     self.state.emit("    addq $8, %rsp");
+                    self.state.emit_fmt(format_args!("    jmp {}", done_label));
+                    // High bit set (>= 2^63): fildq reads as negative signed value.
+                    // We add 2^64 (as x87 constant) to correct: result = fildq(val) + 2^64
+                    self.state.emit_fmt(format_args!("{}:", big_label));
+                    self.state.emit("    subq $8, %rsp");
+                    self.state.emit("    movq %rax, (%rsp)");
+                    self.state.emit("    fildq (%rsp)");
+                    // Load 2^64 = 18446744073709551616.0 as x87 constant
+                    // x87 80-bit encoding of 2^64: exponent=16383+64=16447=0x403F,
+                    // mantissa=0x8000000000000000 (explicit integer bit set)
+                    self.state.emit("    addq $8, %rsp");
+                    self.state.emit("    subq $16, %rsp");
+                    self.state.emit_fmt(format_args!("    movabsq ${}, %rax", -9223372036854775808i64)); // 0x8000000000000000
+                    self.state.emit("    movq %rax, (%rsp)");
+                    self.state.emit_fmt(format_args!("    movq ${}, %rax", 0x403Fi64)); // exponent for 2^64
+                    self.state.emit("    movq %rax, 8(%rsp)");
+                    self.state.emit("    fldt (%rsp)");
+                    self.state.emit("    addq $16, %rsp");
+                    self.state.emit("    faddp %st, %st(1)"); // ST(0) = fildq(val) + 2^64
+                    self.state.emit_fmt(format_args!("{}:", done_label));
                 }
                 // ST(0) now has the value in 80-bit extended precision.
                 // Store full 80-bit to dest slot

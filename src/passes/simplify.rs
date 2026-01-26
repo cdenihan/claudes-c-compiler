@@ -321,10 +321,11 @@ fn fold_const_cast(c: &IrConst, from_ty: IrType, to_ty: IrType) -> Option<IrCons
                 }
             }
             IrType::F128 => {
+                // Use direct integer-to-x87 conversion for full 64-bit precision
                 if from_ty.is_unsigned() {
-                    IrConst::long_double(val as u64 as f64)
+                    IrConst::long_double_from_u64(val as u64)
                 } else {
-                    IrConst::long_double(val as f64)
+                    IrConst::long_double_from_i64(val)
                 }
             }
             _ => return None,
