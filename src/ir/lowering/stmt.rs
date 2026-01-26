@@ -318,6 +318,7 @@ impl Lowerer {
         } else {
             decl.alignment
         };
+        let has_explicit_align = explicit_align.is_some();
         let align = if let Some(explicit) = explicit_align {
             da.var_ty.align().max(explicit)
         } else {
@@ -340,6 +341,7 @@ impl Lowerer {
             section: None,
             is_weak: false,
             visibility: None,
+            has_explicit_align,
         });
 
         // Track as a global for access via GlobalAddr

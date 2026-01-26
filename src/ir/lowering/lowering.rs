@@ -1385,7 +1385,7 @@ impl Lowerer {
                 GlobalInit::Zero
             };
 
-            let align = {
+            let (align, has_explicit_align) = {
                 let c_align = self.alignof_type(&decl.type_spec);
                 let natural = if c_align > 0 { c_align.max(da.var_ty.align()) } else { da.var_ty.align() };
                 // Resolve _Alignas alignment: use the lowerer's alignof_type (which can
@@ -1397,9 +1397,9 @@ impl Lowerer {
                     decl.alignment
                 };
                 if let Some(explicit_val) = explicit {
-                    natural.max(explicit_val)
+                    (natural.max(explicit_val), true)
                 } else {
-                    natural
+                    (natural, false)
                 }
             };
 
@@ -1425,6 +1425,7 @@ impl Lowerer {
                 section: declarator.section.clone(),
                 is_weak: declarator.is_weak,
                 visibility: declarator.visibility.clone(),
+                has_explicit_align,
             });
         }
     }

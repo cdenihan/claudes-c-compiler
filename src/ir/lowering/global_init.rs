@@ -577,6 +577,7 @@ impl Lowerer {
             section: None,
             is_weak: false,
             visibility: None,
+            has_explicit_align: false, // compound literals don't have explicit alignment
         });
 
         GlobalInit::GlobalAddr(label)

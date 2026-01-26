@@ -63,6 +63,9 @@ pub struct IrGlobal {
     pub is_weak: bool,
     /// __attribute__((visibility("hidden"|"default"|...))) or #pragma GCC visibility.
     pub visibility: Option<String>,
+    /// Whether the user specified an explicit alignment via __attribute__((aligned(N))) or _Alignas.
+    /// When true, we respect the user's alignment exactly and don't auto-promote to 16.
+    pub has_explicit_align: bool,
 }
 
 /// Initializer for a global variable.

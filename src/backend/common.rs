@@ -424,8 +424,11 @@ pub fn emit_data_sections(out: &mut AsmOutput, module: &IrModule, ptr_dir: PtrDi
 /// Globals placed in custom sections are excluded from promotion because they may
 /// form contiguous arrays (e.g. the kernel's __param or .init.setup sections) where
 /// the linker expects elements at their natural stride with no extra padding.
+/// Additionally, when the user explicitly specified an alignment via __attribute__((aligned(N)))
+/// or _Alignas, we respect their choice and don't auto-promote. GCC behaves the same way:
+/// explicit aligned(8) on a 24-byte struct gives 8-byte alignment, not 16.
 fn effective_align(g: &IrGlobal) -> usize {
-    if g.section.is_some() {
+    if g.section.is_some() || g.has_explicit_align {
         return g.align;
     }
     if g.size >= 16 && g.align < 16 {
