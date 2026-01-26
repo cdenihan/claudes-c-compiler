@@ -570,6 +570,11 @@ impl<'a> SemaConstEval<'a> {
                 if matches!(target, CType::Float) {
                     let int_val = if target_signed { bits as i64 as f32 } else { bits as u64 as f32 };
                     IrConst::F32(int_val)
+                } else if !target_signed {
+                    // Unsigned 32-bit: use I64 to preserve unsigned semantics.
+                    // IrConst::I32 is signed, so values >= 0x80000000 would sign-extend
+                    // incorrectly when converted to i64 for 64-bit comparisons.
+                    IrConst::I64(bits as u32 as i64)
                 } else {
                     IrConst::I32(bits as i32)
                 }

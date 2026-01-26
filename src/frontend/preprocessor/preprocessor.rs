@@ -626,9 +626,10 @@ impl Preprocessor {
                 self.define_simple_macro("__ARM_ARCH_PROFILE", "65"); // 'A'
                 // Floating-point and SIMD
                 self.define_simple_macro("__ARM_FP", "14"); // 0b1110: half+single+double precision
-                // TODO: Define __ARM_NEON once we support NEON intrinsics (arm_neon.h)
-                // Not defining it causes code (e.g., libpng) to use generic C fallback paths
-                // instead of trying to use NEON vector types we can't parse yet.
+                // NOTE: We do NOT define __ARM_NEON because we don't support NEON intrinsics
+                // (no arm_neon.h, no vector types like uint32x4_t, etc.)
+                // This causes code like xxhash/libpng to fall back to scalar implementations.
+                // TODO: Define __ARM_NEON once NEON intrinsic support is implemented.
                 self.define_simple_macro("__ARM_FP16_ARGS", "1");
                 self.define_simple_macro("__ARM_FP16_FORMAT_IEEE", "1");
                 // ABI

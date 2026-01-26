@@ -1,0 +1,24 @@
+Fix gnu_inline attribute linkage semantics for non-extern inline functions
+
+Bug: Non-static, non-extern inline functions with __attribute__((gnu_inline))
+were incorrectly emitted with LOCAL (static) linkage instead of GLOBAL.
+
+In GNU89 inline semantics (triggered by gnu_inline attribute in C99/gnu11):
+- inline (no extern, no static) + gnu_inline -> external definition (GLOBAL)
+- extern inline + gnu_inline -> inline definition only (LOCAL, can skip)
+
+The kernel uses this pattern extensively: __always_inline expands to
+inline __attribute__((always_inline)), and compiler_types.h adds gnu_inline.
+Functions like free_pages_prepare and post_alloc_hook in mm/page_alloc.c have
+extern declarations in headers and gnu_inline definitions in .c files, requiring
+GLOBAL linkage.
+
+The bug was in the is_gnu_inline_extern condition which used
+(func.is_extern || !func.is_static) instead of just func.is_extern,
+causing non-extern inline+gnu_inline functions to be incorrectly treated
+as local-only definitions.
+
+Fix: Changed condition to only treat explicitly 'extern' functions as
+having no external definition under gnu_inline semantics.
+
+Status: IN PROGRESS

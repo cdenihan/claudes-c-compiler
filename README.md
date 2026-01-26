@@ -97,6 +97,8 @@ See `git log` for full history. Key milestones:
 | tcc | PASS | All 78 tests pass (version, hello world, tests2 suite) |
 | mbedtls | PASS | All 7 tests pass (md5, sha256, sha512, aes, rsa, ecp, selftest including ARIA) |
 | jq | PASS | All 12 tests pass on x86/RISC-V; ARM 11/12 (regex crash in oniguruma regexec.c) |
+| kernel | PASS (x86, ARM) | Linux kernel boots on x86 and ARM; RISC-V boot not yet working |
+| mquickjs-clang | PASS | All architectures pass |
 | liburing | FAIL | Builds but all 5 runtime tests fail (io_uring init returns -1) |
 | postgres | PARTIAL | 211/216 tests pass (5 remaining: strerror, stats, stack depth) |
 

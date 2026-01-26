@@ -85,22 +85,34 @@ pub fn eval_const_binop_int(op: &BinOp, l: i64, r: i64, is_32bit: bool, is_unsig
                 l.wrapping_shr(r as u32)
             }
         }
-        BinOp::Eq => bool_to_i64(l == r),
-        BinOp::Ne => bool_to_i64(l != r),
+        BinOp::Eq => {
+            if is_32bit { bool_to_i64(l as u32 == r as u32) }
+            else if is_unsigned { bool_to_i64(l as u64 == r as u64) }
+            else { bool_to_i64(l == r) }
+        }
+        BinOp::Ne => {
+            if is_32bit { bool_to_i64(l as u32 != r as u32) }
+            else if is_unsigned { bool_to_i64(l as u64 != r as u64) }
+            else { bool_to_i64(l != r) }
+        }
         BinOp::Lt => {
-            if is_unsigned { bool_to_i64((l as u64) < (r as u64)) }
+            if is_32bit { if is_unsigned { bool_to_i64((l as u32) < (r as u32)) } else { bool_to_i64((l as i32) < (r as i32)) } }
+            else if is_unsigned { bool_to_i64((l as u64) < (r as u64)) }
             else { bool_to_i64(l < r) }
         }
         BinOp::Gt => {
-            if is_unsigned { bool_to_i64((l as u64) > (r as u64)) }
+            if is_32bit { if is_unsigned { bool_to_i64((l as u32) > (r as u32)) } else { bool_to_i64((l as i32) > (r as i32)) } }
+            else if is_unsigned { bool_to_i64((l as u64) > (r as u64)) }
             else { bool_to_i64(l > r) }
         }
         BinOp::Le => {
-            if is_unsigned { bool_to_i64((l as u64) <= (r as u64)) }
+            if is_32bit { if is_unsigned { bool_to_i64((l as u32) <= (r as u32)) } else { bool_to_i64((l as i32) <= (r as i32)) } }
+            else if is_unsigned { bool_to_i64((l as u64) <= (r as u64)) }
             else { bool_to_i64(l <= r) }
         }
         BinOp::Ge => {
-            if is_unsigned { bool_to_i64((l as u64) >= (r as u64)) }
+            if is_32bit { if is_unsigned { bool_to_i64((l as u32) >= (r as u32)) } else { bool_to_i64((l as i32) >= (r as i32)) } }
+            else if is_unsigned { bool_to_i64((l as u64) >= (r as u64)) }
             else { bool_to_i64(l >= r) }
         }
         BinOp::LogicalAnd => bool_to_i64(l != 0 && r != 0),
