@@ -1,0 +1,26 @@
+Fix: goto jumping past variable declarations produces garbage values
+
+Bug: When goto jumps past a local variable declaration, the variable's alloca
+is emitted in unreachable dead code (the block after the goto). At runtime,
+the alloca never executes, so the variable has no valid stack slot. Any
+subsequent use of that variable reads/writes garbage memory.
+
+Example:
+  goto skip;
+  int x = 42;   // alloca lands in dead block after goto
+skip:
+  x = 5;        // uses the alloca Value, but it was never allocated at runtime
+  printf("%d\n", x);  // prints garbage
+
+Fix: Hoist local variable allocas to the entry block by collecting them in a
+deferred buffer (entry_allocas) during lowering, then splicing them into
+blocks[0] after the parameter allocas during finalize_function.
+
+Files changed:
+  - src/ir/lowering/func_state.rs: Added entry_allocas field
+  - src/ir/lowering/lowering.rs: Added emit_entry_alloca() method, merge in finalize_function
+  - src/ir/lowering/stmt.rs: Changed lower_local_decl to use emit_entry_alloca for static-size locals
+
+Tests fixed:
+  - wacc_chapter_6_valid_extra_credit_goto_after_declaration (all archs)
+  - tcc_54_goto (all archs)
