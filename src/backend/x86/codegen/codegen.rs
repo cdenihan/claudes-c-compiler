@@ -1385,24 +1385,11 @@ impl ArchCodegen for X86Codegen {
             self.num_named_stack_bytes = stack_bytes;
         }
 
-        let mut space = calculate_stack_space_common(&mut self.state, func, 0, |space, alloc_size, align| {
-            // x86 uses negative offsets from rbp
-            // Honor alignment: round up space to alignment boundary before allocating
-            let effective_align = if align > 0 { align.max(8) } else { 8 };
-            let alloc = (alloc_size + 7) & !7;
-            let new_space = ((space + alloc + effective_align - 1) / effective_align) * effective_align;
-            (-new_space, new_space)
-        });
-
-        // For variadic functions, reserve 176 bytes for the register save area:
-        // 48 bytes for 6 integer registers (rdi, rsi, rdx, rcx, r8, r9)
-        // 128 bytes for 8 XMM registers (xmm0-xmm7, 16 bytes each)
-        if func.is_variadic {
-            space += 176;
-            self.reg_save_area_offset = -space;
-        }
-
-        // Run register allocator: assign callee-saved registers to hot values.
+        // Run register allocator BEFORE stack space computation so we can
+        // skip allocating stack slots for values assigned to registers.
+        // This significantly reduces frame sizes (e.g., 160 -> 16 bytes for
+        // simple recursive functions), which fixes postgres plpgsql stack
+        // depth tests and improves overall performance.
         let config = RegAllocConfig {
             available_regs: X86_CALLEE_SAVED.to_vec(),
         };
@@ -1415,6 +1402,26 @@ impl ArchCodegen for X86Codegen {
         // or lists callee-saved registers in clobbers, those registers must be
         // saved/restored in the function prologue/epilogue to preserve the ABI.
         collect_inline_asm_callee_saved_x86(func, &mut self.used_callee_saved);
+
+        // Build set of register-assigned value IDs to skip stack slot allocation.
+        let reg_assigned: FxHashSet<u32> = self.reg_assignments.keys().copied().collect();
+
+        let mut space = calculate_stack_space_common(&mut self.state, func, 0, |space, alloc_size, align| {
+            // x86 uses negative offsets from rbp
+            // Honor alignment: round up space to alignment boundary before allocating
+            let effective_align = if align > 0 { align.max(8) } else { 8 };
+            let alloc = (alloc_size + 7) & !7;
+            let new_space = ((space + alloc + effective_align - 1) / effective_align) * effective_align;
+            (-new_space, new_space)
+        }, &reg_assigned);
+
+        // For variadic functions, reserve 176 bytes for the register save area:
+        // 48 bytes for 6 integer registers (rdi, rsi, rdx, rcx, r8, r9)
+        // 128 bytes for 8 XMM registers (xmm0-xmm7, 16 bytes each)
+        if func.is_variadic {
+            space += 176;
+            self.reg_save_area_offset = -space;
+        }
 
         // Add space for saving callee-saved registers.
         // Each callee-saved register needs 8 bytes on the stack.

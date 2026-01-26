@@ -146,8 +146,72 @@ pub fn allocate_registers(
         });
     }
 
-    // All non-eligible values are excluded.
-    // (We'll filter by the eligible set below instead of using excluded.)
+    // Exclude values used as pointers in GEP, Load, Store, CallIndirect, Memcpy,
+    // VaArg/VaStart/VaEnd/VaCopy, atomics, or StackRestore. These values are
+    // accessed through resolve_slot_addr() in codegen, which requires a valid
+    // stack slot. If such a value were register-assigned and its stack slot
+    // skipped, the codegen would read from an uninitialized stack offset.
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Load { ptr, .. } => {
+                    eligible.remove(&ptr.0);
+                }
+                Instruction::Store { ptr, .. } => {
+                    eligible.remove(&ptr.0);
+                }
+                Instruction::GetElementPtr { base, .. } => {
+                    eligible.remove(&base.0);
+                }
+                Instruction::CallIndirect { func_ptr, .. } => {
+                    if let Operand::Value(v) = func_ptr {
+                        eligible.remove(&v.0);
+                    }
+                }
+                Instruction::Memcpy { dest, src, .. } => {
+                    eligible.remove(&dest.0);
+                    eligible.remove(&src.0);
+                }
+                Instruction::VaArg { va_list_ptr, .. } => {
+                    eligible.remove(&va_list_ptr.0);
+                }
+                Instruction::VaStart { va_list_ptr } => {
+                    eligible.remove(&va_list_ptr.0);
+                }
+                Instruction::VaEnd { va_list_ptr } => {
+                    eligible.remove(&va_list_ptr.0);
+                }
+                Instruction::VaCopy { dest_ptr, src_ptr } => {
+                    eligible.remove(&dest_ptr.0);
+                    eligible.remove(&src_ptr.0);
+                }
+                Instruction::AtomicRmw { ptr, .. } => {
+                    if let Operand::Value(v) = ptr {
+                        eligible.remove(&v.0);
+                    }
+                }
+                Instruction::AtomicCmpxchg { ptr, .. } => {
+                    if let Operand::Value(v) = ptr {
+                        eligible.remove(&v.0);
+                    }
+                }
+                Instruction::AtomicLoad { ptr, .. } => {
+                    if let Operand::Value(v) = ptr {
+                        eligible.remove(&v.0);
+                    }
+                }
+                Instruction::AtomicStore { ptr, .. } => {
+                    if let Operand::Value(v) = ptr {
+                        eligible.remove(&v.0);
+                    }
+                }
+                Instruction::StackRestore { ptr } => {
+                    eligible.remove(&ptr.0);
+                }
+                _ => {}
+            }
+        }
+    }
 
     // Filter intervals to only eligible values.
     let mut candidates: Vec<&LiveInterval> = liveness.intervals.iter()

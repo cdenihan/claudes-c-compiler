@@ -749,6 +749,7 @@ pub fn calculate_stack_space_common(
     func: &IrFunction,
     initial_offset: i64,
     assign_slot: impl Fn(i64, i64, i64) -> (i64, i64),
+    reg_assigned: &FxHashSet<u32>,
 ) -> i64 {
     let total_instructions: usize = func.blocks.iter().map(|b| b.instructions.len()).sum();
     let num_blocks = func.blocks.len();
@@ -856,6 +857,13 @@ pub fn calculate_stack_space_common(
 
                 if is_i128 {
                     state.i128_values.insert(dest.0);
+                }
+
+                // Skip stack slot allocation for values assigned to registers.
+                // These values will live in callee-saved registers and never
+                // need a stack slot, saving significant frame space.
+                if reg_assigned.contains(&dest.0) {
+                    continue;
                 }
 
                 if let Some(target_blk) = single_use_block(dest.0) {

@@ -1042,15 +1042,6 @@ impl ArchCodegen for RiscvCodegen {
     }
 
     fn calculate_stack_space(&mut self, func: &IrFunction) -> i64 {
-        let space = calculate_stack_space_common(&mut self.state, func, 16, |space, alloc_size, align| {
-            // RISC-V uses negative offsets from s0 (frame pointer)
-            // Honor alignment: round up space to alignment boundary before allocating
-            let effective_align = if align > 0 { align.max(8) } else { 8 };
-            let alloc = ((alloc_size + 7) & !7).max(8);
-            let new_space = ((space + alloc + effective_align - 1) / effective_align) * effective_align;
-            (-(new_space as i64), new_space)
-        });
-
         // For variadic functions, count the actual GP registers used by named
         // parameters. A struct that occupies 2 GP regs counts as 2, not 1.
         // This is critical for va_start to correctly point to the first variadic arg.
@@ -1066,7 +1057,8 @@ impl ArchCodegen for RiscvCodegen {
             self.is_variadic = false;
         }
 
-        // Run register allocator: assign callee-saved registers to hot values.
+        // Run register allocator BEFORE stack space computation so we can
+        // skip allocating stack slots for values assigned to registers.
         let config = RegAllocConfig {
             available_regs: RISCV_CALLEE_SAVED.to_vec(),
         };
@@ -1076,6 +1068,18 @@ impl ArchCodegen for RiscvCodegen {
 
         // Scan inline asm instructions for callee-saved register usage.
         collect_inline_asm_callee_saved_riscv(func, &mut self.used_callee_saved);
+
+        // Build set of register-assigned value IDs to skip stack slot allocation.
+        let reg_assigned: FxHashSet<u32> = self.reg_assignments.keys().copied().collect();
+
+        let space = calculate_stack_space_common(&mut self.state, func, 16, |space, alloc_size, align| {
+            // RISC-V uses negative offsets from s0 (frame pointer)
+            // Honor alignment: round up space to alignment boundary before allocating
+            let effective_align = if align > 0 { align.max(8) } else { 8 };
+            let alloc = ((alloc_size + 7) & !7).max(8);
+            let new_space = ((space + alloc + effective_align - 1) / effective_align) * effective_align;
+            (-(new_space as i64), new_space)
+        }, &reg_assigned);
 
         // Add space for saving callee-saved registers.
         // Each callee-saved register needs 8 bytes on the stack.

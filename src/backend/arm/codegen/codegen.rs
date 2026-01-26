@@ -1,6 +1,6 @@
 use crate::ir::ir::*;
 use crate::common::types::IrType;
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::backend::common::PtrDirective;
 use crate::backend::state::{CodegenState, StackSlot};
 use crate::backend::traits::ArchCodegen;
@@ -996,6 +996,19 @@ impl ArchCodegen for ArmCodegen {
     fn function_type_directive(&self) -> &'static str { "%function" }
 
     fn calculate_stack_space(&mut self, func: &IrFunction) -> i64 {
+        // Run register allocator BEFORE stack space computation so we can
+        // skip allocating stack slots for values assigned to registers.
+        // Skip variadic functions to avoid callee-save area conflicting with VA save areas.
+        let config = RegAllocConfig {
+            available_regs: if func.is_variadic { Vec::new() } else { ARM_CALLEE_SAVED.to_vec() },
+        };
+        let alloc_result = regalloc::allocate_registers(func, &config);
+        self.reg_assignments = alloc_result.assignments;
+        self.used_callee_saved = alloc_result.used_regs;
+
+        // Build set of register-assigned value IDs to skip stack slot allocation.
+        let reg_assigned: FxHashSet<u32> = self.reg_assignments.keys().copied().collect();
+
         let mut space = calculate_stack_space_common(&mut self.state, func, 16, |space, alloc_size, align| {
             // ARM uses positive offsets from sp, starting at 16 (after fp/lr)
             // Honor alignment: round up slot offset to alignment boundary
@@ -1003,7 +1016,7 @@ impl ArchCodegen for ArmCodegen {
             let slot = (space + effective_align - 1) & !(effective_align - 1);
             let new_space = slot + ((alloc_size + 7) & !7).max(8);
             (slot, new_space)
-        });
+        }, &reg_assigned);
 
         // For variadic functions, reserve space for register save areas:
         // - GP save area: x0-x7 = 64 bytes (8 regs * 8 bytes)
@@ -1034,15 +1047,6 @@ impl ArchCodegen for ArmCodegen {
             // Track stack-passed named args (GP args beyond 8 register slots)
             self.va_named_stack_gp_count = named_gp.saturating_sub(8);
         }
-
-        // Run register allocator: assign callee-saved registers to hot values.
-        // Skip variadic functions to avoid callee-save area conflicting with VA save areas.
-        let config = RegAllocConfig {
-            available_regs: if func.is_variadic { Vec::new() } else { ARM_CALLEE_SAVED.to_vec() },
-        };
-        let alloc_result = regalloc::allocate_registers(func, &config);
-        self.reg_assignments = alloc_result.assignments;
-        self.used_callee_saved = alloc_result.used_regs;
 
         // Reserve space for saving callee-saved registers (8 bytes each).
         let save_count = self.used_callee_saved.len() as i64;
