@@ -1,0 +1,22 @@
+Fix __builtin_isunordered and __builtin_islessgreater FP comparison builtins
+
+Problem:
+__builtin_isunordered(a, b) always returns 1 regardless of inputs.
+  It should return 1 only when either argument is NaN.
+  Current implementation uses IrCmpOp::Ne which is wrong - it just checks a != b.
+
+__builtin_islessgreater(nan, 3.14) returns 1 instead of 0.
+  It should return (a < b) || (a > b), which is false when either is NaN.
+  Current implementation uses IrCmpOp::Ne which doesn't handle NaN correctly.
+
+Also: __builtin_classify_type returns integer_type_class (1) for function types
+  instead of pointer_type_class (5).
+
+Root cause: In expr_builtins.rs, FpCompare uses inappropriate IrCmpOp values
+for isunordered and islessgreater.
+
+Fix plan:
+1. __builtin_isunordered: emit (a != a) || (b != b) to check NaN-ness
+2. __builtin_islessgreater: emit (a < b) || (a > b) as two comparisons + OR
+3. classify_ctype: map Function types to pointer_type_class (5)
+4. Add regression tests
