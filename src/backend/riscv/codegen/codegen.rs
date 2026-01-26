@@ -3291,6 +3291,71 @@ impl ArchCodegen for RiscvCodegen {
         self.state.emit_fmt(format_args!("{}:", done));
     }
 
+    fn emit_i128_prep_shift_lhs(&mut self, lhs: &Operand) {
+        // Load LHS into t3:t4 for constant-amount shifts
+        self.operand_to_t0_t1(lhs);
+        self.state.emit("    mv t3, t0");
+        self.state.emit("    mv t4, t1");
+    }
+
+    fn emit_i128_shl_const(&mut self, amount: u32) {
+        // Input: t3 (low), t4 (high). Output: t0 (low), t1 (high).
+        let amount = amount & 127;
+        if amount == 0 {
+            self.state.emit("    mv t0, t3");
+            self.state.emit("    mv t1, t4");
+        } else if amount == 64 {
+            self.state.emit("    mv t1, t3");
+            self.state.emit("    li t0, 0");
+        } else if amount > 64 {
+            self.state.emit_fmt(format_args!("    slli t1, t3, {}", amount - 64));
+            self.state.emit("    li t0, 0");
+        } else {
+            self.state.emit_fmt(format_args!("    slli t1, t4, {}", amount));
+            self.state.emit_fmt(format_args!("    srli t2, t3, {}", 64 - amount));
+            self.state.emit("    or t1, t1, t2");
+            self.state.emit_fmt(format_args!("    slli t0, t3, {}", amount));
+        }
+    }
+
+    fn emit_i128_lshr_const(&mut self, amount: u32) {
+        let amount = amount & 127;
+        if amount == 0 {
+            self.state.emit("    mv t0, t3");
+            self.state.emit("    mv t1, t4");
+        } else if amount == 64 {
+            self.state.emit("    mv t0, t4");
+            self.state.emit("    li t1, 0");
+        } else if amount > 64 {
+            self.state.emit_fmt(format_args!("    srli t0, t4, {}", amount - 64));
+            self.state.emit("    li t1, 0");
+        } else {
+            self.state.emit_fmt(format_args!("    srli t0, t3, {}", amount));
+            self.state.emit_fmt(format_args!("    slli t2, t4, {}", 64 - amount));
+            self.state.emit("    or t0, t0, t2");
+            self.state.emit_fmt(format_args!("    srli t1, t4, {}", amount));
+        }
+    }
+
+    fn emit_i128_ashr_const(&mut self, amount: u32) {
+        let amount = amount & 127;
+        if amount == 0 {
+            self.state.emit("    mv t0, t3");
+            self.state.emit("    mv t1, t4");
+        } else if amount == 64 {
+            self.state.emit("    mv t0, t4");
+            self.state.emit("    srai t1, t4, 63");
+        } else if amount > 64 {
+            self.state.emit_fmt(format_args!("    srai t0, t4, {}", amount - 64));
+            self.state.emit("    srai t1, t4, 63");
+        } else {
+            self.state.emit_fmt(format_args!("    srli t0, t3, {}", amount));
+            self.state.emit_fmt(format_args!("    slli t2, t4, {}", 64 - amount));
+            self.state.emit("    or t0, t0, t2");
+            self.state.emit_fmt(format_args!("    srai t1, t4, {}", amount));
+        }
+    }
+
     fn emit_i128_divrem_call(&mut self, func_name: &str, lhs: &Operand, rhs: &Operand) {
         // RISC-V LP64D: first 128-bit arg in a0:a1, second in a2:a3
         self.operand_to_t0_t1(lhs);

@@ -960,6 +960,16 @@ pub trait ArchCodegen {
     /// Store the i128 result pair to a destination value.
     fn emit_i128_store_result(&mut self, dest: &Value);
 
+    /// Emit an optimized 128-bit shift left by a known constant amount.
+    /// LHS is already loaded into the arch-specific registers. Result goes to result regs.
+    fn emit_i128_shl_const(&mut self, amount: u32);
+
+    /// Emit an optimized 128-bit logical right shift by a known constant amount.
+    fn emit_i128_lshr_const(&mut self, amount: u32);
+
+    /// Emit an optimized 128-bit arithmetic right shift by a known constant amount.
+    fn emit_i128_ashr_const(&mut self, amount: u32);
+
     /// Emit an i128 binary operation. Default dispatches to per-op primitives.
     fn emit_i128_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand) {
         match op {
@@ -972,6 +982,20 @@ pub trait ArchCodegen {
                     _ => unreachable!(),
                 };
                 self.emit_i128_divrem_call(func_name, lhs, rhs);
+            }
+            // For shifts with constant amounts, emit optimized branchless code
+            IrBinOp::Shl | IrBinOp::LShr | IrBinOp::AShr
+                if get_const_i128_shift_amount(rhs).is_some() =>
+            {
+                let amount = get_const_i128_shift_amount(rhs).unwrap();
+                // Load only the LHS (the value to shift)
+                self.emit_i128_prep_shift_lhs(lhs);
+                match op {
+                    IrBinOp::Shl => self.emit_i128_shl_const(amount),
+                    IrBinOp::LShr => self.emit_i128_lshr_const(amount),
+                    IrBinOp::AShr => self.emit_i128_ashr_const(amount),
+                    _ => unreachable!(),
+                }
             }
             _ => {
                 self.emit_i128_prep_binop(lhs, rhs);
@@ -990,6 +1014,12 @@ pub trait ArchCodegen {
             }
         }
         self.emit_i128_store_result(dest);
+    }
+
+    /// Load the LHS operand for a shift (without loading RHS).
+    /// Default implementation uses the full prep_binop with a dummy RHS.
+    fn emit_i128_prep_shift_lhs(&mut self, lhs: &Operand) {
+        self.emit_i128_prep_binop(lhs, &Operand::Const(IrConst::I128(0)));
     }
 
     // ---- 128-bit comparison dispatch ----
@@ -1030,6 +1060,22 @@ pub trait ArchCodegen {
 // emit_store/emit_load (e.g., x86 for F128 handling) can delegate to the
 // default logic for non-special-cased types without duplicating the 3-way
 // SlotAddr dispatch code.
+
+/// Extract a constant shift amount from an operand (for optimizing 128-bit shifts).
+/// Returns Some(amount) if the operand is a constant in the range [0, 127].
+pub fn get_const_i128_shift_amount(rhs: &Operand) -> Option<u32> {
+    match rhs {
+        Operand::Const(c) => {
+            let val = c.to_i64()?;
+            if val >= 0 && val < 128 {
+                Some(val as u32)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
 
 /// Default store implementation: 3-way SlotAddr dispatch for i128 and typed stores.
 /// Backends that override `emit_store` should call this for types they don't handle specially.

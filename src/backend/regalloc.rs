@@ -54,7 +54,9 @@ pub fn allocate_registers(
     }
 
     // Disable register allocation for functions with inline assembly or atomics.
-    // Inline asm can clobber callee-saved registers without the allocator knowing.
+    // Inline asm can clobber callee-saved registers without the allocator knowing,
+    // and the inline asm scratch register pool includes callee-saved registers
+    // (e.g., ARM x19-x21) that conflict with the allocator's register assignments.
     // Atomic operations use complex multi-instruction sequences that may conflict.
     let has_unsafe = func.blocks.iter().any(|block| {
         block.instructions.iter().any(|inst| matches!(inst,

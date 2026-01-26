@@ -4365,6 +4365,63 @@ impl ArchCodegen for X86Codegen {
         self.state.emit("1:");
     }
 
+    fn emit_i128_prep_shift_lhs(&mut self, lhs: &Operand) {
+        // Load LHS into rax:rdx for constant-amount shifts
+        self.operand_to_rax_rdx(lhs);
+    }
+
+    fn emit_i128_shl_const(&mut self, amount: u32) {
+        // Input: rax (low), rdx (high). Output: rax (low), rdx (high).
+        let amount = amount & 127;
+        if amount == 0 {
+            // no-op
+        } else if amount == 64 {
+            self.state.emit("    movq %rax, %rdx");
+            self.state.emit("    xorq %rax, %rax");
+        } else if amount > 64 {
+            self.state.emit_fmt(format_args!("    shlq ${}, %rax", amount - 64));
+            self.state.emit("    movq %rax, %rdx");
+            self.state.emit("    xorq %rax, %rax");
+        } else {
+            self.state.emit_fmt(format_args!("    shldq ${}, %rax, %rdx", amount));
+            self.state.emit_fmt(format_args!("    shlq ${}, %rax", amount));
+        }
+    }
+
+    fn emit_i128_lshr_const(&mut self, amount: u32) {
+        let amount = amount & 127;
+        if amount == 0 {
+            // no-op
+        } else if amount == 64 {
+            self.state.emit("    movq %rdx, %rax");
+            self.state.emit("    xorq %rdx, %rdx");
+        } else if amount > 64 {
+            self.state.emit_fmt(format_args!("    shrq ${}, %rdx", amount - 64));
+            self.state.emit("    movq %rdx, %rax");
+            self.state.emit("    xorq %rdx, %rdx");
+        } else {
+            self.state.emit_fmt(format_args!("    shrdq ${}, %rdx, %rax", amount));
+            self.state.emit_fmt(format_args!("    shrq ${}, %rdx", amount));
+        }
+    }
+
+    fn emit_i128_ashr_const(&mut self, amount: u32) {
+        let amount = amount & 127;
+        if amount == 0 {
+            // no-op
+        } else if amount == 64 {
+            self.state.emit("    movq %rdx, %rax");
+            self.state.emit("    sarq $63, %rdx");
+        } else if amount > 64 {
+            self.state.emit_fmt(format_args!("    sarq ${}, %rdx", amount - 64));
+            self.state.emit("    movq %rdx, %rax");
+            self.state.emit("    sarq $63, %rdx");
+        } else {
+            self.state.emit_fmt(format_args!("    shrdq ${}, %rdx, %rax", amount));
+            self.state.emit_fmt(format_args!("    sarq ${}, %rdx", amount));
+        }
+    }
+
     fn emit_i128_divrem_call(&mut self, func_name: &str, lhs: &Operand, rhs: &Operand) {
         // x86-64 SysV: args in rdi:rsi (lhs), rdx:rcx (rhs)
         self.operand_to_rax_rdx(rhs);

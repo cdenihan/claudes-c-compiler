@@ -11,7 +11,7 @@ use crate::backend::state::CodegenState;
 use super::codegen::ArmCodegen;
 
 impl ArmCodegen {
-    pub(super) fn substitute_asm_operands_static(line: &str, op_regs: &[String], op_names: &[Option<String>]) -> String {
+    pub(super) fn substitute_asm_operands_static(line: &str, op_regs: &[String], op_names: &[Option<String>], gcc_to_internal: &[usize]) -> String {
         let mut result = String::new();
         let chars: Vec<char> = line.chars().collect();
         let mut i = 0;
@@ -67,13 +67,21 @@ impl ArmCodegen {
                     }
                 } else if chars[i].is_ascii_digit() {
                     // Positional operand: %0, %1, %w2, etc.
+                    // The number is a GCC operand number (outputs numbered first,
+                    // then real inputs, skipping synthetic "+" inputs).
+                    // Map through gcc_to_internal to get the internal operand index.
                     let mut num = 0usize;
                     while i < chars.len() && chars[i].is_ascii_digit() {
                         num = num * 10 + (chars[i] as usize - '0' as usize);
                         i += 1;
                     }
-                    if num < op_regs.len() {
-                        result.push_str(&Self::format_reg_static(&op_regs[num], modifier));
+                    let internal_idx = if num < gcc_to_internal.len() {
+                        gcc_to_internal[num]
+                    } else {
+                        num
+                    };
+                    if internal_idx < op_regs.len() {
+                        result.push_str(&Self::format_reg_static(&op_regs[internal_idx], modifier));
                     } else {
                         result.push_str(&format!("x{}", num));
                     }

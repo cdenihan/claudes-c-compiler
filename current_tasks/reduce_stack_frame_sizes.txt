@@ -1,0 +1,19 @@
+Reduce stack frame sizes for postgres plpgsql stack depth fix
+
+Problem: PostgreSQL plpgsql tests fail with "stack depth limit exceeded"
+because CCC generates stack frames 2.5-4x larger than GCC for key recursive
+functions in the PL/pgSQL execution path.
+
+Root causes:
+1. Tier 2 liveness-based stack packing threshold too high (>=8 blocks && >=64 insts)
+   Many postgres functions have 3-7 blocks with many multi-block intermediates
+   that each get their own permanent 8-byte stack slot instead of being packed.
+2. Dead values (defined but never read) still get stack slots allocated.
+3. Call results always get stack slots even when only used once immediately after.
+
+Fix plan:
+- Lower Tier 2 threshold to enable liveness packing for smaller functions
+- Add dead value elimination to skip stack slots for values never read
+- These are safe, architecture-independent changes in generation.rs
+
+Status: in_progress

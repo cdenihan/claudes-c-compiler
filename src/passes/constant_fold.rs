@@ -113,9 +113,17 @@ fn try_fold(inst: &Instruction) -> Option<Instruction> {
 fn try_fold_with_map(inst: &Instruction, const_map: &[Option<ConstMapEntry>]) -> Option<Instruction> {
     match inst {
         Instruction::BinOp { dest, op, lhs, rhs, ty } => {
-            // Skip 128-bit types: our fold_binop uses i64, which would truncate
+            // For 128-bit types, use native i128 arithmetic to avoid truncation
             if ty.is_128bit() {
-                return None;
+                let lc = resolve_const(lhs, const_map)?;
+                let rc = resolve_const(rhs, const_map)?;
+                let l = lc.to_i128()?;
+                let r = rc.to_i128()?;
+                let result = fold_binop_i128(*op, l, r, ty.is_unsigned())?;
+                return Some(Instruction::Copy {
+                    dest: *dest,
+                    src: Operand::Const(IrConst::I128(result)),
+                });
             }
             // Try float folding first
             if ty.is_float() {
@@ -153,9 +161,19 @@ fn try_fold_with_map(inst: &Instruction, const_map: &[Option<ConstMapEntry>]) ->
             })
         }
         Instruction::UnaryOp { dest, op, src, ty } => {
-            // Skip 128-bit types
+            // For 128-bit types, fold Neg and Not using native i128
             if ty.is_128bit() {
-                return None;
+                let sc = resolve_const(src, const_map)?;
+                let s = sc.to_i128()?;
+                let result = match op {
+                    IrUnaryOp::Neg => s.wrapping_neg(),
+                    IrUnaryOp::Not => !s,
+                    _ => return None,
+                };
+                return Some(Instruction::Copy {
+                    dest: *dest,
+                    src: Operand::Const(IrConst::I128(result)),
+                });
             }
             // Try float unary folding
             if ty.is_float() {
@@ -186,9 +204,17 @@ fn try_fold_with_map(inst: &Instruction, const_map: &[Option<ConstMapEntry>]) ->
             })
         }
         Instruction::Cmp { dest, op, lhs, rhs, ty } => {
-            // Skip 128-bit comparison types
+            // For 128-bit types, fold comparisons using native i128
             if ty.is_128bit() {
-                return None;
+                let lc = resolve_const(lhs, const_map)?;
+                let rc = resolve_const(rhs, const_map)?;
+                let l = lc.to_i128()?;
+                let r = rc.to_i128()?;
+                let result = fold_cmp_i128(*op, l, r);
+                return Some(Instruction::Copy {
+                    dest: *dest,
+                    src: Operand::Const(IrConst::I32(result as i32)),
+                });
             }
             // Try float comparison folding
             if ty.is_float() {
@@ -226,9 +252,14 @@ fn try_fold_with_map(inst: &Instruction, const_map: &[Option<ConstMapEntry>]) ->
             })
         }
         Instruction::Cast { dest, src, from_ty, to_ty } => {
-            // Skip casts involving 128-bit types
+            // For casts involving 128-bit types, use native i128 arithmetic
             if from_ty.is_128bit() || to_ty.is_128bit() {
-                return None;
+                let sc = resolve_const(src, const_map)?;
+                let result = fold_cast_i128(&sc, *from_ty, *to_ty)?;
+                return Some(Instruction::Copy {
+                    dest: *dest,
+                    src: Operand::Const(result),
+                });
             }
             // Handle float-to-int and int-to-float casts
             if from_ty.is_float() || to_ty.is_float() {
@@ -483,6 +514,80 @@ fn try_fold_float_cast_mapped(dest: Value, src: &Operand, from_ty: IrType, to_ty
         dest,
         src: Operand::Const(result),
     })
+}
+
+/// Evaluate a binary operation on two constant 128-bit integers.
+/// Uses native Rust i128/u128 arithmetic for full precision.
+fn fold_binop_i128(op: IrBinOp, lhs: i128, rhs: i128, is_unsigned: bool) -> Option<i128> {
+    Some(match op {
+        IrBinOp::Add => lhs.wrapping_add(rhs),
+        IrBinOp::Sub => lhs.wrapping_sub(rhs),
+        IrBinOp::Mul => lhs.wrapping_mul(rhs),
+        IrBinOp::SDiv => {
+            if rhs == 0 { return None; }
+            lhs.wrapping_div(rhs)
+        }
+        IrBinOp::UDiv => {
+            if rhs == 0 { return None; }
+            (lhs as u128).wrapping_div(rhs as u128) as i128
+        }
+        IrBinOp::SRem => {
+            if rhs == 0 { return None; }
+            lhs.wrapping_rem(rhs)
+        }
+        IrBinOp::URem => {
+            if rhs == 0 { return None; }
+            (lhs as u128).wrapping_rem(rhs as u128) as i128
+        }
+        IrBinOp::And => lhs & rhs,
+        IrBinOp::Or => lhs | rhs,
+        IrBinOp::Xor => lhs ^ rhs,
+        IrBinOp::Shl => lhs.wrapping_shl(rhs as u32),
+        IrBinOp::AShr => lhs.wrapping_shr(rhs as u32),
+        IrBinOp::LShr => (lhs as u128).wrapping_shr(rhs as u32) as i128,
+    })
+}
+
+/// Evaluate a comparison on two constant 128-bit integers.
+fn fold_cmp_i128(op: IrCmpOp, lhs: i128, rhs: i128) -> bool {
+    match op {
+        IrCmpOp::Eq => lhs == rhs,
+        IrCmpOp::Ne => lhs != rhs,
+        IrCmpOp::Slt => lhs < rhs,
+        IrCmpOp::Sle => lhs <= rhs,
+        IrCmpOp::Sgt => lhs > rhs,
+        IrCmpOp::Sge => lhs >= rhs,
+        IrCmpOp::Ult => (lhs as u128) < (rhs as u128),
+        IrCmpOp::Ule => (lhs as u128) <= (rhs as u128),
+        IrCmpOp::Ugt => (lhs as u128) > (rhs as u128),
+        IrCmpOp::Uge => (lhs as u128) >= (rhs as u128),
+    }
+}
+
+/// Fold a cast involving 128-bit types.
+fn fold_cast_i128(src: &IrConst, from_ty: IrType, to_ty: IrType) -> Option<IrConst> {
+    let val = src.to_i128()?;
+
+    if to_ty.is_128bit() {
+        // Widening to i128: the value is already i128 from to_i128()
+        Some(IrConst::I128(val))
+    } else if to_ty.is_float() {
+        // i128 to float
+        let fval = if from_ty.is_unsigned() {
+            (val as u128) as f64
+        } else {
+            val as f64
+        };
+        Some(match to_ty {
+            IrType::F32 => IrConst::F32(fval as f32),
+            IrType::F64 => IrConst::F64(fval),
+            _ => return None,
+        })
+    } else {
+        // Narrowing from i128 to smaller int
+        let i64_val = val as i64;
+        Some(IrConst::from_i64(fold_cast(i64_val, IrType::I64, to_ty), to_ty))
+    }
 }
 
 /// Evaluate a binary operation on two constant integers.

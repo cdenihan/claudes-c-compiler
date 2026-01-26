@@ -20,7 +20,7 @@ const ARM_CALLEE_SAVED: [PhysReg; 9] = [
 
 fn callee_saved_name(reg: PhysReg) -> &'static str {
     match reg.0 {
-        20 => "x20", 21 => "x21", 22 => "x22", 23 => "x23", 24 => "x24",
+        19 => "x19", 20 => "x20", 21 => "x21", 22 => "x22", 23 => "x23", 24 => "x24",
         25 => "x25", 26 => "x26", 27 => "x27", 28 => "x28",
         _ => unreachable!("invalid ARM callee-saved register index"),
     }
@@ -28,7 +28,7 @@ fn callee_saved_name(reg: PhysReg) -> &'static str {
 
 fn callee_saved_name_32(reg: PhysReg) -> &'static str {
     match reg.0 {
-        20 => "w20", 21 => "w21", 22 => "w22", 23 => "w23", 24 => "w24",
+        19 => "w19", 20 => "w20", 21 => "w21", 22 => "w22", 23 => "w23", 24 => "w24",
         25 => "w25", 26 => "w26", 27 => "w27", 28 => "w28",
         _ => unreachable!("invalid ARM callee-saved register index"),
     }
@@ -196,6 +196,186 @@ impl ArmCodegen {
             }
             _ => None,
         }
+    }
+
+    /// If `op` is a constant that is a power of two, return its log2 (shift amount).
+    fn const_as_power_of_2(op: &Operand) -> Option<u32> {
+        match op {
+            Operand::Const(c) => {
+                let val: u64 = match c {
+                    IrConst::I8(v) => *v as u8 as u64,
+                    IrConst::I16(v) => *v as u16 as u64,
+                    IrConst::I32(v) => *v as u32 as u64,
+                    IrConst::I64(v) => *v as u64,
+                    IrConst::Zero => return None,
+                    _ => return None,
+                };
+                if val > 0 && val.is_power_of_two() {
+                    Some(val.trailing_zeros())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Pre-scan all inline asm instructions in a function to predict which
+    /// callee-saved registers will be needed as scratch registers.
+    ///
+    /// The inline asm scratch allocator (`assign_scratch_reg`) walks through
+    /// `ARM_GP_SCRATCH` = [x9..x15, x19, x20, x21], skipping registers that
+    /// appear in the clobber/excluded list. When enough caller-saved scratch regs
+    /// (x9-x15) are clobbered, the allocator falls through to callee-saved
+    /// registers (x19, x20, x21). These must be saved/restored in the prologue,
+    /// but the prologue is emitted before inline asm codegen runs. This function
+    /// simulates the allocation to discover the callee-saved registers early.
+    fn prescan_inline_asm_callee_saved(func: &IrFunction, used_callee_saved: &mut Vec<PhysReg>) {
+        for block in &func.blocks {
+            for instr in &block.instructions {
+                if let Instruction::InlineAsm {
+                    outputs, inputs, clobbers, ..
+                } = instr {
+                    // Build excluded set: clobber registers + specific constraint regs
+                    let mut excluded: Vec<String> = Vec::new();
+                    for clobber in clobbers {
+                        if clobber == "cc" || clobber == "memory" {
+                            continue;
+                        }
+                        excluded.push(clobber.clone());
+                        // Also exclude the alternate width alias (wN <-> xN)
+                        if let Some(suffix) = clobber.strip_prefix('w') {
+                            if suffix.chars().all(|c| c.is_ascii_digit()) {
+                                excluded.push(format!("x{}", suffix));
+                            }
+                        } else if let Some(suffix) = clobber.strip_prefix('x') {
+                            if suffix.chars().all(|c| c.is_ascii_digit()) {
+                                excluded.push(format!("w{}", suffix));
+                            }
+                        }
+                    }
+
+                    // Count GP scratch registers needed:
+                    // 1. GpReg operands (outputs + inputs that are "r" type, not tied, not specific)
+                    // 2. Memory operands that need indirection (non-alloca pointers get a scratch reg)
+                    let mut gp_scratch_needed = 0usize;
+
+                    for (constraint, _, _) in outputs {
+                        let c = constraint.trim_start_matches(|ch: char| ch == '=' || ch == '+' || ch == '&');
+                        if c.starts_with('{') && c.ends_with('}') {
+                            let reg_name = &c[1..c.len()-1];
+                            excluded.push(reg_name.to_string());
+                        } else if c == "m" || c == "Q" || c.contains('Q') || c.contains('m') {
+                            // Memory operands may need a scratch reg for indirection.
+                            // Conservatively count each one.
+                            gp_scratch_needed += 1;
+                        } else if c == "w" {
+                            // FP register, doesn't consume GP scratch
+                        } else if !c.is_empty() && c.chars().all(|ch| ch.is_ascii_digit()) {
+                            // Tied operand, doesn't need its own scratch
+                        } else {
+                            // GpReg
+                            gp_scratch_needed += 1;
+                        }
+                    }
+
+                    // Count "+" read-write outputs that generate synthetic inputs.
+                    // Synthetic inputs from "+r" have constraint "r" and consume a
+                    // GP scratch slot in phase 1 (even though the register is later
+                    // overwritten by copy_metadata_from). We must count these too.
+                    let num_plus = outputs.iter().filter(|(c,_,_)| c.contains('+')).count();
+                    {
+                        let mut plus_idx = 0;
+                        for (constraint, _, _) in outputs.iter() {
+                            if constraint.contains('+') {
+                                let c = constraint.trim_start_matches(|ch: char| ch == '=' || ch == '+' || ch == '&');
+                                // Synthetic input inherits constraint with '+' stripped
+                                // "+r" → "r" (GpReg, consumes scratch), "+m" → "m" (Memory, skip)
+                                if c != "m" && c != "Q" && !c.contains('Q') && !c.contains('m') && c != "w"
+                                    && !(c.starts_with('{') && c.ends_with('}'))
+                                    && !(c.chars().all(|ch| ch.is_ascii_digit()) && !c.is_empty())
+                                {
+                                    gp_scratch_needed += 1;
+                                }
+                                plus_idx += 1;
+                            }
+                        }
+                        let _ = plus_idx;
+                    }
+
+                    for (i, (constraint, val, _)) in inputs.iter().enumerate() {
+                        // Skip synthetic inputs (they're already counted above)
+                        if i < num_plus {
+                            continue;
+                        }
+                        let c = constraint.trim_start_matches(|ch: char| ch == '=' || ch == '+' || ch == '&');
+                        if c.starts_with('{') && c.ends_with('}') {
+                            let reg_name = &c[1..c.len()-1];
+                            excluded.push(reg_name.to_string());
+                        } else if c == "m" || c == "Q" || c.contains('Q') || c.contains('m') {
+                            gp_scratch_needed += 1;
+                        } else if c == "w" {
+                            // FP register
+                        } else if !c.is_empty() && c.chars().all(|ch| ch.is_ascii_digit()) {
+                            // Tied operand
+                        } else {
+                            // Check if constant input with immediate-capable constraint
+                            // would be promoted to Immediate (no scratch needed)
+                            let is_const = matches!(val, Operand::Const(_));
+                            let has_imm_alt = c.contains('i') || c.contains('I') || c.contains('n');
+                            if is_const && has_imm_alt {
+                                // Would be promoted to Immediate, no GP scratch needed
+                            } else {
+                                gp_scratch_needed += 1;
+                            }
+                        }
+                    }
+
+                    // Simulate walking through ARM_GP_SCRATCH, skipping excluded regs
+                    let mut scratch_idx = 0;
+                    let mut assigned = 0;
+                    while assigned < gp_scratch_needed && scratch_idx < ARM_GP_SCRATCH.len() {
+                        let reg = ARM_GP_SCRATCH[scratch_idx];
+                        scratch_idx += 1;
+                        if excluded.iter().any(|e| e == reg) {
+                            continue;
+                        }
+                        assigned += 1;
+                        // Check if this is a callee-saved register
+                        if let Some(num_str) = reg.strip_prefix('x') {
+                            if let Ok(n) = num_str.parse::<u8>() {
+                                if (19..=28).contains(&n) {
+                                    let phys = PhysReg(n);
+                                    if !used_callee_saved.contains(&phys) {
+                                        used_callee_saved.push(phys);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Also handle overflow beyond ARM_GP_SCRATCH (format!("x{}", 9 + idx))
+                    while assigned < gp_scratch_needed {
+                        let idx = scratch_idx;
+                        scratch_idx += 1;
+                        let reg_num = 9 + idx;
+                        let reg_name = format!("x{}", reg_num);
+                        if excluded.iter().any(|e| e == &reg_name) {
+                            continue;
+                        }
+                        assigned += 1;
+                        if (19..=28).contains(&reg_num) {
+                            let phys = PhysReg(reg_num as u8);
+                            if !used_callee_saved.contains(&phys) {
+                                used_callee_saved.push(phys);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Sort for deterministic prologue/epilogue emission
+        used_callee_saved.sort_by_key(|r| r.0);
     }
 
     /// Restore callee-saved registers before epilogue.
@@ -1445,6 +1625,12 @@ impl ArchCodegen for ArmCodegen {
         self.reg_assignments = alloc_result.assignments;
         self.used_callee_saved = alloc_result.used_regs;
 
+        // Pre-scan inline asm instructions to predict which callee-saved registers
+        // will be needed as scratch registers. This must happen BEFORE stack layout
+        // computation because the prologue (which saves callee-saved regs) is emitted
+        // before inline asm codegen runs assign_scratch_reg.
+        Self::prescan_inline_asm_callee_saved(func, &mut self.used_callee_saved);
+
         // Build set of register-assigned value IDs to skip stack slot allocation.
         let reg_assigned: FxHashSet<u32> = self.reg_assignments.keys().copied().collect();
 
@@ -2134,6 +2320,31 @@ impl ArchCodegen for ArmCodegen {
         // Note: i128 dispatch is handled by the shared emit_binop default in traits.rs.
         let use_32bit = ty == IrType::I32 || ty == IrType::U32;
         let is_unsigned = ty.is_unsigned();
+
+        // Strength reduction: UDiv/URem by power-of-2 constant → shift/mask.
+        if let Some(shift) = Self::const_as_power_of_2(rhs) {
+            if op == IrBinOp::UDiv {
+                self.emit_load_operand(lhs);
+                if use_32bit {
+                    self.state.emit_fmt(format_args!("    lsr w0, w0, #{}", shift));
+                } else {
+                    self.state.emit_fmt(format_args!("    lsr x0, x0, #{}", shift));
+                }
+                self.store_x0_to(dest);
+                return;
+            }
+            if op == IrBinOp::URem {
+                self.emit_load_operand(lhs);
+                let mask = (1u64 << shift) - 1;
+                if use_32bit {
+                    self.state.emit_fmt(format_args!("    and w0, w0, #{}", mask));
+                } else {
+                    self.state.emit_fmt(format_args!("    and x0, x0, #{}", mask));
+                }
+                self.store_x0_to(dest);
+                return;
+            }
+        }
 
         // Register-direct path: use ARM 3-operand instructions with callee-saved dest.
         if let Some(dest_phys) = self.dest_reg(dest) {
@@ -3612,6 +3823,73 @@ impl ArchCodegen for ArmCodegen {
         self.state.emit_fmt(format_args!("{}:", done));
     }
 
+    fn emit_i128_prep_shift_lhs(&mut self, lhs: &Operand) {
+        // Load only LHS into x2:x3 for constant-amount shifts
+        self.operand_to_x0_x1(lhs);
+        self.state.emit("    mov x2, x0");
+        self.state.emit("    mov x3, x1");
+    }
+
+    fn emit_i128_shl_const(&mut self, amount: u32) {
+        // Input: x2 (low), x3 (high). Output: x0 (low), x1 (high).
+        let amount = amount & 127;
+        if amount == 0 {
+            self.state.emit("    mov x0, x2");
+            self.state.emit("    mov x1, x3");
+        } else if amount == 64 {
+            self.state.emit("    mov x1, x2");
+            self.state.emit("    mov x0, #0");
+        } else if amount > 64 {
+            self.state.emit_fmt(format_args!("    lsl x1, x2, #{}", amount - 64));
+            self.state.emit("    mov x0, #0");
+        } else {
+            // 0 < amount < 64
+            self.state.emit_fmt(format_args!("    lsl x1, x3, #{}", amount));
+            self.state.emit_fmt(format_args!("    orr x1, x1, x2, lsr #{}", 64 - amount));
+            self.state.emit_fmt(format_args!("    lsl x0, x2, #{}", amount));
+        }
+    }
+
+    fn emit_i128_lshr_const(&mut self, amount: u32) {
+        // Input: x2 (low), x3 (high). Output: x0 (low), x1 (high).
+        let amount = amount & 127;
+        if amount == 0 {
+            self.state.emit("    mov x0, x2");
+            self.state.emit("    mov x1, x3");
+        } else if amount == 64 {
+            self.state.emit("    mov x0, x3");
+            self.state.emit("    mov x1, #0");
+        } else if amount > 64 {
+            self.state.emit_fmt(format_args!("    lsr x0, x3, #{}", amount - 64));
+            self.state.emit("    mov x1, #0");
+        } else {
+            // 0 < amount < 64
+            self.state.emit_fmt(format_args!("    lsr x0, x2, #{}", amount));
+            self.state.emit_fmt(format_args!("    orr x0, x0, x3, lsl #{}", 64 - amount));
+            self.state.emit_fmt(format_args!("    lsr x1, x3, #{}", amount));
+        }
+    }
+
+    fn emit_i128_ashr_const(&mut self, amount: u32) {
+        // Input: x2 (low), x3 (high). Output: x0 (low), x1 (high).
+        let amount = amount & 127;
+        if amount == 0 {
+            self.state.emit("    mov x0, x2");
+            self.state.emit("    mov x1, x3");
+        } else if amount == 64 {
+            self.state.emit("    mov x0, x3");
+            self.state.emit("    asr x1, x3, #63");
+        } else if amount > 64 {
+            self.state.emit_fmt(format_args!("    asr x0, x3, #{}", amount - 64));
+            self.state.emit("    asr x1, x3, #63");
+        } else {
+            // 0 < amount < 64
+            self.state.emit_fmt(format_args!("    lsr x0, x2, #{}", amount));
+            self.state.emit_fmt(format_args!("    orr x0, x0, x3, lsl #{}", 64 - amount));
+            self.state.emit_fmt(format_args!("    asr x1, x3, #{}", amount));
+        }
+    }
+
     fn emit_i128_divrem_call(&mut self, func_name: &str, lhs: &Operand, rhs: &Operand) {
         // AAPCS64: first 128-bit arg in x0:x1, second in x2:x3
         self.operand_to_x0_x1(lhs);
@@ -3781,6 +4059,19 @@ impl InlineAsmEmitter for ArmCodegen {
                     format!("x{}", 9 + idx)
                 };
                 if !excluded.iter().any(|e| e == &reg) {
+                    // If this is a callee-saved register (x19-x28), ensure it is
+                    // saved/restored in the prologue/epilogue.
+                    let reg_num = reg.strip_prefix('x')
+                        .and_then(|s| s.parse::<u8>().ok());
+                    if let Some(n) = reg_num {
+                        if (19..=28).contains(&n) {
+                            let phys = PhysReg(n);
+                            if !self.used_callee_saved.contains(&phys) {
+                                self.used_callee_saved.push(phys);
+                                self.used_callee_saved.sort_by_key(|r| r.0);
+                            }
+                        }
+                    }
                     return reg;
                 }
             }
@@ -3847,7 +4138,7 @@ impl InlineAsmEmitter for ArmCodegen {
         }
     }
 
-    fn substitute_template_line(&self, line: &str, operands: &[AsmOperand], _gcc_to_internal: &[usize], _operand_types: &[IrType], goto_labels: &[(String, BlockId)]) -> String {
+    fn substitute_template_line(&self, line: &str, operands: &[AsmOperand], gcc_to_internal: &[usize], _operand_types: &[IrType], goto_labels: &[(String, BlockId)]) -> String {
         // For memory operands (Q/m constraints), use mem_addr (e.g., "[x9]") or
         // format as [sp, #offset] for stack-based memory. For register operands,
         // use the register name directly.
@@ -3872,7 +4163,7 @@ impl InlineAsmEmitter for ArmCodegen {
             }
         }).collect();
         let op_names: Vec<Option<String>> = operands.iter().map(|o| o.name.clone()).collect();
-        let mut result = Self::substitute_asm_operands_static(line, &op_regs, &op_names);
+        let mut result = Self::substitute_asm_operands_static(line, &op_regs, &op_names, gcc_to_internal);
         // Substitute %l[name] goto label references
         result = crate::backend::inline_asm::substitute_goto_labels(&result, goto_labels, operands.len());
         result
