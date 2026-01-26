@@ -19,6 +19,37 @@ impl Lowerer {
         self.sema_const_values.get(&key).cloned()
     }
 
+    /// Check if an expression tree contains a Sizeof node at any depth.
+    /// Used to avoid trusting sema's pre-computed values for expressions involving
+    /// sizeof, since sema evaluates sizeof before the lowerer resolves unsized array
+    /// dimensions from initializers. For example, `sizeof(cases) / sizeof(cases[0]) + 1`
+    /// contains Sizeof nodes in the division subtree, so the entire expression must
+    /// be recomputed by the lowerer.
+    fn expr_contains_sizeof(expr: &Expr) -> bool {
+        match expr {
+            Expr::Sizeof(_, _) => true,
+            Expr::BinaryOp(_, lhs, rhs, _) => {
+                Self::expr_contains_sizeof(lhs) || Self::expr_contains_sizeof(rhs)
+            }
+            Expr::UnaryOp(_, inner, _) | Expr::PostfixOp(_, inner, _) => {
+                Self::expr_contains_sizeof(inner)
+            }
+            Expr::Cast(_, inner, _) => Self::expr_contains_sizeof(inner),
+            Expr::Conditional(cond, then_e, else_e, _) => {
+                Self::expr_contains_sizeof(cond)
+                    || Self::expr_contains_sizeof(then_e)
+                    || Self::expr_contains_sizeof(else_e)
+            }
+            Expr::GnuConditional(cond, else_e, _) => {
+                Self::expr_contains_sizeof(cond) || Self::expr_contains_sizeof(else_e)
+            }
+            Expr::Comma(lhs, rhs, _) => {
+                Self::expr_contains_sizeof(lhs) || Self::expr_contains_sizeof(rhs)
+            }
+            _ => false,
+        }
+    }
+
     /// Try to evaluate a constant expression at compile time.
     ///
     /// First checks sema's pre-computed ConstMap (O(1) lookup for expressions
@@ -28,9 +59,16 @@ impl Lowerer {
     pub(super) fn eval_const_expr(&self, expr: &Expr) -> Option<IrConst> {
         // Fast path: consult sema's pre-computed constant values.
         // This avoids re-evaluating expressions that sema already handled.
-        // We skip the sema lookup for identifiers since the lowerer may have
-        // more information (const local values, static locals) that sema lacks.
-        if !matches!(expr, Expr::Identifier(_, _)) {
+        // We skip the sema lookup for:
+        //   - Identifiers: the lowerer may have more information (const local values,
+        //     static locals) that sema lacks.
+        //   - Expressions containing sizeof: sema may have computed sizeof for unsized
+        //     arrays (e.g., `PT cases[] = {1,2,3,...}`) before the lowerer resolved the
+        //     actual element count from the initializer. The lowerer's sizeof_expr/
+        //     sizeof_type uses the correctly-sized global, so we must recompute.
+        //     This check covers sizeof itself and any parent expression containing it,
+        //     such as `sizeof(x) / sizeof(x[0]) + 1`.
+        if !matches!(expr, Expr::Identifier(_, _)) && !Self::expr_contains_sizeof(expr) {
             if let Some(val) = self.lookup_sema_const(expr) {
                 return Some(val);
             }
