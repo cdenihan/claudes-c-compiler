@@ -824,7 +824,231 @@ pub fn peephole_optimize(asm: String) -> String {
         }
     }
 
+    // Phase 4: Eliminate unused callee-saved register saves/restores.
+    // After all optimization passes, some callee-saved registers that were
+    // allocated by the register allocator may have had all their body uses
+    // eliminated by earlier peephole passes. Detect these and remove the
+    // now-unnecessary prologue save and epilogue restore instructions.
+    // Note: the stack frame size is preserved even when saves are eliminated;
+    // see comment in eliminate_unused_callee_saves for rationale.
+    eliminate_unused_callee_saves(&store, &mut infos);
+
     store.build_result(&infos)
+}
+
+// ── Unused callee-saved register elimination ─────────────────────────────────
+//
+// After peephole optimization, some callee-saved registers may no longer be
+// referenced in the function body (all uses were optimized away). This pass
+// detects such registers and removes their prologue save / epilogue restore
+// instructions. The stack frame is not shrunk (see rationale inside function).
+
+/// Check if a register family ID is callee-saved (rbx=3, r12=12, r13=13, r14=14, r15=15).
+fn is_callee_saved_reg(reg: RegId) -> bool {
+    matches!(reg, 3 | 12 | 13 | 14 | 15)
+}
+
+/// Returns all string patterns that could reference a given register family in asm text.
+/// For example, register family 13 (r13) can appear as %r13, %r13d, %r13w, %r13b.
+fn reg_family_patterns(reg: RegId) -> &'static [&'static str] {
+    match reg {
+        3 => &["%rbx", "%ebx", "%bx", "%bl", "%bh"],
+        12 => &["%r12", "%r12d", "%r12w", "%r12b"],
+        13 => &["%r13", "%r13d", "%r13w", "%r13b"],
+        14 => &["%r14", "%r14d", "%r14w", "%r14b"],
+        15 => &["%r15", "%r15d", "%r15w", "%r15b"],
+        _ => &[],
+    }
+}
+
+/// Check if a line of assembly text references a given register family.
+fn line_references_reg(line: &str, reg: RegId) -> bool {
+    let patterns = reg_family_patterns(reg);
+    for pat in patterns {
+        if line.contains(pat) {
+            return true;
+        }
+    }
+    false
+}
+
+fn eliminate_unused_callee_saves(store: &LineStore, infos: &mut [LineInfo]) {
+    let len = store.len();
+    if len == 0 {
+        return;
+    }
+
+    // Find function boundaries by scanning for function labels.
+    // A function starts at a .globl or .type directive followed by a label,
+    // or more simply, we look for the prologue pattern:
+    //   pushq %rbp
+    //   movq %rsp, %rbp
+    //   subq $N, %rsp
+    // We process each such function independently.
+
+    let mut i = 0;
+    while i < len {
+        // Look for the prologue: pushq %rbp
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+        if !matches!(infos[i].kind, LineKind::Push { reg: 5 }) {
+            // Not pushq %rbp
+            i += 1;
+            continue;
+        }
+
+        // Next non-nop should be "movq %rsp, %rbp"
+        let mut j = i + 1;
+        while j < len && infos[j].is_nop() {
+            j += 1;
+        }
+        if j >= len {
+            i = j;
+            continue;
+        }
+        // Check it's "movq %rsp, %rbp"
+        let mov_rbp_line = infos[j].trimmed(store.get(j));
+        if mov_rbp_line != "movq %rsp, %rbp" {
+            i = j + 1;
+            continue;
+        }
+        j += 1;
+
+        // Next non-nop should be "subq $N, %rsp"
+        while j < len && infos[j].is_nop() {
+            j += 1;
+        }
+        if j >= len {
+            i = j;
+            continue;
+        }
+        let subq_line = infos[j].trimmed(store.get(j));
+        // Validate this is a "subq $N, %rsp" instruction (prologue frame allocation).
+        if let Some(rest) = subq_line.strip_prefix("subq $") {
+            if let Some(val_str) = rest.strip_suffix(", %rsp") {
+                if val_str.parse::<i64>().is_err() {
+                    i = j + 1;
+                    continue;
+                }
+            } else {
+                i = j + 1;
+                continue;
+            }
+        } else {
+            // No subq: no callee saves possible in this pattern
+            i = j + 1;
+            continue;
+        }
+        j += 1;
+
+        // Collect callee-saved register saves immediately after subq.
+        // Pattern: movq %REG, OFFSET(%rbp) where REG is callee-saved.
+        struct CalleeSave {
+            reg: RegId,
+            offset: i32,
+            save_line_idx: usize,
+        }
+        let mut saves: Vec<CalleeSave> = Vec::new();
+        while j < len && infos[j].is_nop() {
+            j += 1;
+        }
+        while j < len {
+            if infos[j].is_nop() {
+                j += 1;
+                continue;
+            }
+            if let LineKind::StoreRbp { reg, offset, size: MoveSize::Q } = infos[j].kind {
+                if is_callee_saved_reg(reg) && offset < 0 {
+                    saves.push(CalleeSave {
+                        reg,
+                        offset,
+                        save_line_idx: j,
+                    });
+                    j += 1;
+                    continue;
+                }
+            }
+            break;
+        }
+
+        if saves.is_empty() {
+            i = j;
+            continue;
+        }
+
+        // Find the end of this function by looking for the .size directive.
+        let body_start = j;
+        let mut func_end = len;
+        for k in body_start..len {
+            if infos[k].is_nop() {
+                continue;
+            }
+            // .size directive ends a function
+            let line = infos[k].trimmed(store.get(k));
+            if line.starts_with(".size ") {
+                func_end = k + 1;
+                break;
+            }
+        }
+
+        // For each callee-saved register, check if it's referenced in the body
+        // (between saves and function end), excluding the save/restore lines themselves.
+        // Collect restore line indices too.
+        for save in &saves {
+            let reg = save.reg;
+
+            // Find all restore lines for this register (LoadRbp with same reg and offset)
+            let mut restore_indices: Vec<usize> = Vec::new();
+            let mut body_has_reference = false;
+
+            for k in body_start..func_end {
+                if infos[k].is_nop() {
+                    continue;
+                }
+
+                // Check if this is a restore of the same register at the same offset
+                if let LineKind::LoadRbp { reg: load_reg, offset: load_offset, size: MoveSize::Q } = infos[k].kind {
+                    if load_reg == reg && load_offset == save.offset {
+                        // Check if this is in an epilogue context
+                        if is_near_epilogue(infos, k) {
+                            restore_indices.push(k);
+                            continue;
+                        }
+                    }
+                }
+
+                // Check if the line references this register family at all
+                let line_text = store.get(k);
+                if line_references_reg(line_text, reg) {
+                    body_has_reference = true;
+                    break;
+                }
+            }
+
+            if !body_has_reference && !restore_indices.is_empty() {
+                // This callee-saved register is unused in the body.
+                // NOP out the save and all restores.
+                mark_nop(&mut infos[save.save_line_idx]);
+                for &ri in &restore_indices {
+                    mark_nop(&mut infos[ri]);
+                }
+            }
+        }
+
+        // Note: we intentionally do NOT shrink the stack frame (subq $N, %rsp)
+        // even though some callee-saved saves were eliminated. The remaining saves
+        // still reference their original rbp-relative offsets, which are below rsp
+        // if we shrink the frame. Data below rsp can be corrupted by interrupts
+        // or signal handlers. Keeping the original frame size ensures all saved
+        // registers remain safely above rsp. The unused slots become dead space,
+        // which wastes a few bytes but is safe.
+        // TODO: To also shrink the frame, we would need to rewrite the offsets of
+        // all remaining callee-saved saves/restores to pack them tightly.
+
+        i = func_end;
+    }
 }
 
 // ── Combined local pass ───────────────────────────────────────────────────────

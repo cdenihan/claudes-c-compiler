@@ -1,9 +1,0 @@
-Fix: globals with explicit __attribute__((aligned(N))) should not be auto-promoted to 16-byte alignment.
-
-The effective_align() function in backend/common.rs unconditionally promoted alignment
-to 16 for globals with size >= 16. This broke the Linux kernel's .init.setup section
-(obs_kernel_param structs are 24 bytes with aligned(8), but CCC placed them 32 bytes
-apart). GCC respects explicit alignment and doesn't auto-promote in that case.
-
-Added has_explicit_align field to IrGlobal to track user-specified alignment.
-Modified effective_align() to skip promotion when has_explicit_align is true.
