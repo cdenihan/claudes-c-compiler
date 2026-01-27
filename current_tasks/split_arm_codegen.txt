@@ -1,0 +1,11 @@
+Task: Split arm codegen.rs into focused submodules
+
+arm/codegen/codegen.rs is ~4,268 lines. Extract:
+1. atomics.rs (~160 lines) - atomic operations
+2. i128.rs (~240 lines) - i128 multi-word arithmetic
+3. f128.rs (~90 lines) - F128/quad-precision soft-float
+4. intrinsics.rs (~250 lines) - NEON/SIMD intrinsics
+5. call.rs (~450 lines) - function call emission
+6. va_arg.rs (~210 lines) - variadic argument handling
+
+Target: reduce codegen.rs to ~2,800 lines.
