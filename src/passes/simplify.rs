@@ -29,6 +29,13 @@
 //! - Cast(Cast(x, A->B), B->A) where A fits in B => Copy of x (widen-then-narrow)
 //! - Cast(Cast(x, A->B), B->C) => Cast(x, A->C) (double widen/narrow)
 //! - Cast of constant => constant (fold at compile time)
+//!
+//! Comparison simplification (requires def lookup):
+//! - Cmp(Ne, cmp_result, 0) => Copy(cmp_result) -- redundant boolean test
+//! - Cmp(Eq, cmp_result, 0) => Cmp(inverted_op, orig_lhs, orig_rhs) -- negated comparison
+//! - Cmp(Ne, cmp_result, 1) => Cmp(inverted_op, orig_lhs, orig_rhs) -- negated boolean
+//! - Cmp(Eq, cmp_result, 1) => Copy(cmp_result) -- redundant boolean test
+//! - Cmp(op, x, x) => constant -- self-comparison
 
 use crate::common::types::IrType;
 use crate::ir::ir::*;
@@ -47,8 +54,12 @@ pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
     let max_id = func.max_value_id() as usize;
     let mut cast_defs: Vec<Option<CastDef>> = vec![None; max_id + 1];
     let mut gep_defs: Vec<Option<GepDef>> = vec![None; max_id + 1];
+    let mut cmp_defs: Vec<Option<CmpDef>> = vec![None; max_id + 1];
+    // Track values known to be boolean (0 or 1). This includes Cmp results
+    // and bitwise And/Or/Xor of boolean values.
+    let mut is_boolean = vec![false; max_id + 1];
 
-    // Collect definitions
+    // Collect definitions - first pass: mark Cmp results as boolean
     for block in &func.blocks {
         for inst in &block.instructions {
             match inst {
@@ -71,14 +82,66 @@ pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
                         });
                     }
                 }
+                Instruction::Cmp { dest, op, lhs, rhs, ty } => {
+                    let id = dest.0 as usize;
+                    if id < cmp_defs.len() {
+                        cmp_defs[id] = Some(CmpDef {
+                            op: *op,
+                            lhs: *lhs,
+                            rhs: *rhs,
+                            ty: *ty,
+                        });
+                    }
+                    if id < is_boolean.len() {
+                        is_boolean[id] = true;
+                    }
+                }
                 _ => {}
+            }
+        }
+    }
+
+    // Second pass: propagate boolean-ness through And/Or/Xor of boolean values.
+    // A single pass is sufficient for most patterns since And/Or/Xor of Cmp results
+    // are the dominant case. For deeply nested boolean expressions, this misses some
+    // cases, but those are rare in practice.
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::BinOp { dest, op, lhs, rhs, .. } = inst {
+                if matches!(op, IrBinOp::And | IrBinOp::Or | IrBinOp::Xor) {
+                    let lhs_bool = match lhs {
+                        Operand::Value(v) => {
+                            let id = v.0 as usize;
+                            id < is_boolean.len() && is_boolean[id]
+                        }
+                        Operand::Const(c) => {
+                            // Constants 0 and 1 are boolean
+                            matches!(c.to_i64(), Some(0) | Some(1))
+                        }
+                    };
+                    let rhs_bool = match rhs {
+                        Operand::Value(v) => {
+                            let id = v.0 as usize;
+                            id < is_boolean.len() && is_boolean[id]
+                        }
+                        Operand::Const(c) => {
+                            matches!(c.to_i64(), Some(0) | Some(1))
+                        }
+                    };
+                    if lhs_bool && rhs_bool {
+                        let id = dest.0 as usize;
+                        if id < is_boolean.len() {
+                            is_boolean[id] = true;
+                        }
+                    }
+                }
             }
         }
     }
 
     for block in &mut func.blocks {
         for inst in &mut block.instructions {
-            if let Some(simplified) = try_simplify(inst, &cast_defs, &gep_defs) {
+            if let Some(simplified) = try_simplify(inst, &cast_defs, &gep_defs, &cmp_defs, &is_boolean) {
                 *inst = simplified;
                 total += 1;
             }
@@ -102,11 +165,22 @@ struct GepDef {
     offset: Operand,
 }
 
+/// Cached information about a Cmp instruction for comparison simplification.
+#[derive(Clone, Copy)]
+struct CmpDef {
+    op: IrCmpOp,
+    lhs: Operand,
+    rhs: Operand,
+    ty: IrType,
+}
+
 /// Try to simplify an instruction using algebraic identities and strength reduction.
 fn try_simplify(
     inst: &Instruction,
     cast_defs: &[Option<CastDef>],
     gep_defs: &[Option<GepDef>],
+    cmp_defs: &[Option<CmpDef>],
+    is_boolean: &[bool],
 ) -> Option<Instruction> {
     match inst {
         Instruction::BinOp { dest, op, lhs, rhs, ty } => {
@@ -117,6 +191,9 @@ fn try_simplify(
         }
         Instruction::GetElementPtr { dest, base, offset, ty } => {
             simplify_gep(*dest, *base, offset, *ty, gep_defs)
+        }
+        Instruction::Cmp { dest, op, lhs, rhs, ty } => {
+            simplify_cmp(*dest, *op, lhs, rhs, *ty, cmp_defs, is_boolean)
         }
         Instruction::Select { dest, true_val, false_val, .. } => {
             // select cond, x, x => x (both arms are the same)
@@ -339,6 +416,188 @@ fn fold_const_cast(c: &IrConst, from_ty: IrType, to_ty: IrType) -> Option<IrCons
     }
     if let Some(fval) = c.to_f64() {
         return IrConst::cast_float_to_target(fval, to_ty);
+    }
+
+    None
+}
+
+/// Invert a comparison operator (negate the condition).
+fn invert_cmp_op(op: IrCmpOp) -> IrCmpOp {
+    match op {
+        IrCmpOp::Eq => IrCmpOp::Ne,
+        IrCmpOp::Ne => IrCmpOp::Eq,
+        IrCmpOp::Slt => IrCmpOp::Sge,
+        IrCmpOp::Sle => IrCmpOp::Sgt,
+        IrCmpOp::Sgt => IrCmpOp::Sle,
+        IrCmpOp::Sge => IrCmpOp::Slt,
+        IrCmpOp::Ult => IrCmpOp::Uge,
+        IrCmpOp::Ule => IrCmpOp::Ugt,
+        IrCmpOp::Ugt => IrCmpOp::Ule,
+        IrCmpOp::Uge => IrCmpOp::Ult,
+    }
+}
+
+/// Simplify a Cmp instruction.
+///
+/// Handles:
+/// - Cmp(op, x, x) => constant (self-comparison: Eq/Sle/Sge/Ule/Uge => 1, others => 0)
+/// - Cmp(Ne, cmp_result, 0) => Copy(cmp_result) when cmp_result is from another Cmp
+///   (a Cmp already produces 0/1, so comparing != 0 is a no-op)
+/// - Cmp(Eq, cmp_result, 0) => Cmp(inverted_op, orig_lhs, orig_rhs)
+///   (negating a boolean comparison result)
+/// - Cmp(Ne, cmp_result, 1) => Cmp(inverted_op, orig_lhs, orig_rhs)
+///   (checking if comparison result is not-true = inverted)
+/// - Cmp(Eq, cmp_result, 1) => Copy(cmp_result) when cmp_result is from another Cmp
+///   (comparing a 0/1 value against 1 is the same as the original comparison)
+fn simplify_cmp(
+    dest: Value,
+    op: IrCmpOp,
+    lhs: &Operand,
+    rhs: &Operand,
+    ty: IrType,
+    cmp_defs: &[Option<CmpDef>],
+    is_boolean: &[bool],
+) -> Option<Instruction> {
+    // Self-comparison: Cmp(op, x, x) => constant
+    if same_value_operands(lhs, rhs) && ty.is_integer() {
+        let result: i8 = match op {
+            // x == x, x <= x, x >= x are always true
+            IrCmpOp::Eq | IrCmpOp::Sle | IrCmpOp::Sge | IrCmpOp::Ule | IrCmpOp::Uge => 1,
+            // x != x, x < x, x > x are always false
+            IrCmpOp::Ne | IrCmpOp::Slt | IrCmpOp::Sgt | IrCmpOp::Ult | IrCmpOp::Ugt => 0,
+        };
+        return Some(Instruction::Copy {
+            dest,
+            src: Operand::Const(IrConst::I8(result)),
+        });
+    }
+
+    // Check if one operand is a Cmp result and the other is a constant 0 or 1.
+    // A Cmp instruction always produces I8 with value 0 or 1, so:
+    //   Cmp(Ne, cmp_result, 0) is identity (already 0/1)
+    //   Cmp(Eq, cmp_result, 0) is negation
+    //   Cmp(Ne, cmp_result, 1) is negation
+    //   Cmp(Eq, cmp_result, 1) is identity
+    //
+    // We handle both orderings: (value, const) and (const, value).
+    let (cmp_val, const_val, swapped) = match (lhs, rhs) {
+        (Operand::Value(v), Operand::Const(c)) => (Some(v), Some(c), false),
+        (Operand::Const(c), Operand::Value(v)) => (Some(v), Some(c), true),
+        _ => (None, None, false),
+    };
+
+    if let (Some(val), Some(cval)) = (cmp_val, const_val) {
+        let const_i64 = cval.to_i64();
+        let is_zero_const = const_i64 == Some(0);
+        let is_one_const = const_i64 == Some(1);
+
+        // Check if the value is known boolean (0 or 1). This includes:
+        // - Values defined by Cmp instructions
+        // - Values from And/Or/Xor of boolean values
+        let idx = val.0 as usize;
+        let val_is_boolean = idx < is_boolean.len() && is_boolean[idx];
+
+        // If the value is from a Cmp, we can do precise inversion
+        let inner_cmp = if let Some(Some(cdef)) = cmp_defs.get(idx) { Some(cdef) } else { None };
+
+        if val_is_boolean {
+            match op {
+                IrCmpOp::Eq => {
+                    if is_zero_const {
+                        // Cmp(Eq, boolean_val, 0) => logical NOT of boolean_val
+                        // If from a Cmp, we can invert the comparison directly
+                        if let Some(ic) = inner_cmp {
+                            return Some(Instruction::Cmp {
+                                dest,
+                                op: invert_cmp_op(ic.op),
+                                lhs: ic.lhs,
+                                rhs: ic.rhs,
+                                ty: ic.ty,
+                            });
+                        }
+                        // For non-Cmp boolean values (e.g., And/Or of booleans),
+                        // Cmp(Eq, val, 0) = Xor(val, 1) - but we can't easily
+                        // express this without creating new instructions, so skip.
+                    }
+                    if is_one_const {
+                        // Cmp(Eq, boolean_val, 1) => Copy(boolean_val)
+                        // For a boolean value, "== 1" is identity
+                        return Some(Instruction::Copy {
+                            dest,
+                            src: Operand::Value(*val),
+                        });
+                    }
+                }
+                IrCmpOp::Ne => {
+                    if is_zero_const {
+                        // Cmp(Ne, boolean_val, 0) => Copy(boolean_val)
+                        // For a boolean value, "!= 0" is identity
+                        return Some(Instruction::Copy {
+                            dest,
+                            src: Operand::Value(*val),
+                        });
+                    }
+                    if is_one_const {
+                        // Cmp(Ne, boolean_val, 1) => logical NOT
+                        if let Some(ic) = inner_cmp {
+                            return Some(Instruction::Cmp {
+                                dest,
+                                op: invert_cmp_op(ic.op),
+                                lhs: ic.lhs,
+                                rhs: ic.rhs,
+                                ty: ic.ty,
+                            });
+                        }
+                    }
+                }
+                _ => {
+                    // For ordered comparisons (Slt, Sgt, etc.) with a boolean value:
+                    // Boolean values are 0 or 1, so we can simplify some patterns.
+                    // However, these are rare enough that we skip them for now.
+                }
+            }
+        }
+
+        // Even without knowing the inner def is a Cmp, we can simplify some patterns
+        // for ordered comparisons with constants on unsigned types.
+        if !swapped {
+            match op {
+                // Cmp(Ult, x, 0) is always false (nothing is less than 0 unsigned)
+                IrCmpOp::Ult if is_zero_const => {
+                    return Some(Instruction::Copy {
+                        dest,
+                        src: Operand::Const(IrConst::I8(0)),
+                    });
+                }
+                // Cmp(Uge, x, 0) is always true (everything is >= 0 unsigned)
+                IrCmpOp::Uge if is_zero_const => {
+                    return Some(Instruction::Copy {
+                        dest,
+                        src: Operand::Const(IrConst::I8(1)),
+                    });
+                }
+                _ => {}
+            }
+        } else {
+            // Swapped: Cmp(op, const, value) => semantically Cmp(swapped_op, value, const)
+            match op {
+                // Cmp(Ugt, 0, x) == Cmp(Ult, x, 0) is always false
+                IrCmpOp::Ugt if is_zero_const => {
+                    return Some(Instruction::Copy {
+                        dest,
+                        src: Operand::Const(IrConst::I8(0)),
+                    });
+                }
+                // Cmp(Ule, 0, x) == Cmp(Uge, x, 0) is always true
+                IrCmpOp::Ule if is_zero_const => {
+                    return Some(Instruction::Copy {
+                        dest,
+                        src: Operand::Const(IrConst::I8(1)),
+                    });
+                }
+                _ => {}
+            }
+        }
     }
 
     None
@@ -805,6 +1064,14 @@ mod tests {
         vec![]
     }
 
+    fn no_cmp_defs() -> Vec<Option<CmpDef>> {
+        vec![]
+    }
+
+    fn no_booleans() -> Vec<bool> {
+        vec![]
+    }
+
     #[test]
     fn test_add_zero() {
         let empty_defs = no_defs();
@@ -815,7 +1082,7 @@ mod tests {
             rhs: Operand::Const(IrConst::I32(0)),
             ty: IrType::I32,
         };
-        let result = try_simplify(&inst, &empty_defs, &no_gep_defs()).unwrap();
+        let result = try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
         match result {
             Instruction::Copy { src: Operand::Value(v), .. } => assert_eq!(v.0, 1),
             _ => panic!("Expected Copy"),
@@ -832,7 +1099,7 @@ mod tests {
             rhs: Operand::Const(IrConst::I32(0)),
             ty: IrType::I32,
         };
-        let result = try_simplify(&inst, &empty_defs, &no_gep_defs()).unwrap();
+        let result = try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
         match result {
             Instruction::Copy { src: Operand::Const(IrConst::I32(0)), .. } => {}
             _ => panic!("Expected Copy with zero"),
@@ -849,7 +1116,7 @@ mod tests {
             rhs: Operand::Const(IrConst::I32(1)),
             ty: IrType::I32,
         };
-        let result = try_simplify(&inst, &empty_defs, &no_gep_defs()).unwrap();
+        let result = try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
         match result {
             Instruction::Copy { src: Operand::Value(v), .. } => assert_eq!(v.0, 1),
             _ => panic!("Expected Copy of lhs"),
@@ -866,7 +1133,7 @@ mod tests {
             rhs: Operand::Value(Value(1)),
             ty: IrType::I32,
         };
-        let result = try_simplify(&inst, &empty_defs, &no_gep_defs()).unwrap();
+        let result = try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
         match result {
             Instruction::Copy { src: Operand::Const(IrConst::I32(0)), .. } => {}
             _ => panic!("Expected Copy with zero"),
@@ -883,7 +1150,7 @@ mod tests {
             rhs: Operand::Value(Value(1)),
             ty: IrType::I32,
         };
-        let result = try_simplify(&inst, &empty_defs, &no_gep_defs()).unwrap();
+        let result = try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
         match result {
             Instruction::Copy { src: Operand::Const(IrConst::I32(0)), .. } => {}
             _ => panic!("Expected Copy with zero"),
@@ -900,7 +1167,7 @@ mod tests {
             rhs: Operand::Value(Value(1)),
             ty: IrType::I32,
         };
-        let result = try_simplify(&inst, &empty_defs, &no_gep_defs()).unwrap();
+        let result = try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
         match result {
             Instruction::Copy { src: Operand::Value(v), .. } => assert_eq!(v.0, 1),
             _ => panic!("Expected Copy of operand"),
@@ -918,7 +1185,7 @@ mod tests {
             rhs: Operand::Value(Value(1)),
             ty: IrType::I32,
         };
-        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs()).is_none());
+        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).is_none());
     }
 
     #[test]
@@ -932,7 +1199,7 @@ mod tests {
             rhs: Operand::Const(IrConst::I64(4)),
             ty: IrType::I64,
         };
-        let result = try_simplify(&inst, &empty_defs, &no_gep_defs()).unwrap();
+        let result = try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
         match result {
             Instruction::BinOp { op: IrBinOp::Shl, rhs: Operand::Const(IrConst::I64(2)), .. } => {}
             _ => panic!("Expected Shl by 2, got {:?}", result),
@@ -950,7 +1217,7 @@ mod tests {
             rhs: Operand::Const(IrConst::I64(2)),
             ty: IrType::I64,
         };
-        let result = try_simplify(&inst, &empty_defs, &no_gep_defs()).unwrap();
+        let result = try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
         match result {
             Instruction::BinOp { op: IrBinOp::Add, lhs: Operand::Value(a), rhs: Operand::Value(b), .. } => {
                 assert_eq!(a.0, 1);
@@ -971,7 +1238,7 @@ mod tests {
             rhs: Operand::Const(IrConst::I32(8)),
             ty: IrType::I32,
         };
-        let result = try_simplify(&inst, &empty_defs, &no_gep_defs()).unwrap();
+        let result = try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
         match result {
             Instruction::BinOp { op: IrBinOp::Shl, rhs: Operand::Const(IrConst::I32(3)), .. } => {}
             _ => panic!("Expected Shl by 3, got {:?}", result),
@@ -989,7 +1256,7 @@ mod tests {
             rhs: Operand::Const(IrConst::I64(3)),
             ty: IrType::I64,
         };
-        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs()).is_none());
+        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).is_none());
     }
 
     #[test]
@@ -1003,7 +1270,7 @@ mod tests {
             rhs: Operand::Const(IrConst::I64(2)),
             ty: IrType::F64,
         };
-        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs()).is_none());
+        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).is_none());
     }
 
     #[test]
@@ -1017,7 +1284,7 @@ mod tests {
             rhs: Operand::Const(IrConst::I64(8)),
             ty: IrType::U64,
         };
-        let result = try_simplify(&inst, &empty_defs, &no_gep_defs()).unwrap();
+        let result = try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
         match result {
             Instruction::BinOp { op: IrBinOp::LShr, rhs: Operand::Const(IrConst::I64(3)), .. } => {}
             _ => panic!("Expected LShr by 3, got {:?}", result),
@@ -1035,7 +1302,7 @@ mod tests {
             rhs: Operand::Const(IrConst::I64(8)),
             ty: IrType::U64,
         };
-        let result = try_simplify(&inst, &empty_defs, &no_gep_defs()).unwrap();
+        let result = try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
         match result {
             Instruction::BinOp { op: IrBinOp::And, rhs: Operand::Const(IrConst::I64(7)), .. } => {}
             _ => panic!("Expected And with 7, got {:?}", result),
@@ -1051,7 +1318,7 @@ mod tests {
             from_ty: IrType::I32,
             to_ty: IrType::I32,
         };
-        let result = try_simplify(&inst, &empty_defs, &no_gep_defs()).unwrap();
+        let result = try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
         match result {
             Instruction::Copy { src: Operand::Value(v), .. } => assert_eq!(v.0, 1),
             _ => panic!("Expected Copy"),
@@ -1073,7 +1340,7 @@ mod tests {
             from_ty: IrType::I64,
             to_ty: IrType::I32,
         };
-        let result = try_simplify(&inst, &defs, &no_gep_defs()).unwrap();
+        let result = try_simplify(&inst, &defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
         match result {
             Instruction::Copy { src: Operand::Value(v), .. } => assert_eq!(v.0, 0),
             _ => panic!("Expected Copy of original value"),
@@ -1090,7 +1357,7 @@ mod tests {
             from_ty: IrType::I32,
             to_ty: IrType::I64,
         };
-        let result = try_simplify(&inst, &empty_defs, &no_gep_defs()).unwrap();
+        let result = try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
         match result {
             Instruction::Copy { src: Operand::Const(IrConst::I64(42)), .. } => {}
             _ => panic!("Expected Copy with I64(42)"),
@@ -1106,7 +1373,7 @@ mod tests {
             from_ty: IrType::I32,
             to_ty: IrType::I64,
         };
-        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs()).is_none());
+        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).is_none());
     }
 
     #[test]
@@ -1118,7 +1385,7 @@ mod tests {
             offset: Operand::Const(IrConst::I64(0)),
             ty: IrType::Ptr,
         };
-        let result = try_simplify(&inst, &empty_defs, &no_gep_defs()).unwrap();
+        let result = try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
         match result {
             Instruction::Copy { src: Operand::Value(v), .. } => assert_eq!(v.0, 1),
             _ => panic!("Expected Copy of base"),
@@ -1134,7 +1401,7 @@ mod tests {
             offset: Operand::Const(IrConst::I64(4)),
             ty: IrType::Ptr,
         };
-        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs()).is_none());
+        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).is_none());
     }
 
     #[test]
@@ -1152,7 +1419,7 @@ mod tests {
             offset: Operand::Const(IrConst::I64(4)),
             ty: IrType::Ptr,
         };
-        let result = try_simplify(&inst, &empty_defs, &gep_defs).unwrap();
+        let result = try_simplify(&inst, &empty_defs, &gep_defs, &no_cmp_defs(), &no_booleans()).unwrap();
         match result {
             Instruction::GetElementPtr { base, offset: Operand::Const(IrConst::I64(12)), .. } => {
                 assert_eq!(base.0, 0, "Should use original base");
@@ -1176,7 +1443,7 @@ mod tests {
             offset: Operand::Const(IrConst::I64(-4)),
             ty: IrType::Ptr,
         };
-        let result = try_simplify(&inst, &empty_defs, &gep_defs).unwrap();
+        let result = try_simplify(&inst, &empty_defs, &gep_defs, &no_cmp_defs(), &no_booleans()).unwrap();
         match result {
             Instruction::Copy { src: Operand::Value(v), .. } => {
                 assert_eq!(v.0, 0, "Should copy original base when offsets cancel");
@@ -1199,7 +1466,7 @@ mod tests {
             ty: IrType::F64,
         };
         // Should NOT simplify (float add with zero)
-        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs()).is_none());
+        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).is_none());
     }
 
     #[test]
@@ -1213,7 +1480,7 @@ mod tests {
             rhs: Operand::Const(IrConst::F64(-0.0)),
             ty: IrType::F64,
         };
-        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs()).is_none());
+        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).is_none());
     }
 
     #[test]
@@ -1227,7 +1494,7 @@ mod tests {
             rhs: Operand::Const(IrConst::F64(0.0)),
             ty: IrType::F64,
         };
-        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs()).is_none());
+        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).is_none());
     }
 
     #[test]
@@ -1241,7 +1508,7 @@ mod tests {
             rhs: Operand::Value(Value(1)),
             ty: IrType::F64,
         };
-        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs()).is_none());
+        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).is_none());
     }
 
     #[test]
@@ -1255,7 +1522,7 @@ mod tests {
             rhs: Operand::Value(Value(1)),
             ty: IrType::F64,
         };
-        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs()).is_none());
+        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).is_none());
     }
 
     #[test]
@@ -1269,7 +1536,7 @@ mod tests {
             rhs: Operand::Const(IrConst::F64(0.0)),
             ty: IrType::F64,
         };
-        let result = try_simplify(&inst, &empty_defs, &no_gep_defs()).unwrap();
+        let result = try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
         match result {
             Instruction::Copy { src: Operand::Value(v), .. } => assert_eq!(v.0, 1),
             _ => panic!("Expected Copy"),
@@ -1287,7 +1554,7 @@ mod tests {
             rhs: Operand::Const(IrConst::F64(-0.0)),
             ty: IrType::F64,
         };
-        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs()).is_none());
+        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).is_none());
     }
 
     #[test]
@@ -1302,7 +1569,7 @@ mod tests {
             rhs: Operand::Const(IrConst::F64(1.0)),
             ty: IrType::F64,
         };
-        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs()).is_none());
+        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).is_none());
     }
 
     #[test]
@@ -1316,7 +1583,7 @@ mod tests {
             rhs: Operand::Const(IrConst::F64(1.0)),
             ty: IrType::F64,
         };
-        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs()).is_none());
+        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).is_none());
     }
 
     // === Math call simplification tests ===
@@ -1339,7 +1606,7 @@ mod tests {
     fn test_sqrt_to_intrinsic() {
         let empty_defs = no_defs();
         let inst = make_call("sqrt", vec![Operand::Value(Value(1))], IrType::F64);
-        let result = try_simplify(&inst, &empty_defs, &no_gep_defs()).unwrap();
+        let result = try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
         match result {
             Instruction::Intrinsic { op: IntrinsicOp::SqrtF64, args, .. } => {
                 assert_eq!(args.len(), 1);
@@ -1352,7 +1619,7 @@ mod tests {
     fn test_sqrtf_to_intrinsic() {
         let empty_defs = no_defs();
         let inst = make_call("sqrtf", vec![Operand::Value(Value(1))], IrType::F32);
-        let result = try_simplify(&inst, &empty_defs, &no_gep_defs()).unwrap();
+        let result = try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
         match result {
             Instruction::Intrinsic { op: IntrinsicOp::SqrtF32, args, .. } => {
                 assert_eq!(args.len(), 1);
@@ -1365,7 +1632,7 @@ mod tests {
     fn test_fabs_to_intrinsic() {
         let empty_defs = no_defs();
         let inst = make_call("fabs", vec![Operand::Value(Value(1))], IrType::F64);
-        let result = try_simplify(&inst, &empty_defs, &no_gep_defs()).unwrap();
+        let result = try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
         match result {
             Instruction::Intrinsic { op: IntrinsicOp::FabsF64, args, .. } => {
                 assert_eq!(args.len(), 1);
@@ -1378,7 +1645,7 @@ mod tests {
     fn test_fabsf_to_intrinsic() {
         let empty_defs = no_defs();
         let inst = make_call("fabsf", vec![Operand::Value(Value(1))], IrType::F32);
-        let result = try_simplify(&inst, &empty_defs, &no_gep_defs()).unwrap();
+        let result = try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
         match result {
             Instruction::Intrinsic { op: IntrinsicOp::FabsF32, args, .. } => {
                 assert_eq!(args.len(), 1);
@@ -1394,7 +1661,7 @@ mod tests {
             Operand::Value(Value(1)),
             Operand::Const(IrConst::F64(0.0)),
         ], IrType::F64);
-        let result = try_simplify(&inst, &empty_defs, &no_gep_defs()).unwrap();
+        let result = try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
         match result {
             Instruction::Copy { src: Operand::Const(IrConst::F64(v)), .. } => {
                 assert_eq!(v, 1.0);
@@ -1410,7 +1677,7 @@ mod tests {
             Operand::Value(Value(1)),
             Operand::Const(IrConst::F64(1.0)),
         ], IrType::F64);
-        let result = try_simplify(&inst, &empty_defs, &no_gep_defs()).unwrap();
+        let result = try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
         match result {
             Instruction::Copy { src: Operand::Value(v), .. } => assert_eq!(v.0, 1),
             _ => panic!("Expected Copy of base, got {:?}", result),
@@ -1424,7 +1691,7 @@ mod tests {
             Operand::Value(Value(1)),
             Operand::Const(IrConst::F64(2.0)),
         ], IrType::F64);
-        let result = try_simplify(&inst, &empty_defs, &no_gep_defs()).unwrap();
+        let result = try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
         match result {
             Instruction::BinOp { op: IrBinOp::Mul, lhs: Operand::Value(a), rhs: Operand::Value(b), .. } => {
                 assert_eq!(a.0, 1);
@@ -1441,7 +1708,7 @@ mod tests {
             Operand::Value(Value(1)),
             Operand::Const(IrConst::F64(-1.0)),
         ], IrType::F64);
-        let result = try_simplify(&inst, &empty_defs, &no_gep_defs()).unwrap();
+        let result = try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
         match result {
             Instruction::BinOp { op: IrBinOp::SDiv, lhs: Operand::Const(IrConst::F64(v)), .. } => {
                 assert_eq!(v, 1.0);
@@ -1457,7 +1724,7 @@ mod tests {
             Operand::Value(Value(1)),
             Operand::Const(IrConst::F64(0.5)),
         ], IrType::F64);
-        let result = try_simplify(&inst, &empty_defs, &no_gep_defs()).unwrap();
+        let result = try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
         match result {
             Instruction::Intrinsic { op: IntrinsicOp::SqrtF64, .. } => {}
             _ => panic!("Expected SqrtF64 intrinsic, got {:?}", result),
@@ -1471,7 +1738,7 @@ mod tests {
             Operand::Value(Value(1)),
             Operand::Const(IrConst::F64(3.0)),
         ], IrType::F64);
-        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs()).is_none());
+        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).is_none());
     }
 
     #[test]
@@ -1479,14 +1746,14 @@ mod tests {
         let empty_defs = no_defs();
         // sqrt with 0 args should not simplify
         let inst = make_call("sqrt", vec![], IrType::F64);
-        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs()).is_none());
+        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).is_none());
     }
 
     #[test]
     fn test_unknown_func_no_simplify() {
         let empty_defs = no_defs();
         let inst = make_call("sin", vec![Operand::Value(Value(1))], IrType::F64);
-        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs()).is_none());
+        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).is_none());
     }
 
     #[test]
@@ -1497,7 +1764,7 @@ mod tests {
             Operand::Value(Value(1)),
             Operand::Value(Value(2)),
         ], IrType::F64);
-        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs()).is_none());
+        assert!(try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).is_none());
     }
 
     #[test]
@@ -1507,10 +1774,266 @@ mod tests {
             Operand::Value(Value(1)),
             Operand::Const(IrConst::F32(2.0)),
         ], IrType::F32);
-        let result = try_simplify(&inst, &empty_defs, &no_gep_defs()).unwrap();
+        let result = try_simplify(&inst, &empty_defs, &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
         match result {
             Instruction::BinOp { op: IrBinOp::Mul, ty: IrType::F32, .. } => {}
             _ => panic!("Expected F32 Mul, got {:?}", result),
         }
+    }
+
+    // === Cmp simplification tests ===
+
+    #[test]
+    fn test_cmp_self_eq() {
+        // Cmp(Eq, x, x) => 1 (always true)
+        let inst = Instruction::Cmp {
+            dest: Value(2),
+            op: IrCmpOp::Eq,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Value(Value(1)),
+            ty: IrType::I32,
+        };
+        let result = try_simplify(&inst, &no_defs(), &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
+        match result {
+            Instruction::Copy { src: Operand::Const(IrConst::I8(1)), .. } => {}
+            _ => panic!("Expected Copy with I8(1), got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_cmp_self_ne() {
+        // Cmp(Ne, x, x) => 0 (always false)
+        let inst = Instruction::Cmp {
+            dest: Value(2),
+            op: IrCmpOp::Ne,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Value(Value(1)),
+            ty: IrType::I64,
+        };
+        let result = try_simplify(&inst, &no_defs(), &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
+        match result {
+            Instruction::Copy { src: Operand::Const(IrConst::I8(0)), .. } => {}
+            _ => panic!("Expected Copy with I8(0), got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_cmp_self_sle() {
+        // Cmp(Sle, x, x) => 1 (always true)
+        let inst = Instruction::Cmp {
+            dest: Value(2),
+            op: IrCmpOp::Sle,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Value(Value(1)),
+            ty: IrType::I32,
+        };
+        let result = try_simplify(&inst, &no_defs(), &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
+        match result {
+            Instruction::Copy { src: Operand::Const(IrConst::I8(1)), .. } => {}
+            _ => panic!("Expected Copy with I8(1), got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_cmp_self_slt() {
+        // Cmp(Slt, x, x) => 0 (always false)
+        let inst = Instruction::Cmp {
+            dest: Value(2),
+            op: IrCmpOp::Slt,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Value(Value(1)),
+            ty: IrType::I32,
+        };
+        let result = try_simplify(&inst, &no_defs(), &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
+        match result {
+            Instruction::Copy { src: Operand::Const(IrConst::I8(0)), .. } => {}
+            _ => panic!("Expected Copy with I8(0), got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_cmp_ne_cmp_result_zero() {
+        // Cmp(Ne, cmp_result, 0) => Copy(cmp_result)
+        // %1 = Cmp(Eq, %a, %b, I64)  -- defines %1 as boolean
+        // %2 = Cmp(Ne, %1, 0, I64)   -- redundant, should become Copy(%1)
+        let mut cmp_defs: Vec<Option<CmpDef>> = vec![None; 3];
+        cmp_defs[1] = Some(CmpDef {
+            op: IrCmpOp::Eq,
+            lhs: Operand::Value(Value(10)),
+            rhs: Operand::Value(Value(11)),
+            ty: IrType::I64,
+        });
+        let mut booleans = vec![false; 3];
+        booleans[1] = true;
+
+        let inst = Instruction::Cmp {
+            dest: Value(2),
+            op: IrCmpOp::Ne,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I64(0)),
+            ty: IrType::I64,
+        };
+        let result = try_simplify(&inst, &no_defs(), &no_gep_defs(), &cmp_defs, &booleans).unwrap();
+        match result {
+            Instruction::Copy { src: Operand::Value(v), .. } => assert_eq!(v.0, 1),
+            _ => panic!("Expected Copy of Value(1), got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_cmp_eq_cmp_result_zero() {
+        // Cmp(Eq, cmp_result, 0) => Cmp(inverted, orig_lhs, orig_rhs)
+        // %1 = Cmp(Slt, %a, %b, I64) -- %a < %b
+        // %2 = Cmp(Eq, %1, 0, I64)   -- should become Cmp(Sge, %a, %b, I64)
+        let mut cmp_defs: Vec<Option<CmpDef>> = vec![None; 3];
+        cmp_defs[1] = Some(CmpDef {
+            op: IrCmpOp::Slt,
+            lhs: Operand::Value(Value(10)),
+            rhs: Operand::Value(Value(11)),
+            ty: IrType::I64,
+        });
+        let mut booleans = vec![false; 3];
+        booleans[1] = true;
+
+        let inst = Instruction::Cmp {
+            dest: Value(2),
+            op: IrCmpOp::Eq,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I64(0)),
+            ty: IrType::I64,
+        };
+        let result = try_simplify(&inst, &no_defs(), &no_gep_defs(), &cmp_defs, &booleans).unwrap();
+        match result {
+            Instruction::Cmp { op: IrCmpOp::Sge, lhs: Operand::Value(a), rhs: Operand::Value(b), .. } => {
+                assert_eq!(a.0, 10);
+                assert_eq!(b.0, 11);
+            }
+            _ => panic!("Expected Cmp(Sge, V10, V11), got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_cmp_eq_cmp_result_one() {
+        // Cmp(Eq, cmp_result, 1) => Copy(cmp_result)
+        let mut cmp_defs: Vec<Option<CmpDef>> = vec![None; 3];
+        cmp_defs[1] = Some(CmpDef {
+            op: IrCmpOp::Eq,
+            lhs: Operand::Value(Value(10)),
+            rhs: Operand::Value(Value(11)),
+            ty: IrType::I64,
+        });
+        let mut booleans = vec![false; 3];
+        booleans[1] = true;
+
+        let inst = Instruction::Cmp {
+            dest: Value(2),
+            op: IrCmpOp::Eq,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I64(1)),
+            ty: IrType::I64,
+        };
+        let result = try_simplify(&inst, &no_defs(), &no_gep_defs(), &cmp_defs, &booleans).unwrap();
+        match result {
+            Instruction::Copy { src: Operand::Value(v), .. } => assert_eq!(v.0, 1),
+            _ => panic!("Expected Copy of Value(1), got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_cmp_ne_cmp_result_one() {
+        // Cmp(Ne, cmp_result, 1) => Cmp(inverted)
+        let mut cmp_defs: Vec<Option<CmpDef>> = vec![None; 3];
+        cmp_defs[1] = Some(CmpDef {
+            op: IrCmpOp::Ne,
+            lhs: Operand::Value(Value(10)),
+            rhs: Operand::Value(Value(11)),
+            ty: IrType::I64,
+        });
+        let mut booleans = vec![false; 3];
+        booleans[1] = true;
+
+        let inst = Instruction::Cmp {
+            dest: Value(2),
+            op: IrCmpOp::Ne,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I64(1)),
+            ty: IrType::I64,
+        };
+        let result = try_simplify(&inst, &no_defs(), &no_gep_defs(), &cmp_defs, &booleans).unwrap();
+        match result {
+            Instruction::Cmp { op: IrCmpOp::Eq, lhs: Operand::Value(a), rhs: Operand::Value(b), .. } => {
+                assert_eq!(a.0, 10);
+                assert_eq!(b.0, 11);
+            }
+            _ => panic!("Expected Cmp(Eq, V10, V11), got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_cmp_ne_boolean_and_zero() {
+        // Cmp(Ne, And(cmp1, cmp2), 0) => Copy(And_result)
+        // The And of two booleans is itself boolean
+        let mut booleans = vec![false; 5];
+        booleans[3] = true; // Value(3) = And(cmp1, cmp2) is boolean
+
+        let inst = Instruction::Cmp {
+            dest: Value(4),
+            op: IrCmpOp::Ne,
+            lhs: Operand::Value(Value(3)),
+            rhs: Operand::Const(IrConst::I64(0)),
+            ty: IrType::I64,
+        };
+        let result = try_simplify(&inst, &no_defs(), &no_gep_defs(), &no_cmp_defs(), &booleans).unwrap();
+        match result {
+            Instruction::Copy { src: Operand::Value(v), .. } => assert_eq!(v.0, 3),
+            _ => panic!("Expected Copy of Value(3), got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_cmp_ult_zero_always_false() {
+        // Cmp(Ult, x, 0) is always false (nothing is < 0 unsigned)
+        let inst = Instruction::Cmp {
+            dest: Value(2),
+            op: IrCmpOp::Ult,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I64(0)),
+            ty: IrType::U64,
+        };
+        let result = try_simplify(&inst, &no_defs(), &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
+        match result {
+            Instruction::Copy { src: Operand::Const(IrConst::I8(0)), .. } => {}
+            _ => panic!("Expected Copy with I8(0), got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_cmp_uge_zero_always_true() {
+        // Cmp(Uge, x, 0) is always true (everything is >= 0 unsigned)
+        let inst = Instruction::Cmp {
+            dest: Value(2),
+            op: IrCmpOp::Uge,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I64(0)),
+            ty: IrType::U64,
+        };
+        let result = try_simplify(&inst, &no_defs(), &no_gep_defs(), &no_cmp_defs(), &no_booleans()).unwrap();
+        match result {
+            Instruction::Copy { src: Operand::Const(IrConst::I8(1)), .. } => {}
+            _ => panic!("Expected Copy with I8(1), got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_cmp_no_simplify_non_boolean() {
+        // Cmp(Ne, non_cmp_value, 0) should NOT simplify (value could be any integer)
+        let inst = Instruction::Cmp {
+            dest: Value(2),
+            op: IrCmpOp::Ne,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I64(0)),
+            ty: IrType::I64,
+        };
+        assert!(try_simplify(&inst, &no_defs(), &no_gep_defs(), &no_cmp_defs(), &no_booleans()).is_none());
     }
 }
