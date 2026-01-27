@@ -1,0 +1,21 @@
+Task: Unify duplicated const_eval code between sema and lowering
+Status: in_progress
+Started: 2026-01-27
+
+Problem:
+sema/const_eval.rs (1278 lines) and ir/lowering/const_eval.rs (1667 lines) contain
+~450 lines of near-identical code for:
+- Literal evaluation (IntLiteral, LongLiteral, etc.)
+- Builtin function folding (__builtin_bswap, __builtin_clz, etc.)
+- eval_const_expr_as_bits
+- eval_const_binop wrapper
+- promote_sub_int_for_unary / promote_const_for_unary
+- Cast chain evaluation
+- Offsetof patterns
+
+Plan:
+1. Extract shared pure-evaluation logic into common/const_eval.rs
+2. Move all literal eval, builtin folding, unary promotion, and
+   eval_as_bits into the shared module using a trait for type resolution
+3. Have both sema and lowering delegate to the shared implementation
+4. Each retains only its unique logic (sema: type inference, lowering: global addresses)
