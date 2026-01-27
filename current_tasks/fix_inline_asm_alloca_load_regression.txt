@@ -1,0 +1,19 @@
+Task: Fix inline asm alloca register input loading regression
+Status: in_progress
+
+Commit 2e817b3 incorrectly removed the is_alloca check from inline asm
+register input loading in all three backends (x86, ARM, RISC-V).
+
+When an alloca value is used as a register input to inline asm, the
+codegen must compute the ADDRESS of the alloca (leaq/add) because the
+IR value of an alloca represents a pointer to the allocated memory.
+The commit changed this to always load the VALUE from the slot, which
+is wrong for allocas - it loads the contents of the array/variable
+instead of its address.
+
+This causes musl's tmpfile() to break because it passes (long)s where
+s is a stack char array to an inline asm syscall. The syscall receives
+the string contents as a "pointer" instead of the actual address.
+
+Fix: Restore the is_alloca check in load_input_to_register for all
+three backends.
