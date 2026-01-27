@@ -24,10 +24,15 @@ pub fn run(module: &mut IrModule) -> usize {
     module.for_each_function(simplify_cfg)
 }
 
+/// Per-function entry point for dirty-tracking pipeline.
+pub(crate) fn run_function(func: &mut IrFunction) -> usize {
+    simplify_cfg(func)
+}
+
 /// Simplify the CFG of a single function.
 /// Iterates until no more simplifications are possible (fixpoint).
-fn simplify_cfg(func: &mut IrFunction) -> usize {
-    if func.blocks.is_empty() {
+pub(crate) fn simplify_cfg(func: &mut IrFunction) -> usize {
+    if func.blocks.len() <= 1 {
         return 0;
     }
 

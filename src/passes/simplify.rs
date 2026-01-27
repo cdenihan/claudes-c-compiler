@@ -39,7 +39,7 @@ pub fn run(module: &mut IrModule) -> usize {
     module.for_each_function(simplify_function)
 }
 
-fn simplify_function(func: &mut IrFunction) -> usize {
+pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
     let mut total = 0;
 
     // Build def maps for chain optimizations: Value -> defining instruction

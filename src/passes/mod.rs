@@ -24,6 +24,39 @@ pub mod simplify;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::ir::{Instruction, IrModule, IrFunction, GlobalInit, Operand, Value};
 
+/// Run a per-function pass only on functions in the visit set.
+///
+/// `visit` indicates which functions to process in this iteration.
+/// `changed` accumulates which functions were modified by any pass
+/// (so the next iteration knows what to re-visit).
+fn run_on_visited<F>(
+    module: &mut IrModule,
+    visit: &[bool],
+    changed: &mut [bool],
+    mut f: F,
+) -> usize
+where
+    F: FnMut(&mut IrFunction) -> usize,
+{
+    let mut total = 0;
+    for (i, func) in module.functions.iter_mut().enumerate() {
+        if func.is_declaration {
+            continue;
+        }
+        if i < visit.len() && !visit[i] {
+            continue;
+        }
+        let n = f(func);
+        if n > 0 {
+            if i < changed.len() {
+                changed[i] = true;
+            }
+            total += n;
+        }
+    }
+    total
+}
+
 /// Run all optimization passes on the module.
 ///
 /// The pass pipeline is:
@@ -94,78 +127,102 @@ pub fn run_passes(module: &mut IrModule, _opt_level: u32) {
         resolve_inline_asm_symbols(module);
     }
 
-    // Always run 3 iterations of the full pipeline. The early-exit check below
-    // will skip remaining iterations if no changes were made.
+    // Run up to 3 iterations of the full pipeline. After the first full pass,
+    // subsequent iterations only process functions that were modified (dirty
+    // tracking), avoiding redundant work on already-optimized functions.
     let iterations = 3;
 
+    // Per-function dirty tracking: dirty[i] == true means function i needs
+    // reprocessing. All functions start dirty for the first iteration.
+    let num_funcs = module.functions.len();
+    let mut dirty = vec![true; num_funcs];
+
+    // Pre-compute disabled pass flags once to avoid repeated string searches.
+    let dis_cfg = disabled.contains("cfg");
+    let dis_copyprop = disabled.contains("copyprop");
+    let dis_narrow = disabled.contains("narrow");
+    let dis_simplify = disabled.contains("simplify");
+    let dis_constfold = disabled.contains("constfold");
+    let dis_gvn = disabled.contains("gvn");
+    let dis_licm = disabled.contains("licm");
+    let dis_ifconv = disabled.contains("ifconv");
+    let dis_dce = disabled.contains("dce");
+    let dis_ipcp = disabled.contains("ipcp");
+
+    // `changed` accumulates which functions were modified during each iteration.
+    let mut changed = vec![false; num_funcs];
+
     for iter in 0..iterations {
-        let mut changes = 0usize;
+        let mut total_changes = 0usize;
+
+        // Clear the changed accumulator for this iteration
+        changed.iter_mut().for_each(|c| *c = false);
 
         // Phase 1: CFG simplification (remove dead blocks, thread jump chains,
         // simplify redundant conditional branches). Running early eliminates
         // dead code before other passes waste time analyzing it.
-        if !disabled.contains("cfg") {
-            changes += cfg_simplify::run(module);
+        if !dis_cfg {
+            total_changes += run_on_visited(module, &dirty, &mut changed, cfg_simplify::run_function);
         }
 
         // Phase 2: Copy propagation (early - propagate copies from phi elimination
         // and lowering so subsequent passes see through them)
-        if !disabled.contains("copyprop") {
-            changes += copy_prop::run(module);
+        if !dis_copyprop {
+            total_changes += run_on_visited(module, &dirty, &mut changed, copy_prop::propagate_copies);
         }
 
         // Phase 2b: Integer narrowing (widen-operate-narrow => direct narrow operation)
         // Must run after copy propagation so widening casts are visible,
         // and before other optimizations to reduce instruction count.
-        if !disabled.contains("narrow") {
-            changes += narrow::run(module);
+        if !dis_narrow {
+            total_changes += run_on_visited(module, &dirty, &mut changed, narrow::narrow_function);
         }
 
         // Phase 3: Algebraic simplification (x+0 => x, x*1 => x, etc.)
-        if !disabled.contains("simplify") {
-            changes += simplify::run(module);
+        if !dis_simplify {
+            total_changes += run_on_visited(module, &dirty, &mut changed, simplify::simplify_function);
         }
 
         // Phase 4: Constant folding (evaluate const exprs at compile time)
-        if !disabled.contains("constfold") {
-            changes += constant_fold::run(module);
+        if !dis_constfold {
+            total_changes += run_on_visited(module, &dirty, &mut changed, constant_fold::fold_function);
         }
 
         // Phase 5: GVN / Common Subexpression Elimination (dominator-based)
         // Eliminates redundant computations both within and across basic blocks.
-        if !disabled.contains("gvn") {
-            changes += gvn::run(module);
+        if !dis_gvn {
+            total_changes += run_on_visited(module, &dirty, &mut changed, gvn::run_gvn_function);
         }
 
         // Phase 6: LICM - hoist loop-invariant code to preheaders.
         // Runs after scalar opts have simplified expressions, so we can
         // identify more invariants. Particularly helps inner loops with
         // redundant index computations (e.g., i*n in matrix multiply).
-        if !disabled.contains("licm") {
-            changes += licm::run(module);
+        if !dis_licm {
+            total_changes += run_on_visited(module, &dirty, &mut changed, licm::licm_function);
         }
 
         // Phase 7: If-conversion - convert simple branch+phi diamonds to Select
         // instructions. Runs after scalar optimizations have simplified the CFG,
         // enabling cmov/csel emission instead of branches for simple conditionals.
-        if !disabled.contains("ifconv") {
-            changes += if_convert::run(module);
+        if !dis_ifconv {
+            total_changes += run_on_visited(module, &dirty, &mut changed, if_convert::if_convert_function);
         }
 
         // Phase 8: Copy propagation again (clean up copies created by GVN/simplify)
-        if !disabled.contains("copyprop") {
-            changes += copy_prop::run(module);
+        if !dis_copyprop {
+            total_changes += run_on_visited(module, &dirty, &mut changed, copy_prop::propagate_copies);
         }
 
         // Phase 9: Dead code elimination (clean up dead instructions including dead copies)
-        if !disabled.contains("dce") {
-            changes += dce::run(module);
+        if !dis_dce {
+            total_changes += run_on_visited(module, &dirty, &mut changed, dce::eliminate_dead_code);
         }
 
         // Phase 10: CFG simplification again (DCE + constant folding may have
         // simplified conditions, creating dead blocks or redundant branches)
-        if !disabled.contains("cfg") {
-            changes += cfg_simplify::run(module);
+        if !dis_cfg {
+            total_changes += run_on_visited(module, &dirty, &mut changed, cfg_simplify::run_function);
         }
 
         // Phase 10.5: Interprocedural constant return propagation (IPCP).
@@ -176,14 +233,23 @@ pub fn run_passes(module: &mut IrModule, _opt_level: u32) {
         // branches that reference undefined symbols.
         // Run after iteration 0 (first pass) so returns have been simplified,
         // and the result feeds into iteration 1 for cleanup.
-        if iter == 0 && !disabled.contains("ipcp") {
-            changes += ipcp::run(module);
+        if iter == 0 && !dis_ipcp {
+            // IPCP is interprocedural - it can change callers of constant-returning
+            // functions, so mark all functions as changed if it modifies any.
+            let ipcp_changes = ipcp::run(module);
+            if ipcp_changes > 0 {
+                changed.iter_mut().for_each(|c| *c = true);
+            }
+            total_changes += ipcp_changes;
         }
 
         // Early exit: if no passes changed anything, additional iterations are useless
-        if changes == 0 {
+        if total_changes == 0 {
             break;
         }
+
+        // Prepare dirty set for next iteration: only re-visit functions that changed.
+        std::mem::swap(&mut dirty, &mut changed);
     }
 
     // Phase 11: Dead static function elimination.

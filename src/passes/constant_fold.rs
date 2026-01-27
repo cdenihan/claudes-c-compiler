@@ -26,7 +26,7 @@ pub fn run(module: &mut IrModule) -> usize {
 /// type (if any), so that sub-int constants (I8/I16) can be correctly zero-
 /// extended (for U8/U16 targets) or sign-extended (for I8/I16 targets) when
 /// used as operands of UnaryOp/BitNot instructions.
-fn fold_function(func: &mut IrFunction) -> usize {
+pub(crate) fn fold_function(func: &mut IrFunction) -> usize {
     let max_id = func.max_value_id() as usize;
     let mut total = 0;
 

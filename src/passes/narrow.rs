@@ -50,7 +50,7 @@ struct BinOpDef {
 }
 
 /// Narrow operations in a single function.
-fn narrow_function(func: &mut IrFunction) -> usize {
+pub(crate) fn narrow_function(func: &mut IrFunction) -> usize {
     let max_id = func.max_value_id() as usize;
     let mut changes = 0;
 

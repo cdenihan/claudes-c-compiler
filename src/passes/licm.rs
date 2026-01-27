@@ -43,7 +43,7 @@ struct NaturalLoop {
 }
 
 /// Run LICM on a single function.
-fn licm_function(func: &mut IrFunction) -> usize {
+pub(crate) fn licm_function(func: &mut IrFunction) -> usize {
     let num_blocks = func.blocks.len();
     if num_blocks < 2 {
         return 0; // Need at least 2 blocks for a loop

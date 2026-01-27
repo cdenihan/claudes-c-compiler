@@ -21,7 +21,7 @@ pub fn run(module: &mut IrModule) -> usize {
 
 /// Eliminate dead code in a single function.
 /// Iterates until no more dead code is found (fixpoint).
-fn eliminate_dead_code(func: &mut IrFunction) -> usize {
+pub(crate) fn eliminate_dead_code(func: &mut IrFunction) -> usize {
     let max_id = func.max_value_id() as usize;
     // Allocate the bitvector once and reuse across fixpoint iterations
     let mut used = vec![false; max_id + 1];

@@ -57,17 +57,11 @@ pub fn run(module: &mut IrModule) -> usize {
 }
 
 /// Run dominator-based GVN on a single function.
-fn run_gvn_function(func: &mut IrFunction) -> usize {
+pub(crate) fn run_gvn_function(func: &mut IrFunction) -> usize {
     let num_blocks = func.blocks.len();
     if num_blocks == 0 {
         return 0;
     }
-
-    // Build CFG and dominator tree
-    let label_to_idx = analysis::build_label_map(func);
-    let (preds, succs) = analysis::build_cfg(func, &label_to_idx);
-    let idom = analysis::compute_dominators(num_blocks, &preds, &succs);
-    let dom_children = analysis::build_dom_tree_children(num_blocks, &idom);
 
     // Allocate value number table indexed by Value ID
     let max_id = func.max_value_id() as usize;
@@ -76,12 +70,30 @@ fn run_gvn_function(func: &mut IrFunction) -> usize {
 
     // Scoped expression-to-value map using a rollback log
     let mut expr_to_value: FxHashMap<ExprKey, Value> = FxHashMap::default();
+    // Track Load CSE entries for cross-block propagation with invalidation.
+    let mut load_keys: Vec<ExprKey> = Vec::new();
+
+    // Fast path for single-block functions: skip CFG/dominator computation
+    // entirely. We only need to do CSE within the single block.
+    if num_blocks == 1 {
+        let mut rollback_log: Vec<(ExprKey, Option<Value>)> = Vec::new();
+        let mut vn_log: Vec<(usize, u32)> = Vec::new();
+        return process_block(
+            0, func, &mut value_numbers, &mut next_vn,
+            &mut expr_to_value, &mut rollback_log, &mut vn_log, &mut load_keys,
+        );
+    }
+
+    // Build CFG and dominator tree
+    let label_to_idx = analysis::build_label_map(func);
+    let (preds, succs) = analysis::build_cfg(func, &label_to_idx);
+    let idom = analysis::compute_dominators(num_blocks, &preds, &succs);
+    let dom_children = analysis::build_dom_tree_children(num_blocks, &idom);
+
     // Rollback log: tracks (key, old_value) pairs pushed at each scope
     let mut rollback_log: Vec<(ExprKey, Option<Value>)> = Vec::new();
     // Track value_numbers slots assigned, for rollback
     let mut vn_log: Vec<(usize, u32)> = Vec::new();
-    // Track Load CSE entries for cross-block propagation with invalidation.
-    let mut load_keys: Vec<ExprKey> = Vec::new();
 
     let mut total_eliminated = 0;
 
@@ -175,9 +187,11 @@ fn gvn_dfs(
     );
     *total_eliminated += eliminated;
 
-    // Recurse into dominator tree children
-    let children: Vec<usize> = dom_children[block_idx].clone();
-    for child in children {
+    // Recurse into dominator tree children.
+    // Iterate by index to avoid cloning the children Vec.
+    let num_children = dom_children[block_idx].len();
+    for ci in 0..num_children {
+        let child = dom_children[block_idx][ci];
         gvn_dfs(
             child,
             func,

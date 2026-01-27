@@ -25,7 +25,7 @@ pub fn run(module: &mut IrModule) -> usize {
 }
 
 /// Propagate copies within a single function.
-fn propagate_copies(func: &mut IrFunction) -> usize {
+pub(crate) fn propagate_copies(func: &mut IrFunction) -> usize {
     let max_id = func.max_value_id() as usize;
 
     // Phase 1: Build the copy map as a flat lookup table (dest -> resolved source)

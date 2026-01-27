@@ -45,7 +45,7 @@ pub fn run(module: &mut IrModule) -> usize {
 }
 
 /// Run if-conversion on a single function.
-fn if_convert_function(func: &mut IrFunction) -> usize {
+pub(crate) fn if_convert_function(func: &mut IrFunction) -> usize {
     let num_blocks = func.blocks.len();
     if num_blocks < 3 {
         return 0; // Need at least 3 blocks (pred + one arm + merge)
