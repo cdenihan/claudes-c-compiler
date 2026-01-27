@@ -209,6 +209,7 @@ impl InlineAsmEmitter for RiscvCodegen {
         let op_mem_offsets: Vec<i64> = operands.iter().map(|o| o.mem_offset).collect();
         let op_mem_addrs: Vec<String> = operands.iter().map(|o| o.mem_addr.clone()).collect();
         let op_imm_values: Vec<Option<i64>> = operands.iter().map(|o| o.imm_value).collect();
+        let op_imm_symbols: Vec<Option<String>> = operands.iter().map(|o| o.imm_symbol.clone()).collect();
 
         // Convert AsmOperandKind back to RvConstraintKind for the substitution function
         let op_kinds: Vec<RvConstraintKind> = operands.iter().map(|o| match &o.kind {
@@ -227,7 +228,7 @@ impl InlineAsmEmitter for RiscvCodegen {
             AsmOperandKind::X87St0 | AsmOperandKind::X87St1 => RvConstraintKind::GpReg,
         }).collect();
 
-        let mut result = Self::substitute_riscv_asm_operands(line, &op_regs, &op_names, &op_kinds, &op_mem_offsets, &op_mem_addrs, &op_imm_values, gcc_to_internal);
+        let mut result = Self::substitute_riscv_asm_operands(line, &op_regs, &op_names, &op_kinds, &op_mem_offsets, &op_mem_addrs, &op_imm_values, &op_imm_symbols, gcc_to_internal);
         // Substitute %l[name] goto label references
         result = crate::backend::inline_asm::substitute_goto_labels(&result, goto_labels, operands.len());
         result

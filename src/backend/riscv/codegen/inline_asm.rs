@@ -55,6 +55,7 @@ impl RiscvCodegen {
         op_mem_offsets: &[i64],
         op_mem_addrs: &[String],
         op_imm_values: &[Option<i64>],
+        op_imm_symbols: &[Option<String>],
         use_addr_format: bool, // true for Address kind
     ) -> String {
         if idx >= op_kinds.len() {
@@ -78,6 +79,10 @@ impl RiscvCodegen {
                 }
             }
             RvConstraintKind::Immediate => {
+                // Check for immediate symbol first (e.g., string literal, function/variable name)
+                if let Some(Some(ref sym)) = op_imm_symbols.get(idx) {
+                    return sym.clone();
+                }
                 // Emit the immediate value directly
                 if let Some(imm) = op_imm_values[idx] {
                     format!("{}", imm)
@@ -100,6 +105,7 @@ impl RiscvCodegen {
         op_mem_offsets: &[i64],
         op_mem_addrs: &[String],
         op_imm_values: &[Option<i64>],
+        op_imm_symbols: &[Option<String>],
         gcc_to_internal: &[usize],
     ) -> String {
         let mut result = String::new();
@@ -214,7 +220,7 @@ impl RiscvCodegen {
                     for (idx, op_name) in op_names.iter().enumerate() {
                         if let Some(ref n) = op_name {
                             if n == &name {
-                                result.push_str(&Self::format_operand(idx, op_regs, op_kinds, op_mem_offsets, op_mem_addrs, op_imm_values, true));
+                                result.push_str(&Self::format_operand(idx, op_regs, op_kinds, op_mem_offsets, op_mem_addrs, op_imm_values, op_imm_symbols, true));
                                 found = true;
                                 break;
                             }
@@ -239,7 +245,7 @@ impl RiscvCodegen {
                         num
                     };
                     if internal_idx < op_regs.len() {
-                        result.push_str(&Self::format_operand(internal_idx, op_regs, op_kinds, op_mem_offsets, op_mem_addrs, op_imm_values, true));
+                        result.push_str(&Self::format_operand(internal_idx, op_regs, op_kinds, op_mem_offsets, op_mem_addrs, op_imm_values, op_imm_symbols, true));
                     } else {
                         result.push_str(&format!("%{}", num));
                     }

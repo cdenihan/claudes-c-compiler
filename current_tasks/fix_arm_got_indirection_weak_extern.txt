@@ -1,0 +1,11 @@
+Fix ARM64 GOT indirection for weak/extern symbols
+
+The ARM64 backend's emit_global_addr always generates direct adrp+add sequences
+(R_AARCH64_ADR_PREL_PG_HI21 + R_AARCH64_ADD_ABS_LO12_NC) even for symbols that
+may bind externally (weak, non-static). The kernel linker rejects this.
+
+The fix: use GOT-indirect addressing (adrp :got:name + ldr :got_lo12:name) for
+symbols where needs_got() returns true, matching the x86 backend's pattern.
+
+Identified via kernel delta debugging: drivers/firmware/efi/efi-init.c fails
+because extern __weak efi_arch_tables gets direct PC-relative addressing.
