@@ -1,0 +1,18 @@
+Fix __auto_type + typeof expression type cache poisoning
+
+Bug: When __auto_type resolved its type, the compiler cloned the declaration's
+expression trees. After the clone was dropped, heap addresses were reused by
+subsequent declarations. The expression type cache (keyed by pointer address)
+retained stale entries mapping freed addresses to CType::Int. When a new
+pointer-typed expression (e.g., files->fdt) was allocated at the same address,
+the cache returned CType::Int instead of CType::Pointer, causing a 32-bit
+sign-extending load (movslq) instead of a 64-bit load (movq).
+
+This caused the Linux kernel's fd_install() function (fs/file.c) to be
+miscompiled, resulting in boot crashes on x86.
+
+Fix: Clear expr_ctype_cache after creating resolved_decl with cloned
+declarators in lower_local_decl, preventing stale cache entries from
+poisoning type resolution for subsequent declarations.
+
+Status: in_progress
