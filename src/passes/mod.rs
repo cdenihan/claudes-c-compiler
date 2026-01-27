@@ -22,7 +22,7 @@ pub mod licm;
 pub mod narrow;
 pub mod simplify;
 
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::ir::{Instruction, IrModule, IrFunction, GlobalInit, Operand, Value};
 
 /// Run a per-function pass only on functions in the visit set.
@@ -675,13 +675,60 @@ fn eliminate_dead_static_functions(module: &mut IrModule) {
         id < reachable.len() && reachable[id]
     });
 
-    // Note: symbol_attrs are NOT filtered by reachability. They contain assembler
-    // directives (.weak, .hidden) for extern declarations. These symbols may not appear
-    // in the module's function/global lists (they're defined in other translation units),
-    // so they can't be tracked by the reachability graph. Emitting a .weak directive
-    // for an unreferenced symbol is harmless — the assembler and linker simply ignore it.
-    // Dropping these directives, however, would cause linker errors for weak extern
-    // symbols (e.g., the kernel's kallsyms_names declared as `extern __weak`).
+    // Filter symbol_attrs: visibility directives (.hidden, .protected, .internal) for
+    // unreferenced symbols cause the assembler to emit undefined symbol entries, which
+    // can cause linker errors (e.g., kernel's hidden vdso symbols). Only emit visibility
+    // directives for symbols that are actually referenced by surviving code.
+    // .weak directives for unreferenced symbols are harmless — the assembler ignores them.
+    {
+        // Collect all symbol names referenced by surviving functions and globals.
+        let mut referenced_symbols: FxHashSet<&str> = FxHashSet::default();
+        for func in &module.functions {
+            if func.is_declaration { continue; }
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    match inst {
+                        Instruction::Call { func: callee, .. } => {
+                            referenced_symbols.insert(callee.as_str());
+                        }
+                        Instruction::GlobalAddr { name, .. } => {
+                            referenced_symbols.insert(name.as_str());
+                        }
+                        Instruction::InlineAsm { input_symbols, .. } => {
+                            for sym in input_symbols {
+                                if let Some(s) = sym {
+                                    let base = s.split('+').next().unwrap_or(s);
+                                    referenced_symbols.insert(base);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        for global in &module.globals {
+            collect_global_init_refs_set(&global.init, &mut referenced_symbols);
+        }
+        // Also include names of surviving non-extern globals and non-declaration functions,
+        // since they might be targets of symbol_attrs directives.
+        for func in &module.functions {
+            referenced_symbols.insert(func.name.as_str());
+        }
+        for global in &module.globals {
+            referenced_symbols.insert(global.name.as_str());
+        }
+
+        module.symbol_attrs.retain(|(name, is_weak, visibility)| {
+            // Always keep .weak-only directives (no visibility) — they're harmless
+            if *is_weak && visibility.is_none() {
+                return true;
+            }
+            // For entries with visibility (.hidden, .protected, .internal),
+            // only keep if the symbol is actually referenced
+            referenced_symbols.contains(name.as_str())
+        });
+    }
 }
 
 /// Collect symbol references from a global initializer into a Vec.
@@ -697,6 +744,25 @@ fn collect_global_init_refs_vec(init: &GlobalInit, refs: &mut Vec<String>) {
         GlobalInit::Compound(fields) => {
             for field in fields {
                 collect_global_init_refs_vec(field, refs);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect symbol references from a global initializer into a HashSet (borrowed strings).
+fn collect_global_init_refs_set<'a>(init: &'a GlobalInit, refs: &mut FxHashSet<&'a str>) {
+    match init {
+        GlobalInit::GlobalAddr(name) | GlobalInit::GlobalAddrOffset(name, _) => {
+            refs.insert(name.as_str());
+        }
+        GlobalInit::GlobalLabelDiff(label1, label2, _) => {
+            refs.insert(label1.as_str());
+            refs.insert(label2.as_str());
+        }
+        GlobalInit::Compound(fields) => {
+            for field in fields {
+                collect_global_init_refs_set(field, refs);
             }
         }
         _ => {}

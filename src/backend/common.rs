@@ -676,8 +676,11 @@ fn emit_globals(out: &mut AsmOutput, globals: &[IrGlobal], ptr_dir: PtrDirective
             continue;
         }
         let section_name = g.section.as_ref().unwrap();
-        // "aw" for writable, "a" for read-only sections
-        let flags = if section_name.contains("rodata") { "a" } else { "aw" };
+        // Use "a" (read-only) for const-qualified globals or rodata sections,
+        // "aw" (writable) otherwise. GCC uses the const qualification of the
+        // variable to determine section flags, not just the section name.
+        // This matters for kernel sections like .modinfo which contain const data.
+        let flags = if g.is_const || section_name.contains("rodata") { "a" } else { "aw" };
         // Sections starting with ".bss" are NOBITS (no file space, BSS semantics)
         let section_type = if section_name.starts_with(".bss") { "@nobits" } else { "@progbits" };
         out.emit_fmt(format_args!(".section {},\"{}\",{}", section_name, flags, section_type));
