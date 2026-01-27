@@ -4,8 +4,17 @@
 //! Values with the longest live ranges and most uses get priority for register
 //! assignment. Values that don't fit in available registers remain on the stack.
 //!
-//! Shared by all backends: x86-64 (rbx, r12-r15), AArch64 (x20-x28), and RISC-V (s1, s7-s11).
-//! Uses callee-saved registers so no save/restore is needed around calls.
+//! Two-phase allocation:
+//! 1. **Callee-saved registers** (x86: rbx, r12-r15; ARM: x20-x28; RISC-V: s1, s7-s11):
+//!    Assigned to values whose live ranges span function calls. These registers
+//!    are preserved across calls by the ABI, so no save/restore is needed at call
+//!    sites (but prologue/epilogue must save them).
+//!
+//! 2. **Caller-saved registers** (x86: r11, r10, r8, r9):
+//!    Assigned to values whose live ranges do NOT span any function call. These
+//!    registers are destroyed by calls, so they can only hold values between calls.
+//!    No prologue/epilogue save/restore is needed since we never assign them to
+//!    values that cross call boundaries.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
@@ -32,8 +41,13 @@ pub struct RegAllocResult {
 
 /// Configuration for the register allocator.
 pub struct RegAllocConfig {
-    /// Available registers for allocation (e.g., s1-s11 for RISC-V).
+    /// Available callee-saved registers for allocation (e.g., s1-s11 for RISC-V).
     pub available_regs: Vec<PhysReg>,
+    /// Available caller-saved registers for allocation.
+    /// These are assigned to values whose live ranges do NOT span any call.
+    /// Since they don't cross calls, no prologue/epilogue save/restore is needed.
+    /// Examples: x86 r11, r10, r8, r9.
+    pub caller_saved_regs: Vec<PhysReg>,
 }
 
 /// Run the linear scan register allocator on a function.
@@ -52,7 +66,7 @@ pub fn allocate_registers(
     func: &IrFunction,
     config: &RegAllocConfig,
 ) -> RegAllocResult {
-    if config.available_regs.is_empty() {
+    if config.available_regs.is_empty() && config.caller_saved_regs.is_empty() {
         return RegAllocResult {
             assignments: FxHashMap::default(),
             used_regs: Vec::new(),
@@ -309,9 +323,58 @@ pub fn allocate_registers(
         // needed since the stack slot already exists).
     }
 
-    // Build sorted list of used registers.
+    // Build sorted list of used callee-saved registers (for prologue/epilogue).
     let mut used_regs: Vec<PhysReg> = used_regs_set.iter().map(|&r| PhysReg(r)).collect();
     used_regs.sort_by_key(|r| r.0);
+
+    // Phase 2: Caller-saved register allocation.
+    //
+    // Assign caller-saved registers to eligible values whose live ranges do NOT
+    // span any function call. Since these registers are destroyed by calls, we
+    // can only use them for values that live entirely between calls (or in
+    // call-free regions). No prologue/epilogue save/restore is needed.
+    if !config.caller_saved_regs.is_empty() {
+        let mut caller_candidates: Vec<&LiveInterval> = liveness.intervals.iter()
+            .filter(|iv| eligible.contains(&iv.value_id))
+            .filter(|iv| !assignments.contains_key(&iv.value_id)) // Not already in a callee-saved reg
+            .filter(|iv| iv.end > iv.start) // Must span at least 2 points
+            .filter(|iv| {
+                // Only allocate caller-saved regs to values that do NOT span a call.
+                let start_idx = call_points.partition_point(|&cp| cp < iv.start);
+                !(start_idx < call_points.len() && call_points[start_idx] <= iv.end)
+            })
+            .collect();
+
+        // Prioritize by use_count * interval_length (same heuristic as callee-saved).
+        caller_candidates.sort_by(|a, b| {
+            let score_a = (a.end - a.start) as u64 * use_count.get(&a.value_id).copied().unwrap_or(1) as u64;
+            let score_b = (b.end - b.start) as u64 * use_count.get(&b.value_id).copied().unwrap_or(1) as u64;
+            score_b.cmp(&score_a)
+        });
+
+        // Linear scan for caller-saved registers.
+        let num_caller_regs = config.caller_saved_regs.len();
+        let mut caller_free_until: Vec<u32> = vec![0; num_caller_regs];
+
+        for interval in &caller_candidates {
+            let mut best: Option<usize> = None;
+            let mut best_free_time: u32 = u32::MAX;
+
+            for (i, &free_until) in caller_free_until.iter().enumerate() {
+                if free_until <= interval.start {
+                    if best.is_none() || free_until < best_free_time {
+                        best = Some(i);
+                        best_free_time = free_until;
+                    }
+                }
+            }
+
+            if let Some(reg_idx) = best {
+                caller_free_until[reg_idx] = interval.end + 1;
+                assignments.insert(interval.value_id, config.caller_saved_regs[reg_idx]);
+            }
+        }
+    }
 
     RegAllocResult {
         assignments,

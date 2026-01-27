@@ -1360,8 +1360,9 @@ impl ArchCodegen for RiscvCodegen {
         let mut asm_clobbered_regs: Vec<PhysReg> = Vec::new();
         collect_inline_asm_callee_saved_riscv(func, &mut asm_clobbered_regs);
         let available_regs = crate::backend::generation::filter_available_regs(&RISCV_CALLEE_SAVED, &asm_clobbered_regs);
+        // TODO: Add RISC-V caller-saved register allocation (t2-t6)
         let (reg_assigned, cached_liveness) = crate::backend::generation::run_regalloc_and_merge_clobbers(
-            func, available_regs, &asm_clobbered_regs,
+            func, available_regs, Vec::new(), &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
         );
         self.f128_load_sources.clear();

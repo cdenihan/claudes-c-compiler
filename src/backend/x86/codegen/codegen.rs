@@ -19,19 +19,33 @@ const X86_CALLEE_SAVED: [PhysReg; 5] = [
     PhysReg(1), PhysReg(2), PhysReg(3), PhysReg(4), PhysReg(5),
 ];
 
+/// x86-64 caller-saved registers available for allocation to values that
+/// do NOT span function calls. These registers are destroyed by calls, so
+/// they can only hold values between calls. No prologue/epilogue save is needed.
+///
+/// PhysReg encoding: 10=r11, 11=r10, 12=r8, 13=r9
+/// (IDs 10+ to avoid overlap with callee-saved 1-5)
+const X86_CALLER_SAVED: [PhysReg; 4] = [
+    PhysReg(10), PhysReg(11), PhysReg(12), PhysReg(13),
+];
+
 /// Map a PhysReg index to its x86-64 register name.
-fn callee_saved_name(reg: PhysReg) -> &'static str {
+/// Handles both callee-saved (1-5) and caller-saved (10-13) registers.
+fn phys_reg_name(reg: PhysReg) -> &'static str {
     match reg.0 {
         1 => "rbx", 2 => "r12", 3 => "r13", 4 => "r14", 5 => "r15",
-        _ => unreachable!("invalid x86 callee-saved register index"),
+        10 => "r11", 11 => "r10", 12 => "r8", 13 => "r9",
+        _ => unreachable!("invalid x86 register index {}", reg.0),
     }
 }
 
 /// Map a PhysReg index to its x86-64 32-bit sub-register name.
-fn callee_saved_name_32(reg: PhysReg) -> &'static str {
+/// Handles both callee-saved (1-5) and caller-saved (10-13) registers.
+fn phys_reg_name_32(reg: PhysReg) -> &'static str {
     match reg.0 {
         1 => "ebx", 2 => "r12d", 3 => "r13d", 4 => "r14d", 5 => "r15d",
-        _ => unreachable!("invalid x86 callee-saved register index"),
+        10 => "r11d", 11 => "r10d", 12 => "r8d", 13 => "r9d",
+        _ => unreachable!("invalid x86 register index {}", reg.0),
     }
 }
 
@@ -233,12 +247,12 @@ impl X86Codegen {
         let rhs_phys = self.operand_reg(rhs);
         if let (Some(lhs_r), Some(rhs_r)) = (lhs_phys, rhs_phys) {
             // Both in callee-saved registers: compare directly
-            let lhs_name = if use_32bit { callee_saved_name_32(lhs_r) } else { callee_saved_name(lhs_r) };
-            let rhs_name = if use_32bit { callee_saved_name_32(rhs_r) } else { callee_saved_name(rhs_r) };
+            let lhs_name = if use_32bit { phys_reg_name_32(lhs_r) } else { phys_reg_name(lhs_r) };
+            let rhs_name = if use_32bit { phys_reg_name_32(rhs_r) } else { phys_reg_name(rhs_r) };
             self.state.emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rhs_name, lhs_name));
         } else if let Some(imm) = Self::const_as_imm32(rhs) {
             if let Some(lhs_r) = lhs_phys {
-                let lhs_name = if use_32bit { callee_saved_name_32(lhs_r) } else { callee_saved_name(lhs_r) };
+                let lhs_name = if use_32bit { phys_reg_name_32(lhs_r) } else { phys_reg_name(lhs_r) };
                 self.state.emit_fmt(format_args!("    {} ${}, %{}", cmp_instr, imm, lhs_name));
             } else {
                 self.operand_to_rax(lhs);
@@ -246,12 +260,12 @@ impl X86Codegen {
                 self.state.emit_fmt(format_args!("    {} ${}, %{}", cmp_instr, imm, reg));
             }
         } else if let Some(lhs_r) = lhs_phys {
-            let lhs_name = if use_32bit { callee_saved_name_32(lhs_r) } else { callee_saved_name(lhs_r) };
+            let lhs_name = if use_32bit { phys_reg_name_32(lhs_r) } else { phys_reg_name(lhs_r) };
             self.operand_to_rcx(rhs);
             let rcx = if use_32bit { "ecx" } else { "rcx" };
             self.state.emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rcx, lhs_name));
         } else if let Some(rhs_r) = rhs_phys {
-            let rhs_name = if use_32bit { callee_saved_name_32(rhs_r) } else { callee_saved_name(rhs_r) };
+            let rhs_name = if use_32bit { phys_reg_name_32(rhs_r) } else { phys_reg_name(rhs_r) };
             self.operand_to_rax(lhs);
             let reg = if use_32bit { "eax" } else { "rax" };
             self.state.emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rhs_name, reg));
@@ -266,7 +280,7 @@ impl X86Codegen {
     /// Load an operand into a specific callee-saved register.
     /// Handles constants, register-allocated values, and stack values.
     fn operand_to_callee_reg(&mut self, op: &Operand, target: PhysReg) {
-        let target_name = callee_saved_name(target);
+        let target_name = phys_reg_name(target);
         match op {
             Operand::Const(c) => {
                 match c {
@@ -291,7 +305,7 @@ impl X86Codegen {
             Operand::Value(v) => {
                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
                     if reg.0 != target.0 {
-                        let src_name = callee_saved_name(reg);
+                        let src_name = phys_reg_name(reg);
                         self.state.emit_fmt(format_args!("    movq %{}, %{}", src_name, target_name));
                     }
                     // If same register, nothing to do
@@ -366,7 +380,7 @@ impl X86Codegen {
                 }
                 // Check register allocation: load from callee-saved register
                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
-                    let reg_name = callee_saved_name(reg);
+                    let reg_name = phys_reg_name(reg);
                     self.state.out.emit_instr_reg_reg("    movq", reg_name, "rax");
                     self.state.reg_cache.set_acc(v.0, false);
                 } else if self.state.get_slot(v.0).is_some() {
@@ -381,14 +395,14 @@ impl X86Codegen {
     }
 
     /// Store %rax to a value's location (register or stack slot).
-    /// Register-only strategy: if the value has a callee-saved register assignment,
+    /// Register-only strategy: if the value has a register assignment (callee-saved or caller-saved),
     /// store ONLY to the register (skip the stack write). This eliminates redundant
     /// memory stores for register-allocated values. Values without a register
     /// assignment are stored to their stack slot as before.
     fn store_rax_to(&mut self, dest: &Value) {
         if let Some(&reg) = self.reg_assignments.get(&dest.0) {
             // Value has a callee-saved register: store only to register, skip stack.
-            let reg_name = callee_saved_name(reg);
+            let reg_name = phys_reg_name(reg);
             self.state.out.emit_instr_reg_reg("    movq", "rax", reg_name);
         } else if let Some(slot) = self.state.get_slot(dest.0) {
             // No register: store to stack slot.
@@ -450,7 +464,7 @@ impl X86Codegen {
             Operand::Value(v) => {
                 // Check register allocation: load from callee-saved register
                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
-                    let reg_name = callee_saved_name(reg);
+                    let reg_name = phys_reg_name(reg);
                     self.state.out.emit_instr_reg_reg("    movq", reg_name, "rcx");
                 } else if self.state.get_slot(v.0).is_some() {
                     self.value_to_reg(v, "rcx");
@@ -490,7 +504,7 @@ impl X86Codegen {
     fn value_to_reg(&mut self, val: &Value, reg: &str) {
         // Check register allocation first (allocas are never register-allocated)
         if let Some(&phys_reg) = self.reg_assignments.get(&val.0) {
-            let reg_name = callee_saved_name(phys_reg);
+            let reg_name = phys_reg_name(phys_reg);
             if reg_name != reg {
                 self.state.out.emit_instr_reg_reg("    movq", reg_name, reg);
             }
@@ -567,7 +581,7 @@ impl X86Codegen {
                         // Check register allocation first, since register-allocated values
                         // may not have their stack slot written.
                         if let Some(&reg) = self.reg_assignments.get(&v.0) {
-                            let reg_name = callee_saved_name(reg);
+                            let reg_name = phys_reg_name(reg);
                             self.state.emit_fmt(format_args!("    movq %{}, %rax", reg_name));
                         } else {
                             self.state.emit_fmt(format_args!("    movq {}(%rbp), %rax", slot.0));
@@ -577,7 +591,7 @@ impl X86Codegen {
                 } else {
                     // No stack slot: check register allocation
                     if let Some(&reg) = self.reg_assignments.get(&v.0) {
-                        let reg_name = callee_saved_name(reg);
+                        let reg_name = phys_reg_name(reg);
                         self.state.emit_fmt(format_args!("    movq %{}, %rax", reg_name));
                         self.state.emit("    xorq %rdx, %rdx");
                     } else {
@@ -1799,8 +1813,59 @@ impl ArchCodegen for X86Codegen {
         let mut asm_clobbered_regs: Vec<PhysReg> = Vec::new();
         collect_inline_asm_callee_saved_x86(func, &mut asm_clobbered_regs);
         let available_regs = crate::backend::generation::filter_available_regs(&X86_CALLEE_SAVED, &asm_clobbered_regs);
+
+        // Build caller-saved register pool. Start with all 4 caller-saved regs
+        // (r11, r10, r8, r9), then remove any that are unsafe for this function.
+        let mut caller_saved_regs = X86_CALLER_SAVED.to_vec();
+        // Conservatively disable ALL caller-saved register allocation for
+        // functions containing inline asm. Inline asm with generic "r"
+        // constraints can use any GP register including r8-r11.
+        let has_inline_asm = func.blocks.iter().any(|b| {
+            b.instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::InlineAsm { .. }))
+        });
+        if has_inline_asm {
+            caller_saved_regs.clear();
+        }
+        // r10 is used for indirect calls (call *%r10), so exclude it.
+        // r8 is used by atomic RMW cmpxchg loops and i128 multiply/compare.
+        // r9 is used by i128 multiply.
+        let mut has_indirect_call = false;
+        let mut has_i128_ops = false;
+        let mut has_atomic_rmw = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::CallIndirect { .. } => { has_indirect_call = true; }
+                    Instruction::BinOp { ty, .. }
+                    | Instruction::UnaryOp { ty, .. } => {
+                        if matches!(ty, IrType::I128 | IrType::U128) {
+                            has_i128_ops = true;
+                        }
+                    }
+                    Instruction::Cmp { ty, .. } => {
+                        if matches!(ty, IrType::I128 | IrType::U128) {
+                            has_i128_ops = true;
+                        }
+                    }
+                    Instruction::AtomicRmw { .. } => { has_atomic_rmw = true; }
+                    _ => {}
+                }
+            }
+        }
+        if has_indirect_call {
+            caller_saved_regs.retain(|r| r.0 != 11); // r10 = PhysReg(11)
+        }
+        if has_i128_ops {
+            caller_saved_regs.retain(|r| r.0 != 12 && r.0 != 13); // r8, r9
+        }
+        if has_atomic_rmw {
+            caller_saved_regs.retain(|r| r.0 != 12); // r8
+        }
+
         let (reg_assigned, cached_liveness) = crate::backend::generation::run_regalloc_and_merge_clobbers(
-            func, available_regs, &asm_clobbered_regs,
+            func, available_regs, caller_saved_regs, &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
         );
 
@@ -1873,7 +1938,7 @@ impl ArchCodegen for X86Codegen {
         let used_regs = self.used_callee_saved.clone();
         for (i, &reg) in used_regs.iter().enumerate() {
             let offset = -(frame_size as i64) + (i as i64 * 8);
-            let reg_name = callee_saved_name(reg);
+            let reg_name = phys_reg_name(reg);
             self.state.emit_fmt(format_args!("    movq %{}, {}(%rbp)", reg_name, offset));
         }
 
@@ -1904,7 +1969,7 @@ impl ArchCodegen for X86Codegen {
         let used_regs = self.used_callee_saved.clone();
         for (i, &reg) in used_regs.iter().enumerate() {
             let offset = -(frame_size as i64) + (i as i64 * 8);
-            let reg_name = callee_saved_name(reg);
+            let reg_name = phys_reg_name(reg);
             self.state.emit_fmt(format_args!("    movq {}(%rbp), %{}", offset, reg_name));
         }
         self.state.emit("    movq %rbp, %rsp");
@@ -2377,7 +2442,7 @@ impl ArchCodegen for X86Codegen {
         // - regular load: ptr to rcx, then load through rcx
         // Check register allocation: use callee-saved register if available.
         if let Some(&reg) = self.reg_assignments.get(&val_id) {
-            let reg_name = callee_saved_name(reg);
+            let reg_name = phys_reg_name(reg);
             self.state.out.emit_instr_reg_reg("    movq", reg_name, "rcx");
         } else {
             self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rcx");
@@ -2406,7 +2471,7 @@ impl ArchCodegen for X86Codegen {
             self.state.emit_fmt(format_args!("    leaq {}(%rbp), %rcx", slot.0));
         } else if let Some(&reg) = self.reg_assignments.get(&val_id) {
             // Register-allocated: use callee-saved register directly.
-            let reg_name = callee_saved_name(reg);
+            let reg_name = phys_reg_name(reg);
             self.state.emit_fmt(format_args!("    movq %{}, %rcx", reg_name));
         } else {
             self.state.emit_fmt(format_args!("    movq {}(%rbp), %rcx", slot.0));
@@ -2432,7 +2497,7 @@ impl ArchCodegen for X86Codegen {
         // Pointer base + constant offset: load ptr, then lea offset(ptr), %rax.
         // First load the base pointer into rax.
         if let Some(&reg) = self.reg_assignments.get(&val_id) {
-            let reg_name = callee_saved_name(reg);
+            let reg_name = phys_reg_name(reg);
             self.state.emit_fmt(format_args!("    movq %{}, %rax", reg_name));
         } else {
             self.state.emit_fmt(format_args!("    movq {}(%rbp), %rax", slot.0));
@@ -2487,7 +2552,7 @@ impl ArchCodegen for X86Codegen {
         if is_alloca {
             self.state.emit_fmt(format_args!("    leaq {}(%rbp), %rdi", slot.0));
         } else if let Some(&reg) = self.reg_assignments.get(&val_id) {
-            let reg_name = callee_saved_name(reg);
+            let reg_name = phys_reg_name(reg);
             self.state.emit_fmt(format_args!("    movq %{}, %rdi", reg_name));
         } else {
             self.state.emit_fmt(format_args!("    movq {}(%rbp), %rdi", slot.0));
@@ -2498,7 +2563,7 @@ impl ArchCodegen for X86Codegen {
         if is_alloca {
             self.state.emit_fmt(format_args!("    leaq {}(%rbp), %rsi", slot.0));
         } else if let Some(&reg) = self.reg_assignments.get(&val_id) {
-            let reg_name = callee_saved_name(reg);
+            let reg_name = phys_reg_name(reg);
             self.state.emit_fmt(format_args!("    movq %{}, %rsi", reg_name));
         } else {
             self.state.emit_fmt(format_args!("    movq {}(%rbp), %rsi", slot.0));
@@ -2638,8 +2703,8 @@ impl ArchCodegen for X86Codegen {
         match (dest_phys, src_phys) {
             (Some(d), Some(s)) => {
                 if d.0 != s.0 {
-                    let d_name = callee_saved_name(d);
-                    let s_name = callee_saved_name(s);
+                    let d_name = phys_reg_name(d);
+                    let s_name = phys_reg_name(s);
                     self.state.out.emit_instr_reg_reg("    movq", s_name, d_name);
                 }
                 // Same register = no-op
@@ -2650,7 +2715,7 @@ impl ArchCodegen for X86Codegen {
                 // Load src into rax first (preserving reg_cache semantics),
                 // then move to dest register.
                 self.operand_to_rax(src);
-                let d_name = callee_saved_name(d);
+                let d_name = phys_reg_name(d);
                 self.state.out.emit_instr_reg_reg("    movq", "rax", d_name);
                 self.state.reg_cache.invalidate_acc();
             }
@@ -2672,8 +2737,8 @@ impl ArchCodegen for X86Codegen {
         // --- Register-direct path: operate on callee-saved destination register ---
         // Avoids going through %rax, eliminating 1-3 mov instructions per operation.
         if let Some(dest_phys) = self.dest_reg(dest) {
-            let dest_name = callee_saved_name(dest_phys);
-            let dest_name_32 = callee_saved_name_32(dest_phys);
+            let dest_name = phys_reg_name(dest_phys);
+            let dest_name_32 = phys_reg_name_32(dest_phys);
 
             // Simple ALU ops (add/sub/and/or/xor/mul) with register destination
             let is_simple_alu = matches!(op, IrBinOp::Add | IrBinOp::Sub | IrBinOp::And
@@ -2714,7 +2779,7 @@ impl ArchCodegen for X86Codegen {
                 } else {
                     self.operand_to_callee_reg(lhs, dest_phys);
                     if let Some(rhs_phys) = rhs_phys {
-                        (callee_saved_name(rhs_phys).to_string(), callee_saved_name_32(rhs_phys).to_string())
+                        (phys_reg_name(rhs_phys).to_string(), phys_reg_name_32(rhs_phys).to_string())
                     } else {
                         self.operand_to_rax(rhs);
                         ("rax".to_string(), "eax".to_string())
@@ -3167,7 +3232,7 @@ impl ArchCodegen for X86Codegen {
                 // instead of MOV which would load stack contents) and
                 // over-aligned allocas.
                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
-                    let reg_name = callee_saved_name(reg);
+                    let reg_name = phys_reg_name(reg);
                     self.state.emit_fmt(format_args!("    movq %{}, %rdx", reg_name));
                 } else if self.state.get_slot(v.0).is_some() {
                     self.value_to_reg(v, "rdx");
@@ -3676,7 +3741,7 @@ impl ArchCodegen for X86Codegen {
         // Load va_list pointer into %rcx (register-aware).
         if let Some(&reg) = self.reg_assignments.get(&va_list_ptr.0) {
             // Value is in a callee-saved register.
-            let reg_name = callee_saved_name(reg);
+            let reg_name = phys_reg_name(reg);
             self.state.emit_fmt(format_args!("    movq %{}, %rcx", reg_name));
         } else if let Some(slot) = self.state.get_slot(va_list_ptr.0) {
             if self.state.is_alloca(va_list_ptr.0) {
@@ -3775,7 +3840,7 @@ impl ArchCodegen for X86Codegen {
 
         // Load va_list pointer into %rax (register-aware).
         if let Some(&reg) = self.reg_assignments.get(&va_list_ptr.0) {
-            let reg_name = callee_saved_name(reg);
+            let reg_name = phys_reg_name(reg);
             self.state.emit_fmt(format_args!("    movq %{}, %rax", reg_name));
         } else if let Some(slot) = self.state.get_slot(va_list_ptr.0) {
             if self.state.is_alloca(va_list_ptr.0) {
@@ -3816,7 +3881,7 @@ impl ArchCodegen for X86Codegen {
     fn emit_va_copy(&mut self, dest_ptr: &Value, src_ptr: &Value) {
         // Copy 24 bytes from src va_list to dest va_list (register-aware).
         if let Some(&reg) = self.reg_assignments.get(&src_ptr.0) {
-            let reg_name = callee_saved_name(reg);
+            let reg_name = phys_reg_name(reg);
             self.state.emit_fmt(format_args!("    movq %{}, %rsi", reg_name));
         } else if let Some(src_slot) = self.state.get_slot(src_ptr.0) {
             if self.state.is_alloca(src_ptr.0) {
@@ -3826,7 +3891,7 @@ impl ArchCodegen for X86Codegen {
             }
         }
         if let Some(&reg) = self.reg_assignments.get(&dest_ptr.0) {
-            let reg_name = callee_saved_name(reg);
+            let reg_name = phys_reg_name(reg);
             self.state.emit_fmt(format_args!("    movq %{}, %rdi", reg_name));
         } else if let Some(dest_slot) = self.state.get_slot(dest_ptr.0) {
             if self.state.is_alloca(dest_ptr.0) {

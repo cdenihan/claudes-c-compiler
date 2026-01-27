@@ -1588,8 +1588,9 @@ impl ArchCodegen for ArmCodegen {
         Self::prescan_inline_asm_callee_saved(func, &mut asm_clobbered_regs);
         let base_regs: &[PhysReg] = if func.is_variadic { &[] } else { &ARM_CALLEE_SAVED };
         let available_regs = crate::backend::generation::filter_available_regs(base_regs, &asm_clobbered_regs);
+        // TODO: Add ARM caller-saved register allocation (x9-x15)
         let (reg_assigned, cached_liveness) = crate::backend::generation::run_regalloc_and_merge_clobbers(
-            func, available_regs, &asm_clobbered_regs,
+            func, available_regs, Vec::new(), &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
         );
 
