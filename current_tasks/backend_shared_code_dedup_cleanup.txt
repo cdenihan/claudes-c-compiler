@@ -1,0 +1,20 @@
+Task: Backend shared code deduplication and cleanup
+
+Status: in_progress
+
+Plan:
+1. Deduplicate SysV eightbyte classification between call_abi.rs and call_emit.rs
+2. Add IrConst::as_i64() method to eliminate duplicated const-to-i64 conversion
+3. Make trait default methods delegate to free functions (emit_cast, emit_unaryop, emit_return)
+4. Extract visibility directive helper and use it in generation.rs
+5. Extract linkage (.globl/.weak) helper and use it in common.rs
+6. Refactor emit_globals to reduce 8-loop pattern into cleaner code
+7. Fix duplicated GlobalInit variant dispatch in emit_global_def compound handling
+
+Files affected:
+- src/backend/call_abi.rs
+- src/backend/call_emit.rs
+- src/backend/traits.rs
+- src/backend/common.rs
+- src/backend/generation.rs
+- src/ir/ir.rs (IrConst)
