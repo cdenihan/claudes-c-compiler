@@ -330,6 +330,7 @@ mod tests {
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+            source_spans: Vec::new(),
         });
 
         let replacements = propagate_copies(&mut func);
@@ -371,6 +372,7 @@ mod tests {
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: Vec::new(),
         });
 
         let replacements = propagate_copies(&mut func);
@@ -407,6 +409,7 @@ mod tests {
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
+            source_spans: Vec::new(),
         });
 
         let replacements = propagate_copies(&mut func);
@@ -434,6 +437,7 @@ mod tests {
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
+            source_spans: Vec::new(),
         });
 
         let replacements = propagate_copies(&mut func);
@@ -462,6 +466,7 @@ mod tests {
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(0)))),
+            source_spans: Vec::new(),
         });
 
         let replacements = propagate_copies(&mut func);

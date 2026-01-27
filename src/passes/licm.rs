@@ -639,12 +639,17 @@ fn hoist_loop_invariants(
         if block_idx < func.blocks.len() {
             let block = &mut func.blocks[block_idx];
             let mut new_insts = Vec::with_capacity(block.instructions.len());
+            let old_spans = std::mem::take(&mut block.source_spans);
+            let has_spans = !old_spans.is_empty();
+            let mut new_spans = if has_spans { Vec::with_capacity(old_spans.len()) } else { Vec::new() };
             for (i, inst) in block.instructions.drain(..).enumerate() {
                 if !indices.contains(&i) {
                     new_insts.push(inst);
+                    if has_spans { new_spans.push(old_spans[i]); }
                 }
             }
             block.instructions = new_insts;
+            block.source_spans = new_spans;
         }
     }
 
@@ -677,7 +682,13 @@ fn hoist_loop_invariants(
     // Insert at the end of the preheader (before terminator)
     if preheader < func.blocks.len() {
         let preheader_block = &mut func.blocks[preheader];
+        let num_sorted = sorted.len();
         preheader_block.instructions.extend(sorted);
+        if !preheader_block.source_spans.is_empty() {
+            preheader_block.source_spans.extend(
+                std::iter::repeat(crate::common::source::Span::dummy()).take(num_sorted)
+            );
+        }
     }
 
     num_hoisted
@@ -796,6 +807,7 @@ mod tests {
                 },
             ],
             terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
         });
 
         // Block 1 (header): phi for i, check i < n
@@ -823,6 +835,7 @@ mod tests {
                 true_label: BlockId(2),
                 false_label: BlockId(3),
             },
+            source_spans: Vec::new(),
         });
 
         // Block 2 (body): loop-invariant computation (n * 4), then i++
@@ -847,6 +860,7 @@ mod tests {
                 },
             ],
             terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
         });
 
         // Block 3 (exit)
@@ -854,6 +868,7 @@ mod tests {
             label: BlockId(3),
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Value(Value(4)))),
+            source_spans: Vec::new(),
         });
 
         func.next_value_id = 6;
@@ -973,6 +988,7 @@ mod tests {
                 },
             ],
             terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
         });
 
         // Block 1 (header): phi + load from alloca + compare
@@ -1002,6 +1018,7 @@ mod tests {
                 true_label: BlockId(2),
                 false_label: BlockId(3),
             },
+            source_spans: Vec::new(),
         });
 
         // Block 2 (body): i++
@@ -1017,6 +1034,7 @@ mod tests {
                 },
             ],
             terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
         });
 
         // Block 3 (exit)
@@ -1024,6 +1042,7 @@ mod tests {
             label: BlockId(3),
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+            source_spans: Vec::new(),
         });
 
         func.next_value_id = 6;
@@ -1067,6 +1086,7 @@ mod tests {
                 seg_override: AddressSpace::Default },
             ],
             terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
         });
 
         // Block 1 (header): load from alloca
@@ -1088,6 +1108,7 @@ mod tests {
                 true_label: BlockId(2),
                 false_label: BlockId(3),
             },
+            source_spans: Vec::new(),
         });
 
         // Block 2 (body): store to same alloca (modifies it!)
@@ -1105,6 +1126,7 @@ mod tests {
                 seg_override: AddressSpace::Default },
             ],
             terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
         });
 
         // Block 3 (exit)
@@ -1112,6 +1134,7 @@ mod tests {
             label: BlockId(3),
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
+            source_spans: Vec::new(),
         });
 
         func.next_value_id = 4;
@@ -1165,6 +1188,7 @@ mod tests {
                 },
             ],
             terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
         });
 
         // Block 1 (loop body): inline asm that writes to the alloca
@@ -1183,6 +1207,7 @@ mod tests {
                 },
             ],
             terminator: Terminator::Branch(BlockId(2)),
+            source_spans: Vec::new(),
         });
 
         // Block 2 (cond): load succeeded, check if zero, branch back or exit
@@ -1204,6 +1229,7 @@ mod tests {
                 true_label: BlockId(1),  // loop back
                 false_label: BlockId(3), // exit
             },
+            source_spans: Vec::new(),
         });
 
         // Block 3 (exit)
@@ -1211,6 +1237,7 @@ mod tests {
             label: BlockId(3),
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            source_spans: Vec::new(),
         });
 
         func.next_value_id = 3;

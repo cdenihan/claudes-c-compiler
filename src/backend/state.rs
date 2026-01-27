@@ -143,6 +143,8 @@ pub struct CodegenState {
     /// Used by resolve_slot_addr to return a dummy Indirect slot for these values,
     /// which is safe because all Indirect codepaths check reg_assignments first.
     pub reg_assigned_values: FxHashSet<u32>,
+    /// Whether to emit .file/.loc debug directives for source-level debugging.
+    pub debug_info: bool,
 }
 
 impl CodegenState {
@@ -171,6 +173,7 @@ impl CodegenState {
             code_model_kernel: false,
             no_jump_tables: false,
             reg_assigned_values: FxHashSet::default(),
+            debug_info: false,
         }
     }
 

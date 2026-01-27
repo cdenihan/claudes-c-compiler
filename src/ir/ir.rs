@@ -1,3 +1,4 @@
+use crate::common::source::Span;
 use crate::common::types::{AddressSpace, IrType};
 
 /// A basic block identifier. Uses a u32 index for zero-cost copies
@@ -212,6 +213,10 @@ pub struct BasicBlock {
     pub label: BlockId,
     pub instructions: Vec<Instruction>,
     pub terminator: Terminator,
+    /// Source location spans for each instruction, parallel to `instructions`.
+    /// Used by the backend to emit .file/.loc directives when compiling with -g.
+    /// Empty when debug info is not being tracked (non-debug builds).
+    pub source_spans: Vec<Span>,
 }
 
 /// An SSA value reference.

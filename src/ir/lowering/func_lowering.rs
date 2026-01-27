@@ -407,7 +407,13 @@ impl Lowerer {
                     .map(|pos| pos + 1)
                     .unwrap_or(0);
                 // Splice deferred allocas at the insertion point.
+                let num_allocas = entry_allocas.len();
                 entry_block.instructions.splice(insert_pos..insert_pos, entry_allocas);
+                // Insert dummy spans for the spliced allocas
+                if !entry_block.source_spans.is_empty() {
+                    let dummy_spans = vec![crate::common::source::Span::dummy(); num_allocas];
+                    entry_block.source_spans.splice(insert_pos..insert_pos, dummy_spans);
+                }
             }
         }
 

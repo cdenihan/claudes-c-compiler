@@ -745,7 +745,9 @@ impl Lowerer {
     }
 
     pub(super) fn emit(&mut self, inst: Instruction) {
+        let span = self.func_mut().current_span;
         self.func_mut().instrs.push(inst);
+        self.func_mut().instr_spans.push(span);
     }
 
     /// Emit an alloca into the entry block buffer.
@@ -827,6 +829,7 @@ impl Lowerer {
         let block = BasicBlock {
             label: self.func_mut().current_label,
             instructions: std::mem::take(&mut self.func_mut().instrs),
+            source_spans: std::mem::take(&mut self.func_mut().instr_spans),
             terminator: term,
         };
         self.func_mut().blocks.push(block);
@@ -835,6 +838,7 @@ impl Lowerer {
     pub(super) fn start_block(&mut self, label: BlockId) {
         self.func_mut().current_label = label;
         self.func_mut().instrs.clear();
+        self.func_mut().instr_spans.clear();
     }
 
     // --- Enum and label helpers ---

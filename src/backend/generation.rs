@@ -11,6 +11,7 @@
 
 use crate::ir::ir::*;
 use crate::common::types::{AddressSpace, IrType};
+use crate::common::source::{Span, SourceManager};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use super::common;
 use super::traits::ArchCodegen;
@@ -378,7 +379,19 @@ fn detect_cmp_branch_fusion(block: &BasicBlock, use_counts: &[u32]) -> Option<us
 }
 
 /// Generate assembly for a module using the given architecture's codegen.
-pub fn generate_module(cg: &mut dyn ArchCodegen, module: &IrModule) -> String {
+/// Generate assembly for an IR module with debug info support.
+/// Sets `debug_info` on the codegen state before proceeding.
+pub fn generate_module_with_debug(
+    cg: &mut dyn ArchCodegen,
+    module: &IrModule,
+    debug_info: bool,
+    source_mgr: Option<&crate::common::source::SourceManager>,
+) -> String {
+    cg.state().debug_info = debug_info;
+    generate_module(cg, module, source_mgr)
+}
+
+pub fn generate_module(cg: &mut dyn ArchCodegen, module: &IrModule, source_mgr: Option<&crate::common::source::SourceManager>) -> String {
     // Pre-size the output buffer based on total IR instruction count to avoid
     // repeated reallocations. Each IR instruction typically generates ~40 bytes
     // of assembly text.
@@ -429,6 +442,44 @@ pub fn generate_module(cg: &mut dyn ArchCodegen, module: &IrModule) -> String {
         }
     }
 
+    // Build DWARF file table when debug info is enabled.
+    // Scans all spans in the module, resolves filenames via SourceManager,
+    // and assigns each unique filename a DWARF file number (1-based).
+    let file_table: FxHashMap<String, u32> = if cg.state_ref().debug_info {
+        if let Some(sm) = source_mgr {
+            let mut table: FxHashMap<String, u32> = FxHashMap::default();
+            let mut next_id: u32 = 1; // DWARF file numbers are 1-based
+            for func in &module.functions {
+                if func.is_declaration { continue; }
+                for block in &func.blocks {
+                    for span in &block.source_spans {
+                        if span.start == 0 && span.end == 0 {
+                            continue; // skip dummy spans
+                        }
+                        let loc = sm.resolve_span(*span);
+                        if !table.contains_key(&loc.file) {
+                            table.insert(loc.file, next_id);
+                            next_id += 1;
+                        }
+                    }
+                }
+            }
+            // Emit .file directives
+            if !table.is_empty() {
+                let mut entries: Vec<(&String, &u32)> = table.iter().collect();
+                entries.sort_by_key(|(_name, id)| *id);
+                for (name, id) in entries {
+                    cg.state().emit_fmt(format_args!(".file {} \"{}\"", id, name));
+                }
+            }
+            table
+        } else {
+            FxHashMap::default()
+        }
+    } else {
+        FxHashMap::default()
+    };
+
     // Emit data sections
     let ptr_dir = cg.ptr_directive();
     common::emit_data_sections(&mut cg.state().out, module, ptr_dir);
@@ -474,7 +525,7 @@ pub fn generate_module(cg: &mut dyn ArchCodegen, module: &IrModule) -> String {
             } else {
                 cg.state().current_text_section = ".text".to_string();
             }
-            generate_function(cg, func);
+            generate_function(cg, func, source_mgr, &file_table);
         }
     }
 
@@ -532,7 +583,7 @@ pub fn generate_module(cg: &mut dyn ArchCodegen, module: &IrModule) -> String {
 }
 
 /// Generate code for a single function.
-fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction) {
+fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Option<&SourceManager>, file_table: &FxHashMap<String, u32>) {
     cg.state().reset_for_function();
 
     let type_dir = cg.function_type_directive();
@@ -648,6 +699,11 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction) {
         FxHashSet::default()
     };
 
+    // Debug info state: track last emitted file/line to suppress redundant .loc directives.
+    let emit_debug = cg.state_ref().debug_info && source_mgr.is_some() && !file_table.is_empty();
+    let mut last_debug_file: u32 = 0;
+    let mut last_debug_line: u32 = 0;
+
     for block in &func.blocks {
         if Some(block.label) != entry_label {
             // Invalidate register cache at block boundaries: a value in a register
@@ -682,6 +738,15 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction) {
                     continue;
                 }
             }
+
+            // Emit .loc directive if source location changed.
+            if emit_debug {
+                if let Some(span) = block.source_spans.get(idx) {
+                    emit_loc_directive(cg, span, source_mgr.unwrap(), file_table,
+                                       &mut last_debug_file, &mut last_debug_line);
+                }
+            }
+
             generate_instruction(cg, inst, &gep_fold_map, &global_addr_map, &global_addr_ptr_set);
         }
 
@@ -699,6 +764,31 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction) {
 
     cg.state().emit_fmt(format_args!(".size {}, .-{}", func.name, func.name));
     cg.state().emit("");
+}
+
+/// Emit a `.loc` directive if the source location for this instruction differs
+/// from the previously emitted location. Suppresses redundant directives and
+/// skips dummy spans (start==0, end==0).
+fn emit_loc_directive(
+    cg: &mut dyn ArchCodegen,
+    span: &Span,
+    source_mgr: &SourceManager,
+    file_table: &FxHashMap<String, u32>,
+    last_file: &mut u32,
+    last_line: &mut u32,
+) {
+    // Skip dummy spans
+    if span.start == 0 && span.end == 0 {
+        return;
+    }
+    let loc = source_mgr.resolve_span(*span);
+    if let Some(&dwarf_file_id) = file_table.get(&loc.file) {
+        if dwarf_file_id != *last_file || loc.line != *last_line {
+            cg.state().emit_fmt(format_args!(".loc {} {} {}", dwarf_file_id, loc.line, loc.column));
+            *last_file = dwarf_file_id;
+            *last_line = loc.line;
+        }
+    }
 }
 
 /// Dispatch a single IR instruction to the appropriate arch method.

@@ -212,7 +212,7 @@ impl X86Codegen {
     }
 
     pub fn generate(mut self, module: &IrModule) -> String {
-        let raw = generate_module(&mut self, module);
+        let raw = generate_module(&mut self, module, None);
         super::peephole::peephole_optimize(raw)
     }
 

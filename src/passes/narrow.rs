@@ -710,6 +710,7 @@ mod tests {
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: Vec::new(),
         }]);
 
         let changes = narrow_function(&mut func);
@@ -752,6 +753,7 @@ mod tests {
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+            source_spans: Vec::new(),
         }]);
 
         let changes = narrow_function(&mut func);
@@ -799,6 +801,7 @@ mod tests {
             ],
             // Return %2 (I64 value), so %2 has two uses
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+            source_spans: Vec::new(),
         }]);
 
         let changes = narrow_function(&mut func);
@@ -832,6 +835,7 @@ mod tests {
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: Vec::new(),
         }]);
 
         let changes = narrow_function(&mut func);

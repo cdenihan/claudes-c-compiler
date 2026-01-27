@@ -490,8 +490,15 @@ fn rename_variables(
         }
         // Prepend phis to block instructions
         if !phi_instructions.is_empty() {
+            let num_phis = phi_instructions.len();
             phi_instructions.append(&mut func.blocks[block_idx].instructions);
             func.blocks[block_idx].instructions = phi_instructions;
+            // Prepend dummy spans for the phi instructions
+            if !func.blocks[block_idx].source_spans.is_empty() {
+                let mut new_spans = vec![crate::common::source::Span::dummy(); num_phis];
+                new_spans.append(&mut func.blocks[block_idx].source_spans);
+                func.blocks[block_idx].source_spans = new_spans;
+            }
         }
     }
 
@@ -557,7 +564,13 @@ fn rename_block(
 
     // Rewrite instructions in this block
     let mut new_instructions = Vec::with_capacity(func.blocks[block_idx].instructions.len());
-    for inst in func.blocks[block_idx].instructions.drain(..) {
+    let mut new_spans = Vec::new();
+    let has_spans = !func.blocks[block_idx].source_spans.is_empty();
+    if has_spans {
+        new_spans.reserve(func.blocks[block_idx].source_spans.len());
+    }
+    let old_spans = std::mem::take(&mut func.blocks[block_idx].source_spans);
+    for (inst_idx, inst) in func.blocks[block_idx].instructions.drain(..).enumerate() {
         match inst {
             Instruction::Load { dest, ptr, ty, seg_override } => {
                 if let Some(&alloca_idx) = alloca_to_idx.get(&ptr.0) {
@@ -568,8 +581,10 @@ fn rename_block(
                         dest,
                         src: current_val,
                     });
+                    if has_spans { new_spans.push(old_spans[inst_idx]); }
                 } else {
                     new_instructions.push(Instruction::Load { dest, ptr, ty, seg_override });
+                    if has_spans { new_spans.push(old_spans[inst_idx]); }
                 }
             }
             Instruction::Store { val, ptr, ty, seg_override } => {
@@ -577,16 +592,20 @@ fn rename_block(
                     // Push the stored value onto the def stack
                     def_stacks[alloca_idx].push(val.clone());
                     // Remove the store (it's now represented by the SSA def)
+                    // (span is dropped along with the instruction)
                 } else {
                     new_instructions.push(Instruction::Store { val, ptr, ty, seg_override });
+                    if has_spans { new_spans.push(old_spans[inst_idx]); }
                 }
             }
             other => {
                 new_instructions.push(other);
+                if has_spans { new_spans.push(old_spans[inst_idx]); }
             }
         }
     }
     func.blocks[block_idx].instructions = new_instructions;
+    func.blocks[block_idx].source_spans = new_spans;
 
     // Also rewrite terminator operands if they reference promoted allocas
     // (this shouldn't normally happen, but let's be safe)
@@ -685,6 +704,23 @@ fn remove_promoted_instructions(func: &mut IrFunction, alloca_to_idx: &FxHashMap
     }
 
     for block in &mut func.blocks {
+        let has_spans = !block.source_spans.is_empty();
+        if has_spans {
+            let mut span_idx = 0;
+            let insts = &block.instructions;
+            block.source_spans.retain(|_| {
+                let keep = match &insts[span_idx] {
+                    Instruction::Alloca { dest, .. } => {
+                        !(alloca_to_idx.contains_key(&dest.0) && !param_alloca_values.contains(&dest.0))
+                    }
+                    Instruction::Store { ptr, .. } => !alloca_to_idx.contains_key(&ptr.0),
+                    Instruction::Load { ptr, .. } => !alloca_to_idx.contains_key(&ptr.0),
+                    _ => true,
+                };
+                span_idx += 1;
+                keep
+            });
+        }
         block.instructions.retain(|inst| {
             match inst {
                 Instruction::Alloca { dest, .. } => {
@@ -743,6 +779,7 @@ mod tests {
                 Instruction::Load { dest: Value(1), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
+            source_spans: Vec::new(),
         });
         func
     }
@@ -801,6 +838,7 @@ mod tests {
                 true_label: BlockId(1),
                 false_label: BlockId(2),
             },
+            source_spans: Vec::new(),
         });
 
         // then: store 1 to x, branch to merge
@@ -811,6 +849,7 @@ mod tests {
                 seg_override: AddressSpace::Default },
             ],
             terminator: Terminator::Branch(BlockId(3)),
+            source_spans: Vec::new(),
         });
 
         // else: store 2 to x, branch to merge
@@ -821,6 +860,7 @@ mod tests {
                 seg_override: AddressSpace::Default },
             ],
             terminator: Terminator::Branch(BlockId(3)),
+            source_spans: Vec::new(),
         });
 
         // merge: load x, return
@@ -830,6 +870,7 @@ mod tests {
                 Instruction::Load { dest: Value(4), ptr: Value(1), ty: IrType::I32 , seg_override: AddressSpace::Default },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(4)))),
+            source_spans: Vec::new(),
         });
 
         let mut module = IrModule::new();
@@ -873,6 +914,7 @@ mod tests {
                 Instruction::Load { dest: Value(1), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
+            source_spans: Vec::new(),
         });
 
         let mut module = IrModule::new();
@@ -902,6 +944,7 @@ mod tests {
                 Instruction::Store { val: Operand::Const(IrConst::I32(0)), ptr: Value(1), ty: IrType::I32 , seg_override: AddressSpace::Default },
             ],
             terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
         });
 
         // loop_header: load i, cmp, cond branch
@@ -921,6 +964,7 @@ mod tests {
                 true_label: BlockId(2),
                 false_label: BlockId(3),
             },
+            source_spans: Vec::new(),
         });
 
         // loop_body: sum += i, i++, branch back
@@ -945,6 +989,7 @@ mod tests {
                 Instruction::Store { val: Operand::Value(Value(7)), ptr: Value(1), ty: IrType::I32 , seg_override: AddressSpace::Default },
             ],
             terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
         });
 
         // exit: load sum, return
@@ -954,6 +999,7 @@ mod tests {
                 Instruction::Load { dest: Value(8), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(8)))),
+            source_spans: Vec::new(),
         });
 
         let mut module = IrModule::new();
@@ -984,6 +1030,7 @@ mod tests {
                 Instruction::Load { dest: Value(1), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
+            source_spans: Vec::new(),
         });
 
         let mut module = IrModule::new();

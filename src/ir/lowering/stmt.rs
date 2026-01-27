@@ -32,6 +32,7 @@ impl Lowerer {
             for item in &compound.items {
                 match item {
                     BlockItem::Declaration(decl) => {
+                        self.func_mut().current_span = decl.span;
                         self.collect_enum_constants_scoped(&decl.type_spec);
                         self.lower_local_decl(decl);
                     }
@@ -937,6 +938,11 @@ impl Lowerer {
 
     /// Main statement lowering dispatcher. Delegates to per-statement-type methods.
     pub(super) fn lower_stmt(&mut self, stmt: &Stmt) {
+        // Set the current span for debug info tracking. All instructions emitted
+        // while lowering this statement will inherit this source location.
+        if let Some(span) = stmt.span() {
+            self.func_mut().current_span = span;
+        }
         match stmt {
             Stmt::Return(expr, _span) => {
                 let op = expr.as_ref().map(|e| self.lower_return_expr(e));
@@ -947,7 +953,11 @@ impl Lowerer {
                 let label = self.fresh_label();
                 self.start_block(label);
             }
-            Stmt::Expr(Some(expr)) => { self.lower_expr(expr); }
+            Stmt::Expr(Some(expr)) => {
+                // For expression statements, use the expression's span for better precision
+                self.func_mut().current_span = expr.span();
+                self.lower_expr(expr);
+            }
             Stmt::Expr(None) => {}
             Stmt::Compound(compound) => self.lower_compound_stmt(compound),
             Stmt::If(cond, then_stmt, else_stmt, _span) => self.lower_if_stmt(cond, then_stmt, else_stmt.as_deref()),
@@ -963,7 +973,10 @@ impl Lowerer {
             Stmt::Goto(label, _span) => self.lower_goto_stmt(label),
             Stmt::GotoIndirect(expr, _span) => self.lower_goto_indirect_stmt(expr),
             Stmt::Label(name, stmt, _span) => self.lower_label_stmt(name, stmt),
-            Stmt::Declaration(decl) => self.lower_local_decl(decl),
+            Stmt::Declaration(decl) => {
+                self.func_mut().current_span = decl.span;
+                self.lower_local_decl(decl);
+            }
             Stmt::InlineAsm { template, outputs, inputs, clobbers, goto_labels } => {
                 self.lower_inline_asm_stmt(template, outputs, inputs, clobbers, goto_labels);
             }

@@ -312,6 +312,24 @@ pub enum Stmt {
     },
 }
 
+impl Stmt {
+    /// Extract the source span from this statement, if available.
+    /// Used by IR lowering to propagate source locations for debug info.
+    pub fn span(&self) -> Option<Span> {
+        match self {
+            Stmt::Return(_, span) | Stmt::If(_, _, _, span) | Stmt::While(_, _, span) |
+            Stmt::DoWhile(_, _, span) | Stmt::For(_, _, _, _, span) |
+            Stmt::Break(span) | Stmt::Continue(span) | Stmt::Switch(_, _, span) |
+            Stmt::Case(_, _, span) | Stmt::CaseRange(_, _, _, span) |
+            Stmt::Default(_, span) | Stmt::Goto(_, span) |
+            Stmt::GotoIndirect(_, span) | Stmt::Label(_, _, span) => Some(*span),
+            Stmt::Expr(Some(expr)) => Some(expr.span()),
+            Stmt::Declaration(decl) => Some(decl.span),
+            Stmt::Expr(None) | Stmt::Compound(_) | Stmt::InlineAsm { .. } => None,
+        }
+    }
+}
+
 /// An operand in an inline asm statement.
 #[derive(Debug, Clone)]
 pub struct AsmOperand {

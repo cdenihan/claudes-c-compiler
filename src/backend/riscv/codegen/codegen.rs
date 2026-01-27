@@ -184,7 +184,7 @@ impl RiscvCodegen {
         if self.no_relax {
             self.state.emit(".option norelax");
         }
-        generate_module(&mut self, module)
+        generate_module(&mut self, module, None)
     }
 
     /// Load comparison operands into t1 and t2, then sign/zero-extend

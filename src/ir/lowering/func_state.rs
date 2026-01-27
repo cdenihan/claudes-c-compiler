@@ -10,6 +10,7 @@
 //! made within that scope are undone, giving O(changes) cost instead of O(total).
 
 use crate::common::fx_hash::FxHashMap;
+use crate::common::source::Span;
 use crate::ir::ir::*;
 use crate::common::types::{IrType, CType};
 use super::definitions::{LocalInfo, SwitchFrame};
@@ -132,6 +133,12 @@ pub(super) struct FunctionBuildState {
     /// Populated during allocate_function_params and transferred to IrFunction
     /// in finalize_function. Used by the backend to detect dead param allocas.
     pub param_alloca_values: Vec<Value>,
+    /// Source location spans for the current basic block being built,
+    /// parallel to `instrs`. Each entry corresponds to one instruction.
+    pub instr_spans: Vec<Span>,
+    /// The current source span, set before lowering each statement/expression.
+    /// Emitted instructions inherit this span for debug info tracking.
+    pub current_span: Span,
 }
 
 impl FunctionBuildState {
@@ -160,6 +167,8 @@ impl FunctionBuildState {
             has_vla: false,
             entry_allocas: Vec::new(),
             param_alloca_values: Vec::new(),
+            instr_spans: Vec::new(),
+            current_span: Span::dummy(),
         }
     }
 

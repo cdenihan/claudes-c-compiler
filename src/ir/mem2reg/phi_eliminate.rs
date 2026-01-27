@@ -282,19 +282,37 @@ fn eliminate_phis_in_function(func: &mut IrFunction, next_block_id: &mut u32) {
     // 2. Prepend target copies
     // 3. Insert predecessor copies (for single-successor predecessors only)
     for (block_idx, block) in func.blocks.iter_mut().enumerate() {
-        // Remove phi instructions
+        // Remove phi instructions (and their spans)
+        if !block.source_spans.is_empty() {
+            let mut span_idx = 0;
+            block.source_spans.retain(|_| {
+                let keep = !matches!(block.instructions.get(span_idx), Some(Instruction::Phi { .. }));
+                span_idx += 1;
+                keep
+            });
+        }
         block.instructions.retain(|inst| !matches!(inst, Instruction::Phi { .. }));
 
         // Prepend target copies (these go at the start, replacing the phis)
         if !target_copies[block_idx].is_empty() {
+            let num_copies = target_copies[block_idx].len();
             let mut new_insts = target_copies[block_idx].clone();
             new_insts.append(&mut block.instructions);
             block.instructions = new_insts;
+            if !block.source_spans.is_empty() {
+                let mut new_spans = vec![crate::common::source::Span::dummy(); num_copies];
+                new_spans.append(&mut block.source_spans);
+                block.source_spans = new_spans;
+            }
         }
 
         // Insert predecessor copies before terminator (only for single-successor blocks)
         if let Some(copies) = pred_copies.remove(&block_idx) {
+            let num_copies = copies.len();
             block.instructions.extend(copies);
+            if !block.source_spans.is_empty() {
+                block.source_spans.extend(std::iter::repeat(crate::common::source::Span::dummy()).take(num_copies));
+            }
         }
     }
 
@@ -309,9 +327,11 @@ fn eliminate_phis_in_function(func: &mut IrFunction, next_block_id: &mut u32) {
 
     // 5. Append trampoline blocks to the function
     for trampoline in trampolines {
+        let num_copies = trampoline.copies.len();
         func.blocks.push(BasicBlock {
             label: trampoline.label,
             instructions: trampoline.copies,
+            source_spans: vec![crate::common::source::Span::dummy(); num_copies],
             terminator: Terminator::Branch(trampoline.branch_target),
         });
     }

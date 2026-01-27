@@ -188,6 +188,13 @@ impl Parser {
         self.source_manager = Some(sm);
     }
 
+    /// Take the source manager back from the parser (transfers ownership).
+    /// Used by the driver to pass the source manager to the backend for
+    /// debug info (.file/.loc) emission when compiling with -g.
+    pub fn take_source_manager(&mut self) -> Option<SourceManager> {
+        self.source_manager.take()
+    }
+
     /// Format a location prefix for error messages from a span.
     /// Returns "file:line:col: " if source manager is available, "" otherwise.
     pub(super) fn span_to_location(&self, span: Span) -> String {

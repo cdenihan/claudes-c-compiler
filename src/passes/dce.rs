@@ -36,6 +36,25 @@ pub(crate) fn eliminate_dead_code(func: &mut IrFunction) -> usize {
         let mut removed = 0;
         for block in &mut func.blocks {
             let original_len = block.instructions.len();
+            // Keep source_spans in sync with instructions
+            if !block.source_spans.is_empty() {
+                let mut idx = 0;
+                let insts = &block.instructions;
+                block.source_spans.retain(|_| {
+                    let inst = &insts[idx];
+                    idx += 1;
+                    if has_side_effects(inst) {
+                        return true;
+                    }
+                    match inst.dest() {
+                        Some(dest) => {
+                            let id = dest.0 as usize;
+                            id < used.len() && used[id]
+                        }
+                        None => true,
+                    }
+                });
+            }
             block.instructions.retain(|inst| {
                 if has_side_effects(inst) {
                     return true;
@@ -287,6 +306,7 @@ mod tests {
                 Instruction::Load { dest: Value(2), ptr: Value(0), ty: IrType::I32, seg_override: AddressSpace::Default },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+            source_spans: Vec::new(),
         });
         func
     }
@@ -334,6 +354,7 @@ mod tests {
                 },
             ],
             terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
         });
         let removed = eliminate_dead_code(&mut func);
         assert_eq!(removed, 0); // Call should not be removed

@@ -267,6 +267,8 @@ fn process_block(
 ) -> usize {
     let mut eliminated = 0;
     let mut new_instructions = Vec::with_capacity(func.blocks[block_idx].instructions.len());
+    // GVN replaces instructions 1:1 (original or Copy), so spans stay parallel
+    let new_spans = std::mem::take(&mut func.blocks[block_idx].source_spans);
 
     for inst in func.blocks[block_idx].instructions.drain(..) {
         // Before processing the instruction, check if it clobbers memory.
@@ -345,6 +347,7 @@ fn process_block(
     }
 
     func.blocks[block_idx].instructions = new_instructions;
+    func.blocks[block_idx].source_spans = new_spans;
     eliminated
 }
 
@@ -501,6 +504,7 @@ mod tests {
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: Vec::new(),
         };
 
         let mut func = IrFunction {
@@ -576,6 +580,7 @@ mod tests {
                     },
                 ],
                 terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+                source_spans: Vec::new(),
             }],
             is_variadic: false,
             is_static: false,
@@ -636,6 +641,7 @@ mod tests {
                     },
                 ],
                 terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
+                source_spans: Vec::new(),
             }],
             is_variadic: false,
             is_static: false,
@@ -702,6 +708,7 @@ mod tests {
                     },
                 ],
                 terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+                source_spans: Vec::new(),
             }],
             is_variadic: false,
             is_static: false,
@@ -768,6 +775,7 @@ mod tests {
                     },
                 ],
                 terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+                source_spans: Vec::new(),
             }],
             is_variadic: false,
             is_static: false,
@@ -823,6 +831,7 @@ mod tests {
                         },
                     ],
                     terminator: Terminator::Branch(BlockId(1)),
+                    source_spans: Vec::new(),
                 },
                 BasicBlock {
                     label: BlockId(1),
@@ -837,6 +846,7 @@ mod tests {
                         },
                     ],
                     terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+                    source_spans: Vec::new(),
                 },
             ],
             is_variadic: false,
@@ -900,6 +910,7 @@ mod tests {
                         true_label: BlockId(1),
                         false_label: BlockId(2),
                     },
+                    source_spans: Vec::new(),
                 },
                 // block1: compute add (only reached via true branch)
                 BasicBlock {
@@ -914,6 +925,7 @@ mod tests {
                         },
                     ],
                     terminator: Terminator::Branch(BlockId(3)),
+                    source_spans: Vec::new(),
                 },
                 // block2: compute same add (only reached via false branch)
                 BasicBlock {
@@ -928,12 +940,14 @@ mod tests {
                         },
                     ],
                     terminator: Terminator::Branch(BlockId(3)),
+                    source_spans: Vec::new(),
                 },
                 // block3: merge
                 BasicBlock {
                     label: BlockId(3),
                     instructions: vec![],
                     terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+                    source_spans: Vec::new(),
                 },
             ],
             is_variadic: false,
@@ -1039,6 +1053,7 @@ mod tests {
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+            source_spans: Vec::new(),
         }], 3);
 
         let mut module = make_module(func);
@@ -1081,6 +1096,7 @@ mod tests {
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+            source_spans: Vec::new(),
         }], 3);
 
         let mut module = make_module(func);
@@ -1119,6 +1135,7 @@ mod tests {
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: Vec::new(),
         }], 4);
 
         let mut module = make_module(func);
@@ -1142,6 +1159,7 @@ mod tests {
                     },
                 ],
                 terminator: Terminator::Branch(BlockId(1)),
+                source_spans: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(1),
@@ -1154,6 +1172,7 @@ mod tests {
                     },
                 ],
                 terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+                source_spans: Vec::new(),
             },
         ], 3);
 
@@ -1191,6 +1210,7 @@ mod tests {
                     true_label: BlockId(1),
                     false_label: BlockId(2),
                 },
+                source_spans: Vec::new(),
             },
             // block1: stores to memory
             BasicBlock {
@@ -1204,12 +1224,14 @@ mod tests {
                     },
                 ],
                 terminator: Terminator::Branch(BlockId(3)),
+                source_spans: Vec::new(),
             },
             // block2: no memory modification
             BasicBlock {
                 label: BlockId(2),
                 instructions: vec![],
                 terminator: Terminator::Branch(BlockId(3)),
+                source_spans: Vec::new(),
             },
             // block3: merge point - loads from same pointer
             BasicBlock {
@@ -1223,6 +1245,7 @@ mod tests {
                     },
                 ],
                 terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+                source_spans: Vec::new(),
             },
         ], 4);
 

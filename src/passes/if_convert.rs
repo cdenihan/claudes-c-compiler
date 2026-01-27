@@ -501,14 +501,17 @@ fn apply_diamond(func: &mut IrFunction, diamond: &DiamondInfo) -> bool {
     //    unconditionally (both paths are computed).
     let pred_block = &mut func.blocks[diamond.pred_idx];
 
-    // Add true arm instructions
+    // Add true arm instructions (with dummy spans)
+    let has_spans = !pred_block.source_spans.is_empty();
     for inst in &diamond.true_arm_insts {
         pred_block.instructions.push(inst.clone());
+        if has_spans { pred_block.source_spans.push(crate::common::source::Span::dummy()); }
     }
 
     // Add false arm instructions
     for inst in &diamond.false_arm_insts {
         pred_block.instructions.push(inst.clone());
+        if has_spans { pred_block.source_spans.push(crate::common::source::Span::dummy()); }
     }
 
     // 2. Add Select instructions for each Phi
@@ -520,6 +523,7 @@ fn apply_diamond(func: &mut IrFunction, diamond: &DiamondInfo) -> bool {
             false_val: *false_val,
             ty: *ty,
         });
+        if has_spans { pred_block.source_spans.push(crate::common::source::Span::dummy()); }
     }
 
     // 3. Change pred block's terminator to unconditional branch to merge
@@ -529,6 +533,22 @@ fn apply_diamond(func: &mut IrFunction, diamond: &DiamondInfo) -> bool {
     let converted_dests: std::collections::HashSet<u32> = diamond.phi_selects.iter()
         .map(|(dest, _, _, _)| dest.0)
         .collect();
+    {
+        let merge_block = &mut func.blocks[diamond.merge_idx];
+        if !merge_block.source_spans.is_empty() {
+            let mut idx = 0;
+            let insts = &merge_block.instructions;
+            merge_block.source_spans.retain(|_| {
+                let keep = if let Instruction::Phi { dest, .. } = &insts[idx] {
+                    !converted_dests.contains(&dest.0)
+                } else {
+                    true
+                };
+                idx += 1;
+                keep
+            });
+        }
+    }
     func.blocks[diamond.merge_idx].instructions.retain(|inst| {
         if let Instruction::Phi { dest, .. } = inst {
             !converted_dests.contains(&dest.0)
@@ -543,9 +563,11 @@ fn apply_diamond(func: &mut IrFunction, diamond: &DiamondInfo) -> bool {
     // For triangle patterns, one arm IS the merge block - don't clear it.
     if diamond.true_idx != diamond.merge_idx {
         func.blocks[diamond.true_idx].instructions.clear();
+        func.blocks[diamond.true_idx].source_spans.clear();
     }
     if diamond.false_idx != diamond.merge_idx {
         func.blocks[diamond.false_idx].instructions.clear();
+        func.blocks[diamond.false_idx].source_spans.clear();
     }
 
     true
@@ -574,6 +596,7 @@ mod tests {
                 true_label: BlockId(1),
                 false_label: BlockId(2),
             },
+            source_spans: Vec::new(),
         });
 
         // Block 1: true arm
@@ -581,6 +604,7 @@ mod tests {
             label: BlockId(1),
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(3)),
+            source_spans: Vec::new(),
         });
 
         // Block 2: false arm
@@ -588,6 +612,7 @@ mod tests {
             label: BlockId(2),
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(3)),
+            source_spans: Vec::new(),
         });
 
         // Block 3: merge with phi
@@ -604,6 +629,7 @@ mod tests {
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: Vec::new(),
         });
 
         func.next_value_id = 4;
@@ -648,6 +674,7 @@ mod tests {
                 true_label: BlockId(1),
                 false_label: BlockId(2),
             },
+            source_spans: Vec::new(),
         });
 
         func.blocks.push(BasicBlock {
@@ -662,12 +689,14 @@ mod tests {
                 },
             ],
             terminator: Terminator::Branch(BlockId(3)),
+            source_spans: Vec::new(),
         });
 
         func.blocks.push(BasicBlock {
             label: BlockId(2),
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(3)),
+            source_spans: Vec::new(),
         });
 
         func.blocks.push(BasicBlock {
@@ -683,6 +712,7 @@ mod tests {
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+            source_spans: Vec::new(),
         });
 
         func.next_value_id = 3;
@@ -717,6 +747,7 @@ mod tests {
                 true_label: BlockId(1),
                 false_label: BlockId(2),
             },
+            source_spans: Vec::new(),
         });
 
         func.blocks.push(BasicBlock {
@@ -726,12 +757,14 @@ mod tests {
                 Instruction::Store { val: Operand::Const(IrConst::I32(42)), ptr: Value(10), ty: IrType::I32, seg_override: AddressSpace::Default },
             ],
             terminator: Terminator::Branch(BlockId(3)),
+            source_spans: Vec::new(),
         });
 
         func.blocks.push(BasicBlock {
             label: BlockId(2),
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(3)),
+            source_spans: Vec::new(),
         });
 
         func.blocks.push(BasicBlock {
@@ -747,6 +780,7 @@ mod tests {
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+            source_spans: Vec::new(),
         });
 
         func.next_value_id = 11;

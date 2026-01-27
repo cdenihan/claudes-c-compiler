@@ -664,6 +664,9 @@ impl Driver {
             return Err(format!("{}: {} parse error(s)", input_file, parser.error_count));
         }
 
+        // Retrieve source manager for debug info emission (-g)
+        let source_manager = parser.take_source_manager();
+
         if self.verbose {
             eprintln!("Parsed {} declarations", ast.decls.len());
         }
@@ -752,8 +755,11 @@ impl Driver {
             code_model_kernel: self.code_model_kernel,
             no_jump_tables: self.no_jump_tables,
             no_relax: self.riscv_no_relax,
+            debug_info: self.debug_info,
         };
-        let asm = self.target.generate_assembly_with_opts(&module, &opts);
+        let asm = self.target.generate_assembly_with_opts_and_debug(
+            &module, &opts, source_manager.as_ref(),
+        );
         if time_phases { eprintln!("[TIME] codegen: {:.3}s ({} bytes asm)", t8.elapsed().as_secs_f64(), asm.len()); }
 
         if time_phases { eprintln!("[TIME] total compile {}: {:.3}s", input_file, t0.elapsed().as_secs_f64()); }

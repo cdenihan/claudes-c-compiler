@@ -1081,6 +1081,7 @@ fn inline_call_site(
         let mut new_block = BasicBlock {
             label: BlockId(callee_block.label.0 + block_offset),
             instructions: Vec::with_capacity(callee_block.instructions.len()),
+            source_spans: callee_block.source_spans.clone(),
             terminator: remap_terminator(&callee_block.terminator, value_offset, block_offset),
         };
 
@@ -1139,6 +1140,7 @@ fn inline_call_site(
     }
 
     // Insert stores in reverse order so indices stay valid
+    let has_spans = !entry_block.source_spans.is_empty();
     let num_args_to_store = std::cmp::min(site.args.len(), param_alloca_info.len());
     for i in (0..num_args_to_store).rev() {
         let param_struct_size = callee.param_struct_sizes.get(i).copied().flatten();
@@ -1151,6 +1153,9 @@ fn inline_call_site(
                     src: src_ptr,
                     size: struct_size,
                 });
+                if has_spans {
+                    entry_block.source_spans.insert(insert_pos, crate::common::source::Span::dummy());
+                }
             } else {
                 // Struct arg should always be a Value (pointer), not a Const.
                 // If somehow it's a Const, bail out of inlining.
@@ -1165,6 +1170,9 @@ fn inline_call_site(
                 ty: store_ty,
                 seg_override: AddressSpace::Default,
             });
+            if has_spans {
+                entry_block.source_spans.insert(insert_pos, crate::common::source::Span::dummy());
+            }
         }
     }
 
@@ -1179,6 +1187,14 @@ fn inline_call_site(
     let after_call_instructions: Vec<Instruction> = caller.blocks[call_block_idx]
         .instructions
         .split_off(call_inst_idx + 1);
+    let after_call_spans: Vec<crate::common::source::Span> = {
+        let spans = &mut caller.blocks[call_block_idx].source_spans;
+        if spans.len() > call_inst_idx + 1 {
+            spans.split_off(call_inst_idx + 1)
+        } else {
+            Vec::new()
+        }
+    };
     let original_terminator = std::mem::replace(
         &mut caller.blocks[call_block_idx].terminator,
         Terminator::Branch(inlined_blocks[0].label),
@@ -1186,11 +1202,15 @@ fn inline_call_site(
 
     // Remove the call instruction itself
     caller.blocks[call_block_idx].instructions.pop();
+    if !caller.blocks[call_block_idx].source_spans.is_empty() {
+        caller.blocks[call_block_idx].source_spans.pop();
+    }
 
     // Create the merge block with the remaining instructions and original terminator.
     // If the callee had a non-void return, insert a Phi (or Copy for single-predecessor)
     // at the start of the merge block to define the call's result value.
     let mut merge_instructions = Vec::new();
+    let mut merge_spans: Vec<crate::common::source::Span> = Vec::new();
     if let Some(call_dest) = site.dest {
         if phi_incoming.len() == 1 {
             // Single return path: just copy the value directly (no phi needed)
@@ -1198,6 +1218,7 @@ fn inline_call_site(
                 dest: call_dest,
                 src: phi_incoming[0].0,
             });
+            merge_spans.push(crate::common::source::Span::dummy());
         } else if phi_incoming.len() > 1 {
             // Multiple return paths: need a Phi node
             merge_instructions.push(Instruction::Phi {
@@ -1205,16 +1226,19 @@ fn inline_call_site(
                 ty: callee.return_type,
                 incoming: phi_incoming,
             });
+            merge_spans.push(crate::common::source::Span::dummy());
         }
         // If phi_incoming is empty, the callee never returns a value (e.g., all paths
         // are noreturn/unreachable). The call_dest will be undefined, which is fine
         // since it won't be used.
     }
     merge_instructions.extend(after_call_instructions);
+    merge_spans.extend(after_call_spans);
 
     let merge_block = BasicBlock {
         label: merge_block_id,
         instructions: merge_instructions,
+        source_spans: merge_spans,
         terminator: original_terminator,
     };
 

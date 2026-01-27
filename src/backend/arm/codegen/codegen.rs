@@ -177,7 +177,7 @@ impl ArmCodegen {
     }
 
     pub fn generate(mut self, module: &IrModule) -> String {
-        generate_module(&mut self, module)
+        generate_module(&mut self, module, None)
     }
 
     /// Get the physical register assigned to an operand (if it's a Value with a register).

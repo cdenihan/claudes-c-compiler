@@ -634,11 +634,13 @@ mod tests {
                 true_label: BlockId(1),
                 false_label: BlockId(1),
             },
+            source_spans: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
             instructions: vec![],
             terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
         });
 
         let count = simplify_cfg(&mut func);
@@ -653,16 +655,19 @@ mod tests {
             label: BlockId(0),
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(2)),
+            source_spans: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(2),
             instructions: vec![],
             terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
         });
 
         let count = simplify_cfg(&mut func);
@@ -677,6 +682,7 @@ mod tests {
             label: BlockId(0),
             instructions: vec![],
             terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
@@ -684,6 +690,7 @@ mod tests {
                 Instruction::Copy { dest: Value(0), src: Operand::Const(IrConst::I32(42)) },
             ],
             terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
         });
 
         let count = simplify_cfg(&mut func);
@@ -705,21 +712,25 @@ mod tests {
                 true_label: BlockId(1),
                 false_label: BlockId(1),
             },
+            source_spans: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(2)),
+            source_spans: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(2),
             instructions: vec![],
             terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(3),
             instructions: vec![],
             terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
         });
 
         let count = simplify_cfg(&mut func);
@@ -741,11 +752,13 @@ mod tests {
                 Instruction::Copy { dest: Value(0), src: Operand::Const(IrConst::I32(42)) },
             ],
             terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(2)),
+            source_spans: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(2),
@@ -757,6 +770,7 @@ mod tests {
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
+            source_spans: Vec::new(),
         });
 
         let count = simplify_cfg(&mut func);
@@ -780,6 +794,7 @@ mod tests {
             label: BlockId(0),
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
@@ -787,11 +802,13 @@ mod tests {
                 Instruction::Copy { dest: Value(0), src: Operand::Const(IrConst::I32(42)) },
             ],
             terminator: Terminator::Branch(BlockId(2)),
+            source_spans: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(2),
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Value(Value(0)))),
+            source_spans: Vec::new(),
         });
 
         let count = simplify_cfg(&mut func);
@@ -816,21 +833,25 @@ mod tests {
                 true_label: BlockId(1),
                 false_label: BlockId(2),
             },
+            source_spans: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(3)),
+            source_spans: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(2),
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(3)),
+            source_spans: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(3),
             instructions: vec![],
             terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
         });
 
         let count = simplify_cfg(&mut func);
@@ -873,11 +894,13 @@ mod tests {
                 true_label: BlockId(1),
                 false_label: BlockId(3),
             },
+            source_spans: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(3)),
+            source_spans: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(3),
@@ -892,6 +915,7 @@ mod tests {
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(8)))),
+            source_spans: Vec::new(),
         });
 
         simplify_cfg(&mut func);
@@ -964,6 +988,7 @@ mod tests {
                 true_label: BlockId(1),
                 false_label: BlockId(2),
             },
+            source_spans: Vec::new(),
         });
 
         // Block 1: RHS of && (will become dead)
@@ -979,6 +1004,7 @@ mod tests {
                 },
             ],
             terminator: Terminator::Branch(BlockId(2)),
+            source_spans: Vec::new(),
         });
 
         // Block 2: merge with phi
@@ -999,6 +1025,7 @@ mod tests {
                 true_label: BlockId(3),
                 false_label: BlockId(4),
             },
+            source_spans: Vec::new(),
         });
 
         // Block 3: dead branch (e.g., __field_overflow call)
@@ -1006,6 +1033,7 @@ mod tests {
             label: BlockId(3),
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(1)))),
+            source_spans: Vec::new(),
         });
 
         // Block 4: continuation
@@ -1013,6 +1041,7 @@ mod tests {
             label: BlockId(4),
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            source_spans: Vec::new(),
         });
 
         let _count = simplify_cfg(&mut func);
