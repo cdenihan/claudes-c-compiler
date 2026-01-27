@@ -117,12 +117,20 @@ pub struct CodegenState {
     pub patchable_function_entry: Option<(u32, u32)>,
     /// Whether to emit endbr64 at function entry points (-fcf-protection=branch).
     pub cf_protection_branch: bool,
-    /// For x86 F128 (long double) precision: maps a value ID (result of an F128 load)
-    /// to the pointer value ID it was loaded from. This allows emit_cast to use `fldt`
-    /// directly from the original memory location instead of going through the f64
-    /// intermediate in %rax, preserving full 80-bit precision for casts like
-    /// `(unsigned long long)long_double_var`.
-    pub f128_load_sources: FxHashMap<u32, u32>,
+    /// Maps an F128 value ID to the memory location it was loaded from.
+    /// This enables full-precision F128 operations (casts, comparisons, stores)
+    /// by reloading directly from the original memory location instead of using
+    /// a lossy f64 intermediate.
+    ///
+    /// The tuple is `(source_value_id, byte_offset, is_indirect)`:
+    /// - `source_value_id`: The alloca or pointer value whose slot contains the data.
+    /// - `byte_offset`: Offset from the source slot's base address.
+    /// - `is_indirect`: If true, the source slot holds a pointer that must be
+    ///   dereferenced. If false, the F128 data is directly at the slot.
+    ///
+    /// x86 uses this for x87 `fldt` from original memory (typically offset=0, is_indirect=false).
+    /// ARM/RISC-V use this for IEEE binary128 soft-float operations with full 16-byte precision.
+    pub f128_load_sources: FxHashMap<u32, (u32, i64, bool)>,
     /// Values whose 16-byte slots contain full x87 80-bit data (via fstpt),
     /// not a pointer. These are F128 call results or other values where
     /// full precision was preserved directly in the slot.
@@ -258,6 +266,28 @@ impl CodegenState {
 
     pub fn is_i128_value(&self, v: u32) -> bool {
         self.i128_values.contains(&v)
+    }
+
+    /// Track that `dest_id` was loaded from `source_id` at the given byte offset.
+    /// Automatically determines `is_indirect` based on whether the source is an alloca.
+    /// Allocas have data directly in the slot; non-allocas hold pointers that must be dereferenced.
+    #[inline]
+    pub fn track_f128_load(&mut self, dest_id: u32, source_id: u32, offset: i64) {
+        let is_indirect = !self.is_alloca(source_id);
+        self.f128_load_sources.insert(dest_id, (source_id, offset, is_indirect));
+    }
+
+    /// Track that `value_id` has full F128 data stored directly in its own slot.
+    /// (Used after operations like negation or cast that produce full-precision F128 results.)
+    #[inline]
+    pub fn track_f128_self(&mut self, value_id: u32) {
+        self.f128_load_sources.insert(value_id, (value_id, 0, false));
+    }
+
+    /// Look up the F128 load source for a value: `(source_id, offset, is_indirect)`.
+    #[inline]
+    pub fn get_f128_source(&self, value_id: u32) -> Option<(u32, i64, bool)> {
+        self.f128_load_sources.get(&value_id).copied()
     }
 
     /// Returns true if the given symbol needs GOT indirection in PIC mode.

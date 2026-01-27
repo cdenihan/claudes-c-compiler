@@ -45,7 +45,7 @@ impl ArmCodegen {
         }
         if let Operand::Value(v) = op {
             // Try to load full 16-byte f128 from tracked source.
-            if let Some(&(src_id, offset, is_indirect)) = self.f128_load_sources.get(&v.0) {
+            if let Some((src_id, offset, is_indirect)) = self.state.get_f128_source(v.0) {
                 if is_indirect {
                     // Source slot holds a pointer; dereference to get F128 data.
                     if let Some(slot) = self.state.get_slot(src_id) {
@@ -106,7 +106,7 @@ impl ArmCodegen {
             self.emit_store_to_sp("x0", slot.0 + 8, "str");
         } else if let Operand::Value(v) = val {
             // Check if this value has full f128 data in a tracked source.
-            if let Some(&(src_id, offset, is_indirect)) = self.f128_load_sources.get(&v.0) {
+            if let Some((src_id, offset, is_indirect)) = self.state.get_f128_source(v.0) {
                 if self.emit_f128_copy_from_source(src_id, offset, is_indirect, slot) {
                     return;
                 }
@@ -189,7 +189,7 @@ impl ArmCodegen {
             self.emit_load_imm64("x0", hi as i64);
             self.state.emit("    str x0, [x16, #8]");
         } else if let Operand::Value(v) = val {
-            if let Some(&(src_id, offset, is_indirect)) = self.f128_load_sources.get(&v.0) {
+            if let Some((src_id, offset, is_indirect)) = self.state.get_f128_source(v.0) {
                 // Save dest addr
                 self.state.emit("    mov x16, x17");
                 if self.emit_f128_load_source_to_q0(src_id, offset, is_indirect) {
@@ -321,7 +321,7 @@ impl ArmCodegen {
         if let Some(dest_slot) = self.state.get_slot(dest.0) {
             self.emit_f128_store_q0_to_slot(dest_slot);
             // Track dest as having full f128 data for subsequent operations.
-            self.f128_load_sources.insert(dest.0, (dest.0, 0, false));
+            self.state.track_f128_self(dest.0);
         }
         // Step 4: Convert full f128 result to f64 approximation in x0.
         // This is needed for the register-based data flow (x0 = accumulator).

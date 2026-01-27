@@ -127,16 +127,6 @@ pub struct RiscvCodegen {
     reg_assignments: FxHashMap<u32, PhysReg>,
     /// Which callee-saved registers are used and need save/restore.
     used_callee_saved: Vec<PhysReg>,
-    /// Maps F128 load result value ID -> (source ID, byte offset, is_indirect).
-    /// Used by emit_f128_operand_to_a0_a1 to reload the full 16-byte f128
-    /// from the original memory location for comparisons.
-    /// - For alloca sources (constant-offset GEP folded): (alloca_id, offset, false)
-    ///   The data is at the alloca's stack slot + offset.
-    /// - For pointer sources (variable-index GEP): (ptr_id, 0, true)
-    ///   The ptr_id's slot holds a pointer; data is at *ptr + offset.
-    /// - For self-referential cast results: (dest_id, 0, false)
-    ///   The data is stored directly in the dest's own stack slot.
-    pub(super) f128_load_sources: FxHashMap<u32, (u32, i64, bool)>,
     /// Whether to suppress linker relaxation (-mno-relax).
     /// When true, emits `.option norelax` at the top of the assembly output
     /// to prevent R_RISCV_RELAX relocations. Required for EFI stub code.
@@ -156,7 +146,6 @@ impl RiscvCodegen {
             asm_fp_scratch_idx: 0,
             reg_assignments: FxHashMap::default(),
             used_callee_saved: Vec::new(),
-            f128_load_sources: FxHashMap::default(),
             no_relax: false,
         }
     }
@@ -741,7 +730,7 @@ impl ArchCodegen for RiscvCodegen {
             func, available_regs, Vec::new(), &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
         );
-        self.f128_load_sources.clear();
+        // f128_load_sources is cleared by state.reset_for_function() at the start of each function.
 
         // Scan all calls in the function to find the maximum number of GP register
         // arguments. emit_call_reg_args uses callee-saved s2-s6 as staging temporaries
@@ -1169,11 +1158,10 @@ impl ArchCodegen for RiscvCodegen {
             // Track which alloca+offset this F128 value was loaded from, so that
             // emit_f128_operand_to_a0_a1 can load the full 16-byte f128 directly
             // from the original memory for comparisons (avoiding f64 precision loss).
-            // Track source for full-precision reload. Mark as indirect when
-            // the source is a non-alloca pointer (e.g., GEP result) whose slot
-            // holds a pointer that must be dereferenced to access the data.
+            // Track source for full-precision reload. Automatically determines
+            // is_indirect based on whether ptr is an alloca.
+            self.state.track_f128_load(dest.0, ptr.0, 0);
             let is_indirect = !self.state.is_alloca(ptr.0);
-            self.f128_load_sources.insert(dest.0, (ptr.0, 0, is_indirect));
 
             let addr = self.state.resolve_slot_addr(ptr.0);
             if let Some(addr) = addr {
@@ -1294,8 +1282,8 @@ impl ArchCodegen for RiscvCodegen {
     fn emit_load_with_const_offset(&mut self, dest: &Value, base: &Value, offset: i64, ty: IrType) {
         if ty == IrType::F128 {
             // Track the source alloca + offset for full-precision comparison access.
+            self.state.track_f128_load(dest.0, base.0, offset);
             let is_indirect = !self.state.is_alloca(base.0);
-            self.f128_load_sources.insert(dest.0, (base.0, offset, is_indirect));
 
             // Check if the base pointer lives in a callee-saved register.
             let loaded = if let Some(&reg) = self.reg_assignments.get(&base.0) {
@@ -2431,7 +2419,7 @@ impl ArchCodegen for RiscvCodegen {
             self.state.emit("    fmv.x.d t0, fa0");
             self.state.reg_cache.invalidate_all();
             // Track that this value has full f128 in its slot (not indirect; data is in slot).
-            self.f128_load_sources.insert(dest.0, (dest.0, 0, false));
+            self.state.track_f128_self(dest.0);
             // Store f64 approx only to register (if register-allocated), not to stack.
             if let Some(&reg) = self.reg_assignments.get(&dest.0) {
                 let reg_name = callee_saved_name(reg);
@@ -2893,7 +2881,7 @@ impl ArchCodegen for RiscvCodegen {
             self.state.reg_cache.invalidate_all();
 
             // Track that dest has full f128 in its slot
-            self.f128_load_sources.insert(dest.0, (dest.0, 0, false));
+            self.state.track_f128_self(dest.0);
 
             // Store f64 approx only to register (if register-allocated), not to slot
             if let Some(&reg) = self.reg_assignments.get(&dest.0) {

@@ -27,7 +27,7 @@ impl RiscvCodegen {
             // Try to load the full 16-byte f128 from the original memory location
             // that this value was loaded from (tracked by f128_load_sources with offset).
             // The alloca stores the full IEEE f128 (16 bytes), preserving quad precision.
-            if let Some(&(src_id, offset, is_indirect)) = self.f128_load_sources.get(&v.0) {
+            if let Some((src_id, offset, is_indirect)) = self.state.get_f128_source(v.0) {
                 if is_indirect {
                     // Source is a pointer (e.g., GEP result): slot holds a pointer
                     // that must be dereferenced to access the F128 data.
@@ -146,7 +146,7 @@ impl RiscvCodegen {
             // Uses is_indirect flag to distinguish between:
             // - Direct sources (allocas, cast results): data is in the slot itself
             // - Indirect sources (GEP results): slot holds a pointer to the data
-            if let Some(&(src_id, offset, is_indirect)) = self.f128_load_sources.get(&v.0) {
+            if let Some((src_id, offset, is_indirect)) = self.state.get_f128_source(v.0) {
                 if is_indirect {
                     // Source slot holds a pointer; dereference to get F128 data.
                     if let Some(src_slot) = self.state.get_slot(src_id) {
@@ -209,7 +209,7 @@ impl RiscvCodegen {
         } else if let Operand::Value(v) = val {
             // Check if value has full f128 data in a tracked source.
             // Uses is_indirect flag to distinguish pointer vs data sources.
-            if let Some(&(src_id, offset, is_indirect)) = self.f128_load_sources.get(&v.0) {
+            if let Some((src_id, offset, is_indirect)) = self.state.get_f128_source(v.0) {
                 if is_indirect {
                     // Source slot holds a pointer; save dest addr, dereference src pointer.
                     if let Some(src_slot) = self.state.get_slot(src_id) {
@@ -302,7 +302,7 @@ impl RiscvCodegen {
             self.emit_store_to_s0("a0", dest_slot.0, "sd");
             self.emit_store_to_s0("a1", dest_slot.0 + 8, "sd");
             // Track dest as having full f128 data.
-            self.f128_load_sources.insert(dest.0, (dest.0, 0, false));
+            self.state.track_f128_self(dest.0);
         }
         // Step 4: Convert full f128 result (a0:a1) to f64 approximation in t0.
         self.state.emit("    call __trunctfdf2");

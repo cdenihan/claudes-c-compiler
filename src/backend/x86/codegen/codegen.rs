@@ -1645,7 +1645,7 @@ impl ArchCodegen for X86Codegen {
             if let Some(addr) = self.state.resolve_slot_addr(ptr.0) {
                 self.emit_f128_fldt(&addr, ptr.0, 0);
                 self.emit_f128_load_finish(dest);
-                self.state.f128_load_sources.insert(dest.0, ptr.0);
+                self.state.track_f128_load(dest.0, ptr.0, 0);
             }
             return;
         }
@@ -3183,7 +3183,7 @@ impl ArchCodegen for X86Codegen {
                     }
                 }
                 // Check if loaded from a known F128 alloca
-                if let Some(ptr_id) = self.state.f128_load_sources.get(&v.0).copied() {
+                if let Some((ptr_id, _offset, _is_indirect)) = self.state.get_f128_source(v.0) {
                     if let Some(addr) = self.state.resolve_slot_addr(ptr_id) {
                         self.emit_f128_to_int_from_memory(&addr, to_ty);
                         self.emit_store_result(dest);
@@ -3430,7 +3430,7 @@ impl ArchCodegen for X86Codegen {
                         }
                     }
                     // Check if loaded from a known F128 alloca
-                    if let Some(ptr_id) = self.state.f128_load_sources.get(&v.0).copied() {
+                    if let Some((ptr_id, _offset, _is_indirect)) = self.state.get_f128_source(v.0) {
                         if let Some(addr) = self.state.resolve_slot_addr(ptr_id) {
                             match addr {
                                 SlotAddr::Direct(slot) => {

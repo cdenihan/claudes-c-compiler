@@ -152,12 +152,6 @@ pub struct ArmCodegen {
     /// must not be used. Variadic prologues skip saving q0-q7 and va_start
     /// sets __vr_offs=0 (no FP register save area available).
     general_regs_only: bool,
-    /// Maps F128 load result value ID -> (source ID, byte offset, is_indirect).
-    /// Used for full-precision F128 reloads from original memory locations.
-    /// - For alloca sources: (alloca_id, offset, false) - data is at slot + offset.
-    /// - For pointer sources (GEP results): (ptr_id, 0, true) - slot holds a pointer.
-    /// - For cast results: (dest_id, 0, false) - data is in dest's own slot.
-    pub(super) f128_load_sources: FxHashMap<u32, (u32, i64, bool)>,
 }
 
 impl ArmCodegen {
@@ -178,7 +172,6 @@ impl ArmCodegen {
             callee_save_offset: 0,
             frame_base_offset: None,
             general_regs_only: false,
-            f128_load_sources: FxHashMap::default(),
         }
     }
 
@@ -1358,7 +1351,7 @@ impl ArchCodegen for ArmCodegen {
             func, available_regs, caller_saved_regs, &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
         );
-        self.f128_load_sources.clear();
+        // f128_load_sources is cleared by state.reset_for_function() at the start of each function.
 
         let mut space = calculate_stack_space_common(&mut self.state, func, 16, |space, alloc_size, align| {
             // ARM uses positive offsets from sp, starting at 16 (after fp/lr)
@@ -1585,7 +1578,7 @@ impl ArchCodegen for ArmCodegen {
                 self.state.emit_fmt(format_args!("    ldr q0, [sp, #{}]", fp_reg_off));
                 self.emit_store_to_sp("q0", slot.0 + 128, "str");
                 // Track the alloca as having full f128 data.
-                self.f128_load_sources.insert(dest_val.0, (dest_val.0, 0, false));
+                self.state.track_f128_self(dest_val.0);
                 // Also produce f64 approx in x0 for register-based access.
                 self.state.emit("    bl __trunctfdf2");
                 self.state.emit("    fmov x0, d0");
@@ -1648,7 +1641,7 @@ impl ArchCodegen for ArmCodegen {
                     self.emit_load_from_sp("x0", caller_offset + 8, "ldr");
                     self.emit_store_to_sp("x0", slot.0 + 8, "str");
                     // Track the alloca as having full f128 data.
-                    self.f128_load_sources.insert(dest_val.0, (dest_val.0, 0, false));
+                    self.state.track_f128_self(dest_val.0);
                 }
                 ParamClass::I128Stack { offset } => {
                     let caller_offset = frame_size + offset;
@@ -3087,8 +3080,8 @@ impl ArchCodegen for ArmCodegen {
         if ty == IrType::F128 {
             // Track source alloca for full-precision reload when needed
             // (comparisons, casts, stores back to memory).
+            self.state.track_f128_load(dest.0, ptr.0, 0);
             let is_indirect = !self.state.is_alloca(ptr.0);
-            self.f128_load_sources.insert(dest.0, (ptr.0, 0, is_indirect));
 
             // For register-only pointer values, load via the register directly.
             if let Some(&reg) = self.reg_assignments.get(&ptr.0) {
@@ -3218,8 +3211,8 @@ impl ArchCodegen for ArmCodegen {
     fn emit_load_with_const_offset(&mut self, dest: &Value, base: &Value, offset: i64, ty: IrType) {
         if ty == IrType::F128 {
             // Track source for full-precision reload.
+            self.state.track_f128_load(dest.0, base.0, offset);
             let is_indirect = !self.state.is_alloca(base.0);
-            self.f128_load_sources.insert(dest.0, (base.0, offset, is_indirect));
 
             // Check if the base pointer lives in a callee-saved register.
             // This handles cases where a pointer (e.g. from array indexing) is
