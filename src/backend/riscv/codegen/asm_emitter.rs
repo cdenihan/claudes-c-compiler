@@ -165,9 +165,6 @@ impl InlineAsmEmitter for RiscvCodegen {
                     } else if is_addr {
                         // Non-alloca: stack slot holds a pointer value, load it
                         self.emit_load_from_s0(reg, slot.0, "ld");
-                    } else if self.state.is_alloca(v.0) {
-                        // Non-address alloca: compute address for "r"/"=r" constraint
-                        self.emit_addi_s0(reg, slot.0);
                     } else if is_fp {
                         self.emit_load_from_s0(reg, slot.0, "fld");
                     } else {

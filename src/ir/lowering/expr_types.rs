@@ -1287,6 +1287,25 @@ impl Lowerer {
     /// lowering state (variable allocas, global metadata) that may produce
     /// more precise types than sema's symbol-table-only inference.
     pub(super) fn get_expr_ctype(&self, expr: &Expr) -> Option<CType> {
+        // For identifiers, always consult the lowerer's local/global state
+        // directly rather than the address-keyed cache.  The cache is keyed
+        // by the raw pointer address of the AST node, and the allocator can
+        // reuse addresses across different expression nodes within the same
+        // function (e.g., a macro-expanded `_old` identifier may be allocated
+        // at the same address previously used by `n`).  The lowerer's
+        // lookup_var_info is O(1) and always reflects the current scope, so
+        // bypassing the cache for identifiers is both correct and cheap.
+        if let Expr::Identifier(..) = expr {
+            let result = self.get_expr_ctype_lowerer(expr);
+            if result.is_some() {
+                return result;
+            }
+            // Fall back to sema annotation (keyed by the sema_expr_types map
+            // which was populated during the sema pass — its keys are stable
+            // because they were computed before any AST node deallocation).
+            return self.lookup_sema_expr_type(expr);
+        }
+
         let key = expr as *const Expr as usize;
         let disc = std::mem::discriminant(expr);
 
