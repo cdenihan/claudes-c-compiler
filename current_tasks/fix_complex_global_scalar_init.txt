@@ -1,0 +1,17 @@
+Task: Fix _Complex global variable initialization from scalar values
+Status: in_progress
+Started: 2026-01-27
+
+Problem: When a global _Complex float/double variable is initialized with a
+scalar (non-complex) value, e.g. `_Complex float g = 1.0f;`, the variable
+ends up initialized to zero instead of the correct value (1.0 + 0.0i).
+
+The bug only occurs with scalar initializers. Complex initializers like
+`_Complex float g = 1.0f + 2.0f * I;` work correctly.
+
+Impact: This breaks the compiler_suite_0109_0090 test (complex float
+multiplication loop using a global accumulator initialized with 1.0f),
+and likely affects other complex number tests.
+
+Fix: Locate the global variable initializer emission code and ensure that
+scalar-to-complex conversion is handled when emitting initial data bytes.

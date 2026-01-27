@@ -498,13 +498,23 @@ fn simplify_cmp(
                     // Cmp(Eq, boolean_val, 0) => logical NOT of boolean_val
                     // If from a Cmp, we can invert the comparison directly
                     if let Some(ic) = inner_cmp {
-                        return Some(Instruction::Cmp {
-                            dest,
-                            op: invert_cmp_op(ic.op),
-                            lhs: ic.lhs,
-                            rhs: ic.rhs,
-                            ty: ic.ty,
-                        });
+                        // For float ordered comparisons (Slt, Sle, Sgt, Sge),
+                        // inversion is NOT valid because of NaN: !(a <= b) is
+                        // NOT the same as (a > b) when either operand is NaN.
+                        // !(NaN <= x) should be true (since NaN <= x is false),
+                        // but (NaN > x) is also false. Only Eq<->Ne inversion
+                        // is safe for floats since both handle NaN consistently.
+                        let is_float_ordered = ic.ty.is_float()
+                            && !matches!(ic.op, IrCmpOp::Eq | IrCmpOp::Ne);
+                        if !is_float_ordered {
+                            return Some(Instruction::Cmp {
+                                dest,
+                                op: invert_cmp_op(ic.op),
+                                lhs: ic.lhs,
+                                rhs: ic.rhs,
+                                ty: ic.ty,
+                            });
+                        }
                     }
                     // For non-Cmp boolean values (e.g., And/Or of booleans),
                     // Cmp(Eq, val, 0) = Xor(val, 1) - but we can't easily
@@ -531,13 +541,19 @@ fn simplify_cmp(
                 if is_one_const {
                     // Cmp(Ne, boolean_val, 1) => logical NOT
                     if let Some(ic) = inner_cmp {
-                        return Some(Instruction::Cmp {
-                            dest,
-                            op: invert_cmp_op(ic.op),
-                            lhs: ic.lhs,
-                            rhs: ic.rhs,
-                            ty: ic.ty,
-                        });
+                        // Skip inversion for float ordered comparisons (NaN safety).
+                        // See the Eq/is_zero_const case above for the full explanation.
+                        let is_float_ordered = ic.ty.is_float()
+                            && !matches!(ic.op, IrCmpOp::Eq | IrCmpOp::Ne);
+                        if !is_float_ordered {
+                            return Some(Instruction::Cmp {
+                                dest,
+                                op: invert_cmp_op(ic.op),
+                                lhs: ic.lhs,
+                                rhs: ic.rhs,
+                                ty: ic.ty,
+                            });
+                        }
                     }
                 }
             }

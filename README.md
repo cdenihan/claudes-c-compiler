@@ -20,9 +20,9 @@ A C compiler written from scratch in Rust, targeting x86-64, AArch64, and RISC-V
 - Three backend targets with correct ABI handling
 
 ### Test Results (ratio 10 sample)
-- x86-64: 99.5% passing (2974/2990)
-- AArch64: 98.2% passing (2815/2868)
-- RISC-V 64: 99.5% passing (2846/2859)
+- x86-64: 99.6% passing (2979/2990)
+- AArch64: 99.5% passing (2855/2868)
+- RISC-V 64: 99.8% passing (2852/2859)
 
 ### What Works
 - `int main() { return N; }` for any integer N
@@ -149,6 +149,7 @@ target/release/ccc-riscv -o output input.c # RISC-V 64
 ```
 
 ### Recent Bug Fixes
+- **NaN-incorrect float comparison negation**: Fixed the simplify pass incorrectly transforming `!(a <= b)` into `(a > b)` for floating-point comparisons. With NaN, `!(NaN <= x)` should be true (since `NaN <= x` is false), but `(NaN > x)` is also false. The fix skips comparison inversion for float ordered comparisons (Slt, Sle, Sgt, Sge) where NaN makes the relationship non-total. Only Eq/Ne inversion remains safe for floats. This fixed postgres line geometry NaN tests and many floating-point comparison tests across all architectures.
 - **Sub-int unary Neg/BitNot integer promotion**: Fixed missing sign-extension for sub-int types (`signed char`, `short`) in unary negation and bitwise NOT operations. The operations were performed in I64 without first widening the operand, causing zero-extension of signed values (e.g., `signed char -13` (0xF3) was zero-extended to 243 instead of sign-extended to -13). Fixed by inserting a Cast from the inner type to I64 before the operation, using the correct signedness for sign/zero extension.
 - **Pointer-to-array struct member access**: Fixed miscompilation where accessing a struct member (e.g., `->bits`) through a dereferenced pointer-to-array-of-struct produced a 32-bit load instead of returning the field address. This caused kernel boot failures in `arch/x86/kernel/process.c` where the `cpumask_var_t` typedef (`struct cpumask[1]`) is used with the per-CPU `ACCESS_PRIVATE` macro pattern involving `typeof`/inline-asm pointer casts. The fix adds array-of-struct handling in `get_pointed_struct_layout` so the struct layout is correctly resolved for member access after array decay.
 
