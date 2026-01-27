@@ -970,13 +970,40 @@ pub(super) fn replace_dest_register(inst: &str, old_reg: &str, new_reg: &str) ->
         return None;
     }
 
-    // Handle `xorq %reg, %reg` (zero idiom)
+    // Handle `xorq %reg, %reg` or `xorl %ereg, %ereg` (zero idiom)
     if let Some(rest) = inst.strip_prefix("xorq ") {
         if let Some((src, dst)) = rest.split_once(',') {
             let src = src.trim();
             let dst = dst.trim();
             if src == old_reg && dst == old_reg {
                 return Some(format!("xorq {}, {}", new_reg, new_reg));
+            }
+        }
+    }
+    if let Some(rest) = inst.strip_prefix("xorl ") {
+        if let Some((src, dst)) = rest.split_once(',') {
+            let src = src.trim();
+            let dst = dst.trim();
+            // Check if this is a zero idiom (same 32-bit reg) and the old_reg matches
+            if src == dst {
+                // Map old_reg (64-bit) to its 32-bit name to check if it matches
+                let old_32 = match old_reg {
+                    "%rax" => "%eax", "%rbx" => "%ebx", "%rcx" => "%ecx", "%rdx" => "%edx",
+                    "%rsi" => "%esi", "%rdi" => "%edi", "%rsp" => "%esp", "%rbp" => "%ebp",
+                    "%r8" => "%r8d", "%r9" => "%r9d", "%r10" => "%r10d", "%r11" => "%r11d",
+                    "%r12" => "%r12d", "%r13" => "%r13d", "%r14" => "%r14d", "%r15" => "%r15d",
+                    _ => "",
+                };
+                if src == old_32 {
+                    let new_32 = match new_reg {
+                        "%rax" => "%eax", "%rbx" => "%ebx", "%rcx" => "%ecx", "%rdx" => "%edx",
+                        "%rsi" => "%esi", "%rdi" => "%edi", "%rsp" => "%esp", "%rbp" => "%ebp",
+                        "%r8" => "%r8d", "%r9" => "%r9d", "%r10" => "%r10d", "%r11" => "%r11d",
+                        "%r12" => "%r12d", "%r13" => "%r13d", "%r14" => "%r14d", "%r15" => "%r15d",
+                        _ => new_reg,
+                    };
+                    return Some(format!("xorl {}, {}", new_32, new_32));
+                }
             }
         }
     }

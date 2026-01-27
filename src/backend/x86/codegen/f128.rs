@@ -62,7 +62,7 @@ impl X86Codegen {
                 if hi != 0 {
                     self.state.out.emit_instr_imm_reg("    movq", hi as i64, "rax");
                 } else {
-                    self.state.emit("    xorq %rax, %rax");
+                    self.state.emit("    xorl %eax, %eax");
                 }
                 self.state.out.emit_instr_reg_rbp("    movq", "rax", rbp_off + 8);
             }
@@ -76,7 +76,7 @@ impl X86Codegen {
                 if hi != 0 {
                     self.state.out.emit_instr_imm_reg("    movq", hi as i64, "rax");
                 } else {
-                    self.state.emit("    xorq %rax, %rax");
+                    self.state.emit("    xorl %eax, %eax");
                 }
                 self.state.emit("    movq %rax, 8(%rcx)");
             }
@@ -90,7 +90,7 @@ impl X86Codegen {
                 if hi != 0 {
                     self.state.out.emit_instr_imm_reg("    movq", hi as i64, "rax");
                 } else {
-                    self.state.emit("    xorq %rax, %rax");
+                    self.state.emit("    xorl %eax, %eax");
                 }
                 self.state.emit("    movq %rax, 8(%rcx)");
             }

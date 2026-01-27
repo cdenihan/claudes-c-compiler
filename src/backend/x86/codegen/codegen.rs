@@ -29,6 +29,18 @@ const X86_CALLER_SAVED: [PhysReg; 4] = [
     PhysReg(10), PhysReg(11), PhysReg(12), PhysReg(13),
 ];
 
+/// Convert a 64-bit register name string to its 32-bit sub-register name.
+/// Used for `xorl %eXX, %eXX` zeroing idiom (shorter encoding, breaks dependencies).
+fn reg_name_to_32(name: &str) -> &'static str {
+    match name {
+        "rax" => "eax", "rbx" => "ebx", "rcx" => "ecx", "rdx" => "edx",
+        "rsi" => "esi", "rdi" => "edi", "rsp" => "esp", "rbp" => "ebp",
+        "r8" => "r8d", "r9" => "r9d", "r10" => "r10d", "r11" => "r11d",
+        "r12" => "r12d", "r13" => "r13d", "r14" => "r14d", "r15" => "r15d",
+        _ => unreachable!("invalid 64-bit register name: {}", name),
+    }
+}
+
 /// Map a PhysReg index to its x86-64 register name.
 /// Handles both callee-saved (1-5) and caller-saved (10-13) registers.
 fn phys_reg_name(reg: PhysReg) -> &'static str {
@@ -251,7 +263,18 @@ impl X86Codegen {
             let rhs_name = if use_32bit { phys_reg_name_32(rhs_r) } else { phys_reg_name(rhs_r) };
             self.state.emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rhs_name, lhs_name));
         } else if let Some(imm) = Self::const_as_imm32(rhs) {
-            if let Some(lhs_r) = lhs_phys {
+            if imm == 0 {
+                // test %reg, %reg is shorter than cmp $0, %reg and sets flags identically
+                let test_instr = if use_32bit { "testl" } else { "testq" };
+                if let Some(lhs_r) = lhs_phys {
+                    let lhs_name = if use_32bit { phys_reg_name_32(lhs_r) } else { phys_reg_name(lhs_r) };
+                    self.state.emit_fmt(format_args!("    {} %{}, %{}", test_instr, lhs_name, lhs_name));
+                } else {
+                    self.operand_to_rax(lhs);
+                    let reg = if use_32bit { "eax" } else { "rax" };
+                    self.state.emit_fmt(format_args!("    {} %{}, %{}", test_instr, reg, reg));
+                }
+            } else if let Some(lhs_r) = lhs_phys {
                 let lhs_name = if use_32bit { phys_reg_name_32(lhs_r) } else { phys_reg_name(lhs_r) };
                 self.state.emit_fmt(format_args!("    {} ${}, %{}", cmp_instr, imm, lhs_name));
             } else {
@@ -284,6 +307,10 @@ impl X86Codegen {
         match op {
             Operand::Const(c) => {
                 match c {
+                    IrConst::I8(v) if *v == 0 => self.state.emit_fmt(format_args!("    xorl %{0}, %{0}", phys_reg_name_32(target))),
+                    IrConst::I16(v) if *v == 0 => self.state.emit_fmt(format_args!("    xorl %{0}, %{0}", phys_reg_name_32(target))),
+                    IrConst::I32(v) if *v == 0 => self.state.emit_fmt(format_args!("    xorl %{0}, %{0}", phys_reg_name_32(target))),
+                    IrConst::I64(0) => self.state.emit_fmt(format_args!("    xorl %{0}, %{0}", phys_reg_name_32(target))),
                     IrConst::I8(v) => self.state.emit_fmt(format_args!("    movq ${}, %{}", *v as i64, target_name)),
                     IrConst::I16(v) => self.state.emit_fmt(format_args!("    movq ${}, %{}", *v as i64, target_name)),
                     IrConst::I32(v) => self.state.emit_fmt(format_args!("    movq ${}, %{}", *v as i64, target_name)),
@@ -294,7 +321,7 @@ impl X86Codegen {
                             self.state.out.emit_instr_imm_reg("    movabsq", *v, target_name);
                         }
                     }
-                    IrConst::Zero => self.state.emit_fmt(format_args!("    xorq %{}, %{}", target_name, target_name)),
+                    IrConst::Zero => self.state.emit_fmt(format_args!("    xorl %{0}, %{0}", phys_reg_name_32(target))),
                     _ => {
                         // For float/i128 constants, fall back to loading to rax and moving
                         self.operand_to_rax(op);
@@ -316,7 +343,8 @@ impl X86Codegen {
                         self.state.out.emit_instr_rbp_reg("    movq", slot.0, target_name);
                     }
                 } else {
-                    self.state.out.emit_instr_reg_reg("    xorq", target_name, target_name);
+                    let target_32 = phys_reg_name_32(target);
+                    self.state.out.emit_instr_reg_reg("    xorl", target_32, target_32);
                 }
             }
         }
@@ -329,6 +357,10 @@ impl X86Codegen {
             Operand::Const(c) => {
                 self.state.reg_cache.invalidate_acc();
                 match c {
+                    IrConst::I8(v) if *v == 0 => self.state.emit("    xorl %eax, %eax"),
+                    IrConst::I16(v) if *v == 0 => self.state.emit("    xorl %eax, %eax"),
+                    IrConst::I32(v) if *v == 0 => self.state.emit("    xorl %eax, %eax"),
+                    IrConst::I64(0) => self.state.emit("    xorl %eax, %eax"),
                     IrConst::I8(v) => self.state.out.emit_instr_imm_reg("    movq", *v as i64, "rax"),
                     IrConst::I16(v) => self.state.out.emit_instr_imm_reg("    movq", *v as i64, "rax"),
                     IrConst::I32(v) => self.state.out.emit_instr_imm_reg("    movq", *v as i64, "rax"),
@@ -341,12 +373,16 @@ impl X86Codegen {
                     }
                     IrConst::F32(v) => {
                         let bits = v.to_bits() as u64;
-                        self.state.out.emit_instr_imm_reg("    movq", bits as i64, "rax");
+                        if bits == 0 {
+                            self.state.emit("    xorl %eax, %eax");
+                        } else {
+                            self.state.out.emit_instr_imm_reg("    movq", bits as i64, "rax");
+                        }
                     }
                     IrConst::F64(v) => {
                         let bits = v.to_bits();
                         if bits == 0 {
-                            self.state.emit("    xorq %rax, %rax");
+                            self.state.emit("    xorl %eax, %eax");
                         } else {
                             self.state.out.emit_instr_imm_reg("    movabsq", bits as i64, "rax");
                         }
@@ -355,7 +391,7 @@ impl X86Codegen {
                     IrConst::LongDouble(v, _) => {
                         let bits = v.to_bits();
                         if bits == 0 {
-                            self.state.emit("    xorq %rax, %rax");
+                            self.state.emit("    xorl %eax, %eax");
                         } else {
                             self.state.out.emit_instr_imm_reg("    movabsq", bits as i64, "rax");
                         }
@@ -363,13 +399,15 @@ impl X86Codegen {
                     IrConst::I128(v) => {
                         // Truncate to low 64 bits for rax-only path
                         let low = *v as i64;
-                        if low >= i32::MIN as i64 && low <= i32::MAX as i64 {
+                        if low == 0 {
+                            self.state.emit("    xorl %eax, %eax");
+                        } else if low >= i32::MIN as i64 && low <= i32::MAX as i64 {
                             self.state.out.emit_instr_imm_reg("    movq", low, "rax");
                         } else {
                             self.state.out.emit_instr_imm_reg("    movabsq", low, "rax");
                         }
                     }
-                    IrConst::Zero => self.state.emit("    xorq %rax, %rax"),
+                    IrConst::Zero => self.state.emit("    xorl %eax, %eax"),
                 }
             }
             Operand::Value(v) => {
@@ -387,7 +425,7 @@ impl X86Codegen {
                     self.value_to_reg(v, "rax");
                     self.state.reg_cache.set_acc(v.0, is_alloca);
                 } else {
-                    self.state.emit("    xorq %rax, %rax");
+                    self.state.emit("    xorl %eax, %eax");
                     self.state.reg_cache.invalidate_acc();
                 }
             }
@@ -420,6 +458,10 @@ impl X86Codegen {
         match op {
             Operand::Const(c) => {
                 match c {
+                    IrConst::I8(v) if *v == 0 => self.state.emit("    xorl %ecx, %ecx"),
+                    IrConst::I16(v) if *v == 0 => self.state.emit("    xorl %ecx, %ecx"),
+                    IrConst::I32(v) if *v == 0 => self.state.emit("    xorl %ecx, %ecx"),
+                    IrConst::I64(0) => self.state.emit("    xorl %ecx, %ecx"),
                     IrConst::I8(v) => self.state.out.emit_instr_imm_reg("    movq", *v as i64, "rcx"),
                     IrConst::I16(v) => self.state.out.emit_instr_imm_reg("    movq", *v as i64, "rcx"),
                     IrConst::I32(v) => self.state.out.emit_instr_imm_reg("    movq", *v as i64, "rcx"),
@@ -432,12 +474,16 @@ impl X86Codegen {
                     }
                     IrConst::F32(v) => {
                         let bits = v.to_bits() as u64;
-                        self.state.out.emit_instr_imm_reg("    movq", bits as i64, "rcx");
+                        if bits == 0 {
+                            self.state.emit("    xorl %ecx, %ecx");
+                        } else {
+                            self.state.out.emit_instr_imm_reg("    movq", bits as i64, "rcx");
+                        }
                     }
                     IrConst::F64(v) => {
                         let bits = v.to_bits();
                         if bits == 0 {
-                            self.state.emit("    xorq %rcx, %rcx");
+                            self.state.emit("    xorl %ecx, %ecx");
                         } else {
                             self.state.out.emit_instr_imm_reg("    movabsq", bits as i64, "rcx");
                         }
@@ -445,20 +491,22 @@ impl X86Codegen {
                     IrConst::LongDouble(v, _) => {
                         let bits = v.to_bits();
                         if bits == 0 {
-                            self.state.emit("    xorq %rcx, %rcx");
+                            self.state.emit("    xorl %ecx, %ecx");
                         } else {
                             self.state.out.emit_instr_imm_reg("    movabsq", bits as i64, "rcx");
                         }
                     }
                     IrConst::I128(v) => {
                         let low = *v as i64;
-                        if low >= i32::MIN as i64 && low <= i32::MAX as i64 {
+                        if low == 0 {
+                            self.state.emit("    xorl %ecx, %ecx");
+                        } else if low >= i32::MIN as i64 && low <= i32::MAX as i64 {
                             self.state.out.emit_instr_imm_reg("    movq", low, "rcx");
                         } else {
                             self.state.out.emit_instr_imm_reg("    movabsq", low, "rcx");
                         }
                     }
-                    IrConst::Zero => self.state.emit("    xorq %rcx, %rcx"),
+                    IrConst::Zero => self.state.emit("    xorl %ecx, %ecx"),
                 }
             }
             Operand::Value(v) => {
@@ -469,7 +517,7 @@ impl X86Codegen {
                 } else if self.state.get_slot(v.0).is_some() {
                     self.value_to_reg(v, "rcx");
                 } else {
-                    self.state.emit("    xorq %rcx, %rcx");
+                    self.state.emit("    xorl %ecx, %ecx");
                 }
             }
         }
@@ -541,14 +589,14 @@ impl X86Codegen {
                         let low = *v as u64 as i64;
                         let high = (*v >> 64) as u64 as i64;
                         if low == 0 {
-                            self.state.emit("    xorq %rax, %rax");
+                            self.state.emit("    xorl %eax, %eax");
                         } else if low >= i32::MIN as i64 && low <= i32::MAX as i64 {
                             self.state.out.emit_instr_imm_reg("    movq", low, "rax");
                         } else {
                             self.state.out.emit_instr_imm_reg("    movabsq", low, "rax");
                         }
                         if high == 0 {
-                            self.state.emit("    xorq %rdx, %rdx");
+                            self.state.emit("    xorl %edx, %edx");
                         } else if high >= i32::MIN as i64 && high <= i32::MAX as i64 {
                             self.state.out.emit_instr_imm_reg("    movq", high, "rdx");
                         } else {
@@ -556,13 +604,13 @@ impl X86Codegen {
                         }
                     }
                     IrConst::Zero => {
-                        self.state.emit("    xorq %rax, %rax");
-                        self.state.emit("    xorq %rdx, %rdx");
+                        self.state.emit("    xorl %eax, %eax");
+                        self.state.emit("    xorl %edx, %edx");
                     }
                     _ => {
                         // Smaller constant: load into rax, zero/sign-extend to rdx
                         self.operand_to_rax(op);
-                        self.state.emit("    xorq %rdx, %rdx");
+                        self.state.emit("    xorl %edx, %edx");
                     }
                 }
             }
@@ -571,7 +619,7 @@ impl X86Codegen {
                     if self.state.is_alloca(v.0) {
                         // Alloca: load the address (not a 128-bit value itself)
                         self.state.out.emit_instr_rbp_reg("    leaq", slot.0, "rax");
-                        self.state.emit("    xorq %rdx, %rdx");
+                        self.state.emit("    xorl %edx, %edx");
                     } else if self.state.is_i128_value(v.0) {
                         // 128-bit value in 16-byte stack slot
                         self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rax");
@@ -586,17 +634,17 @@ impl X86Codegen {
                         } else {
                             self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rax");
                         }
-                        self.state.emit("    xorq %rdx, %rdx");
+                        self.state.emit("    xorl %edx, %edx");
                     }
                 } else {
                     // No stack slot: check register allocation
                     if let Some(&reg) = self.reg_assignments.get(&v.0) {
                         let reg_name = phys_reg_name(reg);
                         self.state.out.emit_instr_reg_reg("    movq", reg_name, "rax");
-                        self.state.emit("    xorq %rdx, %rdx");
+                        self.state.emit("    xorl %edx, %edx");
                     } else {
-                        self.state.emit("    xorq %rax, %rax");
-                        self.state.emit("    xorq %rdx, %rdx");
+                        self.state.emit("    xorl %eax, %eax");
+                        self.state.emit("    xorl %edx, %edx");
                     }
                 }
             }
@@ -736,6 +784,10 @@ impl X86Codegen {
         match op {
             Operand::Const(c) => {
                 match c {
+                    IrConst::I8(v) if *v == 0 => self.state.emit_fmt(format_args!("    xorl %{0}, %{0}", reg_name_to_32(reg))),
+                    IrConst::I16(v) if *v == 0 => self.state.emit_fmt(format_args!("    xorl %{0}, %{0}", reg_name_to_32(reg))),
+                    IrConst::I32(v) if *v == 0 => self.state.emit_fmt(format_args!("    xorl %{0}, %{0}", reg_name_to_32(reg))),
+                    IrConst::I64(0) => self.state.emit_fmt(format_args!("    xorl %{0}, %{0}", reg_name_to_32(reg))),
                     IrConst::I8(v) => self.state.emit_fmt(format_args!("    movq ${}, %{}", *v as i64, reg)),
                     IrConst::I16(v) => self.state.emit_fmt(format_args!("    movq ${}, %{}", *v as i64, reg)),
                     IrConst::I32(v) => self.state.emit_fmt(format_args!("    movq ${}, %{}", *v as i64, reg)),
@@ -746,7 +798,7 @@ impl X86Codegen {
                             self.state.out.emit_instr_imm_reg("    movabsq", *v, reg);
                         }
                     }
-                    _ => self.state.emit_fmt(format_args!("    xorq %{0}, %{0}", reg)),
+                    _ => self.state.emit_fmt(format_args!("    xorl %{0}, %{0}", reg_name_to_32(reg))),
                 }
             }
             Operand::Value(v) => {
@@ -1073,7 +1125,9 @@ impl ArchCodegen for X86Codegen {
     }
 
     fn emit_switch_case_branch(&mut self, case_val: i64, label: &str) {
-        if case_val >= i32::MIN as i64 && case_val <= i32::MAX as i64 {
+        if case_val == 0 {
+            self.state.emit("    testq %rax, %rax");
+        } else if case_val >= i32::MIN as i64 && case_val <= i32::MAX as i64 {
             self.state.out.emit_instr_imm_reg("    cmpq", case_val, "rax");
         } else {
             // Value doesn't fit in sign-extended 32-bit immediate; load into %rcx first
@@ -1496,7 +1550,7 @@ impl ArchCodegen for X86Codegen {
     }
 
     fn emit_zero_acc_high(&mut self) {
-        self.state.emit("    xorq %rdx, %rdx");
+        self.state.emit("    xorl %edx, %edx");
     }
 
     fn current_return_type(&self) -> IrType {
@@ -2326,7 +2380,7 @@ impl ArchCodegen for X86Codegen {
                     self.state.emit("    xorl %edx, %edx");
                     self.state.emit("    divl %ecx");
                 } else {
-                    self.state.emit("    xorq %rdx, %rdx");
+                    self.state.emit("    xorl %edx, %edx");
                     self.state.emit("    divq %rcx");
                 }
             }
@@ -2348,7 +2402,7 @@ impl ArchCodegen for X86Codegen {
                     self.state.emit("    divl %ecx");
                     self.state.emit("    movl %edx, %eax");
                 } else {
-                    self.state.emit("    xorq %rdx, %rdx");
+                    self.state.emit("    xorl %edx, %edx");
                     self.state.emit("    divq %rcx");
                     self.state.emit("    movq %rdx, %rax");
                 }
@@ -2588,7 +2642,7 @@ impl ArchCodegen for X86Codegen {
     ///   5. Store result from %rax to dest
     ///
     /// We load the operands first and test the condition last, because
-    /// operand loading may use xorq (for zero constants) which clobbers flags.
+    /// operand loading may use xorl (for zero constants) which clobbers flags.
     /// The movq instructions used for stack/register loads don't affect flags.
     fn emit_select(&mut self, dest: &Value, cond: &Operand, true_val: &Operand, false_val: &Operand, _ty: IrType) {
         // Step 1: Load false_val into %rax (the default value if cond == 0).
@@ -2609,7 +2663,9 @@ impl ArchCodegen for X86Codegen {
                     IrConst::Zero => 0,
                     _ => 0,
                 };
-                if val >= i32::MIN as i64 && val <= i32::MAX as i64 {
+                if val == 0 {
+                    self.state.emit("    xorl %edx, %edx");
+                } else if val >= i32::MIN as i64 && val <= i32::MAX as i64 {
                     self.state.out.emit_instr_imm_reg("    movq", val, "rdx");
                 } else {
                     self.state.out.emit_instr_imm_reg("    movabsq", val, "rdx");
@@ -2626,7 +2682,7 @@ impl ArchCodegen for X86Codegen {
                 } else if self.state.get_slot(v.0).is_some() {
                     self.value_to_reg(v, "rdx");
                 } else {
-                    self.state.emit("    xorq %rdx, %rdx");
+                    self.state.emit("    xorl %edx, %edx");
                 }
             }
         }
@@ -3788,7 +3844,7 @@ impl ArchCodegen for X86Codegen {
         self.state.emit("    testb $64, %cl");
         self.state.emit("    je 1f");
         self.state.emit("    movq %rax, %rdx");
-        self.state.emit("    xorq %rax, %rax");
+        self.state.emit("    xorl %eax, %eax");
         self.state.emit("1:");
     }
 
@@ -3798,7 +3854,7 @@ impl ArchCodegen for X86Codegen {
         self.state.emit("    testb $64, %cl");
         self.state.emit("    je 1f");
         self.state.emit("    movq %rdx, %rax");
-        self.state.emit("    xorq %rdx, %rdx");
+        self.state.emit("    xorl %edx, %edx");
         self.state.emit("1:");
     }
 
@@ -3824,11 +3880,11 @@ impl ArchCodegen for X86Codegen {
             // no-op
         } else if amount == 64 {
             self.state.emit("    movq %rax, %rdx");
-            self.state.emit("    xorq %rax, %rax");
+            self.state.emit("    xorl %eax, %eax");
         } else if amount > 64 {
             self.state.out.emit_instr_imm_reg("    shlq", (amount - 64) as i64, "rax");
             self.state.emit("    movq %rax, %rdx");
-            self.state.emit("    xorq %rax, %rax");
+            self.state.emit("    xorl %eax, %eax");
         } else {
             self.state.emit_fmt(format_args!("    shldq ${}, %rax, %rdx", amount));
             self.state.out.emit_instr_imm_reg("    shlq", amount as i64, "rax");
@@ -3841,11 +3897,11 @@ impl ArchCodegen for X86Codegen {
             // no-op
         } else if amount == 64 {
             self.state.emit("    movq %rdx, %rax");
-            self.state.emit("    xorq %rdx, %rdx");
+            self.state.emit("    xorl %edx, %edx");
         } else if amount > 64 {
             self.state.out.emit_instr_imm_reg("    shrq", (amount - 64) as i64, "rdx");
             self.state.emit("    movq %rdx, %rax");
-            self.state.emit("    xorq %rdx, %rdx");
+            self.state.emit("    xorl %edx, %edx");
         } else {
             self.state.emit_fmt(format_args!("    shrdq ${}, %rdx, %rax", amount));
             self.state.out.emit_instr_imm_reg("    shrq", amount as i64, "rdx");
