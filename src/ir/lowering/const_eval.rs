@@ -706,6 +706,13 @@ impl Lowerer {
                 }
                 None
             }
+            // Member access on a global struct where the field is an array:
+            // e.g., `global_struct.array_field` decays to &global_struct.array_field[0]
+            // This handles patterns like `init_files.open_fds_init` in the Linux kernel
+            // where open_fds_init is an `unsigned long[1]` field.
+            Expr::MemberAccess(_, _, _) => {
+                self.resolve_member_access_array_decay(expr)
+            }
             // (type *)expr -> try evaluating the inner expression
             Expr::Cast(_, inner, _) => {
                 self.eval_global_addr_expr(inner)
@@ -1046,6 +1053,63 @@ impl Lowerer {
             // Cast preserves the address
             Expr::Cast(_, inner, _) => {
                 self.resolve_inner_as_global_addr(inner)
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolve a member access expression where the field is an array type,
+    /// implementing array-to-pointer decay for global struct fields.
+    /// e.g., `global_struct.arr_field` -> GlobalAddrOffset("global_struct", field_offset)
+    /// This is needed for patterns like `.open_fds = init_files.open_fds_init` in the
+    /// Linux kernel, where `open_fds_init` is a `unsigned long[1]` array field.
+    fn resolve_member_access_array_decay(&self, expr: &Expr) -> Option<GlobalInit> {
+        // Use resolve_inner_as_global_addr to get the address of the field
+        let addr = self.resolve_inner_as_global_addr(expr)?;
+        // Now check if the field type is an array (needs decay)
+        // Walk the member access chain to find the final field type
+        let field_ty = self.get_member_access_field_type(expr)?;
+        match field_ty {
+            CType::Array(_, _) => Some(addr),
+            // Also handle function types which decay to function pointers
+            CType::Function(_) => Some(addr),
+            _ => None,
+        }
+    }
+
+    /// Get the C type of the result of a member access expression.
+    /// Walks chains like `s.a.b` to return the type of the final field `b`.
+    fn get_member_access_field_type(&self, expr: &Expr) -> Option<CType> {
+        match expr {
+            Expr::MemberAccess(base, field, _) => {
+                // Get the struct layout of the base expression
+                let layout = self.get_struct_layout_of_expr(base)?;
+                let (_offset, field_ty) = layout.field_offset(field, &self.types)?;
+                Some(field_ty)
+            }
+            _ => None,
+        }
+    }
+
+    /// Get the struct layout for the type of an expression (for member access resolution).
+    fn get_struct_layout_of_expr(&self, expr: &Expr) -> Option<StructLayout> {
+        match expr {
+            Expr::Identifier(name, _) => {
+                let global_name = self.resolve_to_global_name(name)?;
+                let ginfo = self.globals.get(&global_name)?;
+                ginfo.struct_layout.as_ref().map(|rc| (**rc).clone())
+            }
+            Expr::MemberAccess(base, field, _) => {
+                // For chained access s.a.b: get layout of s, find field a's type,
+                // then get layout of a's type (must be struct/union)
+                let base_layout = self.get_struct_layout_of_expr(base)?;
+                let (_offset, field_ty) = base_layout.field_offset(field, &self.types)?;
+                match &field_ty {
+                    CType::Struct(key) | CType::Union(key) => {
+                        self.types.struct_layouts.get(&**key).map(|rc| (**rc).clone())
+                    }
+                    _ => None,
+                }
             }
             _ => None,
         }

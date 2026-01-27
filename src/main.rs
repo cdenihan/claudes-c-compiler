@@ -276,6 +276,11 @@ fn real_main() {
                 let march = &arg["-march=".len()..];
                 driver.riscv_march = Some(march.to_string());
             }
+            "-mno-relax" => {
+                // RISC-V: suppress linker relaxation. Prevents R_RISCV_RELAX
+                // relocations. Required by Linux kernel EFI stub (-fpic -mno-relax).
+                driver.riscv_no_relax = true;
+            }
             arg if arg.starts_with("-m") => {
                 // -m64, -mtune=, etc. (ignored for now)
             }

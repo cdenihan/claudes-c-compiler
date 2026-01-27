@@ -12,4 +12,4 @@ Fix:
 3. Emit ".option norelax" in RISC-V assembly preamble when no_relax is set
 4. Pass -mno-relax to the assembler via build_asm_extra_args
 
-Status: in_progress
+Status: completed

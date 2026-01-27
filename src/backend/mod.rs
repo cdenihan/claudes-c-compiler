@@ -64,6 +64,13 @@ pub struct CodegenOptions {
     /// with retpoline (-mindirect-branch=thunk-extern) to avoid indirect jumps that
     /// objtool would reject.
     pub no_jump_tables: bool,
+    /// Whether to suppress linker relaxation (-mno-relax, RISC-V only).
+    /// When true, the codegen emits `.option norelax` at the top of the
+    /// assembly output, which prevents the GNU assembler from generating
+    /// R_RISCV_RELAX relocation entries. This is required for the Linux
+    /// kernel's EFI stub, which uses -fpic -mno-relax to ensure no
+    /// absolute symbol references are introduced by linker relaxation.
+    pub no_relax: bool,
 }
 
 /// Target architecture.
@@ -156,6 +163,7 @@ impl Target {
             Target::Riscv64 => {
                 let mut cg = riscv::RiscvCodegen::new();
                 cg.set_no_jump_tables(opts.no_jump_tables);
+                cg.set_no_relax(opts.no_relax);
                 cg.generate(module)
             }
         }

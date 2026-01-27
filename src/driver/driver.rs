@@ -93,6 +93,12 @@ pub struct Driver {
     /// RISC-V architecture override from -march= flag (e.g., "rv64imac_zicsr_zifencei").
     /// When set, overrides the default "rv64gc" passed to the assembler.
     pub riscv_march: Option<String>,
+    /// RISC-V -mno-relax flag: suppress linker relaxation.
+    /// When true, the codegen emits `.option norelax` and the assembler is
+    /// invoked with `-mno-relax`. This prevents R_RISCV_RELAX relocations
+    /// that would allow the linker to introduce absolute symbol references.
+    /// Required by the Linux kernel's EFI stub (built with -fpic -mno-relax).
+    pub riscv_no_relax: bool,
     /// Explicit language override from -x flag.
     /// When set, overrides file extension detection for input language.
     /// Values: "c", "assembler", "assembler-with-cpp", "none" (reset).
@@ -148,6 +154,7 @@ impl Driver {
             no_jump_tables: false,
             riscv_abi: None,
             riscv_march: None,
+            riscv_no_relax: false,
             explicit_language: None,
             assembler_extra_args: Vec::new(),
             dep_file: None,
@@ -529,6 +536,9 @@ impl Driver {
             if let Some(ref march) = self.riscv_march {
                 args.push(format!("-march={}", march));
             }
+            if self.riscv_no_relax {
+                args.push("-mno-relax".to_string());
+            }
         }
         args
     }
@@ -738,6 +748,7 @@ impl Driver {
             general_regs_only: self.general_regs_only,
             code_model_kernel: self.code_model_kernel,
             no_jump_tables: self.no_jump_tables,
+            no_relax: self.riscv_no_relax,
         };
         let asm = self.target.generate_assembly_with_opts(&module, &opts);
         if time_phases { eprintln!("[TIME] codegen: {:.3}s ({} bytes asm)", t8.elapsed().as_secs_f64(), asm.len()); }

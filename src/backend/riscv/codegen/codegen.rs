@@ -99,6 +99,10 @@ pub struct RiscvCodegen {
     /// - For self-referential cast results: (dest_id, 0, false)
     ///   The data is stored directly in the dest's own stack slot.
     pub(super) f128_load_sources: FxHashMap<u32, (u32, i64, bool)>,
+    /// Whether to suppress linker relaxation (-mno-relax).
+    /// When true, emits `.option norelax` at the top of the assembly output
+    /// to prevent R_RISCV_RELAX relocations. Required for EFI stub code.
+    no_relax: bool,
 }
 
 impl RiscvCodegen {
@@ -115,6 +119,7 @@ impl RiscvCodegen {
             reg_assignments: FxHashMap::default(),
             used_callee_saved: Vec::new(),
             f128_load_sources: FxHashMap::default(),
+            no_relax: false,
         }
     }
 
@@ -123,7 +128,19 @@ impl RiscvCodegen {
         self.state.no_jump_tables = enabled;
     }
 
+    /// Suppress linker relaxation (-mno-relax).
+    pub fn set_no_relax(&mut self, enabled: bool) {
+        self.no_relax = enabled;
+    }
+
     pub fn generate(mut self, module: &IrModule) -> String {
+        // Emit .option norelax before any code if -mno-relax is set.
+        // This prevents the GNU assembler from generating R_RISCV_RELAX
+        // relocation entries, which is required for EFI stub code that
+        // forbids absolute symbol references from linker relaxation.
+        if self.no_relax {
+            self.state.emit(".option norelax");
+        }
         generate_module(&mut self, module)
     }
 
