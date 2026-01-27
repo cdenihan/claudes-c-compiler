@@ -85,21 +85,26 @@ fn build_gep_fold_map(func: &IrFunction, use_counts: &[u32]) -> FxHashMap<u32, G
     for block in &func.blocks {
         for inst in &block.instructions {
             match inst {
-                // Load.ptr is foldable — UNLESS the load type is i128/u128,
-                // because the i128 load path in generate_instruction doesn't
-                // support GEP folding and falls through to emit_load which
-                // expects the pointer value to have been computed.
-                Instruction::Load { ptr, ty, .. } => {
-                    if matches!(ty, IrType::I128 | IrType::U128) {
+                // Load.ptr is foldable — UNLESS:
+                // - The load type is i128/u128: the i128 load path doesn't
+                //   support GEP folding and falls through to emit_load.
+                // - The load has a segment override (%gs:/%fs:): the segment-
+                //   overridden load path (emit_seg_load) returns early before
+                //   the GEP fold check, so it needs the pointer value to be
+                //   computed by the GEP instruction (not folded away).
+                Instruction::Load { ptr, ty, seg_override, .. } => {
+                    if matches!(ty, IrType::I128 | IrType::U128)
+                        || *seg_override != AddressSpace::Default {
                         mark_non_ptr(ptr.0);
                     }
                 }
                 // Store.ptr is foldable, but Store.val is an Operand that is NOT foldable.
-                // Also invalidate if the store type is i128/u128, for the same
-                // reason as Load above: the i128 store path doesn't fold GEPs.
-                Instruction::Store { val, ptr, ty , .. } => {
+                // Also invalidate if the store type is i128/u128 or has a segment
+                // override, for the same reasons as Load above.
+                Instruction::Store { val, ptr, ty, seg_override, .. } => {
                     if let Operand::Value(v) = val { mark_non_ptr(v.0); }
-                    if matches!(ty, IrType::I128 | IrType::U128) {
+                    if matches!(ty, IrType::I128 | IrType::U128)
+                        || *seg_override != AddressSpace::Default {
                         mark_non_ptr(ptr.0);
                     }
                 }
