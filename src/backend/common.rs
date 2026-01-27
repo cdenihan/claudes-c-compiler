@@ -594,43 +594,94 @@ fn emit_zero_global(out: &mut AsmOutput, g: &IrGlobal, obj_type: &str, ptr_dir: 
     out.emit_fmt(format_args!("    .zero {}", g.size));
 }
 
-/// Emit global variable definitions split into .data and .bss sections.
-fn emit_globals(out: &mut AsmOutput, globals: &[IrGlobal], ptr_dir: PtrDirective) {
-    let mut has_data = false;
-    let mut has_bss = false;
-    let mut has_tdata = false;
-    let mut has_tbss = false;
+/// Target section classification for a global variable.
+///
+/// Each global is classified exactly once into one of these categories,
+/// which determines which assembly section it belongs to.
+#[derive(PartialEq, Eq)]
+enum GlobalSection {
+    /// Extern (undefined) symbol -- only needs visibility directive, no storage.
+    Extern,
+    /// Has `__attribute__((section(...)))` -- emitted in its custom section.
+    Custom,
+    /// Const-qualified, non-TLS, initialized, non-zero-size -> `.rodata`.
+    Rodata,
+    /// Thread-local, initialized, non-zero-size -> `.tdata`.
+    Tdata,
+    /// Non-const, non-TLS, initialized, non-zero-size -> `.data`.
+    Data,
+    /// Zero-initialized, `is_common` flag set -> `.comm` directive.
+    Common,
+    /// Thread-local, zero-initialized (or zero-size) -> `.tbss`.
+    Tbss,
+    /// Non-TLS, zero-initialized (or zero-size with init) -> `.bss`.
+    Bss,
+}
 
-    // Emit visibility directives for extern (undefined) globals that have non-default
-    // visibility. This is needed for PIC code so the assembler/linker knows these symbols
-    // are resolved within the link unit (e.g., #pragma GCC visibility push(hidden)).
-    for g in globals {
-        if g.is_extern {
+/// Classify a global variable into the section it should be emitted to.
+///
+/// The classification priority matches GCC behavior:
+/// 1. Extern symbols get no storage (just visibility directives).
+/// 2. Custom section overrides all other placement.
+/// 3. TLS globals go to .tdata (initialized) or .tbss (zero-init).
+/// 4. Const globals go to .rodata.
+/// 5. Non-zero initialized non-const globals go to .data.
+/// 6. Zero-initialized common globals go to .comm.
+/// 7. Zero-initialized non-common globals go to .bss.
+fn classify_global(g: &IrGlobal) -> GlobalSection {
+    if g.is_extern {
+        return GlobalSection::Extern;
+    }
+    if g.section.is_some() {
+        return GlobalSection::Custom;
+    }
+    let is_zero = matches!(g.init, GlobalInit::Zero);
+    let has_nonzero_init = !is_zero && g.size > 0;
+    if g.is_thread_local {
+        return if has_nonzero_init { GlobalSection::Tdata } else { GlobalSection::Tbss };
+    }
+    if has_nonzero_init {
+        return if g.is_const { GlobalSection::Rodata } else { GlobalSection::Data };
+    }
+    // Zero-initialized (or zero-size with init)
+    if g.is_common && is_zero {
+        return GlobalSection::Common;
+    }
+    GlobalSection::Bss
+}
+
+/// Emit global variable definitions, grouped by target section.
+///
+/// Classifies each global once via `classify_global`, then emits all globals
+/// for each section in a fixed order: extern visibility, custom sections,
+/// .rodata, .tdata, .data, .comm, .tbss, .bss.
+fn emit_globals(out: &mut AsmOutput, globals: &[IrGlobal], ptr_dir: PtrDirective) {
+    // Phase 1: classify every global into its target section.
+    let classified: Vec<GlobalSection> = globals.iter().map(classify_global).collect();
+
+    // Phase 2: emit each section group in order.
+
+    // Extern visibility directives (needed for PIC code so the assembler/linker knows
+    // these symbols are resolved within the link unit).
+    for (g, sect) in globals.iter().zip(&classified) {
+        if matches!(sect, GlobalSection::Extern) {
             emit_visibility_directive(out, &g.name, &g.visibility);
         }
     }
 
-    // Globals with custom section attributes -> emit in their custom section first
-    for g in globals {
-        if g.is_extern || g.section.is_none() {
+    // Custom section globals: each gets its own .section directive since they
+    // may target different sections.
+    for (g, sect) in globals.iter().zip(&classified) {
+        if !matches!(sect, GlobalSection::Custom) {
             continue;
         }
-        let sect = g.section.as_ref().unwrap();
-        let is_zero_init = matches!(g.init, GlobalInit::Zero);
-        // Determine section flags: "aw" for writable, "a" for read-only
-        let flags = if sect.contains("rodata") { "a" } else { "aw" };
-        // Sections with names starting with ".bss" should be NOBITS (like GCC),
-        // so they don't occupy file space and get proper BSS semantics.
-        let section_type = if sect.starts_with(".bss") {
-            "@nobits"
-        } else {
-            "@progbits"
-        };
-        out.emit_fmt(format_args!(
-            ".section {},\"{}\",{}",
-            sect, flags, section_type
-        ));
-        if is_zero_init || g.size == 0 {
+        let section_name = g.section.as_ref().unwrap();
+        // "aw" for writable, "a" for read-only sections
+        let flags = if section_name.contains("rodata") { "a" } else { "aw" };
+        // Sections starting with ".bss" are NOBITS (no file space, BSS semantics)
+        let section_type = if section_name.starts_with(".bss") { "@nobits" } else { "@progbits" };
+        out.emit_fmt(format_args!(".section {},\"{}\",{}", section_name, flags, section_type));
+        if matches!(g.init, GlobalInit::Zero) || g.size == 0 {
             emit_zero_global(out, g, "@object", ptr_dir);
         } else {
             emit_global_def(out, g, ptr_dir);
@@ -638,149 +689,66 @@ fn emit_globals(out: &mut AsmOutput, globals: &[IrGlobal], ptr_dir: PtrDirective
         out.emit("");
     }
 
-    // Const globals -> .rodata (matching GCC behavior for -fno-PIE)
-    // GCC places all const-qualified globals in .rodata regardless of whether they
-    // contain relocations. The linker handles R_X86_64_64 relocations in .rodata fine.
-    // This is critical for kernel code which uses a linker script that doesn't
-    // recognize .data.rel.ro as a valid section.
-    {
-        let mut has_const_rodata = false;
-        for g in globals {
-            if g.is_extern || g.section.is_some() {
-                continue;
-            }
-            if g.is_thread_local {
-                continue; // TLS takes precedence: emit in .tdata/.tbss, not .rodata
-            }
-            if matches!(g.init, GlobalInit::Zero) || g.size == 0 {
-                continue;
-            }
-            if !g.is_const {
-                continue;
-            }
-            if !has_const_rodata {
-                out.emit(".section .rodata");
-                has_const_rodata = true;
-            }
+    // .rodata: const-qualified initialized globals (matches GCC -fno-PIE behavior;
+    // the linker handles relocations in .rodata fine, and kernel linker scripts
+    // don't recognize .data.rel.ro).
+    emit_section_group(out, globals, &classified, &GlobalSection::Rodata,
+        ".section .rodata", false, ptr_dir);
+
+    // .tdata: thread-local initialized globals
+    emit_section_group(out, globals, &classified, &GlobalSection::Tdata,
+        ".section .tdata,\"awT\",@progbits", false, ptr_dir);
+
+    // .data: non-const initialized globals
+    emit_section_group(out, globals, &classified, &GlobalSection::Data,
+        ".section .data", false, ptr_dir);
+
+    // .comm: zero-initialized common globals (weak linkage, linker merges duplicates).
+    // .comm alignment is always in bytes on all platforms, unlike .align.
+    for (g, sect) in globals.iter().zip(&classified) {
+        if matches!(sect, GlobalSection::Common) {
+            out.emit_fmt(format_args!(".comm {},{},{}", g.name, g.size, effective_align(g)));
+        }
+    }
+
+    // .tbss: thread-local zero-initialized globals
+    emit_section_group(out, globals, &classified, &GlobalSection::Tbss,
+        ".section .tbss,\"awT\",@nobits", true, ptr_dir);
+
+    // .bss: non-TLS zero-initialized globals (includes zero-size globals with
+    // empty initializers like `Type arr[0] = {}` to avoid address overlap).
+    emit_section_group(out, globals, &classified, &GlobalSection::Bss,
+        ".section .bss", true, ptr_dir);
+}
+
+/// Emit all globals matching `target` section, with a section header on first match.
+/// If `is_zero` is true, emits as zero-initialized; otherwise as initialized data.
+fn emit_section_group(
+    out: &mut AsmOutput,
+    globals: &[IrGlobal],
+    classified: &[GlobalSection],
+    target: &GlobalSection,
+    section_header: &str,
+    is_zero: bool,
+    ptr_dir: PtrDirective,
+) {
+    let mut emitted_header = false;
+    for (g, sect) in globals.iter().zip(classified) {
+        if sect != target {
+            continue;
+        }
+        if !emitted_header {
+            out.emit(section_header);
+            emitted_header = true;
+        }
+        if is_zero {
+            let obj_type = if g.is_thread_local { "@tls_object" } else { "@object" };
+            emit_zero_global(out, g, obj_type, ptr_dir);
+        } else {
             emit_global_def(out, g, ptr_dir);
         }
-        if has_const_rodata {
-            out.emit("");
-        }
     }
-
-    // Thread-local initialized globals -> .tdata
-    for g in globals {
-        if g.is_extern || !g.is_thread_local || g.section.is_some() {
-            continue;
-        }
-        if matches!(g.init, GlobalInit::Zero) || g.size == 0 {
-            continue;
-        }
-        if !has_tdata {
-            out.emit(".section .tdata,\"awT\",@progbits");
-            has_tdata = true;
-        }
-        emit_global_def(out, g, ptr_dir);
-    }
-    if has_tdata {
-        out.emit("");
-    }
-
-    // Non-const initialized globals -> .data (skip those with custom sections and TLS)
-    for g in globals {
-        if g.is_extern {
-            continue; // extern declarations have no storage
-        }
-        if g.section.is_some() {
-            continue; // already emitted in custom section
-        }
-        if g.is_thread_local {
-            continue; // TLS globals go to .tdata/.tbss
-        }
-        if matches!(g.init, GlobalInit::Zero) {
-            continue;
-        }
-        // Zero-size globals (e.g., empty arrays like `Type arr[0] = {}`) go to .bss
-        // to avoid sharing an address with the next .data global.
-        if g.size == 0 {
-            continue;
-        }
-        // Const globals already emitted to .rodata or .data.rel.ro
-        if g.is_const {
-            continue;
-        }
-        if !has_data {
-            out.emit(".section .data");
-            has_data = true;
-        }
-        emit_global_def(out, g, ptr_dir);
-    }
-    if has_data {
-        out.emit("");
-    }
-
-    // Common globals -> .comm directive (weak linkage, linker merges duplicates)
-    for g in globals {
-        if g.is_extern {
-            continue;
-        }
-        if g.section.is_some() {
-            continue; // already emitted in custom section
-        }
-        if !g.is_common || !matches!(g.init, GlobalInit::Zero) {
-            continue;
-        }
-        // .comm alignment is always in bytes on all platforms, unlike .align
-        out.emit_fmt(format_args!(".comm {},{},{}", g.name, g.size, effective_align(g)));
-    }
-
-    // Thread-local zero-initialized globals -> .tbss
-    for g in globals {
-        if g.is_extern || !g.is_thread_local || g.section.is_some() {
-            continue;
-        }
-        if !matches!(g.init, GlobalInit::Zero) && g.size != 0 {
-            continue; // has initializer, already in .tdata
-        }
-        if !has_tbss {
-            out.emit(".section .tbss,\"awT\",@nobits");
-            has_tbss = true;
-        }
-        emit_zero_global(out, g, "@tls_object", ptr_dir);
-    }
-    if has_tbss {
-        out.emit("");
-    }
-
-    // Zero-initialized globals -> .bss (skip those with custom sections and TLS)
-    // Also includes zero-size globals with empty initializers (e.g., `Type arr[0] = {}`)
-    // which were skipped from .data to avoid address overlap.
-    for g in globals {
-        if g.is_extern {
-            continue; // extern declarations have no storage
-        }
-        if g.section.is_some() {
-            continue; // already emitted in custom section
-        }
-        if g.is_thread_local {
-            continue; // TLS globals go to .tdata/.tbss
-        }
-        let is_zero_init = matches!(g.init, GlobalInit::Zero);
-        let is_zero_size_with_init = g.size == 0 && !is_zero_init;
-        if !is_zero_init && !is_zero_size_with_init {
-            continue;
-        }
-        if g.is_common {
-            continue; // already emitted as .comm
-        }
-        if !has_bss {
-            out.emit(".section .bss");
-            has_bss = true;
-        }
-        emit_zero_global(out, g, "@object", ptr_dir);
-    }
-    if has_bss {
+    if emitted_header {
         out.emit("");
     }
 }
@@ -973,41 +941,13 @@ fn emit_label_diff(out: &mut AsmOutput, lab1: &str, lab2: &str, byte_size: usize
 }
 
 pub fn emit_const_data(out: &mut AsmOutput, c: &IrConst, ty: IrType, ptr_dir: PtrDirective) {
-    // If the constant type is narrower than the global's declared type, widen it
-    // (sign-extend for signed, zero-extend for unsigned).
     match c {
-        IrConst::I8(v) => {
-            match ty {
-                IrType::I8 | IrType::U8 => out.emit_fmt(format_args!("    .byte {}", *v as u8)),
-                IrType::I16 | IrType::U16 => out.emit_fmt(format_args!("    .short {}", *v as i16 as u16)),
-                IrType::I32 | IrType::U32 => out.emit_fmt(format_args!("    .long {}", *v as i32 as u32)),
-                _ => out.emit_fmt(format_args!("    {} {}", ptr_dir.as_str(), *v as i64)),
-            }
-        }
-        IrConst::I16(v) => {
-            match ty {
-                IrType::I8 | IrType::U8 => out.emit_fmt(format_args!("    .byte {}", *v as u8)),
-                IrType::I16 | IrType::U16 => out.emit_fmt(format_args!("    .short {}", *v as u16)),
-                IrType::I32 | IrType::U32 => out.emit_fmt(format_args!("    .long {}", *v as i32 as u32)),
-                _ => out.emit_fmt(format_args!("    {} {}", ptr_dir.as_str(), *v as i64)),
-            }
-        }
-        IrConst::I32(v) => {
-            match ty {
-                IrType::I8 | IrType::U8 => out.emit_fmt(format_args!("    .byte {}", *v as u8)),
-                IrType::I16 | IrType::U16 => out.emit_fmt(format_args!("    .short {}", *v as u16)),
-                IrType::I32 | IrType::U32 => out.emit_fmt(format_args!("    .long {}", *v as u32)),
-                _ => out.emit_fmt(format_args!("    {} {}", ptr_dir.as_str(), *v as i64)),
-            }
-        }
-        IrConst::I64(v) => {
-            match ty {
-                IrType::I8 | IrType::U8 => out.emit_fmt(format_args!("    .byte {}", *v as u8)),
-                IrType::I16 | IrType::U16 => out.emit_fmt(format_args!("    .short {}", *v as u16)),
-                IrType::I32 | IrType::U32 => out.emit_fmt(format_args!("    .long {}", *v as u32)),
-                _ => out.emit_fmt(format_args!("    {} {}", ptr_dir.as_str(), v)),
-            }
-        }
+        // Integer constants: all share the same widening/narrowing logic.
+        // The value is sign-extended to i64, then emitted at the target type's width.
+        IrConst::I8(v) => emit_int_data(out, *v as i64, ty, ptr_dir),
+        IrConst::I16(v) => emit_int_data(out, *v as i64, ty, ptr_dir),
+        IrConst::I32(v) => emit_int_data(out, *v as i64, ty, ptr_dir),
+        IrConst::I64(v) => emit_int_data(out, *v, ty, ptr_dir),
         IrConst::F32(v) => {
             out.emit_fmt(format_args!("    .long {}", v.to_bits()));
         }
@@ -1019,9 +959,7 @@ pub fn emit_const_data(out: &mut AsmOutput, c: &IrConst, ty: IrType, ptr_dir: Pt
                 // x86-64: emit stored x87 80-bit extended precision bytes (full precision).
                 // The raw bytes are in bytes[0..10], with bytes[10..16] = 0 padding.
                 let lo = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-                let hi = u64::from_le_bytes([
-                    bytes[8], bytes[9], 0, 0, 0, 0, 0, 0,
-                ]);
+                let hi = u64::from_le_bytes([bytes[8], bytes[9], 0, 0, 0, 0, 0, 0]);
                 out.emit_fmt(format_args!("    {} {}", ptr_dir.as_str(), lo as i64));
                 out.emit_fmt(format_args!("    {} {}", ptr_dir.as_str(), hi as i64));
             } else if ptr_dir.is_riscv() || ptr_dir.is_arm() {
@@ -1051,6 +989,17 @@ pub fn emit_const_data(out: &mut AsmOutput, c: &IrConst, ty: IrType, ptr_dir: Pt
             let size = ty.size();
             out.emit_fmt(format_args!("    .zero {}", if size == 0 { 4 } else { size }));
         }
+    }
+}
+
+/// Emit an integer constant at the width specified by `ty`.
+/// Truncates or sign-extends `val` (an i64) as needed to match the target width.
+fn emit_int_data(out: &mut AsmOutput, val: i64, ty: IrType, ptr_dir: PtrDirective) {
+    match ty {
+        IrType::I8 | IrType::U8 => out.emit_fmt(format_args!("    .byte {}", val as u8)),
+        IrType::I16 | IrType::U16 => out.emit_fmt(format_args!("    .short {}", val as u16)),
+        IrType::I32 | IrType::U32 => out.emit_fmt(format_args!("    .long {}", val as u32)),
+        _ => out.emit_fmt(format_args!("    {} {}", ptr_dir.as_str(), val)),
     }
 }
 
