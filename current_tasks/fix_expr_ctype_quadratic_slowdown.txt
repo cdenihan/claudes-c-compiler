@@ -1,6 +1,7 @@
 Task: Fix quadratic O(n^2) slowdown in get_expr_ctype for deeply nested struct accesses
-Status: in_progress
+Status: completed
 Started: 2026-01-27
+Completed: 2026-01-27
 
 Problem: net/mac80211/tdls.c compilation times out (>30s) because
 get_expr_ctype() has no memoization and re-traverses deeply nested

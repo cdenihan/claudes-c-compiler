@@ -38,6 +38,9 @@ impl Lowerer {
         self.func_state = Some(FunctionBuildState::new(
             func.name.clone(), base_return_type, return_is_bool,
         ));
+        // Clear get_expr_ctype memoization cache: results depend on
+        // per-function state (local variables), so cannot span functions.
+        self.expr_ctype_cache.borrow_mut().clear();
         self.push_scope();
 
         // Step 1: Compute ABI-adjusted return type

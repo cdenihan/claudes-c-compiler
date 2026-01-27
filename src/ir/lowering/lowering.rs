@@ -12,6 +12,7 @@
 //! Data structure definitions are in `definitions.rs`, per-function state in
 //! `func_state.rs`, and type-system state in `frontend::sema::type_context`.
 
+use std::cell::RefCell;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::frontend::parser::ast::*;
 use crate::frontend::sema::{FunctionInfo, ExprTypeMap, ConstMap};
@@ -80,6 +81,13 @@ pub struct Lowerer {
     /// E.g., `extern int strerror_r(...) __asm__("__xpg_strerror_r")` maps
     /// "strerror_r" -> "__xpg_strerror_r". Used to redirect calls/references at IR emission.
     pub(super) asm_label_map: FxHashMap<String, String>,
+    /// Memoization cache for get_expr_ctype().
+    /// Maps AST Expr node addresses (as usize) to their resolved CType.
+    /// Avoids O(n²) re-traversal of nested struct member access chains
+    /// (e.g., `sdata->u.mgd.tdls_peer_del_work.work` re-resolves from the root
+    /// at each level without this cache). Uses RefCell for interior mutability
+    /// since get_expr_ctype takes &self.
+    pub(super) expr_ctype_cache: RefCell<FxHashMap<usize, Option<CType>>>,
 }
 
 impl Lowerer {
@@ -135,6 +143,7 @@ impl Lowerer {
             local_label_scopes: Vec::new(),
             next_local_label_scope: 0,
             asm_label_map: FxHashMap::default(),
+            expr_ctype_cache: RefCell::new(FxHashMap::default()),
         }
     }
 
