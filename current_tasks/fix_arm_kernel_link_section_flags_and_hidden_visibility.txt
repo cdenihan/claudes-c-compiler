@@ -1,0 +1,14 @@
+Status: in_progress
+Started: 2026-01-27
+
+Fix two ARM kernel link failures:
+
+1. Const globals in custom sections (.modinfo) getting wrong section flags ("aw" instead of "a")
+   - The compiler was using section name heuristics (checking for "rodata") instead of the
+     global's is_const flag to determine section writability
+   - Fix: Use g.is_const to set read-only flags for const-qualified globals in custom sections
+
+2. Unused hidden-visibility extern declarations creating spurious undefined symbols
+   - .hidden directives for unreferenced extern symbols cause the assembler to emit undefined
+     symbol entries, leading to linker errors (e.g., kernel _timens_data, __efistub_* symbols)
+   - Fix: Filter symbol_attrs in DCE pass to only emit visibility directives for referenced symbols
