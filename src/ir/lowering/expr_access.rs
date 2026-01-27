@@ -779,10 +779,15 @@ impl Lowerer {
         });
 
         let is_addr_type = match &field_ctype {
-            Some(ct) => Self::is_aggregate_or_complex(ct),
-            None => self.resolve_field_ctype(base_expr, field_name, is_pointer)
-                .map(|ct| Self::is_aggregate_or_complex(&ct))
-                .unwrap_or(false),
+            Some(ct) => {
+                Self::is_aggregate_or_complex(ct)
+            }
+            None => {
+                let resolved = self.resolve_field_ctype(base_expr, field_name, is_pointer);
+                resolved.as_ref()
+                    .map(|ct| Self::is_aggregate_or_complex(ct))
+                    .unwrap_or(false)
+            }
         };
         if is_addr_type {
             return Operand::Value(field_addr);
@@ -1067,3 +1072,4 @@ impl Lowerer {
         IrType::from_ctype(&ctype)
     }
 }
+

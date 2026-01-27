@@ -13,6 +13,7 @@
 //! `func_state.rs`, and type-system state in `frontend::sema::type_context`.
 
 use std::cell::RefCell;
+use std::mem::Discriminant;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::frontend::parser::ast::*;
 use crate::frontend::sema::{FunctionInfo, ExprTypeMap, ConstMap};
@@ -82,12 +83,13 @@ pub struct Lowerer {
     /// "strerror_r" -> "__xpg_strerror_r". Used to redirect calls/references at IR emission.
     pub(super) asm_label_map: FxHashMap<String, String>,
     /// Memoization cache for get_expr_ctype().
-    /// Maps AST Expr node addresses (as usize) to their resolved CType.
-    /// Avoids O(n²) re-traversal of nested struct member access chains
-    /// (e.g., `sdata->u.mgd.tdls_peer_del_work.work` re-resolves from the root
-    /// at each level without this cache). Uses RefCell for interior mutability
-    /// since get_expr_ctype takes &self.
-    pub(super) expr_ctype_cache: RefCell<FxHashMap<usize, Option<CType>>>,
+    /// Maps AST Expr node addresses (as usize) to their resolved CType plus
+    /// the Expr discriminant at insertion time. The discriminant is checked on
+    /// cache hit to detect address reuse (ABA): expressions inside TypeSpecifier
+    /// trees (typeof, _Generic) can share addresses with different Expr variants
+    /// in the main AST, so a stale hit from a prior discriminant must be treated
+    /// as a miss to avoid returning the wrong type.
+    pub(super) expr_ctype_cache: RefCell<FxHashMap<usize, (Discriminant<Expr>, Option<CType>)>>,
 }
 
 impl Lowerer {

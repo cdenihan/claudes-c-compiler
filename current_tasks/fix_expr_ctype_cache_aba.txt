@@ -10,4 +10,4 @@ macro, producing lea (address) instead of mov (load).
 Fix: Store Expr discriminant alongside cached value; validate on cache hit.
 Discriminant mismatch triggers recomputation instead of returning stale data.
 
-Status: in progress
+Status: completed

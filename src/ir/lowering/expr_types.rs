@@ -1288,10 +1288,18 @@ impl Lowerer {
     /// more precise types than sema's symbol-table-only inference.
     pub(super) fn get_expr_ctype(&self, expr: &Expr) -> Option<CType> {
         let key = expr as *const Expr as usize;
+        let disc = std::mem::discriminant(expr);
 
-        // Check memoization cache first
-        if let Some(cached) = self.expr_ctype_cache.borrow().get(&key) {
-            return cached.clone();
+        // Check memoization cache first.
+        // Validate discriminant to detect address reuse (ABA): expressions inside
+        // TypeSpecifier trees (typeof, _Generic) can share addresses with different
+        // Expr variants in the main AST after the TypeSpecifier is dropped.
+        if let Some((cached_disc, cached_val)) = self.expr_ctype_cache.borrow().get(&key) {
+            if *cached_disc == disc {
+                return cached_val.clone();
+            }
+            // Discriminant mismatch — address was reused by a different Expr variant.
+            // Fall through to recompute.
         }
 
         // Try lowerer-specific inference first
@@ -1309,7 +1317,7 @@ impl Lowerer {
         // locals have been lowered).  Caching None would poison later
         // resolve_typeof calls that need the now-in-scope variable.
         if result.is_some() {
-            self.expr_ctype_cache.borrow_mut().insert(key, result.clone());
+            self.expr_ctype_cache.borrow_mut().insert(key, (disc, result.clone()));
         }
         result
     }
@@ -1587,3 +1595,4 @@ impl Lowerer {
         }
     }
 }
+
