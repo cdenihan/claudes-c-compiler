@@ -171,6 +171,48 @@ pub fn allocate_registers(
                         eligible.insert(dest.0);
                     }
                 }
+                // Select produces its result via the standard accumulator path
+                // (cmov on x86, csel on ARM, branch on RISC-V) and stores via
+                // store_rax_to/store_t0_to. Eligible unless float/i128.
+                Instruction::Select { dest, ty, .. } => {
+                    if !ty.is_float() && !ty.is_long_double()
+                        && !matches!(ty, IrType::I128 | IrType::U128) {
+                        eligible.insert(dest.0);
+                    }
+                }
+                // GlobalAddr produces a pointer via LEA/adrp+add/la into the
+                // accumulator, then stores via store_rax_to/store_t0_to.
+                // Always a pointer type, so always eligible.
+                Instruction::GlobalAddr { dest, .. } => {
+                    eligible.insert(dest.0);
+                }
+                // LabelAddr produces a pointer via LEA/adrp+add/lla into the
+                // accumulator, then stores via store_rax_to/store_t0_to.
+                Instruction::LabelAddr { dest, .. } => {
+                    eligible.insert(dest.0);
+                }
+                // Atomic operations store their results via store_rax_to/store_t0_to.
+                // AtomicLoad loads a value from memory atomically.
+                Instruction::AtomicLoad { dest, ty, .. } => {
+                    if !ty.is_float() && !ty.is_long_double()
+                        && !matches!(ty, IrType::I128 | IrType::U128) {
+                        eligible.insert(dest.0);
+                    }
+                }
+                // AtomicRmw performs read-modify-write and returns old value.
+                Instruction::AtomicRmw { dest, ty, .. } => {
+                    if !ty.is_float() && !ty.is_long_double()
+                        && !matches!(ty, IrType::I128 | IrType::U128) {
+                        eligible.insert(dest.0);
+                    }
+                }
+                // AtomicCmpxchg returns old value or bool via accumulator.
+                Instruction::AtomicCmpxchg { dest, ty, .. } => {
+                    if !ty.is_float() && !ty.is_long_double()
+                        && !matches!(ty, IrType::I128 | IrType::U128) {
+                        eligible.insert(dest.0);
+                    }
+                }
                 _ => {}
             }
 

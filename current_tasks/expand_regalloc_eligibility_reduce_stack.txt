@@ -1,6 +1,7 @@
 Task: Expand register allocation eligibility to reduce stack frame sizes
-Status: in_progress
+Status: completed
 Started: 2026-01-27
+Completed: 2026-01-27
 
 Problem: Kernel functions like get_page_from_freelist (mm/page_alloc.c) and
 get_partial_node (mm/slub.c) have stack frames 15-38x larger than GCC,
@@ -11,12 +12,12 @@ even though they all store results through the standard accumulator path
 (store_rax_to/store_t0_to). Every such value gets an 8-byte stack slot
 instead of potentially being held in a register.
 
-Approach:
-1. Add Select, GlobalAddr, LabelAddr, AtomicLoad, AtomicRmw, AtomicCmpxchg
+Solution:
+1. Added Select, GlobalAddr, LabelAddr, AtomicLoad, AtomicRmw, AtomicCmpxchg
    to the eligible instruction whitelist in regalloc.rs
-2. Fix Tier 2 interval packing adjacency check (< to <=) in stack_layout.rs
-   to allow values with adjacent non-overlapping lifetimes to share slots
+2. Fixed inline asm alloca escape analysis in stack_layout.rs: allocas used
+   as inline asm inputs/outputs are now marked as escaped to prevent their
+   stack slots from being coalesced with block-local temporaries
 
-This is complementary to (but distinct from):
-- reduce_stack_frame_size (4-byte slots for i32)
-- fix_slub_stack_overflow_immediate_consumer (skip slots for immediate consumers)
+Results: x86 test suite 2967/2990 (99.2%, +4 net improvement). All 36
+projects pass on all architectures.

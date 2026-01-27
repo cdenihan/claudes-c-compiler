@@ -231,18 +231,26 @@ fn compute_coalescable_allocas(
                         }
                     }
                 }
-                // InlineAsm: outputs and memory-constraint inputs are uses of the alloca.
-                // The asm block reads/writes through the pointer during execution.
-                // However, if an alloca's address is used as an immediate/"i"
-                // constraint input, it could theoretically be embedded in code, but
-                // this is extremely rare for local allocas and we still coalesce
-                // only across blocks that never execute simultaneously.
+                // InlineAsm: alloca inputs are conservatively marked as escaped.
+                // Inline asm with register constraints ("=r", "r", tied "0"/"1"/etc.)
+                // can transfer an alloca's address into an output register, which may
+                // then be used in later blocks to read/write the alloca's memory.
+                // If the alloca were coalesced into a block-local pool (Tier 3), its
+                // stack space would be shared with temporaries from other blocks,
+                // corrupting the alloca's data when accessed through the output pointer.
+                //
+                // Example: `asm("" : "=r"(out) : "0"(arr))` makes out alias arr;
+                // later blocks reading *out would see corrupted data if arr's slot
+                // was reused. Marking as escaped gives the alloca a permanent Tier 1
+                // slot that persists across all blocks.
                 Instruction::InlineAsm { outputs, inputs, .. } => {
                     for (_, v, _) in outputs {
                         if alloca_set.contains(&v.0) {
+                            escaped.insert(v.0);
                             let blocks = alloca_use_blocks.entry(v.0).or_insert_with(Vec::new);
                             if blocks.last() != Some(&block_idx) { blocks.push(block_idx); }
                         } else if let Some(&root) = gep_to_alloca.get(&v.0) {
+                            escaped.insert(root);
                             let blocks = alloca_use_blocks.entry(root).or_insert_with(Vec::new);
                             if blocks.last() != Some(&block_idx) { blocks.push(block_idx); }
                         }
@@ -250,9 +258,11 @@ fn compute_coalescable_allocas(
                     for (_, op, _) in inputs {
                         if let Operand::Value(v) = op {
                             if alloca_set.contains(&v.0) {
+                                escaped.insert(v.0);
                                 let blocks = alloca_use_blocks.entry(v.0).or_insert_with(Vec::new);
                                 if blocks.last() != Some(&block_idx) { blocks.push(block_idx); }
                             } else if let Some(&root) = gep_to_alloca.get(&v.0) {
+                                escaped.insert(root);
                                 let blocks = alloca_use_blocks.entry(root).or_insert_with(Vec::new);
                                 if blocks.last() != Some(&block_idx) { blocks.push(block_idx); }
                             }
