@@ -466,8 +466,16 @@ impl Lowerer {
                     }
                 }
                 Initializer::List(items) => {
+                    // For arrays of pointers (e.g., `const struct S *ptrs[] = {&a, &b}`),
+                    // struct_layout refers to the pointee struct, NOT the array element.
+                    // Each element is a pointer, not a struct, so use plain item counting.
                     let actual_count = if let Some(ref layout) = da.struct_layout {
-                        self.compute_struct_array_init_count(items, layout)
+                        if da.is_array_of_pointers || da.is_array_of_func_ptrs {
+                            // Array of pointers: each init item is one pointer element
+                            self.compute_init_list_array_size_for_char_array(items, da.base_ty)
+                        } else {
+                            self.compute_struct_array_init_count(items, layout)
+                        }
                     } else {
                         self.compute_init_list_array_size_for_char_array(items, da.base_ty)
                     };
