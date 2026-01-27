@@ -2,7 +2,7 @@ use crate::ir::ir::*;
 use crate::common::types::IrType;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::backend::common::PtrDirective;
-use crate::backend::state::{CodegenState, StackSlot};
+use crate::backend::state::{CodegenState, StackSlot, SlotAddr};
 use crate::backend::traits::ArchCodegen;
 use crate::backend::generation::{generate_module, is_i128_type, calculate_stack_space_common, find_param_alloca};
 use crate::backend::call_abi::{CallAbiConfig, CallArgClass, compute_stack_arg_space};
@@ -19,7 +19,7 @@ const ARM_CALLEE_SAVED: [PhysReg; 9] = [
     PhysReg(25), PhysReg(26), PhysReg(27), PhysReg(28),
 ];
 
-fn callee_saved_name(reg: PhysReg) -> &'static str {
+pub(super) fn callee_saved_name(reg: PhysReg) -> &'static str {
     match reg.0 {
         19 => "x19", 20 => "x20", 21 => "x21", 22 => "x22", 23 => "x23", 24 => "x24",
         25 => "x25", 26 => "x26", 27 => "x27", 28 => "x28",
@@ -118,7 +118,7 @@ pub struct ArmCodegen {
     /// Scratch register index for inline asm FP register allocation
     pub(super) asm_fp_scratch_idx: usize,
     /// Register allocator: value ID -> physical callee-saved register.
-    reg_assignments: FxHashMap<u32, PhysReg>,
+    pub(super) reg_assignments: FxHashMap<u32, PhysReg>,
     /// Which callee-saved registers are actually used (for save/restore).
     pub(super) used_callee_saved: Vec<PhysReg>,
     /// SP offset where callee-saved registers are stored.
@@ -130,6 +130,12 @@ pub struct ArmCodegen {
     /// must not be used. Variadic prologues skip saving q0-q7 and va_start
     /// sets __vr_offs=0 (no FP register save area available).
     general_regs_only: bool,
+    /// Maps F128 load result value ID -> (source ID, byte offset, is_indirect).
+    /// Used for full-precision F128 reloads from original memory locations.
+    /// - For alloca sources: (alloca_id, offset, false) - data is at slot + offset.
+    /// - For pointer sources (GEP results): (ptr_id, 0, true) - slot holds a pointer.
+    /// - For cast results: (dest_id, 0, false) - data is in dest's own slot.
+    pub(super) f128_load_sources: FxHashMap<u32, (u32, i64, bool)>,
 }
 
 impl ArmCodegen {
@@ -150,6 +156,7 @@ impl ArmCodegen {
             callee_save_offset: 0,
             frame_base_offset: None,
             general_regs_only: false,
+            f128_load_sources: FxHashMap::default(),
         }
     }
 
@@ -789,7 +796,7 @@ impl ArmCodegen {
 
     /// Load an immediate into a register using the most efficient sequence.
     /// Handles all 64-bit values including negatives via MOVZ/MOVK or MOVN/MOVK.
-    fn load_large_imm(&mut self, reg: &str, val: i64) {
+    pub(super) fn load_large_imm(&mut self, reg: &str, val: i64) {
         self.emit_load_imm64(reg, val);
     }
 
@@ -984,7 +991,7 @@ impl ArmCodegen {
     }
 
     /// Store x0 to a value's destination (register or stack slot).
-    fn store_x0_to(&mut self, dest: &Value) {
+    pub(super) fn store_x0_to(&mut self, dest: &Value) {
         if let Some(&reg) = self.reg_assignments.get(&dest.0) {
             // Value has a callee-saved register: store only to register, skip stack.
             let reg_name = callee_saved_name(reg);
@@ -1252,6 +1259,7 @@ impl ArchCodegen for ArmCodegen {
             func, available_regs, Vec::new(), &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
         );
+        self.f128_load_sources.clear();
 
         let mut space = calculate_stack_space_common(&mut self.state, func, 16, |space, alloc_size, align| {
             // ARM uses positive offsets from sp, starting at 16 (after fp/lr)
@@ -1460,24 +1468,29 @@ impl ArchCodegen for ArmCodegen {
                 self.emit_store_to_sp("x0", slot.0 + 128, "str");
             }
 
-            // Process F128 FP reg params: load from save area, call __trunctfdf2.
+            // Process F128 FP reg params: store full 16-byte f128, then f64 approx.
             for (i, _param) in func.params.iter().enumerate() {
                 let reg_idx = match param_classes[i] {
                     ParamClass::F128FpReg { reg_idx } => reg_idx,
                     _ => continue,
                 };
-                let slot = match find_param_alloca(func, i) {
+                let (slot, dest_val) = match find_param_alloca(func, i) {
                     Some((dest, _)) => match self.state.get_slot(dest.0) {
-                        Some(slot) => slot,
+                        Some(slot) => (slot, dest),
                         None => continue,
                     },
                     None => continue,
                 };
                 let fp_reg_off = (reg_idx * 16) as i64;
+                // Store full 16-byte f128 to the alloca slot (adjusted for saved Q area).
                 self.state.emit_fmt(format_args!("    ldr q0, [sp, #{}]", fp_reg_off));
+                self.emit_store_to_sp("q0", slot.0 + 128, "str");
+                // Track the alloca as having full f128 data.
+                self.f128_load_sources.insert(dest_val.0, (dest_val.0, 0, false));
+                // Also produce f64 approx in x0 for register-based access.
                 self.state.emit("    bl __trunctfdf2");
                 self.state.emit("    fmov x0, d0");
-                self.emit_store_to_sp("x0", slot.0 + 128, "str");
+                // Don't store f64 to slot -- it would overwrite the full f128.
             }
 
             self.emit_add_sp(128);
@@ -1509,9 +1522,9 @@ impl ArchCodegen for ArmCodegen {
             let class = param_classes[i];
             if !class.is_stack() { continue; }
 
-            let (slot, ty) = match find_param_alloca(func, i) {
+            let (slot, ty, dest_val) = match find_param_alloca(func, i) {
                 Some((dest, ty)) => match self.state.get_slot(dest.0) {
-                    Some(slot) => (slot, ty),
+                    Some(slot) => (slot, ty, dest),
                     None => continue,
                 },
                 None => continue,
@@ -1529,14 +1542,14 @@ impl ArchCodegen for ArmCodegen {
                     }
                 }
                 ParamClass::F128Stack { offset } => {
+                    // Copy full 16-byte f128 from caller's stack to our alloca slot.
                     let caller_offset = frame_size + offset;
                     self.emit_load_from_sp("x0", caller_offset, "ldr");
-                    self.emit_load_from_sp("x1", caller_offset + 8, "ldr");
-                    self.state.emit("    fmov d0, x0");
-                    self.state.emit("    mov v0.d[1], x1");
-                    self.state.emit("    bl __trunctfdf2");
-                    self.state.emit("    fmov x0, d0");
                     self.emit_store_to_sp("x0", slot.0, "str");
+                    self.emit_load_from_sp("x0", caller_offset + 8, "ldr");
+                    self.emit_store_to_sp("x0", slot.0 + 8, "str");
+                    // Track the alloca as having full f128 data.
+                    self.f128_load_sources.insert(dest_val.0, (dest_val.0, 0, false));
                 }
                 ParamClass::I128Stack { offset } => {
                     let caller_offset = frame_size + offset;
@@ -1644,9 +1657,26 @@ impl ArchCodegen for ArmCodegen {
     }
 
     fn emit_return_f128_to_reg(&mut self) {
-        // F128 return: convert f64 bit pattern in x0 to f128 in q0 via __extenddftf2.
+        // F128 return: convert f64 bit pattern in x0 to f128 in q0.
+        // This is the fallback for when we don't have a tracked f128 source.
         self.state.emit("    fmov d0, x0");
         self.state.emit("    bl __extenddftf2");
+    }
+
+    /// Override emit_return for F128: load full f128 from tracked source if available.
+    fn emit_return(&mut self, val: Option<&Operand>, frame_size: i64) {
+        if let Some(val) = val {
+            let ret_ty = self.current_return_type();
+            if ret_ty.is_long_double() {
+                // Try full-precision path.
+                self.emit_f128_operand_to_q0_full(val);
+                // Q0 now has the full f128 for the return value.
+                self.emit_epilogue_and_ret(frame_size);
+                return;
+            }
+        }
+        // For all non-F128 return types, use the default implementation.
+        crate::backend::traits::emit_return_default(self, val, frame_size);
     }
 
     fn emit_return_f32_to_reg(&mut self) {
@@ -2142,23 +2172,18 @@ impl ArchCodegen for ArmCodegen {
     }
 
     fn emit_f128_cmp(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand) {
-        // F128 comparison via soft-float libcalls.
-        // AArch64 has no hardware quad-precision; we must call __eqtf2/__letf2/etc.
-        //
-        // We need to load both LHS and RHS f128 values, but loading each may
-        // involve calls (e.g., __extenddftf2) that clobber Q registers.
-        // Strategy: sub sp for temp space, but force x29-relative slot access
-        // (since x29 = fp is stable) so sp changes don't break slot offsets.
+        // F128 comparison via soft-float libcalls with full precision.
+        // Uses emit_f128_operand_to_q0_full for full 16-byte f128 operands.
         let saved_dyn_alloca = self.state.has_dyn_alloca;
         self.state.has_dyn_alloca = true; // Force x29-relative addressing
 
         // Step 1: Load LHS f128 into Q0, save to stack temp (16 bytes).
         self.emit_sub_sp(16);
-        self.emit_f128_operand_to_q0(lhs);
+        self.emit_f128_operand_to_q0_full(lhs);
         self.state.emit("    str q0, [sp]");
 
         // Step 2: Load RHS f128 into Q0, move to Q1.
-        self.emit_f128_operand_to_q0(rhs);
+        self.emit_f128_operand_to_q0_full(rhs);
         self.state.emit("    mov v1.16b, v0.16b");
 
         // Step 3: Load saved LHS f128 from stack temp into Q0.
@@ -2169,7 +2194,6 @@ impl ArchCodegen for ArmCodegen {
         self.state.has_dyn_alloca = saved_dyn_alloca;
 
         // Step 4: Call the appropriate comparison libcall and map result to boolean.
-        // All __*tf2 functions take f128 in Q0 (lhs) and Q1 (rhs), return int in W0.
         use crate::backend::cast::{f128_cmp_libcall, F128CmpKind};
         let (libcall, kind) = f128_cmp_libcall(op);
         self.state.emit_fmt(format_args!("    bl {}", libcall));
@@ -2886,8 +2910,293 @@ impl ArchCodegen for ArmCodegen {
         }
     }
 
-    // emit_cast: uses default implementation from ArchCodegen trait (handles i128 via primitives)
-    // TODO: Override emit_cast for F128 precision fix (same approach as RISC-V)
+    /// Override emit_store for F128: store full 16-byte IEEE binary128.
+    fn emit_store(&mut self, val: &Operand, ptr: &Value, ty: IrType) {
+        if ty == IrType::F128 {
+            // Handle register-only pointer values.
+            if let Some(&reg) = self.reg_assignments.get(&ptr.0) {
+                let reg_name = callee_saved_name(reg);
+                self.state.emit_fmt(format_args!("    mov x17, {}", reg_name));
+                self.emit_f128_store_to_addr_in_x17(val);
+                return;
+            }
+            let addr = self.state.resolve_slot_addr(ptr.0);
+            if let Some(addr) = addr {
+                match addr {
+                    SlotAddr::Direct(slot) => {
+                        self.emit_f128_store_to_slot(val, slot);
+                    }
+                    SlotAddr::OverAligned(slot, id) => {
+                        self.emit_alloca_aligned_addr(slot, id);
+                        self.emit_f128_store_to_addr_in_x17(val);
+                    }
+                    SlotAddr::Indirect(slot) => {
+                        self.emit_load_from_sp("x17", slot.0, "ldr");
+                        self.emit_f128_store_to_addr_in_x17(val);
+                    }
+                }
+            }
+            return;
+        }
+        crate::backend::traits::emit_store_default(self, val, ptr, ty);
+    }
+
+    /// Override emit_load for F128: load full 16 bytes from source, convert to f64
+    /// in x0 for normal data flow, and track source for full-precision reload.
+    fn emit_load(&mut self, dest: &Value, ptr: &Value, ty: IrType) {
+        if ty == IrType::F128 {
+            // Track source alloca for full-precision reload when needed
+            // (comparisons, casts, stores back to memory).
+            let is_indirect = !self.state.is_alloca(ptr.0);
+            self.f128_load_sources.insert(dest.0, (ptr.0, 0, is_indirect));
+
+            // For register-only pointer values, load via the register directly.
+            if let Some(&reg) = self.reg_assignments.get(&ptr.0) {
+                let reg_name = callee_saved_name(reg);
+                self.state.emit_fmt(format_args!("    mov x17, {}", reg_name));
+                self.state.emit("    ldr q0, [x17]");
+            } else {
+                let addr = self.state.resolve_slot_addr(ptr.0);
+                if let Some(addr) = addr {
+                    match addr {
+                        SlotAddr::Direct(slot) => {
+                            self.emit_load_from_sp("q0", slot.0, "ldr");
+                        }
+                        SlotAddr::OverAligned(slot, id) => {
+                            self.emit_alloca_aligned_addr(slot, id);
+                            self.state.emit("    ldr q0, [x17]");
+                        }
+                        SlotAddr::Indirect(slot) => {
+                            self.emit_load_from_sp("x17", slot.0, "ldr");
+                            self.state.emit("    ldr q0, [x17]");
+                        }
+                    }
+                } else {
+                    // No slot, no register: can't load. Use default.
+                    crate::backend::traits::emit_load_default(self, dest, ptr, ty);
+                    return;
+                }
+            }
+            // Convert f128 to f64 in x0 for register-based data flow.
+            self.state.emit("    bl __trunctfdf2");
+            self.state.emit("    fmov x0, d0");
+            self.state.reg_cache.invalidate_all();
+            self.store_x0_to(dest);
+            return;
+        }
+        crate::backend::traits::emit_load_default(self, dest, ptr, ty);
+    }
+
+    /// Override emit_store_with_const_offset for F128: store full 16 bytes at offset.
+    fn emit_store_with_const_offset(&mut self, val: &Operand, base: &Value, offset: i64, ty: IrType) {
+        if ty == IrType::F128 {
+            let addr = self.state.resolve_slot_addr(base.0);
+            if let Some(addr) = addr {
+                match addr {
+                    SlotAddr::Direct(slot) => {
+                        let folded_slot = StackSlot(slot.0 + offset);
+                        self.emit_f128_store_to_slot(val, folded_slot);
+                    }
+                    SlotAddr::OverAligned(slot, id) => {
+                        self.emit_alloca_aligned_addr(slot, id);
+                        self.emit_add_offset_to_addr_reg(offset);
+                        self.emit_f128_store_to_addr_in_x17(val);
+                    }
+                    SlotAddr::Indirect(slot) => {
+                        self.emit_load_from_sp("x17", slot.0, "ldr");
+                        if offset != 0 {
+                            self.emit_add_offset_to_addr_reg(offset);
+                        }
+                        self.emit_f128_store_to_addr_in_x17(val);
+                    }
+                }
+            }
+            return;
+        }
+        // For non-F128, use default path.
+        self.emit_load_operand(val);
+        let addr = self.state_ref().resolve_slot_addr(base.0);
+        if let Some(addr) = addr {
+            let store_instr = self.store_instr_for_type(ty);
+            match addr {
+                SlotAddr::OverAligned(slot, id) => {
+                    self.emit_save_acc();
+                    self.emit_alloca_aligned_addr(slot, id);
+                    self.emit_add_offset_to_addr_reg(offset);
+                    self.emit_typed_store_indirect(store_instr, ty);
+                }
+                SlotAddr::Direct(slot) => {
+                    let folded_slot = StackSlot(slot.0 + offset);
+                    self.emit_typed_store_to_slot(store_instr, ty, folded_slot);
+                }
+                SlotAddr::Indirect(slot) => {
+                    self.emit_save_acc();
+                    self.emit_load_ptr_from_slot(slot, base.0);
+                    if offset != 0 {
+                        self.emit_add_offset_to_addr_reg(offset);
+                    }
+                    self.emit_typed_store_indirect(store_instr, ty);
+                }
+            }
+        }
+    }
+
+    /// Override emit_load_with_const_offset for F128: load full 16 bytes at offset.
+    fn emit_load_with_const_offset(&mut self, dest: &Value, base: &Value, offset: i64, ty: IrType) {
+        if ty == IrType::F128 {
+            // Track source for full-precision reload.
+            self.f128_load_sources.insert(dest.0, (base.0, offset, false));
+
+            let addr = self.state.resolve_slot_addr(base.0);
+            if let Some(addr) = addr {
+                match addr {
+                    SlotAddr::Direct(slot) => {
+                        let folded_slot = StackSlot(slot.0 + offset);
+                        self.emit_load_from_sp("q0", folded_slot.0, "ldr");
+                    }
+                    SlotAddr::OverAligned(slot, id) => {
+                        self.emit_alloca_aligned_addr(slot, id);
+                        self.emit_add_offset_to_addr_reg(offset);
+                        self.state.emit("    ldr q0, [x17]");
+                    }
+                    SlotAddr::Indirect(slot) => {
+                        self.emit_load_from_sp("x17", slot.0, "ldr");
+                        if offset != 0 {
+                            self.emit_add_offset_to_addr_reg(offset);
+                        }
+                        self.state.emit("    ldr q0, [x17]");
+                    }
+                }
+                // Convert f128 to f64 in x0 for register-based data flow.
+                // Full f128 stays in source alloca, accessible via f128_load_sources.
+                self.state.emit("    bl __trunctfdf2");
+                self.state.emit("    fmov x0, d0");
+                self.state.reg_cache.invalidate_all();
+                self.store_x0_to(dest);
+            }
+            return;
+        }
+        // Default path for non-F128 types.
+        let addr = self.state_ref().resolve_slot_addr(base.0);
+        if let Some(addr) = addr {
+            let load_instr = self.load_instr_for_type(ty);
+            match addr {
+                SlotAddr::OverAligned(slot, id) => {
+                    self.emit_alloca_aligned_addr(slot, id);
+                    self.emit_add_offset_to_addr_reg(offset);
+                    self.emit_typed_load_indirect(load_instr);
+                }
+                SlotAddr::Direct(slot) => {
+                    let folded_slot = StackSlot(slot.0 + offset);
+                    self.emit_typed_load_from_slot(load_instr, folded_slot);
+                }
+                SlotAddr::Indirect(slot) => {
+                    self.emit_load_ptr_from_slot(slot, base.0);
+                    if offset != 0 {
+                        self.emit_add_offset_to_addr_reg(offset);
+                    }
+                    self.emit_typed_load_indirect(load_instr);
+                }
+            }
+            self.emit_store_result(dest);
+        }
+    }
+
+    /// Override emit_cast for F128: use soft-float libcalls for full precision.
+    fn emit_cast(&mut self, dest: &Value, src: &Operand, from_ty: IrType, to_ty: IrType) {
+        // Intercept casts TO F128 from integer types.
+        if to_ty == IrType::F128 && !from_ty.is_float() && !is_i128_type(from_ty) {
+            // Load source integer into x0.
+            self.operand_to_x0(src);
+            // Sign/zero extend sub-64-bit integers.
+            if from_ty.is_signed() {
+                match from_ty.size() {
+                    1 => self.state.emit("    sxtb x0, w0"),
+                    2 => self.state.emit("    sxth x0, w0"),
+                    4 => self.state.emit("    sxtw x0, w0"),
+                    _ => {}
+                }
+                // Call __floatditf: i64 in x0 -> f128 in q0.
+                self.state.emit("    bl __floatditf");
+            } else {
+                match from_ty.size() {
+                    1 => self.state.emit("    and x0, x0, #0xff"),
+                    2 => self.state.emit("    and x0, x0, #0xffff"),
+                    4 => self.state.emit("    mov w0, w0"), // zero-extend w->x
+                    _ => {}
+                }
+                // Call __floatunditf: u64 in x0 -> f128 in q0.
+                self.state.emit("    bl __floatunditf");
+            }
+            // Result f128 is in Q0.
+            // Convert to f64 and store normally. Full precision is not preserved
+            // for cast results (no source alloca to track); when f128 is later
+            // needed, __extenddftf2 will reconstruct from the f64.
+            self.state.emit("    bl __trunctfdf2");
+            self.state.emit("    fmov x0, d0");
+            self.state.reg_cache.invalidate_all();
+            self.store_x0_to(dest);
+            return;
+        }
+
+        // Intercept casts FROM F128 to integer types.
+        if from_ty == IrType::F128 && !to_ty.is_float() && !is_i128_type(to_ty) {
+            // Load full f128 into Q0.
+            self.emit_f128_operand_to_q0_full(src);
+            // Call appropriate soft-float conversion.
+            if to_ty.is_unsigned() || to_ty == IrType::Ptr {
+                self.state.emit("    bl __fixunstfdi");
+            } else {
+                self.state.emit("    bl __fixtfdi");
+            }
+            // Result in x0.
+            self.state.reg_cache.invalidate_all();
+            // Narrow if needed.
+            if to_ty.size() < 8 {
+                self.emit_cast_instrs(IrType::I64, to_ty);
+            }
+            self.store_x0_to(dest);
+            return;
+        }
+
+        // Intercept F128 <-> float casts.
+        if to_ty == IrType::F128 && from_ty.is_float() {
+            // float/double -> F128
+            self.operand_to_x0(src);
+            if from_ty == IrType::F32 {
+                self.state.emit("    fmov s0, w0");
+                self.state.emit("    bl __extendsftf2");
+            } else {
+                // F64 or F128
+                self.state.emit("    fmov d0, x0");
+                self.state.emit("    bl __extenddftf2");
+            }
+            // Result f128 in Q0. Convert to f64 and store normally.
+            self.state.emit("    bl __trunctfdf2");
+            self.state.emit("    fmov x0, d0");
+            self.state.reg_cache.invalidate_all();
+            self.store_x0_to(dest);
+            return;
+        }
+
+        if from_ty == IrType::F128 && to_ty.is_float() {
+            // F128 -> float/double
+            self.emit_f128_operand_to_q0_full(src);
+            if to_ty == IrType::F32 {
+                self.state.emit("    bl __trunctfsf2");
+                self.state.emit("    fmov w0, s0");
+            } else {
+                self.state.emit("    bl __trunctfdf2");
+                self.state.emit("    fmov x0, d0");
+            }
+            self.state.reg_cache.invalidate_all();
+            self.store_x0_to(dest);
+            return;
+        }
+
+        // For all other casts, use the default implementation.
+        crate::backend::traits::emit_cast_default(self, dest, src, from_ty, to_ty);
+    }
 
     fn emit_va_arg(&mut self, dest: &Value, va_list_ptr: &Value, result_ty: IrType) {
         // AArch64 AAPCS64 va_arg implementation.
@@ -2917,7 +3226,7 @@ impl ArchCodegen for ArmCodegen {
 
         if is_f128 {
             // F128 (long double) on AArch64: passed in Q registers, accessed via VR save area.
-            // Same path as F32/F64 but reads 16 bytes (one Q register slot).
+            // Full 16-byte f128 is loaded and stored to dest slot for precision.
             let label_id = self.state.next_label_id();
             let label_stack = format!(".Lva_stack_{}", label_id);
             let label_done = format!(".Lva_done_{}", label_id);
@@ -2931,9 +3240,7 @@ impl ArchCodegen for ArmCodegen {
             // Advance __vr_offs by 16 (one Q register slot)
             self.state.emit("    add w2, w2, #16");
             self.state.emit("    str w2, [x1, #28]");
-            // Load the f128 value from save area and convert to f64
-            // Save x1 (va_list ptr) since __trunctfdf2 may clobber it
-            self.state.emit("    mov x4, x1");
+            // Load f128, convert to f64 approximation.
             self.state.emit("    ldr q0, [x3]");           // load f128 into q0
             self.state.emit("    bl __trunctfdf2");         // q0 -> d0
             self.state.emit("    fmov x0, d0");
@@ -2955,6 +3262,7 @@ impl ArchCodegen for ArmCodegen {
             self.state.emit("    fmov x0, d0");
 
             self.state.emit_fmt(format_args!("{}:", label_done));
+            self.state.reg_cache.invalidate_all();
         } else if is_fp {
             let label_id = self.state.next_label_id();
             let label_stack = format!(".Lva_stack_{}", label_id);
@@ -3372,9 +3680,26 @@ impl ArchCodegen for ArmCodegen {
 
     // ---- Float binop primitives ----
 
+    /// Override emit_float_binop for F128: use full-precision soft-float path
+    /// that stores the full 16-byte f128 result to the dest slot.
+    fn emit_float_binop(&mut self, dest: &Value, op: crate::backend::cast::FloatOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
+        if ty == IrType::F128 {
+            let mnemonic = self.emit_float_binop_mnemonic(op);
+            self.emit_f128_binop_softfloat_full(mnemonic, dest, lhs, rhs);
+            return;
+        }
+        // Non-F128: use default path.
+        let mnemonic = self.emit_float_binop_mnemonic(op);
+        self.emit_load_operand(lhs);
+        self.emit_acc_to_secondary();
+        self.emit_load_operand(rhs);
+        self.emit_float_binop_impl(mnemonic, ty);
+        self.emit_store_result(dest);
+    }
+
     fn emit_float_binop_impl(&mut self, mnemonic: &str, ty: IrType) {
         if ty == IrType::F128 {
-            // F128: use soft-float library calls for full quad-precision arithmetic.
+            // Fallback for old path (should not be reached for F128 due to override above).
             self.emit_f128_binop_softfloat(mnemonic);
             return;
         }

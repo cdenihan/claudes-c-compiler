@@ -1189,7 +1189,7 @@ impl Lowerer {
         let mut bytes = Vec::with_capacity(size);
         if self.is_x86() {
             val.push_le_bytes_x86(&mut bytes, size);
-        } else if self.is_riscv() {
+        } else if self.is_riscv() || self.is_arm() {
             val.push_le_bytes_riscv(&mut bytes, size);
         } else {
             val.push_le_bytes(&mut bytes, size);
@@ -1206,7 +1206,7 @@ impl Lowerer {
         let mut le_buf = Vec::with_capacity(size);
         if self.is_x86() {
             coerced.push_le_bytes_x86(&mut le_buf, size);
-        } else if self.is_riscv() {
+        } else if self.is_riscv() || self.is_arm() {
             coerced.push_le_bytes_riscv(&mut le_buf, size);
         } else {
             coerced.push_le_bytes(&mut le_buf, size);

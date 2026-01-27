@@ -295,18 +295,6 @@ impl ArmCodegen {
     //   Conversion: __extenddftf2 (f64->f128), __trunctfdf2 (f128->f64)
     // ABI: f128 passed/returned in Q registers (q0, q1). Int result in w0/x0.
 
-    /// Load an F128 operand into Q0 via f64->f128 conversion.
-    /// Since ARM F128 values are stored internally as f64 approximations (the
-    /// backend doesn't store full 16-byte f128 in allocas), we consistently use
-    /// __extenddftf2 to convert the f64 to f128 for both values and constants.
-    /// This ensures that `x == 1.2L` works correctly when x was stored as f64.
-    pub(super) fn emit_f128_operand_to_q0(&mut self, op: &Operand) {
-        // Load the f64 approximation into x0, then convert to f128 via __extenddftf2.
-        self.operand_to_x0(op);
-        self.state.emit("    fmov d0, x0");
-        self.state.emit("    bl __extenddftf2");
-    }
-
     /// Emit F128 arithmetic via soft-float libcalls.
     /// Called from emit_float_binop_impl when ty == F128.
     /// At entry: x1 = lhs f64 bits, x0 = rhs f64 bits (from shared float binop dispatch).
