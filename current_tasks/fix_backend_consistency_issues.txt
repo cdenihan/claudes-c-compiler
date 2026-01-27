@@ -1,0 +1,16 @@
+Status: in_progress (Started: 2026-01-27)
+
+Goal: Fix several inconsistencies between x86, ARM, and RISC-V backends that were
+identified by systematic comparison of the three codegen implementations.
+
+Fixes:
+1. Missing cg.set_pic(opts.pic) in generate_assembly_with_opts_and_debug for ARM and RISC-V.
+   When debug info is requested (-g), PIC mode is silently ignored on these backends.
+
+2. Missing emit_label_addr override on ARM and RISC-V. Labels (from computed gotos)
+   are always local, but without an override they fall through to emit_global_addr
+   which may use GOT indirection in PIC mode (unnecessary overhead).
+
+3. Missing emit_return override on RISC-V for F128 (long double). The default path
+   loads an f64 approximation and extends via __extenddftf2, losing precision.
+   RISC-V already has emit_f128_operand_to_a0_a1 which preserves full precision.
