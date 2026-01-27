@@ -4,6 +4,7 @@
 /// It includes helpers for binary operations, subscript, function call return types,
 /// `_Generic` selections, `sizeof` computation, and CType-level expression type resolution.
 
+use crate::common::fx_hash::FxHashMap;
 use crate::frontend::parser::ast::*;
 use crate::ir::ir::*;
 use crate::common::types::{AddressSpace, CType, IrType};
@@ -1274,8 +1275,14 @@ impl Lowerer {
             self.lookup_sema_expr_type(expr)
         };
 
-        // Cache the result (including None, to avoid re-computation)
-        self.expr_ctype_cache.borrow_mut().insert(key, result.clone());
+        // Cache positive results only. We must NOT cache None results because
+        // expression type resolution depends on which locals are in scope, and
+        // locals change as declarations are lowered. An expression that fails
+        // to resolve during pre-lowering type checks (e.g., typeof(*ptr) where
+        // ptr hasn't been lowered yet) may succeed later when ptr is in locals.
+        if result.is_some() {
+            self.expr_ctype_cache.borrow_mut().insert(key, result.clone());
+        }
         result
     }
 
@@ -1444,20 +1451,109 @@ impl Lowerer {
                         // If the last expr is an identifier not in lowerer locals
                         // (e.g., inside typeof where the stmt expr was never lowered),
                         // resolve it from declarations within this compound statement.
+                        // We must resolve declarations in order because later declarations
+                        // may use typeof() referencing earlier declarations (e.g., the
+                        // kernel's xchg macro: typeof(&field) ptr = ...; __typeof__(*ptr) ret = ...;)
                         if let Expr::Identifier(name, _) = expr {
-                            for item in &compound.items {
-                                if let BlockItem::Declaration(decl) = item {
-                                    for declarator in &decl.declarators {
-                                        if declarator.name == *name {
-                                            return Some(self.build_full_ctype(&decl.type_spec, &declarator.derived));
-                                        }
-                                    }
-                                }
-                            }
+                            return self.resolve_var_type_from_compound(compound, name);
                         }
                     }
                 }
                 None
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolve the CType of a variable declared within a compound statement.
+    ///
+    /// When a statement expression's type depends on declarations inside it
+    /// (e.g., `({ typeof(&s->field) p = ...; __typeof__(*p) ret = ...; ret; })`),
+    /// the normal `build_full_ctype` can't resolve typeof expressions that reference
+    /// variables from the same compound statement (they aren't in lowerer locals).
+    ///
+    /// This method scans declarations in order, building a local scope so that
+    /// later typeof references can resolve against earlier declarations.
+    fn resolve_var_type_from_compound(&self, compound: &CompoundStmt, target_name: &str) -> Option<CType> {
+        let mut local_scope: FxHashMap<String, CType> = FxHashMap::default();
+
+        for item in &compound.items {
+            if let BlockItem::Declaration(decl) = item {
+                for declarator in &decl.declarators {
+                    if declarator.name.is_empty() {
+                        continue;
+                    }
+                    // Resolve this declaration's type, using the local_scope
+                    // for typeof expressions that reference earlier declarations.
+                    let resolved_ts = self.resolve_typeof_with_scope(&decl.type_spec, &local_scope);
+                    let ctype = self.build_full_ctype(&resolved_ts, &declarator.derived);
+
+                    if declarator.name == target_name {
+                        return Some(ctype);
+                    }
+                    local_scope.insert(declarator.name.clone(), ctype);
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve a TypeSpecifier by replacing Typeof nodes with concrete type specs,
+    /// using both the normal expression type resolution and a supplementary scope
+    /// of resolved variable types from within a compound statement.
+    fn resolve_typeof_with_scope(&self, ts: &TypeSpecifier, scope: &FxHashMap<String, CType>) -> TypeSpecifier {
+        match ts {
+            TypeSpecifier::Typeof(expr) => {
+                // Try normal resolution first
+                if let Some(ctype) = self.get_expr_ctype(expr) {
+                    return Self::ctype_to_type_spec(&ctype);
+                }
+                // Try resolving using the supplementary scope
+                if let Some(ctype) = self.get_expr_ctype_with_scope(expr, scope) {
+                    return Self::ctype_to_type_spec(&ctype);
+                }
+                // TODO: report diagnostic for unresolved typeof expression
+                TypeSpecifier::Int // ultimate fallback
+            }
+            TypeSpecifier::TypeofType(inner) => {
+                self.resolve_typeof_with_scope(inner, scope)
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// Resolve an expression's CType using a supplementary scope for identifiers.
+    /// This handles the common typeof patterns (identifier, deref, address-of, cast)
+    /// where the identifier is declared in the same compound statement.
+    /// More complex expressions (member access, subscript, etc.) are not supported.
+    fn get_expr_ctype_with_scope(&self, expr: &Expr, scope: &FxHashMap<String, CType>) -> Option<CType> {
+        match expr {
+            Expr::Identifier(name, _) => {
+                scope.get(name.as_str()).cloned()
+            }
+            Expr::Deref(inner, _) => {
+                if let Some(inner_ct) = self.get_expr_ctype(inner)
+                    .or_else(|| self.get_expr_ctype_with_scope(inner, scope))
+                {
+                    match inner_ct {
+                        CType::Pointer(pointee, _) => return Some(*pointee),
+                        CType::Array(elem, _) => return Some(*elem),
+                        _ => {}
+                    }
+                }
+                None
+            }
+            Expr::AddressOf(inner, _) => {
+                if let Some(inner_ct) = self.get_expr_ctype(inner)
+                    .or_else(|| self.get_expr_ctype_with_scope(inner, scope))
+                {
+                    return Some(CType::Pointer(Box::new(inner_ct), AddressSpace::Default));
+                }
+                None
+            }
+            Expr::Cast(type_spec, _, _) => {
+                // typeof((type)expr) = type
+                Some(self.type_spec_to_ctype(type_spec))
             }
             _ => None,
         }
