@@ -1,15 +1,15 @@
 use crate::ir::ir::*;
 use crate::common::types::IrType;
-use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::fx_hash::FxHashMap;
 use crate::backend::common::PtrDirective;
 use crate::backend::state::{CodegenState, StackSlot, SlotAddr};
 use crate::backend::traits::ArchCodegen;
 use crate::backend::generation::{generate_module, is_i128_type, calculate_stack_space_common, find_param_alloca};
 use crate::backend::call_abi::{CallAbiConfig, CallArgClass, compute_stack_arg_space};
 use crate::backend::call_emit::{ParamClass, classify_params};
-use crate::backend::cast::{CastKind, classify_cast, FloatOp};
+use crate::backend::cast::{CastKind, classify_cast};
 use crate::backend::inline_asm::emit_inline_asm_common;
-use crate::backend::regalloc::{self, PhysReg, RegAllocConfig};
+use crate::backend::regalloc::PhysReg;
 use super::asm_emitter::ARM_GP_SCRATCH;
 
 /// Callee-saved registers available for register allocation: x20-x28.

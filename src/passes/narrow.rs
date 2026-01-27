@@ -38,7 +38,6 @@ pub fn run(module: &mut IrModule) -> usize {
 struct CastInfo {
     src: Operand,
     from_ty: IrType,
-    to_ty: IrType,
 }
 
 /// Information about a BinOp instruction.
@@ -86,7 +85,6 @@ pub(crate) fn narrow_function(func: &mut IrFunction) -> usize {
                         widen_map[id] = Some(CastInfo {
                             src: *src,
                             from_ty: *from_ty,
-                            to_ty: *to_ty,
                         });
                     }
                 }

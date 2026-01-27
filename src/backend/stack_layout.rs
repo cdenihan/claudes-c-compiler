@@ -32,7 +32,7 @@ use super::liveness::{
 fn compute_value_use_blocks(func: &IrFunction) -> FxHashMap<u32, Vec<usize>> {
     let mut uses: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
 
-    let mut record_use = |id: u32, block_idx: usize, uses: &mut FxHashMap<u32, Vec<usize>>| {
+    let record_use = |id: u32, block_idx: usize, uses: &mut FxHashMap<u32, Vec<usize>>| {
         let blocks = uses.entry(id).or_insert_with(Vec::new);
         if blocks.last() != Some(&block_idx) {
             blocks.push(block_idx);

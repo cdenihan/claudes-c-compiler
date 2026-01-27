@@ -119,7 +119,7 @@ fn try_fold_with_map(inst: &Instruction, const_map: &[Option<ConstMapEntry>]) ->
                 let rc = resolve_const(rhs, const_map)?;
                 let l = lc.to_i128()?;
                 let r = rc.to_i128()?;
-                let result = fold_binop_i128(*op, l, r, ty.is_unsigned())?;
+                let result = fold_binop_i128(*op, l, r)?;
                 return Some(Instruction::Copy {
                     dest: *dest,
                     src: Operand::Const(IrConst::I128(result)),
@@ -566,7 +566,7 @@ fn try_fold_float_cast_mapped(dest: Value, src: &Operand, from_ty: IrType, to_ty
 
 /// Evaluate a binary operation on two constant 128-bit integers.
 /// Uses native Rust i128/u128 arithmetic for full precision.
-fn fold_binop_i128(op: IrBinOp, lhs: i128, rhs: i128, is_unsigned: bool) -> Option<i128> {
+fn fold_binop_i128(op: IrBinOp, lhs: i128, rhs: i128) -> Option<i128> {
     Some(match op {
         IrBinOp::Add => lhs.wrapping_add(rhs),
         IrBinOp::Sub => lhs.wrapping_sub(rhs),

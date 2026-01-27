@@ -1040,7 +1040,6 @@ impl Parser {
                 // Fallback for empty struct/union or tag-only (no fields available)
                 if align == 0 { 8 } else { align }
             }
-            TypeSpecifier::Union(..) => 8,
             TypeSpecifier::Enum(_, _, _) => 4,
             TypeSpecifier::TypedefName(_) => 8, // conservative default
             _ => 8,

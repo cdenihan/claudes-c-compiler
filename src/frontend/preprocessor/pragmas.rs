@@ -3,7 +3,6 @@
 //! Handles #pragma once, pack, push_macro/pop_macro, weak,
 //! redefine_extname, and GCC visibility directives.
 
-use super::macro_defs::MacroDef;
 use super::preprocessor::Preprocessor;
 
 impl Preprocessor {

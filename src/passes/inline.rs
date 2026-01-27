@@ -176,16 +176,10 @@ pub fn run(module: &mut IrModule) -> usize {
         let caller_has_section = module.functions[func_idx].section.is_some();
         let mut budget_remaining = MAX_INLINE_BUDGET_PER_CALLER;
         let mut always_inline_budget_remaining = MAX_ALWAYS_INLINE_BUDGET_PER_CALLER;
-        let mut changed = true;
-
         // Iterate to handle chains of inlined calls (A calls B calls C, all small inline).
         // Limit iterations to prevent infinite loops from recursive inline functions.
         let max_rounds = 200;
         for _round in 0..max_rounds {
-            if !changed {
-                break;
-            }
-            changed = false;
 
             // Check if the caller has grown too large for further normal inlining.
             // Each SSA value in CCC gets an 8-byte stack slot, so functions with
@@ -313,7 +307,6 @@ pub fn run(module: &mut IrModule) -> usize {
                     budget_remaining = budget_remaining.saturating_sub(callee_inst_count);
                 }
                 total_inlined += 1;
-                changed = true;
                 module.functions[func_idx].has_inlined_calls = true;
             } else {
                 break;
@@ -806,7 +799,6 @@ fn terminator_used_values(term: &Terminator) -> Vec<u32> {
 /// Information about a callee function eligible for inlining.
 struct CalleeData {
     blocks: Vec<BasicBlock>,
-    params: Vec<IrType>,  // types of parameters
     /// For each param, Some(size) if it's a struct-by-value parameter, None otherwise.
     param_struct_sizes: Vec<Option<usize>>,
     return_type: IrType,
@@ -1004,12 +996,10 @@ fn build_callee_map(module: &IrModule) -> HashMap<String, CalleeData> {
             .max()
             .unwrap_or(0);
 
-        let param_types: Vec<IrType> = func.params.iter().map(|p| p.ty).collect();
         let param_struct_sizes: Vec<Option<usize>> = func.params.iter().map(|p| p.struct_size).collect();
 
         map.insert(func.name.clone(), CalleeData {
             blocks: func.blocks.clone(),
-            params: param_types,
             param_struct_sizes,
             return_type: func.return_type,
             num_params: func.params.len(),

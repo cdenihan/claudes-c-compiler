@@ -1,6 +1,6 @@
 use crate::ir::ir::*;
 use crate::common::types::IrType;
-use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::fx_hash::FxHashMap;
 use crate::backend::common::PtrDirective;
 use crate::backend::state::{CodegenState, StackSlot, SlotAddr};
 use crate::backend::traits::ArchCodegen;
@@ -9,7 +9,7 @@ use crate::backend::call_abi::{CallAbiConfig, CallArgClass, compute_stack_arg_sp
 use crate::backend::call_emit::{ParamClass, classify_params};
 use crate::backend::cast::{CastKind, classify_cast, FloatOp};
 use crate::backend::inline_asm::emit_inline_asm_common;
-use crate::backend::regalloc::{self, PhysReg, RegAllocConfig};
+use crate::backend::regalloc::PhysReg;
 
 /// RISC-V callee-saved registers available for register allocation.
 /// s0 is the frame pointer; s2-s6 are used as temporaries in emit_call_reg_args

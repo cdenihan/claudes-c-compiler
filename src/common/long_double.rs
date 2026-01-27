@@ -398,8 +398,7 @@ fn decimal_to_x87_bigint(negative: bool, digits: &[u8], decimal_exp: i32) -> [u8
         }
 
         // Now big_val is an integer. Convert to x87 float.
-        // Find the binary exponent: value = big_val = mantissa64 * 2^(bit_length - 64)
-        let bl = big_val.bit_length();
+        // Find the binary exponent: value = big_val = mantissa64 * 2^(shift)
         let (top64, shift) = big_val.top_64_bits();
 
         if top64 == 0 {

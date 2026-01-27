@@ -402,10 +402,6 @@ impl BuiltinInfo {
         Self { kind: BuiltinKind::Identity }
     }
 
-    fn constant_i64(val: i64) -> Self {
-        Self { kind: BuiltinKind::ConstantI64(val) }
-    }
-
     fn constant_f64(val: f64) -> Self {
         Self { kind: BuiltinKind::ConstantF64(val) }
     }

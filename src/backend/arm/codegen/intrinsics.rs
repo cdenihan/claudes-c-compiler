@@ -4,7 +4,6 @@
 //! F128: IEEE 754 binary128 via compiler-rt/libgcc soft-float libcalls.
 
 use crate::ir::ir::*;
-use crate::common::types::IrType;
 use super::codegen::ArmCodegen;
 
 impl ArmCodegen {

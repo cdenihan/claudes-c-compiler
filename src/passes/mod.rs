@@ -416,7 +416,7 @@ fn eliminate_dead_static_functions(module: &mut IrModule) {
 
     // Helper: look up or create an ID for a name that may not already exist.
     // Used for references that might point to external/undeclared symbols.
-    let mut get_or_create_id = |name: &str, name_to_id: &mut FxHashMap<&str, u32>,
+    let get_or_create_id = |name: &str, name_to_id: &mut FxHashMap<&str, u32>,
                                   next_id: &mut u32| -> u32 {
         if let Some(&id) = name_to_id.get(name) {
             id

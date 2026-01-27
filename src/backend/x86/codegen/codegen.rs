@@ -1,15 +1,15 @@
 use crate::ir::ir::*;
 use crate::common::types::{AddressSpace, IrType};
-use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::fx_hash::FxHashMap;
 use crate::backend::common::PtrDirective;
 use crate::backend::state::{CodegenState, StackSlot};
 use crate::backend::traits::ArchCodegen;
 use crate::backend::generation::{generate_module, is_i128_type, calculate_stack_space_common, find_param_alloca};
 use crate::backend::call_abi::{CallAbiConfig, CallArgClass, compute_stack_push_bytes};
 use crate::backend::call_emit::{ParamClass, classify_params};
-use crate::backend::cast::{CastKind, classify_cast, FloatOp};
-use crate::backend::inline_asm::{InlineAsmEmitter, emit_inline_asm_common};
-use crate::backend::regalloc::{self, PhysReg, RegAllocConfig};
+use crate::backend::cast::FloatOp;
+use crate::backend::inline_asm::emit_inline_asm_common;
+use crate::backend::regalloc::PhysReg;
 
 /// x86-64 callee-saved registers available for register allocation.
 /// System V AMD64 ABI callee-saved: rbx, r12, r13, r14, r15.
@@ -3060,8 +3060,6 @@ impl ArchCodegen for X86Codegen {
     /// value in the destination slot. This ensures subsequent F128 operations
     /// (arithmetic, comparison) that use fldt get correct data.
     fn emit_cast(&mut self, dest: &Value, src: &Operand, from_ty: IrType, to_ty: IrType) {
-        use crate::backend::state::SlotAddr;
-
         // Intercept casts TO F128: produce full 80-bit x87 value in dest slot.
         // classify_cast treats F64->F128 as Noop and F32->F128 as F32->F64,
         // but we need to ensure the dest slot has a proper 80-bit x87 value

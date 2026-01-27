@@ -550,7 +550,7 @@ fn extend_gep_base_liveness(
     for (bi, block) in func.blocks.iter().enumerate() {
         for inst in &block.instructions {
             match inst {
-                Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } => {
+                Instruction::Load { .. } | Instruction::Store { .. } => {
                     let ptr_id = match inst {
                         Instruction::Load { ptr, .. } => ptr.0,
                         Instruction::Store { ptr, .. } => ptr.0,
