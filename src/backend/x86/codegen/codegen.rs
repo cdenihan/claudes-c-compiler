@@ -1204,6 +1204,17 @@ impl X86Codegen {
                     _ => {}
                 }
             }
+
+            // F128 cast kinds: unreachable on x86 because classify_cast() reduces
+            // F128 to F64, and F128-specific casts are handled before this match.
+            CastKind::SignedToF128 { .. }
+            | CastKind::UnsignedToF128 { .. }
+            | CastKind::F128ToSigned { .. }
+            | CastKind::F128ToUnsigned { .. }
+            | CastKind::FloatToF128 { .. }
+            | CastKind::F128ToFloat { .. } => {
+                // On x86, F128 is x87 80-bit and handled by special-case code above.
+            }
         }
     }
 

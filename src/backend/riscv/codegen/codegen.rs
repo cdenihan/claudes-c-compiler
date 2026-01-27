@@ -1118,8 +1118,30 @@ impl RiscvCodegen {
             self.emit_store_to_s0("t0", slot.0, "sd");
             self.state.emit_fmt(format_args!("    li t0, {}", hi as i64));
             self.emit_store_to_s0("t0", slot.0 + 8, "sd");
+        } else if let Operand::Value(v) = val {
+            // Check if this value has full f128 data in a tracked slot
+            // (e.g., from an int->F128 cast that stored full precision).
+            if let Some(&(src_id, offset)) = self.f128_load_sources.get(&v.0) {
+                if let Some(src_slot) = self.state.get_slot(src_id) {
+                    let src_off = src_slot.0 + offset;
+                    // Copy full 16-byte f128 from source to destination.
+                    self.emit_load_from_s0("t0", src_off, "ld");
+                    self.emit_store_to_s0("t0", slot.0, "sd");
+                    self.emit_load_from_s0("t0", src_off + 8, "ld");
+                    self.emit_store_to_s0("t0", slot.0 + 8, "sd");
+                    return;
+                }
+            }
+            // Fallback: convert f64 in t0 to f128 via __extenddftf2, store 16 bytes.
+            self.operand_to_t0(val);
+            self.state.emit("    fmv.d.x fa0, t0");
+            self.state.emit("    call __extenddftf2");
+            // Result f128 in a0:a1
+            self.emit_store_to_s0("a0", slot.0, "sd");
+            self.emit_store_to_s0("a1", slot.0 + 8, "sd");
+            self.state.reg_cache.invalidate_all();
         } else {
-            // Runtime value: convert f64 in t0 to f128 via __extenddftf2, store 16 bytes.
+            // Runtime value without tracking: convert f64 to f128 via __extenddftf2.
             self.operand_to_t0(val);
             self.state.emit("    fmv.d.x fa0, t0");
             self.state.emit("    call __extenddftf2");
@@ -1144,6 +1166,27 @@ impl RiscvCodegen {
             self.state.emit("    sd t0, 0(t5)");
             self.state.emit_fmt(format_args!("    li t0, {}", hi as i64));
             self.state.emit("    sd t0, 8(t5)");
+        } else if let Operand::Value(v) = val {
+            // Check if value has full f128 data in a tracked slot
+            if let Some(&(src_id, offset)) = self.f128_load_sources.get(&v.0) {
+                if let Some(src_slot) = self.state.get_slot(src_id) {
+                    let src_off = src_slot.0 + offset;
+                    self.state.emit("    mv t3, t5");
+                    self.emit_load_from_s0("t0", src_off, "ld");
+                    self.state.emit("    sd t0, 0(t3)");
+                    self.emit_load_from_s0("t0", src_off + 8, "ld");
+                    self.state.emit("    sd t0, 8(t3)");
+                    return;
+                }
+            }
+            // Fallback: use f64 approximation
+            self.state.emit("    mv t3, t5");
+            self.operand_to_t0(val);
+            self.state.emit("    fmv.d.x fa0, t0");
+            self.state.emit("    call __extenddftf2");
+            self.state.emit("    sd a0, 0(t3)");
+            self.state.emit("    sd a1, 8(t3)");
+            self.state.reg_cache.invalidate_all();
         } else {
             // Save t5 (ptr) before operand_to_t0, which may clobber registers.
             self.state.emit("    mv t3, t5");
@@ -2797,10 +2840,112 @@ impl ArchCodegen for RiscvCodegen {
                     _ => {}
                 }
             }
+
+            // F128 cast kinds should never be reached here; they are intercepted
+            // by emit_cast() before reaching emit_cast_instrs(). classify_cast()
+            // (without f128_is_native) reduces F128 to F64, so these arms are
+            // unreachable, but we handle them for safety.
+            CastKind::SignedToF128 { .. }
+            | CastKind::UnsignedToF128 { .. }
+            | CastKind::F128ToSigned { .. }
+            | CastKind::F128ToUnsigned { .. }
+            | CastKind::FloatToF128 { .. }
+            | CastKind::F128ToFloat { .. } => {
+                unreachable!("F128 casts should be handled by emit_cast override");
+            }
         }
     }
 
-    // emit_cast: uses default implementation from ArchCodegen trait (handles i128 via primitives)
+    /// Override emit_cast to handle F128 (IEEE binary128) casts with full precision.
+    /// On RISC-V, long double is 128-bit IEEE, so int<->F128 casts require softfloat
+    /// library calls (__floatditf, __floatunditf, __fixtfdi, __fixunstfdi) to avoid
+    /// precision loss from going through f64 intermediate.
+    fn emit_cast(&mut self, dest: &Value, src: &Operand, from_ty: IrType, to_ty: IrType) {
+        // Intercept casts TO F128 from integer types: produce full-precision f128
+        // in the destination slot via softfloat library call.
+        if to_ty == IrType::F128 && !from_ty.is_float() && !is_i128_type(from_ty) {
+            // Load source integer into t0
+            self.operand_to_t0(src);
+            // Sign/zero extend sub-64-bit integers
+            if from_ty.is_signed() {
+                match from_ty.size() {
+                    1 => {
+                        self.state.emit("    slli t0, t0, 56");
+                        self.state.emit("    srai t0, t0, 56");
+                    }
+                    2 => {
+                        self.state.emit("    slli t0, t0, 48");
+                        self.state.emit("    srai t0, t0, 48");
+                    }
+                    4 => self.state.emit("    sext.w t0, t0"),
+                    _ => {}
+                }
+                // Call __floatditf: i64 in a0 -> f128 in a0:a1
+                self.state.emit("    mv a0, t0");
+                self.state.emit("    call __floatditf");
+            } else {
+                match from_ty.size() {
+                    1 => self.state.emit("    andi t0, t0, 0xff"),
+                    2 => {
+                        self.state.emit("    slli t0, t0, 48");
+                        self.state.emit("    srli t0, t0, 48");
+                    }
+                    4 => {
+                        self.state.emit("    slli t0, t0, 32");
+                        self.state.emit("    srli t0, t0, 32");
+                    }
+                    _ => {}
+                }
+                // Call __floatunditf: u64 in a0 -> f128 in a0:a1
+                self.state.emit("    mv a0, t0");
+                self.state.emit("    call __floatunditf");
+            }
+            // Result f128 is in a0:a1 (lo, hi halves).
+            // Store full 16-byte f128 directly to dest slot for full precision.
+            if let Some(slot) = self.state.get_slot(dest.0) {
+                self.emit_store_to_s0("a0", slot.0, "sd");
+                self.emit_store_to_s0("a1", slot.0 + 8, "sd");
+            }
+            // Produce f64 approximation in t0 for register-based data flow,
+            // but do NOT store it back to the slot (that would overwrite the f128).
+            self.state.emit("    call __trunctfdf2");
+            self.state.emit("    fmv.x.d t0, fa0");
+            self.state.reg_cache.invalidate_all();
+            // Track that this value has full f128 in its slot
+            self.f128_load_sources.insert(dest.0, (dest.0, 0));
+            // Store f64 approx only to register (if register-allocated), not to stack.
+            if let Some(&reg) = self.reg_assignments.get(&dest.0) {
+                let reg_name = callee_saved_name(reg);
+                self.state.emit_fmt(format_args!("    mv {}, t0", reg_name));
+            }
+            self.state.reg_cache.set_acc(dest.0, false);
+            return;
+        }
+
+        // Intercept casts FROM F128 to integer types: load full f128 from source
+        // slot and convert directly via softfloat, avoiding f64 precision loss.
+        if from_ty == IrType::F128 && !to_ty.is_float() && !is_i128_type(to_ty) {
+            // Load full f128 from source into a0:a1
+            self.emit_f128_operand_to_a0_a1(src);
+            // Call appropriate softfloat conversion
+            if to_ty.is_unsigned() || to_ty == IrType::Ptr {
+                self.state.emit("    call __fixunstfdi");
+            } else {
+                self.state.emit("    call __fixtfdi");
+            }
+            self.state.emit("    mv t0, a0");
+            self.state.reg_cache.invalidate_all();
+            // Narrow if needed
+            if to_ty.size() < 8 {
+                self.emit_cast_instrs(IrType::I64, to_ty);
+            }
+            self.store_t0_to(dest);
+            return;
+        }
+
+        // For all other casts, use the default implementation.
+        crate::backend::traits::emit_cast_default(self, dest, src, from_ty, to_ty);
+    }
 
     fn emit_va_arg(&mut self, dest: &Value, va_list_ptr: &Value, result_ty: IrType) {
         // RISC-V LP64D: va_list is just a void* (pointer to the next arg on stack).

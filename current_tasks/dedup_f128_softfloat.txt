@@ -1,0 +1,8 @@
+Task: Deduplicate F128 softfloat logic between ARM and RISC-V backends
+
+Both ARM and RISC-V have near-identical:
+- f128_cmp: same libcall dispatch (__eqtf2, __lttf2, etc.) and comparison semantics
+- emit_f128_binop_softfloat: same mnemonic-to-libcall mapping (fadd->__addtf3, etc.)
+- emit_float_binop_mnemonic: identical ARM/RISC-V (fadd/fsub/fmul/fdiv)
+
+Extract shared helpers or trait defaults to eliminate duplication.

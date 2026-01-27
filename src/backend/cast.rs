@@ -33,6 +33,19 @@ pub enum CastKind {
     IntNarrow { to_ty: IrType },
     /// Same-size signed-to-unsigned (need to mask/clear upper bits).
     SignedToUnsignedSameSize { to_ty: IrType },
+    /// Signed integer -> F128 via softfloat (__floatsitf / __floatditf).
+    /// Used on ARM/RISC-V where long double is IEEE binary128.
+    SignedToF128 { from_ty: IrType },
+    /// Unsigned integer -> F128 via softfloat (__floatunsitf / __floatunditf).
+    UnsignedToF128 { from_ty: IrType },
+    /// F128 -> signed integer via softfloat (__fixtfsi / __fixtfdi).
+    F128ToSigned { to_ty: IrType },
+    /// F128 -> unsigned integer via softfloat (__fixunstfsi / __fixunstfdi).
+    F128ToUnsigned { to_ty: IrType },
+    /// F32/F64 -> F128 widening via softfloat (__extendsftf2 / __extenddftf2).
+    FloatToF128 { from_f32: bool },
+    /// F128 -> F32/F64 narrowing via softfloat (__trunctfsf2 / __trunctfdf2).
+    F128ToFloat { to_f32: bool },
 }
 
 /// Classify a cast between two IR types. This captures the shared decision logic
@@ -40,15 +53,24 @@ pub enum CastKind {
 /// `CastKind` to emit architecture-specific instructions.
 ///
 /// Handles Ptr normalization (Ptr treated as U64) and F128 reduction (F128 treated
-/// as F64 for computation purposes) before classification.
-pub fn classify_cast(from_ty: IrType, to_ty: IrType) -> CastKind {
+/// as F64 for computation purposes on x86) before classification.
+///
+/// `f128_is_native`: true on ARM/RISC-V where F128 is IEEE binary128 and requires
+/// softfloat library calls for conversions. false on x86 where F128 is x87 80-bit
+/// and is approximated as F64.
+pub fn classify_cast_with_f128(from_ty: IrType, to_ty: IrType, f128_is_native: bool) -> CastKind {
     if from_ty == to_ty {
         return CastKind::Noop;
     }
 
-    // F128 (long double) is computed as F64. Treat F128 <-> F64 as noop,
-    // and F128 <-> other as F64 <-> other.
+    // F128 (long double) handling depends on architecture.
     if from_ty == IrType::F128 || to_ty == IrType::F128 {
+        if f128_is_native {
+            // ARM/RISC-V: F128 is true IEEE binary128. Use softfloat library calls.
+            return classify_f128_cast_native(from_ty, to_ty);
+        }
+        // x86: F128 (x87 80-bit) is computed as F64. Treat F128 <-> F64 as noop,
+        // and F128 <-> other as F64 <-> other.
         let effective_from = if from_ty == IrType::F128 { IrType::F64 } else { from_ty };
         let effective_to = if to_ty == IrType::F128 { IrType::F64 } else { to_ty };
         if effective_from == effective_to {
@@ -113,6 +135,53 @@ pub fn classify_cast(from_ty: IrType, to_ty: IrType) -> CastKind {
     }
 
     CastKind::IntNarrow { to_ty }
+}
+
+/// Backward-compatible wrapper: classifies casts with x86 F128 semantics
+/// (F128 treated as F64 approximation).
+pub fn classify_cast(from_ty: IrType, to_ty: IrType) -> CastKind {
+    classify_cast_with_f128(from_ty, to_ty, false)
+}
+
+/// Classify F128 casts on targets where F128 is true IEEE binary128 (ARM/RISC-V).
+/// These require softfloat library calls for full precision.
+fn classify_f128_cast_native(from_ty: IrType, to_ty: IrType) -> CastKind {
+    debug_assert!(from_ty == IrType::F128 || to_ty == IrType::F128);
+
+    if to_ty == IrType::F128 {
+        // Something -> F128
+        if from_ty == IrType::F64 {
+            return CastKind::FloatToF128 { from_f32: false };
+        }
+        if from_ty == IrType::F32 {
+            return CastKind::FloatToF128 { from_f32: true };
+        }
+        // Integer -> F128
+        if from_ty.is_float() {
+            // F128 -> F128: should not happen (handled by from_ty == to_ty check)
+            return CastKind::Noop;
+        }
+        if from_ty.is_unsigned() {
+            return CastKind::UnsignedToF128 { from_ty };
+        }
+        return CastKind::SignedToF128 { from_ty };
+    }
+
+    // F128 -> something
+    if to_ty == IrType::F64 {
+        return CastKind::F128ToFloat { to_f32: false };
+    }
+    if to_ty == IrType::F32 {
+        return CastKind::F128ToFloat { to_f32: true };
+    }
+    // F128 -> integer
+    if to_ty.is_float() {
+        return CastKind::Noop;
+    }
+    if to_ty.is_unsigned() || to_ty == IrType::Ptr {
+        return CastKind::F128ToUnsigned { to_ty };
+    }
+    CastKind::F128ToSigned { to_ty }
 }
 
 /// Float arithmetic operations that all three backends support.

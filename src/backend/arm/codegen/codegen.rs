@@ -3261,10 +3261,23 @@ impl ArchCodegen for ArmCodegen {
                     _ => {}
                 }
             }
+
+            // F128 cast kinds: unreachable via classify_cast() which reduces F128 to F64.
+            // classify_cast() (without f128_is_native) is used here, so F128 is treated
+            // as F64 and these variants are never produced.
+            CastKind::SignedToF128 { .. }
+            | CastKind::UnsignedToF128 { .. }
+            | CastKind::F128ToSigned { .. }
+            | CastKind::F128ToUnsigned { .. }
+            | CastKind::FloatToF128 { .. }
+            | CastKind::F128ToFloat { .. } => {
+                unreachable!("F128 cast variants not produced by classify_cast()");
+            }
         }
     }
 
     // emit_cast: uses default implementation from ArchCodegen trait (handles i128 via primitives)
+    // TODO: Override emit_cast for F128 precision fix (same approach as RISC-V)
 
     fn emit_va_arg(&mut self, dest: &Value, va_list_ptr: &Value, result_ty: IrType) {
         // AArch64 AAPCS64 va_arg implementation.
