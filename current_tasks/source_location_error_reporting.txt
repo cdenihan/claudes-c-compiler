@@ -1,0 +1,17 @@
+Task: Add source location tracking to error messages
+
+Status: in_progress
+
+What:
+1. Emit GCC-style line markers (# linenum "filename") from the preprocessor
+   at #include boundaries so the lexer can track which original file each
+   token came from.
+2. Parse these line markers in the lexer to register files with the
+   SourceManager and update file_id/line tracking dynamically.
+3. Pass the SourceManager to the parser so parse errors include
+   file:line:column information.
+
+Why:
+Currently syntax errors print "error: expected X, got Y" with no file/line
+information, making debugging impossible for users. The Span and SourceManager
+infrastructure exists but is disconnected from error reporting.

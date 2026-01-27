@@ -38,9 +38,11 @@ const MAX_INLINE_BUDGET_PER_CALLER: usize = 800;
 /// value gets a stack slot (~8 bytes), so a function with many instructions
 /// can easily produce a multi-KB stack frame that overflows the kernel's 16KB
 /// stack. GCC enforces similar limits via -fconserve-stack.
-/// Set to 800 to keep stack frames under ~6-7KB even after optimization,
-/// leaving headroom for callers higher on the call stack.
-const MAX_CALLER_INSTRUCTIONS_AFTER_INLINE: usize = 800;
+/// Set to 200 to keep stack frames under ~2KB even after optimization,
+/// leaving headroom for callers higher on the call stack (kernel functions
+/// like mm/page_alloc.c have 10+ level deep call chains that can easily
+/// overflow the 16KB kernel stack if individual frames are too large).
+const MAX_CALLER_INSTRUCTIONS_AFTER_INLINE: usize = 200;
 
 /// Maximum instructions for __attribute__((always_inline)) functions.
 /// GCC always inlines __attribute__((always_inline)) regardless of size, and
@@ -67,8 +69,23 @@ const MAX_ALWAYS_INLINE_BLOCKS: usize = 200;
 /// 3. GCC always inlines these trivial static inline functions
 const MAX_TINY_INLINE_INSTRUCTIONS: usize = 5;
 
-/// Budget for always_inline callees per caller.
-const MAX_ALWAYS_INLINE_BUDGET_PER_CALLER: usize = 20000;
+/// Budget for always_inline callees per caller. Limits total instructions
+/// inlined from always_inline callees to prevent stack frame bloat.
+/// CCC spills every SSA value to stack (~8 bytes each), so inlining 2000+
+/// instructions creates 16KB+ frames that overflow the kernel stack.
+const MAX_ALWAYS_INLINE_BUDGET_PER_CALLER: usize = 2000;
+
+/// Hard cap on caller instruction count. When a caller exceeds this threshold,
+/// even always_inline inlining is stopped (except for tiny callees that must be
+/// inlined to avoid linker errors). This prevents kernel stack overflow from
+/// deeply-nested always_inline chains (e.g., mm/page_alloc.c's __rmqueue ->
+/// __rmqueue_smallest -> __rmqueue_fallback chain, all always_inline, which
+/// can create functions with 1000+ instructions and 3KB+ stack frames that
+/// overflow the kernel's 16KB stack when combined with deep call chains).
+/// GCC can tolerate larger functions because its register allocator keeps most
+/// values in registers; CCC's codegen spills every SSA value to the stack
+/// (~8 bytes each), so we must be more conservative.
+const MAX_CALLER_INSTRUCTIONS_HARD_CAP: usize = 500;
 
 /// Maximum iterations when tracing IR value chains (Load->Store->Copy->GEP->...)
 /// to resolve inline asm operands back to GlobalAddr or constant values.
@@ -147,6 +164,7 @@ pub fn run(module: &mut IrModule) -> usize {
             let caller_inst_count: usize = module.functions[func_idx].blocks.iter()
                 .map(|b| b.instructions.len()).sum();
             let caller_too_large = caller_inst_count > MAX_CALLER_INSTRUCTIONS_AFTER_INLINE;
+            let caller_at_hard_cap = caller_inst_count > MAX_CALLER_INSTRUCTIONS_HARD_CAP;
 
             // Find call sites to inline in the current function.
             // When the caller has a custom section attribute, also consider callees
@@ -192,6 +210,16 @@ pub fn run(module: &mut IrModule) -> usize {
                         .map(|b| b.instructions.len())
                         .sum();
                     if caller_too_large && !callee_data.is_always_inline {
+                        continue;
+                    }
+                    // Hard cap: when the caller is extremely large, stop ALL
+                    // inlining (including always_inline) to prevent kernel stack
+                    // overflow. CCC's codegen spills every SSA value to the stack,
+                    // so functions with 1000+ instructions produce multi-KB frames.
+                    // The kernel has only 16KB stack with guard pages, and deep call
+                    // chains (e.g., page allocator) can easily overflow.
+                    // Tiny callees are still allowed (handled in first pass above).
+                    if caller_at_hard_cap {
                         continue;
                     }
                     let use_relaxed = callee_data.is_always_inline || callee_data.exceeds_normal_limits;
