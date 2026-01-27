@@ -1,0 +1,17 @@
+Task: Refactor emit_globals and emit_const_data in backend/common.rs
+Status: in_progress
+Started: 2026-01-27
+
+Goal: Clean up the two most verbose/duplicated areas in backend/common.rs:
+
+1. emit_globals: Replace 7 filtering passes over the globals array (each with
+   duplicated guard conditions like is_extern/section.is_some/is_thread_local)
+   with a single classify-then-emit pattern. Classify each global into its
+   target section once, then emit each section group.
+
+2. emit_const_data: Eliminate the 4x4 type-widening matrix where I8/I16/I32/I64
+   constant arms each contain identical match-on-ty logic. Extract the common
+   widening pattern into a helper that takes the integer value and emits the
+   correctly-sized directive.
+
+Both changes are purely internal refactoring with no behavioral changes.
