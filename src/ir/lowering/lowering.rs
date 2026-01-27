@@ -382,11 +382,11 @@ impl Lowerer {
                             &declarator.name, &decl.type_spec, ptr_count,
                             &params, variadic, decl.is_static, false,
                         );
-                    } else if declarator.derived.is_empty() || !declarator.derived.iter().any(|d|
-                        matches!(d, DerivedDeclarator::Function(_, _) | DerivedDeclarator::FunctionPointer(_, _)))
-                    {
+                    } else if declarator.derived.is_empty() {
                         // Check if the base type is a function typedef
                         // (e.g., `func_t add;` where func_t is typedef int func_t(int);)
+                        // Only when derived is empty — `func_t *callback;` is a variable,
+                        // not a function declaration.
                         if let TypeSpecifier::TypedefName(tname) = &decl.type_spec {
                             if let Some(fti) = self.types.function_typedefs.get(tname).cloned() {
                                 self.register_function_meta(

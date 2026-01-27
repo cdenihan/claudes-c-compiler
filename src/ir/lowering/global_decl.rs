@@ -75,8 +75,10 @@ impl Lowerer {
                 continue;
             }
 
-            // Skip declarations using function typedefs
-            if declarator.init.is_none() {
+            // Skip declarations using function typedefs (e.g., `func_t add;`),
+            // but NOT function pointer variables (e.g., `func_t *callback;`).
+            // When derived contains Pointer, this is a variable of type pointer-to-function.
+            if declarator.init.is_none() && declarator.derived.is_empty() {
                 if let TypeSpecifier::TypedefName(tname) = &decl.type_spec {
                     if self.types.function_typedefs.contains_key(tname) {
                         continue;
