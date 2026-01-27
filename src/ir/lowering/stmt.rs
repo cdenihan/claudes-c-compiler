@@ -331,6 +331,13 @@ impl Lowerer {
         // so that &x in another static's initializer can resolve to the mangled name.
         self.insert_static_local_scoped(declarator.name.clone(), static_name.clone());
 
+        // Register the global before evaluating its initializer so that
+        // self-referential initializers (e.g., static struct work w = { .entry = { &w.entry, &w.entry } })
+        // can resolve &w.entry via resolve_chained_member_access -> self.globals.get().
+        // This mirrors the same pattern used in lower_global_decl().
+        let ginfo = GlobalInfo::from_analysis(da);
+        self.globals.insert(static_name.clone(), ginfo);
+
         // Determine initializer (evaluated at compile time for static locals)
         // For pointer arrays and scalar pointers, use Ptr as the base type for
         // initializer coercion (matching file-scope global handling). Without this,
@@ -402,12 +409,12 @@ impl Lowerer {
             is_thread_local: decl.is_thread_local,
         });
 
-        // Track as a global for access via GlobalAddr
-        let mut ginfo = GlobalInfo::from_analysis(da);
+        // Update the pre-registered global info with explicit alignment if present
         if let Some(ea) = explicit_align {
-            ginfo.var.explicit_alignment = Some(ea);
+            if let Some(ginfo) = self.globals.get_mut(&static_name) {
+                ginfo.var.explicit_alignment = Some(ea);
+            }
         }
-        self.globals.insert(static_name.clone(), ginfo);
 
         // Store type info in locals (with static_global_name set so each use site
         // emits a fresh GlobalAddr in its own basic block, avoiding unreachable-block issues).

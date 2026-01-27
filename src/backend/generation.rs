@@ -936,7 +936,9 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
                         if let Some(sym) = global_addr_map.get(&ptr.0) {
                             cg.emit_global_store_rip_rel(val, sym, *ty);
                         } else if let Some(gep_info) = gep_fold_map.get(&ptr.0) {
-                            if cg.state_ref().is_alloca(gep_info.base.0) {
+                            // Fold GEP into store when base is safe at use site:
+                            // alloca (stable slot) or register-assigned (liveness extended).
+                            if cg.state_ref().is_alloca(gep_info.base.0) || cg.get_phys_reg_for_value(gep_info.base.0).is_some() {
                                 cg.emit_store_with_const_offset(val, &gep_info.base, gep_info.offset, *ty);
                             } else {
                                 cg.emit_store(val, ptr, *ty);
