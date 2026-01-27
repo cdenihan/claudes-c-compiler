@@ -434,6 +434,20 @@ pub fn generate_module(cg: &mut dyn ArchCodegen, module: &IrModule, source_mgr: 
                 state.tls_symbols.insert(global.name.clone());
             }
         }
+        // Build set of weak extern symbols for AArch64 GOT indirection.
+        // Weak symbols that may bind externally need GOT-indirect addressing
+        // because the kernel linker rejects R_AARCH64_ADR_PREL_PG_HI21
+        // against such symbols.
+        for global in &module.globals {
+            if global.is_weak && global.is_extern {
+                state.weak_extern_symbols.insert(global.name.clone());
+            }
+        }
+        for (name, is_weak, _visibility) in &module.symbol_attrs {
+            if *is_weak {
+                state.weak_extern_symbols.insert(name.clone());
+            }
+        }
     }
 
     // Build DWARF file table when debug info is enabled.

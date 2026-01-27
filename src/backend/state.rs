@@ -139,6 +139,10 @@ pub struct CodegenState {
     pub code_model_kernel: bool,
     /// Whether to disable jump table emission for switch statements (-fno-jump-tables).
     pub no_jump_tables: bool,
+    /// Set of symbol names declared as weak extern (e.g., `extern __weak`).
+    /// On AArch64, these need GOT-indirect addressing because the linker
+    /// rejects R_AARCH64_ADR_PREL_PG_HI21 against symbols that may bind externally.
+    pub weak_extern_symbols: FxHashSet<String>,
     /// Values that were assigned to callee-saved registers and have no stack slot.
     /// Used by resolve_slot_addr to return a dummy Indirect slot for these values,
     /// which is safe because all Indirect codepaths check reg_assignments first.
@@ -172,6 +176,7 @@ impl CodegenState {
             current_text_section: ".text".to_string(),
             code_model_kernel: false,
             no_jump_tables: false,
+            weak_extern_symbols: FxHashSet::default(),
             reg_assigned_values: FxHashSet::default(),
             debug_info: false,
         }
@@ -271,6 +276,25 @@ impl CodegenState {
     /// Returns true if a function call needs PLT indirection in PIC mode.
     pub fn needs_plt(&self, name: &str) -> bool {
         self.needs_got(name)
+    }
+
+    /// Returns true if a symbol needs GOT indirection on AArch64.
+    /// On AArch64, weak extern symbols always need GOT indirection because the
+    /// kernel linker rejects R_AARCH64_ADR_PREL_PG_HI21 against symbols that
+    /// may bind externally. Additionally, PIC mode requires GOT for all non-local symbols.
+    pub fn needs_got_aarch64(&self, name: &str) -> bool {
+        if name.starts_with('.') {
+            return false;
+        }
+        // Weak extern symbols always need GOT indirection on AArch64
+        if self.weak_extern_symbols.contains(name) {
+            return true;
+        }
+        // PIC mode: all non-local symbols need GOT
+        if self.pic_mode {
+            return !self.local_symbols.contains(name);
+        }
+        false
     }
 }
 

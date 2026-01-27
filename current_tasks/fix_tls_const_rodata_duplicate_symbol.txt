@@ -1,0 +1,12 @@
+Task: Fix __thread const globals emitted to both .rodata and .tdata
+Status: in_progress
+
+Bug: When a global variable is both `const` and `__thread` (e.g., `static __thread const int c = 3`),
+the compiler emits the symbol twice:
+1. Once in .rodata (because it's const)
+2. Once in .tdata (because it's __thread)
+
+This causes the assembler to error: "symbol `c` is already defined".
+
+Fix: In the .rodata emission pass in src/backend/common.rs, skip `is_thread_local` globals.
+TLS takes precedence over const — the variable should only appear in .tdata.

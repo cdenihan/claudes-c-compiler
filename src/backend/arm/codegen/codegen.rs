@@ -2891,8 +2891,17 @@ impl ArchCodegen for ArmCodegen {
     }
 
     fn emit_global_addr(&mut self, dest: &Value, name: &str) {
-        self.state.emit_fmt(format_args!("    adrp x0, {}", name));
-        self.state.emit_fmt(format_args!("    add x0, x0, :lo12:{}", name));
+        if self.state.needs_got_aarch64(name) {
+            // GOT-indirect addressing for weak/extern symbols or PIC mode.
+            // Produces R_AARCH64_ADR_GOT_PAGE + R_AARCH64_LD64_GOT_LO12_NC relocations.
+            self.state.emit_fmt(format_args!("    adrp x0, :got:{}", name));
+            self.state.emit_fmt(format_args!("    ldr x0, [x0, :got_lo12:{}]", name));
+        } else {
+            // Direct PC-relative addressing for local/static symbols.
+            // Produces R_AARCH64_ADR_PREL_PG_HI21 + R_AARCH64_ADD_ABS_LO12_NC relocations.
+            self.state.emit_fmt(format_args!("    adrp x0, {}", name));
+            self.state.emit_fmt(format_args!("    add x0, x0, :lo12:{}", name));
+        }
         self.store_x0_to(dest);
     }
 
