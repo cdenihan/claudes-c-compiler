@@ -1,12 +1,13 @@
-//! Shared cast and float operation classification.
+//! Shared cast and float operation classification, plus F128 soft-float libcall mapping.
 //!
 //! All three backends use the same decision logic to determine what kind of cast
 //! to emit — only the actual machine instructions differ. By classifying the cast
 //! once in shared code, we eliminate duplicated Ptr-normalization and F128-reduction
-//! logic from each backend.
+//! logic from each backend. This module also provides the shared mnemonic-to-libcall
+//! mapping for F128 soft-float arithmetic and comparisons (ARM, RISC-V).
 
 use crate::common::types::IrType;
-use crate::ir::ir::IrBinOp;
+use crate::ir::ir::{IrBinOp, IrCmpOp};
 
 /// Classification of type casts. All three backends use the same control flow
 /// to decide which kind of cast to emit; only the actual instructions differ.
@@ -202,5 +203,47 @@ pub fn classify_float_binop(op: IrBinOp) -> Option<FloatOp> {
         IrBinOp::Mul => Some(FloatOp::Mul),
         IrBinOp::SDiv | IrBinOp::UDiv => Some(FloatOp::Div),
         _ => None,
+    }
+}
+
+/// Map a float binop mnemonic (fadd/fsub/fmul/fdiv) to the corresponding F128
+/// soft-float libcall. Used by ARM and RISC-V backends (x86 uses x87 for F128).
+/// Returns None for unrecognized mnemonics (caller should fall back to f64 hardware).
+pub fn f128_binop_libcall(mnemonic: &str) -> Option<&'static str> {
+    match mnemonic {
+        "fadd" => Some("__addtf3"),
+        "fsub" => Some("__subtf3"),
+        "fmul" => Some("__multf3"),
+        "fdiv" => Some("__divtf3"),
+        _ => None,
+    }
+}
+
+/// How to interpret an F128 comparison libcall result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum F128CmpKind {
+    /// Result == 0 means true (Eq)
+    EqZero,
+    /// Result != 0 means true (Ne)
+    NeZero,
+    /// Result < 0 means true (Lt)
+    LtZero,
+    /// Result <= 0 means true (Le)
+    LeZero,
+    /// Result > 0 means true (Gt)
+    GtZero,
+    /// Result >= 0 means true (Ge)
+    GeZero,
+}
+
+/// Map a comparison operation to the F128 soft-float libcall and result interpretation.
+pub fn f128_cmp_libcall(op: IrCmpOp) -> (&'static str, F128CmpKind) {
+    match op {
+        IrCmpOp::Eq => ("__eqtf2", F128CmpKind::EqZero),
+        IrCmpOp::Ne => ("__eqtf2", F128CmpKind::NeZero),
+        IrCmpOp::Slt | IrCmpOp::Ult => ("__lttf2", F128CmpKind::LtZero),
+        IrCmpOp::Sle | IrCmpOp::Ule => ("__letf2", F128CmpKind::LeZero),
+        IrCmpOp::Sgt | IrCmpOp::Ugt => ("__gttf2", F128CmpKind::GtZero),
+        IrCmpOp::Sge | IrCmpOp::Uge => ("__getf2", F128CmpKind::GeZero),
     }
 }

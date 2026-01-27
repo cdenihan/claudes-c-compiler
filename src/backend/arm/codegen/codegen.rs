@@ -1430,12 +1430,9 @@ impl ArmCodegen {
     /// Called from emit_float_binop_impl when ty == F128.
     /// At entry: x1 = lhs f64 bits, x0 = rhs f64 bits (from shared float binop dispatch).
     fn emit_f128_binop_softfloat(&mut self, mnemonic: &str) {
-        let libcall = match mnemonic {
-            "fadd" => "__addtf3",
-            "fsub" => "__subtf3",
-            "fmul" => "__multf3",
-            "fdiv" => "__divtf3",
-            _ => {
+        let libcall = match crate::backend::cast::f128_binop_libcall(mnemonic) {
+            Some(lc) => lc,
+            None => {
                 // Unknown op: fall back to f64 hardware path
                 self.state.emit("    mov x2, x0");
                 self.state.emit("    fmov d0, x1");
@@ -2541,38 +2538,19 @@ impl ArchCodegen for ArmCodegen {
 
         // Step 4: Call the appropriate comparison libcall and map result to boolean.
         // All __*tf2 functions take f128 in Q0 (lhs) and Q1 (rhs), return int in W0.
-        match op {
-            IrCmpOp::Eq => {
-                self.state.emit("    bl __eqtf2");
-                self.state.emit("    cmp w0, #0");
-                self.state.emit("    cset x0, eq");
-            }
-            IrCmpOp::Ne => {
-                self.state.emit("    bl __eqtf2");
-                self.state.emit("    cmp w0, #0");
-                self.state.emit("    cset x0, ne");
-            }
-            IrCmpOp::Slt | IrCmpOp::Ult => {
-                self.state.emit("    bl __lttf2");
-                self.state.emit("    cmp w0, #0");
-                self.state.emit("    cset x0, lt");
-            }
-            IrCmpOp::Sle | IrCmpOp::Ule => {
-                self.state.emit("    bl __letf2");
-                self.state.emit("    cmp w0, #0");
-                self.state.emit("    cset x0, le");
-            }
-            IrCmpOp::Sgt | IrCmpOp::Ugt => {
-                self.state.emit("    bl __gttf2");
-                self.state.emit("    cmp w0, #0");
-                self.state.emit("    cset x0, gt");
-            }
-            IrCmpOp::Sge | IrCmpOp::Uge => {
-                self.state.emit("    bl __getf2");
-                self.state.emit("    cmp w0, #0");
-                self.state.emit("    cset x0, ge");
-            }
-        }
+        use crate::backend::cast::{f128_cmp_libcall, F128CmpKind};
+        let (libcall, kind) = f128_cmp_libcall(op);
+        self.state.emit_fmt(format_args!("    bl {}", libcall));
+        self.state.emit("    cmp w0, #0");
+        let cond = match kind {
+            F128CmpKind::EqZero => "eq",
+            F128CmpKind::NeZero => "ne",
+            F128CmpKind::LtZero => "lt",
+            F128CmpKind::LeZero => "le",
+            F128CmpKind::GtZero => "gt",
+            F128CmpKind::GeZero => "ge",
+        };
+        self.state.emit_fmt(format_args!("    cset x0, {}", cond));
         self.state.reg_cache.invalidate_all();
         self.store_x0_to(dest);
     }
@@ -3761,15 +3739,6 @@ impl ArchCodegen for ArmCodegen {
     }
 
     // ---- Float binop primitives ----
-
-    fn emit_float_binop_mnemonic(&self, op: FloatOp) -> &'static str {
-        match op {
-            FloatOp::Add => "fadd",
-            FloatOp::Sub => "fsub",
-            FloatOp::Mul => "fmul",
-            FloatOp::Div => "fdiv",
-        }
-    }
 
     fn emit_float_binop_impl(&mut self, mnemonic: &str, ty: IrType) {
         if ty == IrType::F128 {

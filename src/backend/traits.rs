@@ -209,7 +209,16 @@ pub trait ArchCodegen {
     }
 
     /// Get the instruction mnemonic for a float binary op.
-    fn emit_float_binop_mnemonic(&self, op: FloatOp) -> &'static str;
+    /// Default returns "fadd"/"fsub"/"fmul"/"fdiv" (ARM, RISC-V).
+    /// x86 overrides to return "add"/"sub"/"mul"/"div" (no `f` prefix).
+    fn emit_float_binop_mnemonic(&self, op: FloatOp) -> &'static str {
+        match op {
+            FloatOp::Add => "fadd",
+            FloatOp::Sub => "fsub",
+            FloatOp::Mul => "fmul",
+            FloatOp::Div => "fdiv",
+        }
+    }
 
     /// Emit the arch-specific float binop instructions.
     fn emit_float_binop_impl(&mut self, mnemonic: &str, ty: IrType);

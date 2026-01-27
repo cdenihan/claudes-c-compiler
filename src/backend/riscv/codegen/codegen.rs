@@ -1047,12 +1047,9 @@ impl RiscvCodegen {
     /// Called when t1 = lhs (f64 bits), t0 = rhs (f64 bits).
     /// Converts both operands from f64 to f128, calls the libcall, converts result back to f64.
     fn emit_f128_binop_softfloat(&mut self, mnemonic: &str) {
-        let libcall = match mnemonic {
-            "fadd" => "__addtf3",
-            "fsub" => "__subtf3",
-            "fmul" => "__multf3",
-            "fdiv" => "__divtf3",
-            _ => {
+        let libcall = match crate::backend::cast::f128_binop_libcall(mnemonic) {
+            Some(lc) => lc,
+            None => {
                 // Unknown op: fall back to f64 hardware path
                 self.state.emit("    mv t2, t0");
                 self.state.emit("    fmv.d.x ft0, t1");
@@ -2219,32 +2216,23 @@ impl ArchCodegen for RiscvCodegen {
         self.emit_addi_sp(16);
 
         // Step 4: Call the appropriate comparison libcall and map result to boolean.
-        match op {
-            IrCmpOp::Eq => {
-                self.state.emit("    call __eqtf2");
-                self.state.emit("    seqz t0, a0");
-            }
-            IrCmpOp::Ne => {
-                self.state.emit("    call __eqtf2");
-                self.state.emit("    snez t0, a0");
-            }
-            IrCmpOp::Slt | IrCmpOp::Ult => {
-                self.state.emit("    call __lttf2");
-                self.state.emit("    slti t0, a0, 0");
-            }
-            IrCmpOp::Sle | IrCmpOp::Ule => {
-                self.state.emit("    call __letf2");
+        use crate::backend::cast::{f128_cmp_libcall, F128CmpKind};
+        let (libcall, kind) = f128_cmp_libcall(op);
+        self.state.emit_fmt(format_args!("    call {}", libcall));
+        match kind {
+            F128CmpKind::EqZero => self.state.emit("    seqz t0, a0"),
+            F128CmpKind::NeZero => self.state.emit("    snez t0, a0"),
+            F128CmpKind::LtZero => self.state.emit("    slti t0, a0, 0"),
+            F128CmpKind::LeZero => {
                 // t0 = (a0 <= 0) = (a0 < 1)
                 self.state.emit("    slti t0, a0, 1");
             }
-            IrCmpOp::Sgt | IrCmpOp::Ugt => {
-                self.state.emit("    call __gttf2");
+            F128CmpKind::GtZero => {
                 // t0 = (a0 > 0): 0 < a0
                 self.state.emit("    li t0, 0");
                 self.state.emit("    slt t0, t0, a0");
             }
-            IrCmpOp::Sge | IrCmpOp::Uge => {
-                self.state.emit("    call __getf2");
+            F128CmpKind::GeZero => {
                 // t0 = (a0 >= 0) = !(a0 < 0)
                 self.state.emit("    slti t0, a0, 0");
                 self.state.emit("    xori t0, t0, 1");
@@ -3311,15 +3299,6 @@ impl ArchCodegen for RiscvCodegen {
     }
 
     // ---- Float binop primitives ----
-
-    fn emit_float_binop_mnemonic(&self, op: FloatOp) -> &'static str {
-        match op {
-            FloatOp::Add => "fadd",
-            FloatOp::Sub => "fsub",
-            FloatOp::Mul => "fmul",
-            FloatOp::Div => "fdiv",
-        }
-    }
 
     fn emit_float_binop_impl(&mut self, mnemonic: &str, ty: IrType) {
         // On RISC-V: emit_acc_to_secondary does "mv t1, t0", acc (rhs) stays in t0
