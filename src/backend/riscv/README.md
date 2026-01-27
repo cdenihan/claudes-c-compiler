@@ -6,8 +6,11 @@ Code generation targeting the RISC-V 64-bit (RV64GC) architecture.
 
 - `codegen/` - Code generation implementation
   - `codegen.rs` - Main `RiscvCodegen` struct implementing the `ArchCodegen` trait. Handles instruction selection, stack frame management (s0 frame pointer), calling convention (a0-a7 for integer args, fa0-fa7 for FP), varargs, and register allocation integration.
-  - `inline_asm.rs` - RISC-V inline assembly constraint classification and template substitution (%0, %[name], %lo/%hi operands).
+  - `asm_emitter.rs` - `InlineAsmEmitter` trait implementation: constraint classification, scratch register allocation (GP and FP), operand loading/storing for inline asm.
   - `atomics.rs` - Sub-word atomic RMW/CAS via LR.W/SC.W loops with bit masking, and software implementations of CLZ, CTZ, BSWAP, POPCOUNT builtins.
+  - `f128.rs` - F128 (quad-precision) soft-float helpers: load/store operations, binary arithmetic via compiler-rt libcalls, and constant handling for IEEE binary128.
+  - `inline_asm.rs` - RISC-V inline assembly constraint classification and template substitution (%0, %[name], %lo/%hi operands).
+  - `intrinsics.rs` - Software emulation of SSE-equivalent 128-bit SIMD operations (bitwise, byte compare, saturating subtract, pmovmskb) using scalar RISC-V instructions, plus hardware intrinsics (fences, CRC32, sqrt, fabs).
 
 ## Register Allocation
 
