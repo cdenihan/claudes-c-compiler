@@ -40,6 +40,7 @@ After the first iteration, IPCP runs to propagate constant returns across functi
 
 ## Architecture
 
+- **loop_analysis.rs** - Shared loop analysis utilities: natural loop detection via back edges in the dominator tree, loop body computation, loop header merging, and preheader identification. Used by LICM and IVSR
 - All passes use `IrModule::for_each_function()` to iterate over defined functions
 - `Instruction::dest()` provides the canonical way to extract a value defined by an instruction
 - `IrConst::is_zero()`, `IrConst::is_one()`, `IrConst::zero(ty)`, `IrConst::one(ty)` provide shared constant helpers

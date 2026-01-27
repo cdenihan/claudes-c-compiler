@@ -20,6 +20,7 @@ pub mod inline;
 pub mod ipcp;
 pub mod iv_strength_reduce;
 pub mod licm;
+pub mod loop_analysis;
 pub mod narrow;
 pub mod simplify;
 

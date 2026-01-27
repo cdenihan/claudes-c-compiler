@@ -24,17 +24,12 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::analysis;
 use crate::ir::ir::*;
+use super::loop_analysis::{self, NaturalLoop};
 
 /// Run IVSR on the entire module.
 /// Returns the number of strength reductions applied.
 pub fn run(module: &mut IrModule) -> usize {
     module.for_each_function(ivsr_function)
-}
-
-/// A natural loop identified by its header block and the set of blocks in the loop body.
-struct NaturalLoop {
-    header: usize,
-    body: FxHashSet<usize>,
 }
 
 /// A basic induction variable: %iv = phi(init, %iv_next) where %iv_next = %iv + step.
@@ -76,13 +71,13 @@ pub(crate) fn ivsr_function(func: &mut IrFunction) -> usize {
     let idom = analysis::compute_dominators(num_blocks, &preds, &succs);
 
     // Find natural loops
-    let loops = find_natural_loops(num_blocks, &succs, &preds, &idom);
+    let loops = loop_analysis::find_natural_loops(num_blocks, &preds, &succs, &idom);
     if loops.is_empty() {
         return 0;
     }
 
     // Merge loops with same header
-    let loops = merge_loops_by_header(loops);
+    let loops = loop_analysis::merge_loops_by_header(loops);
 
     let mut total_reductions = 0;
 
@@ -97,74 +92,6 @@ pub(crate) fn ivsr_function(func: &mut IrFunction) -> usize {
     total_reductions
 }
 
-/// Find all natural loops in the CFG.
-fn find_natural_loops(
-    num_blocks: usize,
-    succs: &analysis::FlatAdj,
-    preds: &analysis::FlatAdj,
-    idom: &[usize],
-) -> Vec<NaturalLoop> {
-    let mut loops = Vec::new();
-
-    let dominates = |a: usize, mut b: usize| -> bool {
-        loop {
-            if b == a { return true; }
-            if b == idom[b] || idom[b] == usize::MAX { return false; }
-            b = idom[b];
-        }
-    };
-
-    for tail in 0..num_blocks {
-        for &header in succs.row(tail) {
-            let header = header as usize;
-            if dominates(header, tail) {
-                let body = compute_loop_body(header, tail, preds);
-                loops.push(NaturalLoop { header, body });
-            }
-        }
-    }
-
-    loops
-}
-
-/// Compute loop body using reverse walk from tail through predecessors.
-fn compute_loop_body(
-    header: usize,
-    tail: usize,
-    preds: &analysis::FlatAdj,
-) -> FxHashSet<usize> {
-    let mut body = FxHashSet::default();
-    body.insert(header);
-    if header == tail {
-        return body;
-    }
-
-    let mut worklist = vec![tail];
-    body.insert(tail);
-    while let Some(block) = worklist.pop() {
-        for &pred in preds.row(block) {
-            let pred = pred as usize;
-            if !body.contains(&pred) {
-                body.insert(pred);
-                worklist.push(pred);
-            }
-        }
-    }
-    body
-}
-
-/// Merge natural loops that share the same header block.
-fn merge_loops_by_header(loops: Vec<NaturalLoop>) -> Vec<NaturalLoop> {
-    let mut header_map: FxHashMap<usize, FxHashSet<usize>> = FxHashMap::default();
-    for nl in loops {
-        header_map.entry(nl.header).or_default().extend(nl.body);
-    }
-    header_map
-        .into_iter()
-        .map(|(header, body)| NaturalLoop { header, body })
-        .collect()
-}
-
 /// Try to strength-reduce induction variables in a single loop.
 fn reduce_loop(
     func: &mut IrFunction,
@@ -174,7 +101,7 @@ fn reduce_loop(
     let header = natural_loop.header;
 
     // Find the preheader (single predecessor outside the loop)
-    let preheader = match find_preheader(header, &natural_loop.body, preds) {
+    let preheader = match loop_analysis::find_preheader(header, &natural_loop.body, preds) {
         Some(ph) => ph,
         None => return 0,
     };
@@ -704,25 +631,6 @@ fn is_loop_invariant(val_id: u32, loop_body: &FxHashSet<usize>, func: &IrFunctio
         }
     }
     true
-}
-
-/// Find a suitable preheader block.
-fn find_preheader(
-    header: usize,
-    loop_body: &FxHashSet<usize>,
-    preds: &analysis::FlatAdj,
-) -> Option<usize> {
-    let outside_preds: Vec<usize> = preds.row(header)
-        .iter()
-        .map(|&p| p as usize)
-        .filter(|p| !loop_body.contains(p))
-        .collect();
-
-    if outside_preds.len() != 1 {
-        return None;
-    }
-
-    Some(outside_preds[0])
 }
 
 #[cfg(test)]
