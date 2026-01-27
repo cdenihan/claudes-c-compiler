@@ -1,0 +1,15 @@
+Task: Add source location tracking for -g debug info
+Status: in_progress
+
+Goal: When compiling with -g, emit .file and .loc directives in the
+assembly output so that the GNU assembler generates DWARF line number
+information. This enables source-level debugging with GDB.
+
+Plan:
+1. Add a source_span side table to IrFunction (Vec<Span> parallel to instructions)
+2. Propagate spans from AST through IR lowering
+3. Preserve spans through mem2reg and phi elimination
+4. Add debug_info flag to CodegenOptions
+5. Thread SourceManager to the codegen pipeline
+6. Emit .file/.loc directives in generate_function (shared across all 3 backends)
+7. Wire up the debug_info flag from Driver to CodegenOptions
