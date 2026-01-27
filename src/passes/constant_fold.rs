@@ -274,12 +274,32 @@ fn try_fold_with_map(inst: &Instruction, const_map: &[Option<ConstMapEntry>]) ->
         }
         Instruction::Select { dest, cond, true_val, false_val, .. } => {
             // If the condition is a known constant, fold to the appropriate value
-            let cond_const = as_i64_const_mapped(cond, const_map)?;
-            let result = if cond_const != 0 { *true_val } else { *false_val };
-            Some(Instruction::Copy {
-                dest: *dest,
-                src: result,
-            })
+            if let Some(cond_const) = as_i64_const_mapped(cond, const_map) {
+                let result = if cond_const != 0 { *true_val } else { *false_val };
+                return Some(Instruction::Copy {
+                    dest: *dest,
+                    src: result,
+                });
+            }
+            // If both arms resolve to the same constant, the Select is redundant
+            // regardless of the condition. This is critical for patterns like:
+            //   if (test_large(x) && always_false(x)) dead_code();
+            // where if-conversion creates Select(cond, 0, 0) but one arm is
+            // still a Value (from cmp ne 0,0) that constant fold hasn't yet
+            // propagated into the Select operands.
+            if let (Some(tv), Some(fv)) = (resolve_const(true_val, const_map), resolve_const(false_val, const_map)) {
+                // Compare constants across potentially different widths (e.g.,
+                // I32(0) from a cmp result vs I64(0) from a short-circuit default).
+                let same = tv.to_hash_key() == fv.to_hash_key()
+                    || matches!((tv.to_i64(), fv.to_i64()), (Some(a), Some(b)) if a == b);
+                if same {
+                    return Some(Instruction::Copy {
+                        dest: *dest,
+                        src: Operand::Const(tv),
+                    });
+                }
+            }
+            None
         }
         _ => None,
     }
