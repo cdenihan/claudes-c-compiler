@@ -1,6 +1,0 @@
-Task: Split frontend/preprocessor/preprocessor.rs into focused submodules
-Status: in_progress
-Started: 2026-01-27
-Description: Split the monolithic preprocessor.rs (1522 lines) into focused
-submodules: predefined_macros.rs, pragmas.rs, text_processing.rs.
-Files: src/frontend/preprocessor/preprocessor.rs
