@@ -741,7 +741,7 @@ impl SemanticAnalyzer {
                             "switch quantity is not an integer"
                         ).with_span(expr.span())
                          .with_note(crate::common::error::Diagnostic::note(
-                            format!("expression has type '{:?}'", ctype)
+                            format!("expression has type '{}'", ctype)
                          ).with_span(expr.span()));
                         self.diagnostics.emit(&diag);
                     }

@@ -974,6 +974,117 @@ pub fn align_up(offset: usize, align: usize) -> usize {
     }
 }
 
+impl std::fmt::Display for CType {
+    /// Format a CType as its C-language type name (e.g., `int`, `unsigned long`,
+    /// `char *`, `void (*)(int, double)`). Used in compiler diagnostics to show
+    /// user-friendly type names instead of the Rust Debug representation.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CType::Void => write!(f, "void"),
+            CType::Bool => write!(f, "_Bool"),
+            CType::Char => write!(f, "char"),
+            CType::UChar => write!(f, "unsigned char"),
+            CType::Short => write!(f, "short"),
+            CType::UShort => write!(f, "unsigned short"),
+            CType::Int => write!(f, "int"),
+            CType::UInt => write!(f, "unsigned int"),
+            CType::Long => write!(f, "long"),
+            CType::ULong => write!(f, "unsigned long"),
+            CType::LongLong => write!(f, "long long"),
+            CType::ULongLong => write!(f, "unsigned long long"),
+            CType::Int128 => write!(f, "__int128"),
+            CType::UInt128 => write!(f, "unsigned __int128"),
+            CType::Float => write!(f, "float"),
+            CType::Double => write!(f, "double"),
+            CType::LongDouble => write!(f, "long double"),
+            CType::ComplexFloat => write!(f, "_Complex float"),
+            CType::ComplexDouble => write!(f, "_Complex double"),
+            CType::ComplexLongDouble => write!(f, "_Complex long double"),
+            CType::Pointer(inner, addr_space) => {
+                let prefix = match addr_space {
+                    AddressSpace::Default => "",
+                    AddressSpace::SegGs => "__seg_gs ",
+                    AddressSpace::SegFs => "__seg_fs ",
+                };
+                // Function pointer: void (*)(int) instead of void (*)(int) *
+                if let CType::Function(ft) = inner.as_ref() {
+                    write!(f, "{}", ft.return_type)?;
+                    write!(f, " ({}*)(", prefix)?;
+                    for (i, (param_ty, _)) in ft.params.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{}", param_ty)?;
+                    }
+                    if ft.variadic {
+                        if !ft.params.is_empty() {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "...")?;
+                    }
+                    write!(f, ")")
+                } else {
+                    write!(f, "{}{} *", prefix, inner)
+                }
+            }
+            CType::Array(inner, size) => {
+                if let Some(n) = size {
+                    write!(f, "{}[{}]", inner, n)
+                } else {
+                    write!(f, "{}[]", inner)
+                }
+            }
+            CType::Function(ft) => {
+                write!(f, "{} (", ft.return_type)?;
+                for (i, (param_ty, _)) in ft.params.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", param_ty)?;
+                }
+                if ft.variadic {
+                    if !ft.params.is_empty() {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "...")?;
+                }
+                write!(f, ")")
+            }
+            CType::Struct(name) => {
+                // Strip the "struct." prefix if present for cleaner display
+                let display_name = name.strip_prefix("struct.").unwrap_or(name);
+                if display_name.starts_with("__anon_struct_") {
+                    write!(f, "struct <anonymous>")
+                } else {
+                    write!(f, "struct {}", display_name)
+                }
+            }
+            CType::Union(name) => {
+                // Strip the "union." or "struct." prefix if present
+                let display_name = name.strip_prefix("union.")
+                    .or_else(|| name.strip_prefix("struct."))
+                    .unwrap_or(name);
+                if display_name.starts_with("__anon_struct_") {
+                    write!(f, "union <anonymous>")
+                } else {
+                    write!(f, "union {}", display_name)
+                }
+            }
+            CType::Enum(e) => {
+                if let Some(ref name) = e.name {
+                    write!(f, "enum {}", name)
+                } else {
+                    write!(f, "enum <anonymous>")
+                }
+            }
+            CType::Vector(elem, total_size) => {
+                // GCC-style vector type display
+                write!(f, "__attribute__((vector_size({}))) {}", total_size, elem)
+            }
+        }
+    }
+}
+
 impl CType {
     /// Size in bytes, with struct/union layout lookup via context.
     /// Uses the thread-local target pointer size for target-dependent types

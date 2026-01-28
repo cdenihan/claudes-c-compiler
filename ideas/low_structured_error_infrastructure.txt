@@ -43,14 +43,19 @@ COMPLETED (2026-01-28):
   - Added diagnostics for __auto_type inference failures
   - All diagnostics include source spans for GCC-compatible location output
 
+COMPLETED (2026-01-28):
+- Added Display impl for CType in common/types.rs to show user-friendly C-style
+  type names in diagnostics (e.g., "unsigned int" instead of "UInt", "char *"
+  instead of "Pointer(Char)", "void (*)(int)" for function pointers)
+- Updated sema diagnostic site to use Display (format with {}) instead of Debug ({:?})
+  for CType in the "expression has type '...'" note message
+
 REMAINING FOLLOW-UPS:
 1. Add spans to preprocessor errors (#error directives)
 2. Add more WarningKind categories as compiler implements more warnings
    (UnusedVariable, ReturnType, SignCompare, ImplicitConversion, etc.)
-3. Add Display impl for CType to show user-friendly type names in diagnostics
-   (currently uses Debug formatting which shows e.g. "Double" instead of "double")
-4. Add more "note:" follow-ups: "previous declaration was here", "did you mean to include <header>?"
-5. Add more lowering diagnostics: unresolved lvalue in assignments, unresolved typedefs,
+3. Add more "note:" follow-ups: "previous declaration was here", "did you mean to include <header>?"
+4. Add more lowering diagnostics: unresolved lvalue in assignments, unresolved typedefs,
    vector type mismatches in compound assignment
 
 Key files:
