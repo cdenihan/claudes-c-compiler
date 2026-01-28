@@ -1,0 +1,8 @@
+Task: Replace magic numbers with named constants
+Status: in_progress
+Description: Replace bare magic number literals across the codebase with named constants
+and add documentation explaining their meaning. Targets:
+- mem2reg: size <= 8 threshold for alloca promotion
+- peephole: store/load limits, lookahead windows, iteration limits
+- stack_layout: copy alias resolution depth limit
+- Any other bare magic numbers found during review

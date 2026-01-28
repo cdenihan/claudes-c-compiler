@@ -98,6 +98,40 @@ fn simplify_redundant_cond_branches(func: &mut IrFunction) -> usize {
 /// no longer exists. Without this cleanup, stale phi entries can cause
 /// miscompilation when the not-taken block is still reachable from other paths.
 fn fold_constant_cond_branches_with_map(func: &mut IrFunction, label_to_idx: &FxHashMap<BlockId, usize>) -> usize {
+    // Build predecessor count: how many predecessors each block has.
+    // Used to enable cross-block value resolution for single-predecessor blocks.
+    let mut pred_count: FxHashMap<BlockId, u32> = FxHashMap::default();
+    let mut single_pred: FxHashMap<BlockId, BlockId> = FxHashMap::default();
+    for block in func.blocks.iter() {
+        match &block.terminator {
+            Terminator::Branch(target) => {
+                let count = pred_count.entry(*target).or_insert(0);
+                *count += 1;
+                if *count == 1 { single_pred.insert(*target, block.label); }
+                else { single_pred.remove(target); }
+            }
+            Terminator::CondBranch { true_label, false_label, .. } => {
+                for target in [true_label, false_label] {
+                    let count = pred_count.entry(*target).or_insert(0);
+                    *count += 1;
+                    if *count == 1 { single_pred.insert(*target, block.label); }
+                    else { single_pred.remove(target); }
+                }
+            }
+            Terminator::Switch { cases, default, .. } => {
+                let mut targets: Vec<BlockId> = vec![*default];
+                for (_, t) in cases { targets.push(*t); }
+                for target in targets {
+                    let count = pred_count.entry(target).or_insert(0);
+                    *count += 1;
+                    if *count == 1 { single_pred.insert(target, block.label); }
+                    else { single_pred.remove(&target); }
+                }
+            }
+            _ => {}
+        }
+    }
+
     // First pass: collect the folding decisions.
     // Each entry: (block_index, taken_target, not_taken_target, block_label)
     let mut folds: Vec<(usize, BlockId, BlockId, BlockId)> = Vec::new();
@@ -107,12 +141,31 @@ fn fold_constant_cond_branches_with_map(func: &mut IrFunction, label_to_idx: &Fx
             let const_val = match cond {
                 Operand::Const(c) => Some(is_const_nonzero(c)),
                 Operand::Value(v) => {
-                    // Look through Copy/Phi instructions in this block to resolve
+                    // Look through Copy/Phi/Cmp/Select instructions in this block to resolve
                     // the Value to a constant. This handles the case where
                     // simplify_trivial_phis created a Copy { dest: V, src: Const(c) }
                     // in a previous fixpoint iteration, but copy_prop hasn't run yet.
-                    resolve_value_to_const_in_block(block, *v)
-                        .map(|c| is_const_nonzero(&c))
+                    let resolved = resolve_value_to_const_in_block(block, *v);
+                    if resolved.is_some() {
+                        resolved.map(|c| is_const_nonzero(&c))
+                    } else {
+                        // If not found in this block, check if this block has a single
+                        // unconditional predecessor. The value may be defined there
+                        // (e.g., after if_convert creates a Select in the predecessor
+                        // that cfg_simplify later resolves to a constant).
+                        single_pred.get(&block.label)
+                            .and_then(|pred_label| label_to_idx.get(pred_label))
+                            .and_then(|&pred_idx| {
+                                let pred_block = &func.blocks[pred_idx];
+                                // Only look at predecessor if it unconditionally branches here
+                                if matches!(&pred_block.terminator, Terminator::Branch(t) if *t == block.label) {
+                                    resolve_value_to_const_in_block(pred_block, *v)
+                                } else {
+                                    None
+                                }
+                            })
+                            .map(|c| is_const_nonzero(&c))
+                    }
                 }
             };
             if let Some(is_true) = const_val {
@@ -238,12 +291,19 @@ fn fold_constant_switches_with_map(func: &mut IrFunction, label_to_idx: &FxHashM
     count
 }
 
-/// Check if a constant value is nonzero (truthy).
-/// Look through Copy and Phi instructions in a block to resolve a Value to
+/// Look through Copy, Phi, Cmp, and Select instructions in a block to resolve a Value to
 /// a constant. This allows fold_constant_cond_branches and fold_constant_switches
 /// to see through Copy instructions created by simplify_trivial_phis within
 /// the same cfg_simplify fixpoint loop, without waiting for a separate copy_prop pass.
+///
+/// Also handles Cmp instructions where both operands resolve to constants within
+/// the same block, which is critical for the kernel's `cpucap_is_possible()` pattern:
+/// after switch folding resolves `cpucap_is_possible(66)` → 0, the comparison
+/// `!cpucap_is_possible(66)` (i.e., `Cmp(Ne, 0, 0)`) can be evaluated at compile
+/// time, enabling dead code elimination of feature-gated code paths like
+/// `preserve_sve_context`.
 fn resolve_value_to_const_in_block(block: &BasicBlock, v: Value) -> Option<IrConst> {
+    // First try direct resolution (Copy, Phi)
     for inst in &block.instructions {
         match inst {
             Instruction::Copy { dest, src: Operand::Const(c) } if *dest == v => {
@@ -274,10 +334,49 @@ fn resolve_value_to_const_in_block(block: &BasicBlock, v: Value) -> Option<IrCon
                 }
                 return first_const;
             }
+            // Evaluate Cmp with constant operands
+            Instruction::Cmp { dest, op, lhs, rhs, .. } if *dest == v => {
+                let lhs_const = resolve_operand_to_i64_in_block(block, lhs);
+                let rhs_const = resolve_operand_to_i64_in_block(block, rhs);
+                if let (Some(l), Some(r)) = (lhs_const, rhs_const) {
+                    let result = match op {
+                        IrCmpOp::Eq => l == r,
+                        IrCmpOp::Ne => l != r,
+                        IrCmpOp::Slt => l < r,
+                        IrCmpOp::Sle => l <= r,
+                        IrCmpOp::Sgt => l > r,
+                        IrCmpOp::Sge => l >= r,
+                        IrCmpOp::Ult => (l as u64) < (r as u64),
+                        IrCmpOp::Ule => (l as u64) <= (r as u64),
+                        IrCmpOp::Ugt => (l as u64) > (r as u64),
+                        IrCmpOp::Uge => (l as u64) >= (r as u64),
+                    };
+                    return Some(IrConst::I32(if result { 1 } else { 0 }));
+                }
+            }
+            // Evaluate Select with constant condition
+            Instruction::Select { dest, cond, true_val, false_val, .. } if *dest == v => {
+                if let Some(cond_const) = resolve_operand_to_i64_in_block(block, cond) {
+                    let chosen = if cond_const != 0 { true_val } else { false_val };
+                    match chosen {
+                        Operand::Const(c) => return Some(*c),
+                        Operand::Value(cv) => return resolve_value_to_const_in_block(block, *cv),
+                    }
+                }
+            }
             _ => {}
         }
     }
     None
+}
+
+/// Resolve an operand to an i64 constant, looking through Copy and Phi
+/// instructions in the same block.
+fn resolve_operand_to_i64_in_block(block: &BasicBlock, op: &Operand) -> Option<i64> {
+    match op {
+        Operand::Const(c) => c.to_i64(),
+        Operand::Value(v) => resolve_value_to_const_in_block(block, *v)?.to_i64(),
+    }
 }
 
 fn is_const_nonzero(c: &IrConst) -> bool {

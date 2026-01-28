@@ -372,8 +372,10 @@ pub fn run_passes(module: &mut IrModule, _opt_level: u32) {
         }
 
         // Phase 4: Constant folding
-        // Upstream: copy_prop (propagated constants), narrow, simplify (reduced exprs)
-        if !dis_constfold && should_run!(4, 1, 2, 3) {
+        // Upstream: copy_prop (propagated constants), narrow, simplify (reduced exprs),
+        //           if_convert (creates Select that constfold can fold with known-constant cond),
+        //           copy_prop2 (propagates constants into Select/Cmp operands after if_convert)
+        if !dis_constfold && should_run!(4, 1, 2, 3, 7, 8) {
             let n = timed_pass!("constfold", run_on_visited(module, &dirty, &mut changed, constant_fold::fold_function));
             cur_pass_changes[4] = n;
             total_changes += n;
