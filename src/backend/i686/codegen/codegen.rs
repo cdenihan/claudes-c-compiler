@@ -193,6 +193,21 @@ impl I686Codegen {
         }
     }
 
+    /// Load a 64-bit value's slot into %eax by OR'ing both 32-bit halves.
+    /// Used for truthiness testing of I64/U64/F64 values on i686, where a value
+    /// is nonzero iff either half is nonzero.
+    fn emit_wide_value_to_eax_ored(&mut self, value_id: u32) {
+        if let Some(slot) = self.state.get_slot(value_id) {
+            emit!(self.state, "    movl {}(%ebp), %eax", slot.0);
+            emit!(self.state, "    orl {}(%ebp), %eax", slot.0 + 4);
+        } else {
+            // Wide values (I64/F64) on i686 should always have stack slots since
+            // they can't fit in a single 32-bit register. Fall back to loading
+            // the low 32 bits only as a last resort.
+            self.operand_to_eax(&Operand::Value(Value(value_id)));
+        }
+    }
+
     /// Load an operand into %ecx.
     fn operand_to_ecx(&mut self, op: &Operand) {
         match op {
@@ -458,42 +473,6 @@ impl I686Codegen {
         } else {
             // No slot available, pop x87 stack to discard
             self.state.emit("    fstp %st(0)");
-        }
-    }
-
-    /// Copy a wide (64-bit) operand into a destination's stack slot.
-    /// Used by emit_select for I64/U64/F64 values that need 8-byte copies.
-    fn emit_wide_copy_to_slot(&mut self, dest: &Value, src: &Operand) {
-        if let Some(dest_slot) = self.state.get_slot(dest.0) {
-            match src {
-                Operand::Value(v) => {
-                    if let Some(src_slot) = self.state.get_slot(v.0) {
-                        emit!(self.state, "    movl {}(%ebp), %eax", src_slot.0);
-                        emit!(self.state, "    movl %eax, {}(%ebp)", dest_slot.0);
-                        emit!(self.state, "    movl {}(%ebp), %eax", src_slot.0 + 4);
-                        emit!(self.state, "    movl %eax, {}(%ebp)", dest_slot.0 + 4);
-                    }
-                }
-                Operand::Const(IrConst::F64(val)) => {
-                    let bits = val.to_bits();
-                    let lo = bits as u32;
-                    let hi = (bits >> 32) as u32;
-                    emit!(self.state, "    movl ${}, {}(%ebp)", lo as i32, dest_slot.0);
-                    emit!(self.state, "    movl ${}, {}(%ebp)", hi as i32, dest_slot.0 + 4);
-                }
-                Operand::Const(IrConst::I64(val)) => {
-                    let lo = *val as u32;
-                    let hi = (*val >> 32) as u32;
-                    emit!(self.state, "    movl ${}, {}(%ebp)", lo as i32, dest_slot.0);
-                    emit!(self.state, "    movl ${}, {}(%ebp)", hi as i32, dest_slot.0 + 4);
-                }
-                _ => {
-                    // For other constant types, use the 32-bit path as fallback
-                    self.emit_load_operand(src);
-                    self.emit_store_result(dest);
-                }
-            }
-            self.state.reg_cache.invalidate_all();
         }
     }
 
@@ -1138,49 +1117,6 @@ impl ArchCodegen for I686Codegen {
         self.emit_store_result(dest);
     }
 
-    /// Override emit_select to handle 64-bit types on i686.
-    /// The default emit_select uses emit_load_operand/emit_store_result which only
-    /// move 32 bits via eax. For I64/U64/F64 we need to copy all 8 bytes.
-    fn emit_select(&mut self, dest: &Value, cond: &Operand, true_val: &Operand, false_val: &Operand, ty: IrType) {
-        let is_wide = matches!(ty, IrType::I64 | IrType::U64 | IrType::F64);
-        if !is_wide {
-            // Non-wide types: use the default branch-based select via accumulator
-            let label_id = self.state.next_label_id();
-            let true_label = format!(".Lsel_true_{}", label_id);
-            let end_label = format!(".Lsel_end_{}", label_id);
-            self.emit_load_operand(cond);
-            self.emit_branch_nonzero(&true_label);
-            self.emit_load_operand(false_val);
-            self.emit_store_result(dest);
-            self.emit_branch(&end_label);
-            self.state.emit_fmt(format_args!("{}:", true_label));
-            self.emit_load_operand(true_val);
-            self.emit_store_result(dest);
-            self.state.emit_fmt(format_args!("{}:", end_label));
-            return;
-        }
-
-        // Wide (64-bit) select: branch and copy 8 bytes per path
-        let label_id = self.state.next_label_id();
-        let true_label = format!(".Lsel_true_{}", label_id);
-        let end_label = format!(".Lsel_end_{}", label_id);
-
-        // Load condition and branch
-        self.emit_load_operand(cond);
-        self.emit_branch_nonzero(&true_label);
-
-        // False path: copy 8-byte false_val to dest
-        self.emit_wide_copy_to_slot(dest, false_val);
-        self.emit_branch(&end_label);
-
-        // True path: copy 8-byte true_val to dest
-        self.state.emit_fmt(format_args!("{}:", true_label));
-        self.emit_wide_copy_to_slot(dest, true_val);
-
-        // End
-        self.state.emit_fmt(format_args!("{}:", end_label));
-    }
-
     /// Override emit_cast to handle F64 source/destination specially on i686.
     /// F64 values are 8 bytes but the accumulator is only 32 bits, so we use
     /// x87 FPU for all F64 conversions, bypassing the default emit_load_operand path.
@@ -1692,49 +1628,26 @@ impl ArchCodegen for I686Codegen {
         emit!(self.state, "    jne {}", label);
     }
 
-    /// Override conditional branch to handle 64-bit types (I64/U64/F64) on i686.
-    ///
-    /// The default path calls emit_load_operand (which only loads 32 bits into eax)
-    /// then emit_branch_nonzero (which only tests eax). For 64-bit values, the high
-    /// 32 bits are ignored, causing incorrect results. For example:
-    /// - `if (1.0)` with F64 1.0 = 0x3FF0_0000_0000_0000: low 32 bits are zero → false!
-    /// - `if (0x100000000LL)`: low 32 bits are zero → false!
-    ///
-    /// Fix: detect 64-bit operands and test both halves (OR low|high, then test).
+    /// On i686, 64-bit conditions (F64/I64/U64) need both 32-bit halves tested.
+    /// The default only loads the low 32 bits into eax, missing nonzero values
+    /// where only the high 32 bits are set (e.g., double 1.0 = 0x3FF00000_00000000).
     fn emit_cond_branch_blocks(&mut self, cond: &Operand, true_block: BlockId, false_block: BlockId) {
-        let true_label = true_block.as_label();
-
+        // Try constant-folding wide conditions at compile time
         match cond {
-            // 64-bit constant: evaluate at compile time
             Operand::Const(IrConst::I64(v)) => {
                 if *v != 0 {
-                    emit!(self.state, "    jmp {}", true_label);
+                    self.emit_branch_to_block(true_block);
                 } else {
                     self.emit_branch_to_block(false_block);
                 }
                 return;
             }
-            Operand::Const(IrConst::F64(f)) => {
-                if f.to_bits() != 0 {
-                    emit!(self.state, "    jmp {}", true_label);
+            Operand::Const(IrConst::F64(fval)) => {
+                // In C, -0.0 is falsy (compares equal to 0.0), so use IEEE 754
+                // comparison rather than bit equality.
+                if *fval != 0.0 {
+                    self.emit_branch_to_block(true_block);
                 } else {
-                    self.emit_branch_to_block(false_block);
-                }
-                return;
-            }
-            // 64-bit value on stack: load both halves and OR together
-            Operand::Value(v) if self.state.is_wide_value(v.0) => {
-                if let Some(slot) = self.state.get_slot(v.0) {
-                    // Load low 32 bits, OR with high 32 bits
-                    emit!(self.state, "    movl {}(%ebp), %eax", slot.0);
-                    emit!(self.state, "    orl {}(%ebp), %eax", slot.0 + 4);
-                    emit!(self.state, "    jne {}", true_label);
-                    self.emit_branch_to_block(false_block);
-                    self.state.reg_cache.invalidate_acc();
-                } else {
-                    // Fallback: load to eax (32-bit truncation, shouldn't happen for wide values)
-                    self.operand_to_eax(cond);
-                    self.emit_branch_nonzero(&true_label);
                     self.emit_branch_to_block(false_block);
                 }
                 return;
@@ -1742,10 +1655,88 @@ impl ArchCodegen for I686Codegen {
             _ => {}
         }
 
-        // Default path for 32-bit and smaller types
-        self.emit_load_operand(cond);
+        // For runtime 64-bit values, OR both halves and test the result
+        if let Operand::Value(v) = cond {
+            if self.state.is_wide_value(v.0) {
+                self.emit_wide_value_to_eax_ored(v.0);
+                self.state.reg_cache.invalidate_acc();
+                let true_label = true_block.as_label();
+                self.emit_branch_nonzero(&true_label);
+                self.emit_branch_to_block(false_block);
+                return;
+            }
+        }
+
+        // Default path for 32-bit values
+        self.operand_to_eax(cond);
+        let true_label = true_block.as_label();
         self.emit_branch_nonzero(&true_label);
         self.emit_branch_to_block(false_block);
+    }
+
+    /// On i686, selects with 64-bit conditions or results need special handling.
+    /// Uses emit_copy_value (which handles wide values) instead of the default
+    /// emit_load_operand/emit_store_result path that only handles 32 bits.
+    fn emit_select(&mut self, dest: &Value, cond: &Operand, true_val: &Operand, false_val: &Operand, ty: IrType) {
+        // Constant-fold wide conditions at compile time
+        match cond {
+            Operand::Const(IrConst::I64(v)) => {
+                self.emit_copy_value(dest, if *v != 0 { true_val } else { false_val });
+                return;
+            }
+            Operand::Const(IrConst::F64(fval)) => {
+                self.emit_copy_value(dest, if *fval != 0.0 { true_val } else { false_val });
+                return;
+            }
+            _ => {}
+        }
+
+        let cond_is_wide = matches!(cond, Operand::Value(v) if self.state.is_wide_value(v.0));
+        let result_is_wide = matches!(ty, IrType::F64 | IrType::I64 | IrType::U64);
+
+        // If neither condition nor result is wide, use the default 32-bit path
+        if !cond_is_wide && !result_is_wide {
+            let label_id = self.state.next_label_id();
+            let true_label = format!(".Lsel_true_{}", label_id);
+            let end_label = format!(".Lsel_end_{}", label_id);
+            self.emit_load_operand(cond);
+            self.emit_branch_nonzero(&true_label);
+            self.emit_load_operand(false_val);
+            self.emit_store_result(dest);
+            self.emit_branch(&end_label);
+            self.state.emit_fmt(format_args!("{}:", true_label));
+            self.emit_load_operand(true_val);
+            self.emit_store_result(dest);
+            self.state.emit_fmt(format_args!("{}:", end_label));
+            return;
+        }
+
+        let label_id = self.state.next_label_id();
+        let true_label = format!(".Lsel_true_{}", label_id);
+        let end_label = format!(".Lsel_end_{}", label_id);
+
+        // Load condition into eax, OR'ing both halves for wide conditions
+        if cond_is_wide {
+            if let Operand::Value(v) = cond {
+                self.emit_wide_value_to_eax_ored(v.0);
+                self.state.reg_cache.invalidate_acc();
+            }
+        } else {
+            self.operand_to_eax(cond);
+        }
+
+        self.emit_branch_nonzero(&true_label);
+
+        // False path: copy false_val to dest, jump to end
+        self.emit_copy_value(dest, false_val);
+        self.emit_branch(&end_label);
+
+        // True path: copy true_val to dest
+        self.state.emit_fmt(format_args!("{}:", true_label));
+        self.emit_copy_value(dest, true_val);
+
+        // End
+        self.state.emit_fmt(format_args!("{}:", end_label));
     }
 
     fn emit_jump_indirect(&mut self) {
