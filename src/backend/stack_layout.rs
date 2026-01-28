@@ -1168,9 +1168,12 @@ pub fn calculate_stack_space_common(
             }
         }
         // Also propagate through copy aliases (dest -> root).
+        // Forward direction only: if root is wide, dest (which shares root's slot) must be wide.
+        // We do NOT propagate in reverse (root_id <- dest_id) because a 32-bit root value
+        // must not be marked wide just because one of its aliases is 64-bit. The alias shares
+        // the same 8-byte slot, but the root's own boolean/condition tests must use 32-bit logic.
         for (&dest_id, &root_id) in &copy_alias {
             copy_edges.push((dest_id, root_id));
-            copy_edges.push((root_id, dest_id));
         }
         // Fixpoint iteration: propagate wide status until stable.
         if !copy_edges.is_empty() {
