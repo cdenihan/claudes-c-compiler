@@ -1,56 +1,41 @@
 Fix remaining i686 project failures
 =====================================
-Date: 2026-01-28 (updated after hardcoded pointer size fix)
+Date: 2026-01-28 (updated after rep movsb callee-save fix)
 
-Current status (after fixing hardcoded 64-bit pointer sizes):
-- Unit tests: ~98.3% pass (10% sample: 2690/2737)
-- Projects passing: 2/12 (zlib, libuv)
-- Projects failing: lua, libsodium, mquickjs, libpng, jq, libjpeg, mbedtls, libffi, musl, tcc
+Current status:
+- Unit tests: ~99.2% pass (10% sample: 2716/2737)
+- Projects passing: 5/12 (zlib, lua, libpng, jq, libuv)
+- Projects failing: libsodium, mquickjs, libjpeg, mbedtls, libffi, musl, tcc
 
-Fixed in latest round (hardcoded pointer size fix):
-- pointer_analysis.rs: fallback element sizes 8 -> target_ptr_size()
-- types.rs: function pointer element size 8 -> target_ptr_size()
-- types.rs: scalar min alloc size .max(8) -> .max(4) on ILP32
-- expr_builtins_intrin.rs: 'l' suffix intrinsics now use target_int_ir_type()
-- expr_builtins_overflow.rs: 'l' suffix overflow builtins use target_int_ir_type()
-- stmt.rs, func_lowering.rs, expr_access.rs: VLA size/stride use target_int_ir_type()
-- complex.rs: array subscript address arithmetic uses target_int_ir_type()
-- const_eval.rs: alignof fallbacks use target_ptr_size()
-- expr_types.rs, expr_calls.rs: fallback types use target_int_ir_type()
-- Unit test pass rate improved from 95.5% to 98.3% (+2.8%)
-
-Note: lua and libpng were reported as passing earlier but are now failing.
-This is a pre-existing regression from other commits, not from the pointer size fix.
+Fixed in latest round (rep movsb callee-save fix):
+- emit_memcpy now always saves/restores ESI and EDI around rep movsb
+- Previously only saved them if they were register-allocated in the function
+- This violated the callee-saved ABI contract and caused widespread crashes
+- jq: went from 1/12 pass to 12/12 pass (was SIGABRT/SIGSEGV on every test)
+- lua: now passes (was failing due to same callee-save corruption)
+- libpng: now passes (same root cause)
 
 Known remaining issues:
 
-1. lua: table operations return nil, factorial returns 1 (not from this fix)
-   - Likely a separate codegen bug
-
-2. libpng: test failures (not from this fix)
-
-3. mquickjs crashes with SIGSEGV
+1. mquickjs crashes with SIGSEGV
    - All test_*.js tests segfault
    - Need to debug under GDB to find specific crash point
 
-4. musl: Build fails during assembly of i386 math routines
+2. musl: Build fails during assembly of i386 math routines
    - Error in src/math/i386/scalblnf.s (inline asm)
    - May need i686-specific inline assembly handling
 
-5. tcc: Build/test failures
+3. tcc: Build/test failures
 
-6. libffi: Build fails (needs i686-specific handling)
+4. libffi: Build fails (needs i686-specific handling)
 
-7. mbedtls: Build fails (__builtin_ia32_pshufd not implemented)
+5. mbedtls: Build fails (__builtin_ia32_pshufd not implemented)
 
-8. libsodium: Timeouts and segfaults
+6. libsodium: Timeouts and segfaults
 
-9. libjpeg: Test failures
-
-10. jq: 1/12 pass, rest fail with SIGABRT or SIGSEGV
+7. libjpeg: Test failures
 
 Priority investigation targets:
-- lua regression (table lookup and factorial broken)
 - mquickjs (JS engine, exercises many codegen paths)
 - musl inline asm for i386 math routines
 - mbedtls SSE2 intrinsic builtins

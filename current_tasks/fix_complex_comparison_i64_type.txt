@@ -1,0 +1,16 @@
+Task: Fix complex comparison IR type from I64 to I32
+
+Problem:
+In lower_complex_comparison() in src/ir/lowering/complex.rs, the AND and comparison
+operations that combine real/imaginary equality results use IrType::I64. However,
+comparison results (from emit_cmp_val) are I32 values (0 or 1). On i686, I64 causes
+64-bit register-pair operations (eax:edx), reading uninitialized upper 32 bits from
+the stack, producing wrong results.
+
+Fix:
+Change IrType::I64 to IrType::I32 in the three places in lower_complex_comparison():
+- Line 890: BinOp(And, real_eq, imag_eq)
+- Line 894: BinOp(And, real_eq, imag_eq) for Ne case
+- Line 895: Cmp(Eq, both_eq, 0) for Ne case
+
+This affects ~15-20 test failures in the i686 suite (complex-comparison, complex-assignment tags).

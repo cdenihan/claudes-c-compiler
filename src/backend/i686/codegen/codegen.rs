@@ -3218,18 +3218,13 @@ impl ArchCodegen for I686Codegen {
 
     fn emit_memcpy(&mut self, dest: &Value, src: &Value, size: usize) {
         use crate::backend::state::SlotAddr;
-        // Save esi and edi if they are allocated to hold values.
-        // Note: memcpy dest/src operands are excluded from register allocation
-        // (regalloc.rs line 356-358), so these saves protect OTHER values that
-        // happen to be register-allocated to esi/edi and live across this memcpy.
-        let save_esi = self.reg_assignments.values().any(|r| r.0 == 1);
-        let save_edi = self.reg_assignments.values().any(|r| r.0 == 2);
-        if save_esi {
-            self.state.emit("    pushl %esi");
-        }
-        if save_edi {
-            self.state.emit("    pushl %edi");
-        }
+        // Always save esi and edi around rep movsb.
+        // These are callee-saved registers in the System V i386 ABI, so we must
+        // preserve them even if the register allocator didn't assign any values
+        // to them in this function. A caller may be relying on their preservation
+        // across a call to this function.
+        self.state.emit("    pushl %esi");
+        self.state.emit("    pushl %edi");
 
         // Load dest address into edi
         if let Some(addr) = self.state.resolve_slot_addr(dest.0) {
@@ -3259,12 +3254,8 @@ impl ArchCodegen for I686Codegen {
         self.state.emit("    rep movsb");
 
         // Restore edi and esi (reverse order of push)
-        if save_edi {
-            self.state.emit("    popl %edi");
-        }
-        if save_esi {
-            self.state.emit("    popl %esi");
-        }
+        self.state.emit("    popl %edi");
+        self.state.emit("    popl %esi");
     }
 
     fn emit_memcpy_load_dest_addr(&mut self, slot: StackSlot, is_alloca: bool, val_id: u32) {
