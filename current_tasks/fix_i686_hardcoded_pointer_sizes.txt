@@ -1,0 +1,16 @@
+Task: Fix hardcoded 64-bit pointer sizes throughout the lowering and backend code for i686 (32-bit) support
+Status: in_progress
+
+Problem:
+Multiple files hardcode pointer size as 8 bytes (64-bit), causing crashes and incorrect code
+generation on the i686 (32-bit, ILP32) target where pointers are 4 bytes.
+
+Files affected:
+- src/ir/lowering/global_init_compound_struct.rs (lines 421, 435): ptr_off + 8
+- src/ir/lowering/global_init_compound.rs (lines 101, 145, 204): let ptr_size = 8
+- src/ir/lowering/global_init_compound_ptrs.rs (line 275): ai * 8
+- src/ir/lowering/types.rs (lines 590, 592, 594, 596): hardcoded 8 for pointer array stride
+- src/backend/call_emit.rs (lines 87, 93, 168, 187, 198, 205, 279, 289): stack slot sizes and alignment
+
+Fix:
+Replace all hardcoded 8 with target_ptr_size() from crate::common::types.
