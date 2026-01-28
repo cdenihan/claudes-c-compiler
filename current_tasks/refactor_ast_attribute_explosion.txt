@@ -1,0 +1,11 @@
+Refactor AST Attribute Explosion (in_progress)
+
+Currently FunctionDef, Declaration, and InitDeclarator each carry 10-14
+separate boolean and Option<String> fields for function/declaration
+attributes (is_static, is_inline, is_extern, is_gnu_inline,
+is_always_inline, is_noinline, is_constructor, is_destructor, is_weak,
+is_used, section, visibility, etc.).
+
+This task consolidates these scattered fields into a shared
+FunctionAttributes struct, reducing duplication and making it easy to add
+new attributes in the future.
