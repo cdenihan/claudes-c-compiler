@@ -90,7 +90,7 @@ impl Lowerer {
                     false
                 };
                 let stripped_for_mem_check = constraint.replace('+', "");
-                let is_memory_only = constraint_is_memory_only(&stripped_for_mem_check);
+                let needs_address = constraint_needs_address(&stripped_for_mem_check);
                 let input_operand = if is_global_reg {
                     if let Expr::Identifier(ref var_name, _) = &out.expr {
                         let asm_reg = self.get_asm_register(var_name).unwrap();
@@ -98,14 +98,20 @@ impl Lowerer {
                     } else {
                         unreachable!()
                     }
-                } else if is_memory_only {
-                    // For "+m" (memory-only read-write) constraints, do NOT emit a Load
-                    // of the current value. The inline asm reads/writes the memory directly
-                    // through the template, so the loaded value would never be used. More
-                    // importantly, emitting the Load can crash when the memory address is
-                    // only valid with a segment prefix (e.g., %gs: for per-CPU variables
-                    // in the Linux kernel) -- the Load would dereference the raw pointer
-                    // without the segment prefix, causing a page fault.
+                } else if needs_address {
+                    // For "+m" (memory-only read-write) and "+A" (RISC-V address for
+                    // AMO/LR/SC) constraints, do NOT emit a Load of the current value.
+                    // These constraints need the ADDRESS (lvalue), not the value (rvalue).
+                    //
+                    // For "+m": the inline asm reads/writes memory directly through the
+                    // template. Emitting a Load can crash when the memory address is only
+                    // valid with a segment prefix (e.g., %gs: for per-CPU variables).
+                    //
+                    // For "+A": the address is loaded into a register and formatted as
+                    // "(reg)" for AMO instructions. Loading the value would cause the
+                    // atomic op to use the memory CONTENTS as an address, leading to
+                    // crashes (e.g., kernel clear_bit using flag bits as an address).
+                    //
                     // We still need a placeholder operand for correct operand numbering.
                     Operand::Value(ptr)
                 } else {

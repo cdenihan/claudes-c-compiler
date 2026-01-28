@@ -1433,18 +1433,40 @@ impl ArchCodegen for I686Codegen {
                 }
                 call_abi::CallArgClass::StructByValStack { size } |
                 call_abi::CallArgClass::LargeStructStack { size } => {
-                    // Copy struct word by word
+                    // Copy struct data to the call stack.
+                    // The operand is a pointer to the struct data. For allocas,
+                    // the data is directly in the stack slot. For other pointers
+                    // (globals, register-allocated), we load through the pointer.
                     let sz = *size;
                     if let Operand::Value(v) = &args[i] {
-                        if let Some(slot) = self.state.get_slot(v.0) {
+                        if self.state.is_alloca(v.0) {
+                            // Alloca: struct data is directly in the slot
+                            if let Some(slot) = self.state.get_slot(v.0) {
+                                let mut copied = 0usize;
+                                while copied + 4 <= sz {
+                                    emit!(self.state, "    movl {}(%ebp), %eax", slot.0 + copied as i64);
+                                    emit!(self.state, "    movl %eax, {}(%esp)", stack_offset + copied);
+                                    copied += 4;
+                                }
+                                while copied < sz {
+                                    emit!(self.state, "    movb {}(%ebp), %al", slot.0 + copied as i64);
+                                    emit!(self.state, "    movb %al, {}(%esp)", stack_offset + copied);
+                                    copied += 1;
+                                }
+                            }
+                        } else {
+                            // Non-alloca: value is a pointer to struct data.
+                            // Load pointer into ecx, then copy through it.
+                            self.operand_to_eax(&args[i]);
+                            self.state.emit("    movl %eax, %ecx");
                             let mut copied = 0usize;
                             while copied + 4 <= sz {
-                                emit!(self.state, "    movl {}(%ebp), %eax", slot.0 + copied as i64);
+                                emit!(self.state, "    movl {}(%ecx), %eax", copied);
                                 emit!(self.state, "    movl %eax, {}(%esp)", stack_offset + copied);
                                 copied += 4;
                             }
                             while copied < sz {
-                                emit!(self.state, "    movb {}(%ebp), %al", slot.0 + copied as i64);
+                                emit!(self.state, "    movb {}(%ecx), %al", copied);
                                 emit!(self.state, "    movb %al, {}(%esp)", stack_offset + copied);
                                 copied += 1;
                             }
