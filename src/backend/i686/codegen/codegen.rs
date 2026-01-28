@@ -2632,7 +2632,7 @@ impl ArchCodegen for I686Codegen {
                  func_ptr: Option<&Operand>, dest: Option<Value>, return_type: IrType,
                  is_variadic: bool, num_fixed_args: usize, struct_arg_sizes: &[Option<usize>],
                  struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
-                 _is_sret: bool,
+                 is_sret: bool,
                  is_fastcall: bool) {
         if !is_fastcall {
             // Delegate to the default trait implementation for cdecl calls.
@@ -2655,7 +2655,11 @@ impl ArchCodegen for I686Codegen {
             self.state().reg_cache.invalidate_acc();
             self.emit_call_reg_args(args, &arg_classes_vec, arg_types, total_sp_adjust, f128_temp_space, stack_arg_space);
             self.emit_call_instruction(direct_name, func_ptr, indirect, stack_arg_space);
-            self.emit_call_cleanup(stack_arg_space, f128_temp_space, indirect);
+            // On i386 SysV, sret calls have the callee pop the hidden pointer with
+            // `ret $4`, so subtract those bytes from the caller's stack cleanup.
+            let callee_pops = self.callee_pops_bytes_for_sret(is_sret);
+            let effective_stack_cleanup = stack_arg_space.saturating_sub(callee_pops);
+            self.emit_call_cleanup(effective_stack_cleanup, f128_temp_space, indirect);
             if let Some(dest) = dest {
                 self.emit_call_store_result(&dest, return_type);
             }
