@@ -2775,6 +2775,62 @@ impl ArchCodegen for I686Codegen {
     }
 
     // --- Memcpy ---
+    //
+    // On i686, `rep movsb` implicitly clobbers esi, edi, and ecx.
+    // Since esi (PhysReg 1) and edi (PhysReg 2) are callee-saved registers
+    // that may be allocated to hold live values, we must save and restore
+    // them around the entire memcpy operation.
+
+    fn emit_memcpy(&mut self, dest: &Value, src: &Value, size: usize) {
+        use crate::backend::state::SlotAddr;
+        // Save esi and edi if they are allocated to hold values.
+        // Note: memcpy dest/src operands are excluded from register allocation
+        // (regalloc.rs line 356-358), so these saves protect OTHER values that
+        // happen to be register-allocated to esi/edi and live across this memcpy.
+        let save_esi = self.reg_assignments.values().any(|r| r.0 == 1);
+        let save_edi = self.reg_assignments.values().any(|r| r.0 == 2);
+        if save_esi {
+            self.state.emit("    pushl %esi");
+        }
+        if save_edi {
+            self.state.emit("    pushl %edi");
+        }
+
+        // Load dest address into edi
+        if let Some(addr) = self.state.resolve_slot_addr(dest.0) {
+            match addr {
+                SlotAddr::OverAligned(slot, id) => {
+                    // Use _to_acc variant which computes into eax
+                    self.emit_alloca_aligned_addr_to_acc(slot, id);
+                    self.state.emit("    movl %eax, %edi");
+                }
+                SlotAddr::Direct(slot) => self.emit_memcpy_load_dest_addr(slot, true, dest.0),
+                SlotAddr::Indirect(slot) => self.emit_memcpy_load_dest_addr(slot, false, dest.0),
+            }
+        }
+        // Load src address into esi
+        if let Some(addr) = self.state.resolve_slot_addr(src.0) {
+            match addr {
+                SlotAddr::OverAligned(slot, id) => {
+                    self.emit_alloca_aligned_addr_to_acc(slot, id);
+                    self.state.emit("    movl %eax, %esi");
+                }
+                SlotAddr::Direct(slot) => self.emit_memcpy_load_src_addr(slot, true, src.0),
+                SlotAddr::Indirect(slot) => self.emit_memcpy_load_src_addr(slot, false, src.0),
+            }
+        }
+        // Perform the copy
+        emit!(self.state, "    movl ${}, %ecx", size);
+        self.state.emit("    rep movsb");
+
+        // Restore edi and esi (reverse order of push)
+        if save_edi {
+            self.state.emit("    popl %edi");
+        }
+        if save_esi {
+            self.state.emit("    popl %esi");
+        }
+    }
 
     fn emit_memcpy_load_dest_addr(&mut self, slot: StackSlot, is_alloca: bool, val_id: u32) {
         if is_alloca {

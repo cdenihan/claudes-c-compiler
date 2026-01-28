@@ -1036,6 +1036,10 @@ fn emit_int_data(out: &mut AsmOutput, val: i64, ty: IrType, ptr_dir: PtrDirectiv
         IrType::I8 | IrType::U8 => out.emit_fmt(format_args!("    .byte {}", val as u8)),
         IrType::I16 | IrType::U16 => out.emit_fmt(format_args!("    .short {}", val as u16)),
         IrType::I32 | IrType::U32 => out.emit_fmt(format_args!("    .long {}", val as u32)),
+        // On i686 (32-bit), pointers are 4 bytes -- emit a single .long, not two.
+        IrType::Ptr if ptr_dir.is_32bit() => {
+            out.emit_fmt(format_args!("    .long {}", val as u32));
+        }
         _ => {
             if ptr_dir.is_32bit() {
                 // i686: split 64-bit value into two .long directives (little-endian)
