@@ -1,0 +1,22 @@
+Fix i686 hardcoded pointer sizes
+=================================
+Status: in_progress
+Date: 2026-01-28
+
+Task: Fix all remaining hardcoded 64-bit pointer/size assumptions that break
+the i686 (ILP32) backend. The compiler was originally built for 64-bit targets,
+and many IR lowering paths still use IrType::I64 / hardcoded 8 where they should
+use target_int_ir_type() / target_ptr_size() / IrConst::ptr_int().
+
+Files to fix:
+- ir/lowering/pointer_analysis.rs: fallback element size 8 -> target_ptr_size()
+- ir/lowering/types.rs: func ptr elem size 8 -> target_ptr_size(), scalar .max(8) -> .max(target_ptr_size())
+- ir/lowering/expr_builtins_intrin.rs: 'l' suffix -> target_int_ir_type() (not I64)
+- ir/lowering/expr_builtins_overflow.rs: 'l' suffix -> target_int_ir_type()
+- ir/lowering/stmt.rs: VLA stride computations I64 -> target_int_ir_type()
+- ir/lowering/func_lowering.rs: VLA param stride I64 -> target_int_ir_type()
+- ir/lowering/expr_access.rs: VLA sizeof I64 -> target_int_ir_type()
+- ir/lowering/complex.rs: array subscript address I64 -> target_int_ir_type()
+- frontend/sema/const_eval.rs: alignof fallback 8 -> target_ptr_size()
+- ir/lowering/expr_types.rs: fallback types I64 -> target_int_ir_type()
+- ir/lowering/expr_calls.rs: fallback return types I64 -> target_int_ir_type()
