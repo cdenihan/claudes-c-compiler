@@ -1145,6 +1145,50 @@ pub fn calculate_stack_space_common(
         // the accumulator path since operand_to_rax handles missing slots.
     }
 
+    // ── Wide value propagation through Copy chains ─────────────────────
+    // On 32-bit targets, Copy instructions for 64-bit values (F64, I64, U64)
+    // need to copy 8 bytes (two movl instructions) instead of the default 4.
+    // The initial wide_values set only includes values from typed instructions
+    // (Load, BinOp, etc.), but phi elimination creates Copy chains where the
+    // destination has no type information. We must propagate wide status through
+    // ALL Copy instructions using a fixpoint iteration.
+    //
+    // This is necessary because codegen processes blocks in layout order, but
+    // phi copies can create cycles: block A copies from a value defined in
+    // block B, which is processed after A. Without pre-propagation, the Copy
+    // in block A would use the 4-byte default path, corrupting the upper 32 bits.
+    if crate::common::types::target_is_32bit() && !state.wide_values.is_empty() {
+        // Collect all Copy edges: (dest_id, src_id)
+        let mut copy_edges: Vec<(u32, u32)> = Vec::new();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Copy { dest, src: Operand::Value(src_val) } = inst {
+                    copy_edges.push((dest.0, src_val.0));
+                }
+            }
+        }
+        // Also propagate through copy aliases (dest -> root).
+        for (&dest_id, &root_id) in &copy_alias {
+            copy_edges.push((dest_id, root_id));
+            copy_edges.push((root_id, dest_id));
+        }
+        // Fixpoint iteration: propagate wide status until stable.
+        if !copy_edges.is_empty() {
+            let mut changed = true;
+            let mut iters = 0;
+            while changed && iters < 100 {
+                changed = false;
+                iters += 1;
+                for &(dest_id, src_id) in &copy_edges {
+                    if state.wide_values.contains(&src_id) && !state.wide_values.contains(&dest_id) {
+                        state.wide_values.insert(dest_id);
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
     total_space
 }
 
