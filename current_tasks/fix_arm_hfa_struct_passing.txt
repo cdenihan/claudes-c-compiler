@@ -1,0 +1,23 @@
+Task: Fix ARM AArch64 ABI for Homogeneous Floating-Point Aggregate (HFA) struct parameter passing
+
+Bug: On AArch64, structs consisting entirely of float/double members (up to 4 members
+of the same FP type) are Homogeneous Floating-Point Aggregates (HFAs). Per the AArch64
+PCS, these must be passed in consecutive floating-point/SIMD registers (d0-d7/s0-s7),
+not in integer registers (x0-x7).
+
+Currently, the ARM backend passes ALL structs via integer registers, which is incorrect
+for HFA structs. This causes ABI incompatibility with GCC-compiled code.
+
+Example:
+  struct { double r; double i; } s = {1.0, 2.0};
+  func(s);  // Should pass s.r in d0, s.i in d1
+            // Currently passes s.r in x0, s.i in x1
+
+This affects:
+- Struct parameter passing (caller side)
+- Struct parameter receiving (callee side)
+- Struct return values (HFAs returned in d0-d3/s0-s3)
+- #pragma weak alias tests (0147 series) where alias reinterprets types
+- ABI compatibility with GCC-compiled object files
+
+Status: in_progress
