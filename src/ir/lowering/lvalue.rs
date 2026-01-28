@@ -533,8 +533,8 @@ impl Lowerer {
             }
         }
         // Default element size: for pointers we don't know the element type,
-        // use 8 bytes as a safe default for pointer dereferencing.
-        8
+        // use pointer size as a safe default for pointer dereferencing.
+        crate::common::types::target_ptr_size()
     }
 
     /// Check if the result of an array subscript is still a sub-array (not a scalar).

@@ -83,14 +83,16 @@ impl ParamClass {
     /// Used by variadic function handling to compute how many stack bytes named
     /// parameters occupy, so va_start can skip past them.
     pub fn stack_bytes(&self) -> usize {
+        let slot_size = crate::common::types::target_ptr_size(); // 8 for LP64, 4 for ILP32
+        let align_mask = slot_size - 1;
         match self {
-            ParamClass::StackScalar { .. } => 8,
+            ParamClass::StackScalar { .. } => slot_size,
             ParamClass::I128Stack { .. } => 16,
             ParamClass::F128Stack { .. } => 16,
-            ParamClass::F128AlwaysStack { .. } => 16,
-            ParamClass::StructStack { size, .. } => (*size + 7) & !7,
-            ParamClass::LargeStructStack { size, .. } => (*size + 7) & !7,
-            ParamClass::LargeStructByRefStack { .. } => 8, // pointer on stack
+            ParamClass::F128AlwaysStack { .. } => if slot_size == 4 { 12 } else { 16 }, // x87 long double = 12 bytes on i686
+            ParamClass::StructStack { size, .. } => (*size + align_mask) & !align_mask,
+            ParamClass::LargeStructStack { size, .. } => (*size + align_mask) & !align_mask,
+            ParamClass::LargeStructByRefStack { .. } => slot_size, // pointer on stack
             _ => 0, // register-passed params don't consume stack space
         }
     }
@@ -136,6 +138,10 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
     let mut float_reg_idx = 0usize;
     let mut stack_offset: i64 = 0;
 
+    // Minimum stack slot size: 8 bytes on LP64 (x86-64/ARM/RISC-V), 4 bytes on ILP32 (i686).
+    let slot_size = crate::common::types::target_ptr_size();
+    let slot_align_mask = (slot_size - 1) as i64;
+
     for param in &func.params {
         let is_float = param.ty.is_float();
         let is_i128 = is_i128_type(param.ty);
@@ -165,14 +171,14 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
                     }
                     SysvStructRegClass::Stack => {
                         result.push(ParamClass::StructStack { offset: stack_offset, size });
-                        stack_offset += ((size + 7) & !7) as i64;
+                        stack_offset += (size as i64 + slot_align_mask) & !slot_align_mask;
                         int_reg_idx = config.max_int_regs;
                     }
                 }
                 int_reg_idx += gp_used;
                 float_reg_idx += fp_used;
             } else if size <= 16 {
-                let regs_needed = if size <= 8 { 1 } else { 2 };
+                let regs_needed = if size <= slot_size { 1 } else { (size + slot_size - 1) / slot_size };
                 if int_reg_idx + regs_needed <= config.max_int_regs {
                     result.push(ParamClass::StructByValReg {
                         base_reg_idx: int_reg_idx,
@@ -184,7 +190,7 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
                         offset: stack_offset,
                         size,
                     });
-                    stack_offset += ((size + 7) & !7) as i64;
+                    stack_offset += (size as i64 + slot_align_mask) & !slot_align_mask;
                     int_reg_idx = config.max_int_regs;
                 }
             } else if config.large_struct_by_ref {
@@ -195,14 +201,14 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
                     int_reg_idx += 1;
                 } else {
                     result.push(ParamClass::LargeStructByRefStack { offset: stack_offset, size });
-                    stack_offset += 8; // stack slot holds a pointer, not the struct data
+                    stack_offset += slot_size as i64; // stack slot holds a pointer
                 }
             } else {
                 result.push(ParamClass::LargeStructStack {
                     offset: stack_offset,
                     size,
                 });
-                stack_offset += ((size + 7) & !7) as i64;
+                stack_offset += (size as i64 + slot_align_mask) & !slot_align_mask;
             }
             continue;
         }
@@ -256,11 +262,19 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
                     int_reg_idx = config.max_int_regs;
                 }
             } else {
-                // x86: F128 always passes on the stack via x87.
-                // Align to 16 bytes to match caller-side padding (compute_stack_arg_padding).
-                stack_offset = (stack_offset + 15) & !15;
-                result.push(ParamClass::F128AlwaysStack { offset: stack_offset });
-                stack_offset += 16;
+                // x86/i686: F128 always passes on the stack via x87.
+                // On i686, x87 long double is 12 bytes (96-bit, 4-byte aligned).
+                // On x86-64, it's 16 bytes (16-byte aligned).
+                if slot_size == 4 {
+                    // i686: long double is 12 bytes, 4-byte aligned
+                    result.push(ParamClass::F128AlwaysStack { offset: stack_offset });
+                    stack_offset += 12;
+                } else {
+                    // x86-64: 16 bytes, 16-byte aligned
+                    stack_offset = (stack_offset + 15) & !15;
+                    result.push(ParamClass::F128AlwaysStack { offset: stack_offset });
+                    stack_offset += 16;
+                }
             }
             continue;
         }
@@ -276,7 +290,14 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
         // Float that overflowed FP registers goes to stack, not GP registers.
         if is_float && !force_gp {
             result.push(ParamClass::StackScalar { offset: stack_offset });
-            stack_offset += 8;
+            // On i686, float is 4 bytes, double is 8 bytes - both use their natural sizes.
+            // On LP64, minimum stack slot is 8 bytes.
+            if slot_size == 4 {
+                let float_stack_size = if param.ty == crate::common::types::IrType::F64 { 8 } else { 4 };
+                stack_offset += float_stack_size;
+            } else {
+                stack_offset += 8;
+            }
             continue;
         }
 
@@ -286,7 +307,7 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
             int_reg_idx += 1;
         } else {
             result.push(ParamClass::StackScalar { offset: stack_offset });
-            stack_offset += 8;
+            stack_offset += slot_size as i64;
         }
     }
 

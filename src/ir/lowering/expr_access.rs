@@ -118,7 +118,7 @@ impl Lowerer {
 
         if to_ty == from_ty
             || to_ty == IrType::Ptr
-            || (from_ty == IrType::Ptr && to_ty.size() == 8)
+            || (from_ty == IrType::Ptr && to_ty.size() == crate::common::types::target_ptr_size())
         {
             return src;
         }

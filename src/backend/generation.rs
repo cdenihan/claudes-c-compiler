@@ -641,10 +641,11 @@ pub fn generate_module(cg: &mut dyn ArchCodegen, module: &IrModule, source_mgr: 
     }
 
     // Emit .init_array for constructor functions
+    let init_fini_align = crate::common::types::target_ptr_size();
     for ctor in &module.constructors {
         cg.state().emit("");
         cg.state().emit(".section .init_array,\"aw\",@init_array");
-        cg.state().emit_fmt(format_args!(".align {}", ptr_dir.align_arg(8)));
+        cg.state().emit_fmt(format_args!(".align {}", ptr_dir.align_arg(init_fini_align)));
         cg.state().emit_fmt(format_args!("{} {}", ptr_dir.as_str(), ctor));
     }
 
@@ -652,7 +653,7 @@ pub fn generate_module(cg: &mut dyn ArchCodegen, module: &IrModule, source_mgr: 
     for dtor in &module.destructors {
         cg.state().emit("");
         cg.state().emit(".section .fini_array,\"aw\",@fini_array");
-        cg.state().emit_fmt(format_args!(".align {}", ptr_dir.align_arg(8)));
+        cg.state().emit_fmt(format_args!(".align {}", ptr_dir.align_arg(init_fini_align)));
         cg.state().emit_fmt(format_args!("{} {}", ptr_dir.as_str(), dtor));
     }
 
@@ -694,8 +695,10 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
                     ".section __patchable_function_entries,\"awo\",@progbits,{}",
                     pfe_label
                 ));
-                cg.state().emit(".align 8");
-                cg.state().emit_fmt(format_args!(".quad {}", pfe_label));
+                let pfe_align = crate::common::types::target_ptr_size();
+                let pfe_dir = cg.ptr_directive();
+                cg.state().emit_fmt(format_args!(".align {}", pfe_align));
+                cg.state().emit_fmt(format_args!("{} {}", pfe_dir.as_str(), pfe_label));
 
                 // Switch back to the function's section (custom or .text)
                 if let Some(ref sect) = func.section {

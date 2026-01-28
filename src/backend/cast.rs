@@ -80,11 +80,13 @@ pub fn classify_cast_with_f128(from_ty: IrType, to_ty: IrType, f128_is_native: b
         return classify_cast(effective_from, effective_to);
     }
 
-    // Ptr is equivalent to U64 on all 64-bit targets.
+    // Ptr is equivalent to U64 on LP64 targets, U32 on ILP32 targets.
     if (from_ty == IrType::Ptr || to_ty == IrType::Ptr) && !from_ty.is_float() && !to_ty.is_float() {
-        let effective_from = if from_ty == IrType::Ptr { IrType::U64 } else { from_ty };
-        let effective_to = if to_ty == IrType::Ptr { IrType::U64 } else { to_ty };
-        if effective_from == effective_to || (effective_from.size() == 8 && effective_to.size() == 8) {
+        let ptr_int_ty = if crate::common::types::target_is_32bit() { IrType::U32 } else { IrType::U64 };
+        let effective_from = if from_ty == IrType::Ptr { ptr_int_ty } else { from_ty };
+        let effective_to = if to_ty == IrType::Ptr { ptr_int_ty } else { to_ty };
+        let ptr_sz = crate::common::types::target_ptr_size();
+        if effective_from == effective_to || (effective_from.size() == ptr_sz && effective_to.size() == ptr_sz) {
             return CastKind::Noop;
         }
         return classify_cast(effective_from, effective_to);

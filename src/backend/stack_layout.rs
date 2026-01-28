@@ -873,7 +873,7 @@ pub fn calculate_stack_space_common(
             if let Instruction::Alloca { dest, size, ty, align, .. } = inst {
                 let effective_align = *align;
                 let extra = if effective_align > 16 { effective_align - 1 } else { 0 };
-                let raw_size = if *size == 0 { 8 } else { *size as i64 };
+                let raw_size = if *size == 0 { crate::common::types::target_ptr_size() as i64 } else { *size as i64 };
 
                 state.alloca_values.insert(dest.0);
                 state.alloca_types.insert(dest.0, *ty);
@@ -931,6 +931,7 @@ pub fn calculate_stack_space_common(
             } else if let Some(dest) = inst.dest() {
                 let is_i128 = matches!(inst.result_type(), Some(IrType::I128) | Some(IrType::U128));
                 let is_f128 = matches!(inst.result_type(), Some(IrType::F128));
+                // 8-byte slots for most values (covers I64/F64 on i686), 16-byte for i128/f128.
                 let slot_size: i64 = if is_i128 || is_f128 { 16 } else { 8 };
 
                 if is_i128 {

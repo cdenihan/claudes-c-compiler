@@ -98,7 +98,7 @@ impl Lowerer {
         _elem_ty: &CType,
         arr_size: usize,
     ) {
-        let ptr_size = 8; // 64-bit pointers
+        let ptr_size = crate::common::types::target_ptr_size();
         let mut ai = 0usize;
 
         for item in items {
@@ -142,7 +142,7 @@ impl Lowerer {
         _elem_ty: &CType,
         arr_size: usize,
     ) {
-        let ptr_size = 8; // 64-bit pointers
+        let ptr_size = crate::common::types::target_ptr_size();
         // Build a sparse map of which indices are initialized
         let mut index_inits: Vec<Option<&Initializer>> = vec![None; arr_size];
 
@@ -201,7 +201,7 @@ impl Lowerer {
 
         let elem_is_pointer = h::type_has_pointer_elements(elem_ty, &self.types);
         let elem_size = self.resolve_ctype_size(elem_ty);
-        let ptr_size = 8; // 64-bit
+        let ptr_size = crate::common::types::target_ptr_size();
 
         let mut ai = 0usize;
         for item in inits {

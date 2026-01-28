@@ -410,6 +410,7 @@ impl Lowerer {
         //    multiple branches are recorded due to sequential field processing
         // For same-offset duplicates, keep the last entry (C last-designator-wins).
         // For overlapping ranges at different offsets, keep the first (already placed).
+        let ptr_sz = crate::common::types::target_ptr_size();
         let mut deduped: Vec<(usize, GlobalInit)> = Vec::new();
         for (off, init) in ptr_ranges {
             if let Some(last) = deduped.last_mut() {
@@ -418,7 +419,7 @@ impl Lowerer {
                     *last = (off, init);
                     continue;
                 }
-                let last_end = last.0 + 8;
+                let last_end = last.0 + ptr_sz;
                 if off < last_end {
                     // Overlapping different offsets: skip (keep first)
                     continue;
@@ -432,7 +433,7 @@ impl Lowerer {
         for (ptr_off, ref addr_init) in &ptr_ranges {
             push_bytes_as_elements(&mut elements, &bytes[pos..*ptr_off]);
             elements.push(addr_init.clone());
-            pos = ptr_off + 8; // pointer is 8 bytes
+            pos = ptr_off + ptr_sz;
         }
         push_bytes_as_elements(&mut elements, &bytes[pos..total_size]);
         GlobalInit::Compound(elements)

@@ -227,22 +227,37 @@ impl Lowerer {
             TypeSpecifier::Short | TypeSpecifier::UnsignedShort => Some((2, 2)),
             TypeSpecifier::Int | TypeSpecifier::UnsignedInt
             | TypeSpecifier::Signed | TypeSpecifier::Unsigned => Some((4, 4)),
-            TypeSpecifier::Long | TypeSpecifier::UnsignedLong
-            | TypeSpecifier::LongLong | TypeSpecifier::UnsignedLongLong => Some((8, 8)),
+            TypeSpecifier::Long | TypeSpecifier::UnsignedLong => {
+                let ptr_sz = crate::common::types::target_ptr_size();
+                Some((ptr_sz, ptr_sz)) // ILP32: 4 bytes, LP64: 8 bytes
+            }
+            TypeSpecifier::LongLong | TypeSpecifier::UnsignedLongLong => Some((8, 8)),
             TypeSpecifier::Int128 | TypeSpecifier::UnsignedInt128 => Some((16, 16)),
             TypeSpecifier::Float => Some((4, 4)),
             TypeSpecifier::Double => Some((8, 8)),
-            TypeSpecifier::LongDouble => Some((16, 16)),
+            TypeSpecifier::LongDouble => {
+                let ptr_sz = crate::common::types::target_ptr_size();
+                if ptr_sz == 4 { Some((12, 4)) } else { Some((16, 16)) }
+            }
             TypeSpecifier::ComplexFloat => Some((8, 4)),
             TypeSpecifier::ComplexDouble => Some((16, 8)),
-            TypeSpecifier::ComplexLongDouble => Some((32, 16)),
-            TypeSpecifier::Pointer(_, _) => Some((8, 8)),
+            TypeSpecifier::ComplexLongDouble => {
+                let ptr_sz = crate::common::types::target_ptr_size();
+                if ptr_sz == 4 { Some((24, 4)) } else { Some((32, 16)) }
+            }
+            TypeSpecifier::Pointer(_, _) => {
+                let ptr_sz = crate::common::types::target_ptr_size();
+                Some((ptr_sz, ptr_sz))
+            }
             TypeSpecifier::Enum(_, _, false) => Some((4, 4)),
             TypeSpecifier::Enum(_, _, true) => {
                 // Packed enums need type context to resolve; let caller handle via CType path
                 None
             }
-            TypeSpecifier::TypedefName(_) => Some((8, 8)), // fallback for unresolved typedefs
+            TypeSpecifier::TypedefName(_) => {
+                let ptr_sz = crate::common::types::target_ptr_size();
+                Some((ptr_sz, ptr_sz)) // fallback for unresolved typedefs
+            }
             _ => None,
         }
     }
@@ -331,7 +346,7 @@ impl Lowerer {
             if let Some(ctype) = self.types.typedefs.get(name) {
                 return ctype.size_ctx(&self.types.struct_layouts);
             }
-            return 8; // fallback
+            return crate::common::types::target_ptr_size(); // fallback
         }
         // Handle packed enums (explicit or forward-reference to packed) via CType resolution
         if let TypeSpecifier::Enum(name, _, is_packed) = ts {
@@ -348,7 +363,7 @@ impl Lowerer {
             if let Some(ctype) = self.get_expr_ctype(expr) {
                 return ctype.size_ctx(&self.types.struct_layouts);
             }
-            return 8; // fallback
+            return crate::common::types::target_ptr_size(); // fallback
         }
         let ts = self.resolve_type_spec(ts);
         if let Some((size, _)) = Self::scalar_type_size_align(ts) {
@@ -360,7 +375,7 @@ impl Lowerer {
                 .map(|n| elem_size * n as usize)
                 .unwrap_or(elem_size);
         }
-        self.struct_union_layout(ts).map(|l| l.size).unwrap_or(8)
+        self.struct_union_layout(ts).map(|l| l.size).unwrap_or(crate::common::types::target_ptr_size())
     }
 
     /// Compute the alignment of a type in bytes (_Alignof).
@@ -370,7 +385,7 @@ impl Lowerer {
             let natural = if let Some(ctype) = self.types.typedefs.get(name) {
                 self.ctype_align(ctype)
             } else {
-                8 // fallback
+                crate::common::types::target_ptr_size() // fallback
             };
             // If the typedef has an __aligned__ override, take the max
             if let Some(&td_align) = self.types.typedef_alignments.get(name) {
@@ -383,7 +398,7 @@ impl Lowerer {
             if let Some(ctype) = self.get_expr_ctype(expr) {
                 return self.ctype_align(&ctype);
             }
-            return 8; // fallback
+            return crate::common::types::target_ptr_size(); // fallback
         }
         let ts = self.resolve_type_spec(ts);
         if let Some((_, align)) = Self::scalar_type_size_align(ts) {
@@ -392,7 +407,7 @@ impl Lowerer {
         if let TypeSpecifier::Array(elem, _) = ts {
             return self.alignof_type(elem);
         }
-        self.struct_union_layout(ts).map(|l| l.align).unwrap_or(8)
+        self.struct_union_layout(ts).map(|l| l.align).unwrap_or(crate::common::types::target_ptr_size())
     }
 
     /// Return the typedef alignment override for a type specifier, if any.
@@ -587,13 +602,14 @@ impl Lowerer {
                     self.collect_derived_array_dims(derived)
                 };
                 let resolved_dims: Vec<usize> = array_dims.iter().map(|d| d.unwrap_or(256)).collect();
-                let total_size: usize = resolved_dims.iter().product::<usize>() * 8;
+                let ptr_sz = crate::common::types::target_ptr_size();
+                let total_size: usize = resolved_dims.iter().product::<usize>() * ptr_sz;
                 let strides = if resolved_dims.len() > 1 {
-                    Self::compute_strides_from_dims(&resolved_dims, 8)
+                    Self::compute_strides_from_dims(&resolved_dims, ptr_sz)
                 } else {
-                    vec![8]  // 1D pointer array: stride is just pointer size
+                    vec![ptr_sz]  // 1D pointer array: stride is just pointer size
                 };
-                return (total_size, 8, true, false, strides);
+                return (total_size, ptr_sz, true, false, strides);
             }
             // Pointer to array (e.g., int (*p)[5]) - treat as pointer
             // Compute strides from the Array dims BEFORE the pointer in the derived list
@@ -624,7 +640,8 @@ impl Lowerer {
             // Treat as a simple pointer with no array strides, so subscript operations
             // will use CType-based stride resolution for correct behavior.
             if ptr_count >= 2 {
-                return (8, 8, false, true, vec![]);
+                let ptr_sz = crate::common::types::target_ptr_size();
+                return (ptr_sz, ptr_sz, false, true, vec![]);
             }
 
             // strides[0] = full pointed-to array size, then per-dim strides
@@ -633,7 +650,7 @@ impl Lowerer {
                 strides.extend(Self::compute_strides_from_dims(&array_dims, base_elem_size));
             }
             let elem_size = full_array_size;
-            return (8, elem_size, false, true, strides);
+            return (crate::common::types::target_ptr_size(), elem_size, false, true, strides);
         }
 
         // If the resolved type itself is an Array (e.g., va_list = Array(Char, 24),

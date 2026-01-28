@@ -52,12 +52,15 @@ impl CallArgClass {
 
     /// Returns the stack space consumed by this argument (0 if register).
     pub fn stack_bytes(&self) -> usize {
+        let slot_size = crate::common::types::target_ptr_size(); // 8 for LP64, 4 for ILP32
+        let align_mask = slot_size - 1;
         match self {
-            CallArgClass::F128Stack | CallArgClass::I128Stack => 16,
+            CallArgClass::F128Stack => if slot_size == 4 { 12 } else { 16 }, // i686: x87 long double = 12 bytes
+            CallArgClass::I128Stack => 16,
             CallArgClass::StructByValStack { size } | CallArgClass::LargeStructStack { size } => {
-                (*size + 7) & !7 // round up to 8-byte alignment
+                (*size + align_mask) & !align_mask
             }
-            CallArgClass::Stack => 8,
+            CallArgClass::Stack => slot_size,
             _ => 0,
         }
     }

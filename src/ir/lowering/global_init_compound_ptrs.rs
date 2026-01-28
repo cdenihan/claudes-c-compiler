@@ -272,7 +272,7 @@ impl Lowerer {
                 let ptr_ty = CType::Pointer(Box::new(CType::Void), AddressSpace::Default);
                 for (ai, inner_item) in inner_items.iter().enumerate() {
                     if ai >= arr_size { break; }
-                    let elem_offset = field_offset + ai * 8;
+                    let elem_offset = field_offset + ai * crate::common::types::target_ptr_size();
                     if let Initializer::Expr(ref expr) = inner_item.init {
                         self.write_expr_to_bytes_or_ptrs(
                             expr, &ptr_ty, elem_offset, None, None, bytes, ptr_ranges,
