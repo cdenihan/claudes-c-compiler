@@ -16,14 +16,17 @@ impl Lowerer {
                 if let Some(info) = self.func_state.as_ref().and_then(|fs| fs.locals.get(name)) {
                     let alloca = info.alloca;
                     let static_global_name = info.static_global_name.clone();
-                    let asm_register_no_init = info.asm_register.is_some() && !info.asm_register_has_init;
-                    // Uninitialized local register variables (e.g., `register unsigned long tp __asm__("tp");`)
-                    // have no addressable storage, just like global register variables.
-                    // Initialized register variables (e.g., `register long x8 __asm__("x8") = n;`)
-                    // use their alloca normally; the register binding only affects inline asm constraints.
-                    if asm_register_no_init {
-                        return None;
-                    }
+                    // Local register variables (e.g., `register void *tos asm("r11")`)
+                    // always have backing allocas that support assignment. Even when declared
+                    // without an initializer (e.g., the kernel's `call_on_stack` pattern:
+                    //   register void *tos asm("r11");
+                    //   tos = stack;
+                    //   asm volatile("..." : "+r"(tos) : "r"(tos) : ...);
+                    // ), the variable may be assigned via a separate statement before being
+                    // used in inline asm. Returning the alloca here ensures assignments
+                    // work correctly. Reading from alloca vs hardware register is handled
+                    // separately in lower_expr (which reads hardware for uninitialized vars).
+                    // This differs from global register variables which truly have no storage.
                     // Static locals: emit fresh GlobalAddr at point of use
                     if let Some(global_name) = static_global_name {
                         let addr = self.fresh_value();

@@ -60,11 +60,8 @@ impl Lowerer {
                 // backing storage, so lower_lvalue returns None. Create a temporary alloca
                 // to preserve GCC operand numbering -- without this, subsequent operand
                 // references (e.g., %P4) would be off-by-one and unresolvable.
-                // TODO: The alloca is a placeholder for operand numbering only.
-                // The output value stored here is discarded; proper write-back to global
-                // register variables is not yet implemented. For "+" constraints, the
-                // Load below reads uninitialized memory, but the backend's constraint
-                // rewriting to {regname} makes it read from the actual hardware register.
+                // Note: local register variables now return their alloca from lower_lvalue,
+                // so they are handled by the branch above.
                 if self.get_asm_register(var_name).is_some() {
                     let tmp = self.fresh_value();
                     self.emit(Instruction::Alloca {
@@ -84,6 +81,12 @@ impl Lowerer {
                 // the current register value via an inline asm instead of loading from
                 // the uninitialized alloca, which would corrupt the register (especially
                 // critical for stack pointer register variables).
+                //
+                // Local register variables (e.g., `register void *tos asm("r11")`)
+                // have real allocas that hold their assigned values. For "+" constraints,
+                // we load from the alloca (not the hardware register), because the
+                // programmer may have assigned a value via `tos = expr;` and expects
+                // the inline asm to see that value, not a stale hardware register.
                 let is_global_reg = if let Expr::Identifier(ref var_name, _) = out.expr {
                     self.get_asm_register(var_name).is_some() && self.lower_lvalue(&out.expr).is_none()
                 } else {
@@ -220,7 +223,28 @@ impl Lowerer {
                     self.lower_expr(&inp.expr)
                 }
             } else {
-                self.lower_expr(&inp.expr)
+                // For local register variables, load from the alloca instead of
+                // reading the hardware register. The variable's value was written
+                // to the alloca by prior C assignments (e.g., `tos = stack`), and
+                // the constraint rewriting already ensures the value is placed in
+                // the correct hardware register for the inline asm.
+                // Global register variables have no alloca, so lower_expr correctly
+                // reads the hardware register for those.
+                if let Expr::Identifier(ref var_name, _) = inp.expr {
+                    if let Some(alloca) = self.get_local_alloca(var_name) {
+                        if self.get_asm_register(var_name).is_some() {
+                            let dest = self.fresh_value();
+                            self.emit(Instruction::Load { dest, ptr: alloca, ty: inp_ty, seg_override: inp_seg });
+                            Operand::Value(dest)
+                        } else {
+                            self.lower_expr(&inp.expr)
+                        }
+                    } else {
+                        self.lower_expr(&inp.expr)
+                    }
+                } else {
+                    self.lower_expr(&inp.expr)
+                }
             };
             ir_inputs.push((constraint, val, name));
             operand_types.push(inp_ty);
@@ -450,6 +474,15 @@ impl Lowerer {
         // Check globals (for global register variables like `current_stack_pointer`)
         self.globals.get(name)
             .and_then(|info| info.asm_register.clone())
+    }
+
+    /// Get the alloca for a local variable by name, if it exists.
+    /// Returns None for global variables (including global register variables)
+    /// and for unknown variable names.
+    fn get_local_alloca(&self, name: &str) -> Option<Value> {
+        self.func_state.as_ref()
+            .and_then(|fs| fs.locals.get(name))
+            .map(|info| info.alloca)
     }
 
     /// Detect address space for an inline asm operand expression.
