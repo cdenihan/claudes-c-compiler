@@ -1,0 +1,19 @@
+Task: Fix ARM miscompilation of mm/vmscan.c causing kernel boot hang
+
+Status: in_progress
+
+Problem:
+When mm/vmscan.c is compiled with ccc-arm and swapped into a GCC-built kernel,
+the kernel hangs during boot. mm/vmscan.c is the virtual memory scanner, a critical
+kernel component responsible for page reclamation.
+
+The DD tool found this is a single-file failure — compiling just this one file
+with our compiler causes a boot hang (400s timeout, no crash message).
+
+Plan:
+1. Compare GCC vs CCC assembly output for mm/vmscan.c
+2. Identify the miscompiled function(s)
+3. Write a minimal reproducer
+4. Fix the compiler bug
+5. Verify the fix with DD tool
+6. Add regression test
