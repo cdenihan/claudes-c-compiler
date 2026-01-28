@@ -1,0 +1,22 @@
+Fix i686 F128 (long double) cast handling
+
+Status: in_progress
+Started: 2026-01-28
+
+Problem:
+On i686, the emit_cast function used classify_cast() which treats F128 as F64
+(f128_is_native=false). This caused int-to-F128 casts to store the x87 result
+as 8-byte F64 (fstpl) into a 12-byte F128 slot. When the value was later loaded
+as F128 (fldt), it read garbage bytes, producing NaN values.
+
+This affected all runtime int/float-to-long-double casts that went through
+memory (e.g., array[i] = (long double)i in a loop), causing widespread test
+failures in long double arithmetic tests.
+
+Fix:
+Changed classify_cast to classify_cast_with_f128(from_ty, to_ty, true) in
+emit_cast(), routing F128 casts through the dedicated SignedToF128/UnsignedToF128/
+FloatToF128/F128ToFloat/etc. paths that use fstpt (12-byte store) instead of
+fstpl (8-byte store).
+
+Impact: i686 test pass rate improved from 78.1% to 82.2% (111+ tests fixed).
