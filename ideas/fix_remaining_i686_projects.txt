@@ -1,6 +1,6 @@
 Fix remaining i686 project failures
 =====================================
-Date: 2026-01-28 (updated after LogicalNot 64-bit fix + Redis i686 fix)
+Date: 2026-01-28 (updated after bitfield I32 ops fix)
 
 Current status:
 - Unit tests: 99.7% pass (27152/27361) - up from 99.2%
@@ -8,7 +8,20 @@ Current status:
   * tcc build succeeds; test suite fails due to missing i686 CRT/headers (same as GCC)
 - Projects failing: libsodium, mquickjs, sqlite, mbedtls, libffi, musl, postgres
 
-Fixed in latest round (LogicalNot 64-bit fix):
+Fixed in latest round (bitfield I32 ops fix):
+- Bitfield extract/store operations used hardcoded IrType::I64 for all shift/mask ops
+  - Root cause: truncate_to_bitfield_value, store_bitfield, store_bitfield_split,
+    extract_bitfield, extract_bitfield_from_addr in src/ir/lowering/expr_assign.rs
+    all used IrType::I64 and 64-bit shift amounts unconditionally.
+  - On i686, this generated shrdl/shldl (64-bit shift pairs) that read eax:edx,
+    but loaded 32-bit values only populated eax, leaving edx uninitialized.
+  - Fix: Use widened_op_type(storage_ty) → I32 on i686, I64 on 64-bit targets.
+  - Fixes bitfield corruption in structs like mquickjs JSString (uint32_t with
+    len:25, is_ascii:1, etc. bitfields).
+  - No regressions: x86-64 99.8%, ARM 99.7%, RISC-V 100.0%, i686 99.7%
+  - Note: mquickjs still fails due to separate ROM table mismatch (see below)
+
+Previously fixed (LogicalNot 64-bit fix):
 - LogicalNot (!) on 64-bit values was truncating to 32 bits on i686
   - Root cause: UnaryOp::LogicalNot in src/ir/lowering/expr_ops.rs used
     target_int_ir_type() (I32 on i686) as the comparison type for ALL values,
@@ -55,7 +68,14 @@ Known remaining issues:
 
 2. mquickjs: SIGSEGV in all 5 tests
    - Crashes in js_string_compare during JS parsing
-   - Root cause unknown; may be related to same inlining/codegen issue as sqlite
+   - Root cause FOUND: TWO issues:
+     a) Bitfield ops used I64 on i686 → FIXED (bitfield I32 ops fix above)
+     b) ROM table mismatch: verify_mquickjs.py builds host tools with x86_64 GCC,
+        generating js_stdlib_table as uint64_t[] (JSValue=uint64_t on x86_64).
+        But on i686 target, JSValue=uint32_t, so the ROM table entries are wrong size.
+        The verify script doesn't pass CONFIG_X86_32=y for i686 builds.
+        This is a BUILD SYSTEM issue in /verify/verify_mquickjs.py (read-only).
+        NOT a compiler bug — mquickjs needs cross-compilation-aware host tool build.
 
 3. musl: 3/6 tests pass (hello, string_ops, math pass)
    - malloc test: malloc returns NULL despite brk() succeeding
