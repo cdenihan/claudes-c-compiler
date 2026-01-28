@@ -111,7 +111,8 @@ impl I686Codegen {
     fn operand_to_eax(&mut self, op: &Operand) {
         // Check register cache - skip load if value is already in eax
         if let Operand::Value(v) = op {
-            if self.state.reg_cache.acc_has(v.0, false) {
+            let is_alloca = self.state.is_alloca(v.0);
+            if self.state.reg_cache.acc_has(v.0, is_alloca) {
                 return;
             }
         }
@@ -157,21 +158,33 @@ impl I686Codegen {
                         self.state.emit("    xorl %eax, %eax");
                     }
                 }
+                self.state.reg_cache.invalidate_acc();
             }
             Operand::Value(v) => {
-                // Check if value is in a callee-saved register
+                let is_alloca = self.state.is_alloca(v.0);
+                // Check if value is in a callee-saved register (allocas are never register-allocated)
                 if let Some(phys) = self.reg_assignments.get(&v.0).copied() {
                     let reg = phys_reg_name(phys);
                     emit!(self.state, "    movl %{}, %eax", reg);
+                    self.state.reg_cache.set_acc(v.0, false);
                 } else if let Some(slot) = self.state.get_slot(v.0) {
-                    emit!(self.state, "    movl {}(%ebp), %eax", slot.0);
+                    if is_alloca {
+                        // Alloca: the slot IS the data; load the address of the slot
+                        if let Some(align) = self.state.alloca_over_align(v.0) {
+                            // Over-aligned alloca: compute aligned address
+                            emit!(self.state, "    leal {}(%ebp), %eax", slot.0);
+                            emit!(self.state, "    addl ${}, %eax", align - 1);
+                            emit!(self.state, "    andl ${}, %eax", -(align as i32));
+                        } else {
+                            emit!(self.state, "    leal {}(%ebp), %eax", slot.0);
+                        }
+                    } else {
+                        // Regular value: load the value from the slot
+                        emit!(self.state, "    movl {}(%ebp), %eax", slot.0);
+                    }
+                    self.state.reg_cache.set_acc(v.0, is_alloca);
                 }
             }
-        }
-        if let Operand::Value(v) = op {
-            self.state.reg_cache.set_acc(v.0, false);
-        } else {
-            self.state.reg_cache.invalidate_acc();
         }
     }
 
@@ -216,11 +229,23 @@ impl I686Codegen {
                 }
             }
             Operand::Value(v) => {
+                let is_alloca = self.state.is_alloca(v.0);
                 if let Some(phys) = self.reg_assignments.get(&v.0).copied() {
                     let reg = phys_reg_name(phys);
                     emit!(self.state, "    movl %{}, %ecx", reg);
                 } else if let Some(slot) = self.state.get_slot(v.0) {
-                    emit!(self.state, "    movl {}(%ebp), %ecx", slot.0);
+                    if is_alloca {
+                        // Alloca: load the address of the slot
+                        if let Some(align) = self.state.alloca_over_align(v.0) {
+                            emit!(self.state, "    leal {}(%ebp), %ecx", slot.0);
+                            emit!(self.state, "    addl ${}, %ecx", align - 1);
+                            emit!(self.state, "    andl ${}, %ecx", -(align as i32));
+                        } else {
+                            emit!(self.state, "    leal {}(%ebp), %ecx", slot.0);
+                        }
+                    } else {
+                        emit!(self.state, "    movl {}(%ebp), %ecx", slot.0);
+                    }
                 }
             }
         }
