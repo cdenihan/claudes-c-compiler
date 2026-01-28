@@ -1,0 +1,20 @@
+Task: Fix sizeof(__typeof__(typedef_name)) returning pointer size instead of actual type size
+
+Status: in_progress
+
+Bug: sizeof(__typeof__(T)) where T is a typedef name returns 8 (pointer size on 64-bit)
+instead of the actual size of T. This causes __typeof__(T) declared variables to have
+wrong .size directives in assembly, leading to undersized per-cpu variables in the
+Linux kernel and boot failures.
+
+Root cause: In ir/lowering/types.rs, sizeof_type() and alignof_type() handled
+TypedefName and Typeof(expr) explicitly, but not TypeofType(inner). When TypeofType
+wrapped a TypedefName, it fell through to resolve_type_spec() which unwrapped it, then
+scalar_type_size_align() treated the bare TypedefName as pointer-sized (wrong fallback).
+
+Fix: Add explicit TypeofType(inner) handlers that recurse into sizeof_type/alignof_type,
+matching the correct handling already present in sema/const_eval.rs.
+
+Impact: Fixes RISC-V kernel boot failure (kernel/cgroup/rstat.c had undersized
+cgroup_rstat_cpu_lock per-cpu variable). Also affects ARM and x86 kernels that use
+__typeof__ in DEFINE_PER_CPU macros.
