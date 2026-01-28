@@ -1,0 +1,19 @@
+Task: Fix i686 Redis build (PIC global addr + mem2reg constant narrowing)
+
+Problem 1 - PIC Global Address:
+emit_global_addr on i686 used GOT-relative addressing (%ebx-based) but never
+set up %ebx as the GOT base register. Since we link with -no-pie, switched to
+absolute addressing (movl $name, %eax).
+
+Problem 2 - mem2reg Constant Narrowing:
+Integer literals were always lowered as IrConst::I64 (in expr.rs). When mem2reg
+promoted an alloca-based 32-bit variable, the I64 constant was pushed onto the
+def_stack, causing phi-elimination copies to use 64-bit operations. On i686
+this left the upper 32 bits uninitialized, causing redis-server to crash in
+setKeyByLink where the `exists` variable (int/I32) was misread.
+
+Fix: Added IrConst::narrowed_to() method and used it in mem2reg Store handling
+to narrow constants to match the alloca type.
+
+Blocks: Redis build on i686
+Status: in_progress
