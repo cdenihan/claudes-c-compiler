@@ -94,9 +94,9 @@ pub struct SemanticAnalyzer {
     /// Counter for generating unique anonymous struct/union keys.
     /// Uses Cell for interior mutability so type_spec_to_ctype can take &self.
     anon_struct_counter: Cell<usize>,
-    /// Collected semantic errors (e.g., type errors).
-    errors: Vec<String>,
     /// Structured diagnostic engine for error/warning reporting.
+    /// All sema errors and warnings are emitted with source spans through this
+    /// engine, which handles rendering, filtering (-Wall/-Werror), and counting.
     diagnostics: DiagnosticEngine,
 }
 
@@ -107,7 +107,6 @@ impl SemanticAnalyzer {
             result: SemaResult::default(),
             enum_counter: 0,
             anon_struct_counter: Cell::new(0),
-            errors: Vec::new(),
             diagnostics: DiagnosticEngine::new(),
         };
         // Pre-populate with common implicit declarations
@@ -116,8 +115,9 @@ impl SemanticAnalyzer {
     }
 
     /// Analyze a translation unit. Builds symbol table and collects semantic info.
-    /// Returns Ok(()) on success, or a list of error strings on failure.
-    pub fn analyze(&mut self, tu: &TranslationUnit) -> Result<(), Vec<String>> {
+    /// Returns Ok(()) on success, or an error count on failure.
+    /// All errors are emitted through the DiagnosticEngine with source spans.
+    pub fn analyze(&mut self, tu: &TranslationUnit) -> Result<(), usize> {
         for decl in &tu.decls {
             match decl {
                 ExternalDecl::FunctionDef(func) => {
@@ -131,10 +131,10 @@ impl SemanticAnalyzer {
                 }
             }
         }
-        if self.errors.is_empty() {
-            Ok(())
+        if self.diagnostics.has_errors() {
+            Err(self.diagnostics.error_count())
         } else {
-            Err(self.errors.clone())
+            Ok(())
         }
     }
 
@@ -737,10 +737,13 @@ impl SemanticAnalyzer {
                 let key = expr as *const Expr as usize;
                 if let Some(ctype) = self.result.expr_types.get(&key) {
                     if !ctype.is_integer() {
-                        let msg = "switch quantity is not an integer";
-                        // TODO: Remove legacy errors Vec once fully migrated to DiagnosticEngine
-                        self.errors.push(msg.to_string());
-                        self.diagnostics.error_no_span(msg);
+                        let diag = crate::common::error::Diagnostic::error(
+                            "switch quantity is not an integer"
+                        ).with_span(expr.span())
+                         .with_note(crate::common::error::Diagnostic::note(
+                            format!("expression has type '{:?}'", ctype)
+                         ).with_span(expr.span()));
+                        self.diagnostics.emit(&diag);
                     }
                 }
                 self.analyze_stmt(body);
@@ -782,7 +785,7 @@ impl SemanticAnalyzer {
 
     fn analyze_expr(&mut self, expr: &Expr) {
         match expr {
-            Expr::Identifier(name, _span) => {
+            Expr::Identifier(name, span) => {
                 // Check if it's a known symbol
                 if self.symbol_table.lookup(name).is_none()
                     && !self.result.type_context.enum_constants.contains_key(name)
@@ -791,23 +794,25 @@ impl SemanticAnalyzer {
                     && name != "__func__" && name != "__FUNCTION__"
                     && name != "__PRETTY_FUNCTION__"
                 {
-                    self.diagnostics.warning_with_kind_no_span(
+                    self.diagnostics.warning_with_kind(
                         format!("'{}' undeclared", name),
+                        *span,
                         crate::common::error::WarningKind::Undeclared,
                     );
                 }
             }
             Expr::FunctionCall(callee, args, _) => {
                 // Check for builtin calls
-                if let Expr::Identifier(name, _) = callee.as_ref() {
+                if let Expr::Identifier(name, callee_span) = callee.as_ref() {
                     if builtins::is_builtin(name) {
                         // Valid builtin call - will be resolved during lowering
                     } else if self.result.functions.get(name).is_none()
                         && self.symbol_table.lookup(name).is_none()
                     {
                         // Implicit function declaration (C89 style) - register it
-                        self.diagnostics.warning_with_kind_no_span(
+                        self.diagnostics.warning_with_kind(
                             format!("implicit declaration of function '{}'", name),
+                            *callee_span,
                             crate::common::error::WarningKind::ImplicitFunctionDeclaration,
                         );
                         let func_info = FunctionInfo {

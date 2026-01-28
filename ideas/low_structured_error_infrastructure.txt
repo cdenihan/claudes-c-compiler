@@ -19,19 +19,31 @@ COMPLETED (2026-01-28):
 - Updated sema and preprocessor warning sites with WarningKind tags
 - Wired WarningConfig from CLI through Driver to DiagnosticEngine
 
+COMPLETED (2026-01-28):
+- Added source spans to all 3 sema diagnostic sites:
+  - "switch quantity is not an integer" error now includes the expression span
+  - "'name' undeclared" warning now includes the identifier span
+  - "implicit declaration of function 'name'" warning now includes the callee span
+- Removed legacy `errors: Vec<String>` from SemanticAnalyzer; now uses
+  DiagnosticEngine.has_errors() / error_count() exclusively
+- Changed analyze() return type from Result<(), Vec<String>> to Result<(), usize>
+- Added first "note:" follow-up message: switch type error now includes
+  "note: expression has type 'Foo'" with span pointing to the expression
+- Removed #[allow(dead_code)] from Diagnostic::with_note() (now in active use)
+
 REMAINING FOLLOW-UPS:
-1. Add spans to sema errors/warnings (currently use error_no_span/warning_no_span)
-2. Add spans to preprocessor errors (#error directives)
-3. Wire DiagnosticEngine into IR lowering phase (standalone eprintln! with no buffering)
-4. Add more WarningKind categories as compiler implements more warnings
+1. Add spans to preprocessor errors (#error directives)
+2. Wire DiagnosticEngine into IR lowering phase (standalone eprintln! with no buffering)
+3. Add more WarningKind categories as compiler implements more warnings
    (UnusedVariable, ReturnType, SignCompare, ImplicitConversion, etc.)
-5. Remove the legacy `errors: Vec<String>` from sema (currently kept for backward compat)
-6. Consider adding "note:" follow-up messages for context (e.g., "previous declaration was here")
+4. Add Display impl for CType to show user-friendly type names in diagnostics
+   (currently uses Debug formatting which shows e.g. "Double" instead of "double")
+5. Add more "note:" follow-ups: "previous declaration was here", "did you mean to include <header>?"
 
 Key files:
-- src/common/error.rs (DiagnosticEngine, Diagnostic, Severity)
+- src/common/error.rs (DiagnosticEngine, Diagnostic, Severity, with_note)
 - src/common/source.rs (SourceManager with line map, get_source_line for snippets)
 - src/frontend/parser/parser.rs (uses emit_error/emit_warning)
-- src/frontend/sema/sema.rs (uses diagnostics.error_no_span/warning_no_span)
+- src/frontend/sema/sema.rs (uses diagnostics.error/warning_with_kind with spans)
 - src/frontend/preprocessor/preprocessor.rs (collects errors and warnings Vecs)
 - src/driver/driver.rs (creates and threads DiagnosticEngine through phases)

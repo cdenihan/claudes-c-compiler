@@ -328,8 +328,7 @@ impl Diagnostic {
     }
 
     /// Add a follow-up note to this diagnostic.
-    /// TODO: Use for "note: previous declaration was here" style follow-ups.
-    #[allow(dead_code)]
+    /// Used for "note: expression has type '...'" and similar context.
     pub fn with_note(mut self, note: Diagnostic) -> Self {
         self.notes.push(note);
         self

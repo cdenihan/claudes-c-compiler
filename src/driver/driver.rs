@@ -801,9 +801,9 @@ impl Driver {
         let t3 = std::time::Instant::now();
         let mut sema = SemanticAnalyzer::new();
         sema.set_diagnostics(diagnostics);
-        if let Err(errors) = sema.analyze(&ast) {
-            // Errors already emitted through diagnostic engine; just report count
-            return Err(format!("{} error(s) during semantic analysis", errors.len()));
+        if let Err(error_count) = sema.analyze(&ast) {
+            // Errors already emitted through diagnostic engine with source spans
+            return Err(format!("{} error(s) during semantic analysis", error_count));
         }
         let diagnostics = sema.take_diagnostics();
         let sema_result = sema.into_result();

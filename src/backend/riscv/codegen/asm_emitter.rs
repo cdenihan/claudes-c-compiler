@@ -80,6 +80,16 @@ impl InlineAsmEmitter for RiscvCodegen {
     }
 
     fn resolve_memory_operand(&mut self, op: &mut AsmOperand, val: &Operand, excluded: &[String]) -> bool {
+        // For alloca memory operands with large offsets (>2047), the direct
+        // `{offset}(s0)` format doesn't fit RISC-V's 12-bit signed immediate.
+        // Compute the address into a scratch register instead.
+        if op.mem_offset != 0 && !(op.mem_offset >= -2048 && op.mem_offset <= 2047) {
+            let tmp_reg = self.assign_scratch_reg(&AsmOperandKind::GpReg, excluded);
+            self.emit_addi_s0(&tmp_reg, op.mem_offset);
+            op.mem_addr = format!("0({})", tmp_reg);
+            op.mem_offset = 0;
+            return true;
+        }
         // If mem_addr is set or mem_offset is non-zero (alloca case), nothing to do
         if !op.mem_addr.is_empty() || op.mem_offset != 0 {
             return false;
@@ -90,7 +100,9 @@ impl InlineAsmEmitter for RiscvCodegen {
             Operand::Value(v) => {
                 if let Some(slot) = self.state.get_slot(v.0) {
                     let tmp_reg = self.assign_scratch_reg(&AsmOperandKind::GpReg, excluded);
-                    self.state.emit_fmt(format_args!("    ld {}, {}(s0)", tmp_reg, slot.0));
+                    // Use emit_load_from_s0 to handle large stack offsets (>2047)
+                    // that don't fit in RISC-V's 12-bit signed immediate range.
+                    self.emit_load_from_s0(&tmp_reg, slot.0, "ld");
                     op.mem_addr = format!("0({})", tmp_reg);
                     return true;
                 }
@@ -259,7 +271,8 @@ impl InlineAsmEmitter for RiscvCodegen {
                             .find(|&&c| !all_output_regs.contains(&c))
                             .copied()
                             .unwrap_or("t0");
-                        self.state.emit_fmt(format_args!("    ld {}, {}(s0)", scratch, slot.0));
+                        // Use emit_load_from_s0 to handle large stack offsets (>2047)
+                        self.emit_load_from_s0(scratch, slot.0, "ld");
                         self.state.emit_fmt(format_args!("    fsd {}, 0({})", reg, scratch));
                     }
                 }
@@ -277,7 +290,8 @@ impl InlineAsmEmitter for RiscvCodegen {
                             .find(|&&c| !all_output_regs.contains(&c))
                             .copied()
                             .unwrap_or(if reg != "t0" { "t0" } else { "t1" });
-                        self.state.emit_fmt(format_args!("    ld {}, {}(s0)", scratch, slot.0));
+                        // Use emit_load_from_s0 to handle large stack offsets (>2047)
+                        self.emit_load_from_s0(scratch, slot.0, "ld");
                         self.state.emit_fmt(format_args!("    sd {}, 0({})", reg, scratch));
                     }
                 }
