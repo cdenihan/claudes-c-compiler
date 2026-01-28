@@ -1,0 +1,15 @@
+Task: Convert FunctionAttributes booleans to bitflags
+
+Status: in_progress
+
+Description:
+FunctionAttributes in ast.rs carries 10 boolean fields (is_static, is_inline,
+is_extern, is_gnu_inline, is_always_inline, is_noinline, is_constructor,
+is_destructor, is_weak, is_used). Each new GCC attribute adds another field.
+
+Plan:
+1. Replace 10 boolean fields with a single bitflags u16 field
+2. Keep section: Option<String> and visibility: Option<String> as-is (non-boolean)
+3. Add getter/setter methods for each flag
+4. Update all usage sites across the codebase (parser, sema, lowering, backend)
+5. Benefits: smaller AST nodes, easier to add new attributes, cleaner API
