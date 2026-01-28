@@ -1,0 +1,32 @@
+Fix inline __attribute__((vector_size(N))) variable declarations
+================================================================
+Date: 2026-01-28
+
+Problem:
+When vector types are declared using inline attributes (not typedefs),
+the vector elements are read incorrectly. Example:
+
+    // This works correctly:
+    typedef float __attribute__((vector_size(16))) v4f;
+    v4f a = {1., 2., 3., 4.};
+    v4f b = a + a; // Correct: {2, 4, 6, 8}
+
+    // This produces wrong results:
+    __attribute__((vector_size(16))) float a = {1., 2., 3., 4.};
+    __attribute__((vector_size(16))) float b = a + a; // Wrong: garbage values
+
+Root cause:
+The typedef path correctly wraps the base type in CType::Vector and
+stores element size information. The inline attribute path likely has a
+bug in how the vector_size attribute is propagated to the variable's
+CType, causing element-wise loads/stores to use wrong sizes or offsets.
+
+Key locations to investigate:
+- src/ir/lowering/stmt.rs: vector_size handling in local declarations
+- src/ir/lowering/global_decl.rs: vector_size handling in global declarations
+- src/frontend/parser/declarations.rs: how vector_size is parsed and
+  attached to non-typedef declarations
+
+Impact: Would fix several gcc_torture vector tests (scal_to_vec1/2/3,
+pr60960, pr70903, pr85169, simd_6, 20050316_1/2/3, 20060420_1,
+pr53645/pr53645_2) across all architectures.
