@@ -502,10 +502,14 @@ impl StructLayout {
                         placed_abs_bit = abs_bit_pos;
                     }
 
-                    // Compute this field's storage unit: the type-aligned byte offset
-                    // that contains this field's bits
-                    let field_storage_offset = if field_align > 0 {
-                        ((placed_abs_bit / 8) as usize) & !(field_align - 1)
+                    // Compute this field's storage unit: the sizeof(type)-aligned byte
+                    // offset that contains this field's bits.
+                    // Per the SysV ABI, the storage unit is sizeof(type) bytes wide and
+                    // aligned to sizeof(type), NOT to the ABI alignment of the type.
+                    // On i686, long long has ABI alignment 4 but sizeof 8; the storage
+                    // unit must still be 8-byte aligned within the bitfield region.
+                    let field_storage_offset = if field_size > 0 {
+                        ((placed_abs_bit / 8) as usize) & !(field_size - 1)
                     } else {
                         (placed_abs_bit / 8) as usize
                     };
