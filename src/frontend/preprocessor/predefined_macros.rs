@@ -421,6 +421,17 @@ impl Preprocessor {
                 self.define_simple_macro("__LONG_MAX__", "2147483647L");
                 self.define_simple_macro("__SIZE_MAX__", "4294967295U");
                 self.define_simple_macro("__PTRDIFF_MAX__", "2147483647");
+                // Override <limits.h> macros for ILP32 (long is 32-bit)
+                self.define_simple_macro("LONG_MIN", "(-2147483647L-1L)");
+                self.define_simple_macro("LONG_MAX", "2147483647L");
+                self.define_simple_macro("ULONG_MAX", "4294967295UL");
+                // Override <stdint.h> macros for ILP32 (pointer/size_t are 32-bit)
+                self.define_simple_macro("INTPTR_MIN", "(-2147483647-1)");
+                self.define_simple_macro("INTPTR_MAX", "2147483647");
+                self.define_simple_macro("UINTPTR_MAX", "4294967295U");
+                self.define_simple_macro("SIZE_MAX", "4294967295U");
+                self.define_simple_macro("PTRDIFF_MIN", "(-2147483647-1)");
+                self.define_simple_macro("PTRDIFF_MAX", "2147483647");
                 // Type names for ILP32 (long is 32-bit, so many types change)
                 self.define_simple_macro("__SIZE_TYPE__", "unsigned int");
                 self.define_simple_macro("__PTRDIFF_TYPE__", "int");

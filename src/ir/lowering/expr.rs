@@ -321,6 +321,21 @@ impl Lowerer {
             Expr::UIntLiteral(val, _) => {
                 if *val <= u32::MAX as u64 { IrType::U32 } else { IrType::U64 }
             }
+            // On ILP32, long is 32-bit; values that overflow promote to long long (64-bit)
+            Expr::LongLiteral(val, _) => {
+                if crate::common::types::target_is_32bit() {
+                    if *val >= i32::MIN as i64 && *val <= i32::MAX as i64 { IrType::I32 } else { IrType::I64 }
+                } else {
+                    IrType::I64
+                }
+            }
+            Expr::ULongLiteral(val, _) => {
+                if crate::common::types::target_is_32bit() {
+                    if *val <= u32::MAX as u64 { IrType::U32 } else { IrType::U64 }
+                } else {
+                    IrType::U64
+                }
+            }
             Expr::CharLiteral(_, _) => IrType::I8,
             // Comparisons and logical ops produce C int (I32), not I64
             Expr::BinaryOp(op, lhs, rhs, _) => {

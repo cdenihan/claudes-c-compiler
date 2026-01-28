@@ -78,10 +78,50 @@ impl<'a> ExprTypeChecker<'a> {
 
         match expr {
             // Literals have well-defined types
-            Expr::IntLiteral(_, _) | Expr::CharLiteral(_, _) => Some(CType::Int),
-            Expr::UIntLiteral(_, _) => Some(CType::UInt),
-            Expr::LongLiteral(_, _) => Some(CType::Long),
-            Expr::ULongLiteral(_, _) => Some(CType::ULong),
+            Expr::IntLiteral(val, _) => {
+                // On ILP32, values > INT_MAX need promotion: int -> long -> long long
+                // On LP64, values > INT_MAX fit in long (same as long long)
+                if crate::common::types::target_is_32bit() {
+                    if *val >= i32::MIN as i64 && *val <= i32::MAX as i64 {
+                        Some(CType::Int)
+                    } else {
+                        // Doesn't fit in int or long (both 32-bit on ILP32), promote to long long
+                        Some(CType::LongLong)
+                    }
+                } else {
+                    Some(CType::Int)
+                }
+            }
+            Expr::CharLiteral(_, _) => Some(CType::Int),
+            Expr::UIntLiteral(val, _) => {
+                if crate::common::types::target_is_32bit() && *val > u32::MAX as u64 {
+                    Some(CType::ULongLong)
+                } else {
+                    Some(CType::UInt)
+                }
+            }
+            Expr::LongLiteral(val, _) => {
+                // On ILP32, long is 32-bit. If value doesn't fit, promote to long long.
+                // C11 6.4.4.1: for 'l' suffix, type is: long, long long (decimal)
+                //               or: long, unsigned long, long long, unsigned long long (hex/octal)
+                if crate::common::types::target_is_32bit() {
+                    if *val >= i32::MIN as i64 && *val <= i32::MAX as i64 {
+                        Some(CType::Long) // fits in 32-bit long
+                    } else {
+                        Some(CType::LongLong) // promote to 64-bit long long
+                    }
+                } else {
+                    Some(CType::Long)
+                }
+            }
+            Expr::ULongLiteral(val, _) => {
+                // On ILP32, unsigned long is 32-bit. If value doesn't fit, promote to unsigned long long.
+                if crate::common::types::target_is_32bit() && *val > u32::MAX as u64 {
+                    Some(CType::ULongLong)
+                } else {
+                    Some(CType::ULong)
+                }
+            }
             Expr::FloatLiteral(_, _) => Some(CType::Double),
             Expr::FloatLiteralF32(_, _) => Some(CType::Float),
             Expr::FloatLiteralLongDouble(_, _, _) => Some(CType::LongDouble),

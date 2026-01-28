@@ -564,10 +564,37 @@ impl Lowerer {
         use crate::common::types::target_is_32bit;
         let is_32bit = target_is_32bit();
         match expr {
-            Expr::IntLiteral(_, _) | Expr::CharLiteral(_, _) => if is_32bit { IrType::I32 } else { IrType::I64 },
-            Expr::UIntLiteral(_, _) => if is_32bit { IrType::U32 } else { IrType::U64 },
-            Expr::LongLiteral(_, _) => if is_32bit { IrType::I32 } else { IrType::I64 },
-            Expr::ULongLiteral(_, _) => if is_32bit { IrType::U32 } else { IrType::U64 },
+            Expr::IntLiteral(val, _) => {
+                if is_32bit {
+                    // On ILP32, int is 32-bit. Values outside i32 range promote to long long (64-bit).
+                    if *val >= i32::MIN as i64 && *val <= i32::MAX as i64 { IrType::I32 } else { IrType::I64 }
+                } else {
+                    IrType::I64
+                }
+            }
+            Expr::CharLiteral(_, _) => if is_32bit { IrType::I32 } else { IrType::I64 },
+            Expr::UIntLiteral(val, _) => {
+                if is_32bit {
+                    if *val <= u32::MAX as u64 { IrType::U32 } else { IrType::U64 }
+                } else {
+                    IrType::U64
+                }
+            }
+            Expr::LongLiteral(val, _) => {
+                if is_32bit {
+                    // On ILP32, long is 32-bit. Values outside i32 range promote to long long (64-bit).
+                    if *val >= i32::MIN as i64 && *val <= i32::MAX as i64 { IrType::I32 } else { IrType::I64 }
+                } else {
+                    IrType::I64
+                }
+            }
+            Expr::ULongLiteral(val, _) => {
+                if is_32bit {
+                    if *val <= u32::MAX as u64 { IrType::U32 } else { IrType::U64 }
+                } else {
+                    IrType::U64
+                }
+            }
             Expr::FloatLiteral(_, _) => IrType::F64,
             Expr::FloatLiteralF32(_, _) => IrType::F32,
             Expr::FloatLiteralLongDouble(_, _, _) => IrType::F128,
@@ -934,8 +961,22 @@ impl Lowerer {
                     8
                 }
             }
-            // Long/unsigned long literal: size depends on target (4 on ILP32, 8 on LP64)
-            Expr::LongLiteral(_, _) | Expr::ULongLiteral(_, _) => crate::common::types::target_ptr_size(),
+            // Long literal: on ILP32, long is 4 bytes unless value overflows to long long (8 bytes)
+            Expr::LongLiteral(val, _) => {
+                if crate::common::types::target_is_32bit() {
+                    if *val >= i32::MIN as i64 && *val <= i32::MAX as i64 { 4 } else { 8 }
+                } else {
+                    8 // LP64: long is always 8 bytes
+                }
+            }
+            // Unsigned long literal: on ILP32, unsigned long is 4 bytes unless value overflows
+            Expr::ULongLiteral(val, _) => {
+                if crate::common::types::target_is_32bit() {
+                    if *val <= u32::MAX as u64 { 4 } else { 8 }
+                } else {
+                    8 // LP64: unsigned long is always 8 bytes
+                }
+            }
             // Float literal: type double (8 bytes) by default in C
             Expr::FloatLiteral(_, _) => 8,
             // Float literal with f suffix: type float (4 bytes)
@@ -1441,10 +1482,37 @@ impl Lowerer {
                 self.get_binop_ctype(op, lhs, rhs)
             }
             // Literal types for _Generic support
-            Expr::IntLiteral(_, _) => Some(CType::Int),
-            Expr::UIntLiteral(_, _) => Some(CType::UInt),
-            Expr::LongLiteral(_, _) => Some(CType::Long),
-            Expr::ULongLiteral(_, _) => Some(CType::ULong),
+            // On ILP32, values that overflow the 32-bit type promote to long long
+            Expr::IntLiteral(val, _) => {
+                if crate::common::types::target_is_32bit()
+                    && (*val < i32::MIN as i64 || *val > i32::MAX as i64) {
+                    Some(CType::LongLong)
+                } else {
+                    Some(CType::Int)
+                }
+            }
+            Expr::UIntLiteral(val, _) => {
+                if crate::common::types::target_is_32bit() && *val > u32::MAX as u64 {
+                    Some(CType::ULongLong)
+                } else {
+                    Some(CType::UInt)
+                }
+            }
+            Expr::LongLiteral(val, _) => {
+                if crate::common::types::target_is_32bit()
+                    && (*val < i32::MIN as i64 || *val > i32::MAX as i64) {
+                    Some(CType::LongLong)
+                } else {
+                    Some(CType::Long)
+                }
+            }
+            Expr::ULongLiteral(val, _) => {
+                if crate::common::types::target_is_32bit() && *val > u32::MAX as u64 {
+                    Some(CType::ULongLong)
+                } else {
+                    Some(CType::ULong)
+                }
+            }
             Expr::CharLiteral(_, _) => Some(CType::Int), // char literals have type int in C
             Expr::FloatLiteral(_, _) => Some(CType::Double),
             Expr::FloatLiteralF32(_, _) => Some(CType::Float),
