@@ -370,6 +370,10 @@ impl Lowerer {
             }
             return crate::common::types::target_ptr_size(); // fallback
         }
+        // Handle typeof(type-name) by recursing on the inner type specifier
+        if let TypeSpecifier::TypeofType(inner) = ts {
+            return self.sizeof_type(inner);
+        }
         let ts = self.resolve_type_spec(ts);
         if let Some((size, _)) = Self::scalar_type_size_align(ts) {
             return size;
@@ -404,6 +408,10 @@ impl Lowerer {
                 return self.ctype_align(&ctype);
             }
             return crate::common::types::target_ptr_size(); // fallback
+        }
+        // Handle typeof(type-name) by recursing on the inner type specifier
+        if let TypeSpecifier::TypeofType(inner) = ts {
+            return self.alignof_type(inner);
         }
         let ts = self.resolve_type_spec(ts);
         if let Some((_, align)) = Self::scalar_type_size_align(ts) {
