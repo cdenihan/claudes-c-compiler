@@ -642,8 +642,13 @@ impl ArchCodegen for RiscvCodegen {
 
     fn emit_switch_case_branch(&mut self, case_val: i64, label: &str) {
         // Load case value into t1, compare, and branch if equal.
+        // Use bne-skip + jump pattern for +-2GB range instead of beq which has
+        // only +-4KB range and can overflow in large functions (e.g. PostgreSQL).
+        let skip = self.state.fresh_label("sw_skip");
         self.state.emit_fmt(format_args!("    li t1, {}", case_val));
-        self.state.emit_fmt(format_args!("    beq t0, t1, {}", label));
+        self.state.emit_fmt(format_args!("    bne t0, t1, {}", skip));
+        self.state.emit_fmt(format_args!("    jump {}, t6", label));
+        self.state.emit_fmt(format_args!("{}:", skip));
     }
 
     fn emit_switch_jump_table(&mut self, val: &Operand, cases: &[(i64, BlockId)], default: &BlockId) {
@@ -666,8 +671,13 @@ impl ArchCodegen for RiscvCodegen {
             }
         }
         // Range check (unsigned): branch to default if index >= range
+        // Use bltu-skip + jump pattern for +-2GB range instead of bgeu which has
+        // only +-4KB range and can overflow in large functions.
+        let range_ok = self.state.fresh_label("range_ok");
         self.state.emit_fmt(format_args!("    li t1, {}", range));
-        self.state.emit_fmt(format_args!("    bgeu t0, t1, {}", default_label));
+        self.state.emit_fmt(format_args!("    bltu t0, t1, {}", range_ok));
+        self.state.emit_fmt(format_args!("    jump {}, t6", default_label));
+        self.state.emit_fmt(format_args!("{}:", range_ok));
 
         if self.state.pic_mode {
             // PIC mode: use relative 32-bit offsets to avoid R_RISCV_64 relocations.

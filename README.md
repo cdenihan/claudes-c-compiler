@@ -71,7 +71,7 @@ and PostgreSQL.
 | mbedTLS | AES, RSA, ECP, SHA, ARIA self-tests |
 | jq | All 12 tests on all architectures |
 | Linux kernel | Builds and boots on x86-64 and AArch64 |
-| PostgreSQL | x86: 216/216; ARM: 216/216; RISC-V: builds, make check fails |
+| PostgreSQL | x86: 216/216; ARM: 216/216; RISC-V: 216/216 |
 
 ### Known limitations
 

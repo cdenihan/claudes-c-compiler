@@ -1,0 +1,16 @@
+Task: Add Display trait implementation for CType
+Status: in_progress
+Started: 2026-01-28
+
+Goal:
+Implement std::fmt::Display for CType to produce user-friendly C-style type names
+in diagnostic messages (e.g., "unsigned int" instead of "UInt", "char *" instead
+of "Pointer(Char)").
+
+This is item #3 from the structured error infrastructure follow-ups in
+ideas/low_structured_error_infrastructure.txt.
+
+Changes:
+- Add Display impl for CType in common/types.rs
+- Update diagnostic sites to use {} instead of {:?} for CType
+- Update the ideas file to mark this as completed
