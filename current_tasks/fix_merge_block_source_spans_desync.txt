@@ -1,0 +1,22 @@
+Fix merge_single_pred_blocks source_spans desync causing DCE panic
+
+The merge_single_pred_blocks pass in cfg_simplify.rs can create blocks where
+source_spans.len() != instructions.len() when merging a predecessor that has
+spans with a successor that doesn't (or vice versa). This causes panics in
+multiple subsequent passes:
+
+1. DCE panics at dce.rs:126 with "index out of bounds" when swapping spans
+2. LICM panics at licm.rs:543 when indexing old_spans
+3. Inline pass has similar OOB risk at inline.rs:1238
+
+Root cause: merge_single_pred_blocks appends instructions from the successor
+but only conditionally appends spans (based on whether converted_spans is
+non-empty), without checking if the predecessor already has spans.
+
+Fix:
+1. Fix merge_single_pred_blocks to maintain the source_spans invariant:
+   - If either block has spans, pad the other with dummy spans to keep parallel
+2. Add defensive bounds checking in DCE and inline passes
+3. Add regression test
+
+Status: in_progress
