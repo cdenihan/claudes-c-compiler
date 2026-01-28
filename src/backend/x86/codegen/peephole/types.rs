@@ -841,6 +841,44 @@ pub(super) fn has_indirect_memory_access(s: &str) -> bool {
     if trimmed.starts_with("rep ") || trimmed.starts_with("rep\t") {
         return true;
     }
+
+    // Multi-instruction lines (containing ';' statement separator) commonly come
+    // from inline asm templates. The peephole optimizer cannot safely analyze
+    // which registers are clobbered by the first instruction(s) in such lines
+    // (e.g., "1: rdmsr ; xor %esi,%esi" where rdmsr implicitly clobbers eax/edx
+    // but the parser only sees the xor destination). Treat these conservatively
+    // to prevent incorrect store forwarding across inline asm boundaries.
+    if s.contains(';') {
+        return true;
+    }
+
+    // Privileged/special x86 instructions that implicitly clobber multiple
+    // registers not visible in the instruction text:
+    //   rdmsr  -> reads ecx, writes eax:edx
+    //   wrmsr  -> reads ecx:eax:edx (all inputs, but may affect state)
+    //   cpuid  -> reads eax, writes eax:ebx:ecx:edx
+    //   rdtsc  -> writes eax:edx
+    //   rdtscp -> writes eax:edx:ecx
+    //   xgetbv -> reads ecx, writes eax:edx
+    // Treat these as barriers for store forwarding since parse_dest_reg_fast
+    // cannot detect their implicit register writes.
+    if trimmed.starts_with("rdmsr") || trimmed.starts_with("wrmsr")
+        || trimmed.starts_with("cpuid") || trimmed.starts_with("rdtsc")
+        || trimmed.starts_with("xgetbv")
+    {
+        return true;
+    }
+
+    // Also handle numeric-label-prefixed instructions (common in inline asm).
+    // Pattern: "N: instruction" where N is a digit. The instruction after the
+    // label may have implicit clobbers that parse_dest_reg_fast can't detect.
+    if !trimmed.is_empty() {
+        let fb = trimmed.as_bytes()[0];
+        if fb.is_ascii_digit() && trimmed.contains(": ") {
+            return true;
+        }
+    }
+
     // Look for patterns like "(%r" where the register is not rbp or rsp
     let bytes = s.as_bytes();
     let len = bytes.len();

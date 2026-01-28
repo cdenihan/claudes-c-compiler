@@ -1843,4 +1843,68 @@ mod tests {
         assert!(result.contains("-40(%rbp), %rax"),
             "must NOT eliminate load after jmpq* indirect jump target: {}", result);
     }
+
+    #[test]
+    fn test_inline_asm_rdmsr_invalidates_store_forwarding() {
+        // Inline asm "1: rdmsr ; xor %esi,%esi" clobbers %eax and %edx
+        // (rdmsr writes eax:edx). The peephole optimizer must not forward
+        // a stale %rax value across this inline asm line.
+        // This is the pattern from kernel arch/x86/kernel/apic/apic.c
+        // (native_read_msr_safe) that caused a boot hang.
+        let asm = [
+            "    leaq -16(%rbp), %rax",           // rax = &err
+            "    movq %rax, -40(%rbp)",            // save ptr to stack slot
+            "    movabsq $27, %rcx",               // msr number
+            "    1: rdmsr ; xor %esi,%esi",        // inline asm: clobbers rax, rdx
+            "    pushq %rcx",
+            "    movq -40(%rbp), %rcx",            // MUST load from stack, NOT forward rax
+            "    movl %esi, (%rcx)",               // store err through pointer
+            "    popq %rcx",
+        ].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        // The load from -40(%rbp) must NOT be replaced with "movq %rax, %rcx"
+        // because rax was clobbered by rdmsr.
+        assert!(result.contains("-40(%rbp), %rcx"),
+            "must NOT forward rax across rdmsr (rax clobbered by inline asm): {}", result);
+    }
+
+    #[test]
+    fn test_semicolon_multi_instruction_invalidates_mappings() {
+        // Lines with ';' (statement separator) contain multiple instructions.
+        // The peephole optimizer can't safely analyze all clobbers.
+        let asm = [
+            "    movq %rax, -24(%rbp)",
+            "    xorl %eax, %eax ; movl $1, %ecx",  // multi-instr: clobbers rax, ecx
+            "    movq -24(%rbp), %rax",              // must NOT be eliminated
+        ].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(result.contains("-24(%rbp), %rax"),
+            "must not forward across multi-instruction line with ';': {}", result);
+    }
+
+    #[test]
+    fn test_rdmsr_standalone_invalidates_mappings() {
+        // Standalone rdmsr instruction clobbers eax and edx implicitly.
+        let asm = [
+            "    movq %rax, -24(%rbp)",
+            "    rdmsr",
+            "    movq -24(%rbp), %rax",   // must NOT be eliminated
+        ].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(result.contains("-24(%rbp), %rax"),
+            "must not forward across rdmsr (implicit clobber of rax/rdx): {}", result);
+    }
+
+    #[test]
+    fn test_cpuid_invalidates_mappings() {
+        // cpuid clobbers eax, ebx, ecx, edx.
+        let asm = [
+            "    movq %rax, -24(%rbp)",
+            "    cpuid",
+            "    movq -24(%rbp), %rax",   // must NOT be eliminated
+        ].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(result.contains("-24(%rbp), %rax"),
+            "must not forward across cpuid (implicit clobber of rax/rbx/rcx/rdx): {}", result);
+    }
 }
