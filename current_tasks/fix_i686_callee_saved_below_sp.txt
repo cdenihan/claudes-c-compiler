@@ -1,0 +1,16 @@
+Task: Fix i686 callee-saved register saves below stack pointer
+Status: in_progress
+Started: 2026-01-28
+
+Problem:
+The i686 backend's emit_prologue saves callee-saved registers (ebx, esi, edi)
+at offsets -(frame_size + (i+1)*4)(%ebp), which is BELOW the stack pointer
+(esp = ebp - frame_size). Since i686 has no red zone, these saves can be
+overwritten by any function call or interrupt, corrupting callee-saved
+registers.
+
+This causes Lua to crash in lua_newstate where preinit_thread corrupts esi.
+
+Fix:
+Include the callee-saved register save area in the stack allocation so that
+saves are within the allocated frame (above esp).
