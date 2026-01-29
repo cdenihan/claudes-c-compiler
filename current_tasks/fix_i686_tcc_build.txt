@@ -1,0 +1,16 @@
+Fix i686 TCC build: environment setup for i686 cross-compilation
+================================================================
+Status: in_progress
+
+Problem: TCC build on i686 fails (1/78 tests pass) because:
+1. TCC's configure script uses `uname -m` which returns x86_64 on the host,
+   causing TCC to be compiled with x86_64 codegen instead of i386
+2. The i386 sysroot (CRT files, headers) is not at the standard triplet path
+   `/usr/lib/i386-linux-gnu/` - it's at `/usr/i686-linux-gnu/lib/`
+
+Fix:
+1. Create i386 sysroot symlinks at standard triplet locations
+2. Create a smart uname wrapper that detects i686 cross-compilation context
+3. Add a setup script to the repo for reproducibility
+
+Expected result: 76/78 tests pass (2 bitfield tests have arch-specific expected output)
