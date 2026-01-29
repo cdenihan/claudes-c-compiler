@@ -260,14 +260,117 @@ impl Lowerer {
 
         self.emit(Instruction::InlineAsm {
             template: template.to_string(),
-            outputs: ir_outputs,
-            inputs: ir_inputs,
+            outputs: ir_outputs.clone(),
+            inputs: ir_inputs.clone(),
             clobbers: clobbers.to_vec(),
             operand_types,
             goto_labels: ir_goto_labels,
             input_symbols,
             seg_overrides,
         });
+
+        // Dead store elimination for inline asm output allocas.
+        //
+        // When an inline asm has a write-only output ("=r") that writes to an alloca,
+        // and no input reads from that same alloca (e.g., because the input was promoted
+        // to a constant by try_recover_local_const), the store that initialized the
+        // alloca before the inline asm is dead. Removing it prevents stack accesses
+        // in critical sections like the RISC-V set_satp_mode function where the MMU
+        // is in identity-mapping mode and the stack is not mapped.
+        //
+        // Pattern:
+        //   Store(const, alloca_v)          <-- dead store (to be removed)
+        //   InlineAsm { outputs: [("=r", alloca_v)], inputs: [("rK", Const(0))], ... }
+        self.eliminate_dead_stores_before_inline_asm(&ir_outputs, &ir_inputs);
+    }
+
+    /// Remove stores to write-only inline asm output allocas when the inline asm
+    /// doesn't read from those allocas (input was promoted to constant/immediate).
+    fn eliminate_dead_stores_before_inline_asm(
+        &mut self,
+        outputs: &[(String, Value, Option<String>)],
+        inputs: &[(String, Operand, Option<String>)],
+    ) {
+        // Collect write-only output alloca values (constraint starts with "=" but not "+")
+        let mut writeonly_allocas: Vec<Value> = Vec::new();
+        for (constraint, ptr, _) in outputs {
+            if constraint.starts_with('=') && !constraint.contains('+') {
+                writeonly_allocas.push(*ptr);
+            }
+        }
+        if writeonly_allocas.is_empty() {
+            return;
+        }
+
+        // Check which output allocas are NOT read by any input
+        // An input reads from an alloca if:
+        //   - It's Operand::Value(v) where v == alloca (direct reference)
+        //   - It's Operand::Value(v) where v is a Load from the alloca (found via recent instrs)
+        let fs = self.func_state.as_ref().unwrap();
+        let mut alloca_read_by_input: Vec<bool> = vec![false; writeonly_allocas.len()];
+
+        // Build a set of Values that are Loads from our target allocas
+        let mut load_from_alloca: Vec<(u32, usize)> = Vec::new(); // (load_dest_id, alloca_idx)
+        for inst in fs.instrs.iter().rev().take(50) {
+            if let Instruction::Load { dest, ptr, .. } = inst {
+                for (i, alloca_v) in writeonly_allocas.iter().enumerate() {
+                    if *ptr == *alloca_v {
+                        load_from_alloca.push((dest.0, i));
+                    }
+                }
+            }
+        }
+
+        for (_, val, _) in inputs {
+            match val {
+                Operand::Value(v) => {
+                    // Direct reference to the alloca
+                    for (i, alloca_v) in writeonly_allocas.iter().enumerate() {
+                        if *v == *alloca_v {
+                            alloca_read_by_input[i] = true;
+                        }
+                    }
+                    // Reference via a Load from the alloca
+                    for (load_dest, alloca_idx) in &load_from_alloca {
+                        if v.0 == *load_dest {
+                            alloca_read_by_input[*alloca_idx] = true;
+                        }
+                    }
+                }
+                Operand::Const(_) => {
+                    // Constant inputs don't read from allocas
+                }
+            }
+        }
+
+        // For each unread output alloca, find and remove the preceding dead store
+        let fs = self.func_state.as_mut().unwrap();
+        let instrs_len = fs.instrs.len();
+        // The InlineAsm is at instrs[instrs_len - 1], scan backwards from instrs_len - 2
+        for (i, is_read) in alloca_read_by_input.iter().enumerate() {
+            if *is_read {
+                continue;
+            }
+            let target_alloca = writeonly_allocas[i];
+            // Scan backwards (skip the InlineAsm itself)
+            // Stop at function calls, other inline asm, or after 30 instructions
+            let start = if instrs_len >= 2 { instrs_len - 2 } else { continue };
+            let limit = if start > 30 { start - 30 } else { 0 };
+            for idx in (limit..=start).rev() {
+                match &fs.instrs[idx] {
+                    Instruction::Store { ptr, .. } if *ptr == target_alloca => {
+                        // Found the dead store - remove it
+                        fs.instrs.remove(idx);
+                        fs.instr_spans.remove(idx);
+                        break;
+                    }
+                    // Stop at barriers: calls, other inline asm, or loads from this alloca
+                    Instruction::Call { .. } | Instruction::InlineAsm { .. } => break,
+                    Instruction::Load { ptr, .. } if *ptr == target_alloca => break,
+                    _ => {}
+                }
+            }
+        }
     }
 
     /// Extract a global symbol name (possibly with offset) from an expression,
