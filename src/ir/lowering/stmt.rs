@@ -416,7 +416,7 @@ impl Lowerer {
             visibility: None,
             has_explicit_align,
             is_const: var_is_const,
-            is_used: false,
+            is_used: declarator.attrs.is_used(),
             is_thread_local: decl.is_thread_local(),
         });
 

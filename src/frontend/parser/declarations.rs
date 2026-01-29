@@ -660,6 +660,7 @@ impl Parser {
                     da.section = local_section;
                     da.asm_register = skip_asm_reg;
                     da.cleanup_fn = local_cleanup_fn;
+                    da.set_used(self.attrs.parsing_used());
                     da
                 },
                 span: start,

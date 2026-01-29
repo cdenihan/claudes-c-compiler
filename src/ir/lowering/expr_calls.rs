@@ -97,6 +97,19 @@ impl Lowerer {
             }
         }
 
+        // Strip AddressOf wrapping a function name: (&func)(args) => func(args).
+        // In C, taking the address of a function and calling through it is equivalent
+        // to calling the function directly. The kernel's static_call mechanism uses
+        // this pattern: ({ ...; (&__SCT__trampoline); })(args) and requires a direct
+        // call instruction so the call site can be patched at runtime.
+        if let Expr::AddressOf(inner, _) = stripped_func {
+            if let Expr::Identifier(name, _) = inner.as_ref() {
+                if !self.is_func_ptr_variable(name) {
+                    stripped_func = inner;
+                }
+            }
+        }
+
         // Resolve _Generic selections to the selected expression.
         // Without this, _Generic(expr, type1: func1, type2: func2)(args) would
         // fall through to the catch-all indirect call path, which dereferences
@@ -771,16 +784,71 @@ impl Lowerer {
                 let saa = struct_arg_aligns;
                 let sac = struct_arg_classes;
                 let func_ptr = self.lower_expr(func);
-                self.emit(Instruction::CallIndirect {
-                    func_ptr,
-                    info: CallInfo {
-                        dest: Some(dest), args: arg_vals, arg_types,
-                        return_type: indirect_ret_ty, is_variadic, num_fixed_args,
-                        struct_arg_sizes: sas, struct_arg_aligns: saa, struct_arg_classes: sac,
-                        is_sret: sret_size.is_some(), is_fastcall: false,
-                    },
-                });
-                indirect_ret_ty
+
+                // Check if the lowered expression is a GlobalAddr of a known function.
+                // This handles patterns like ({ ...; (&func); })(args) where a
+                // statement expression yields a function address. The kernel's
+                // static_call mechanism uses this pattern and requires a direct call
+                // instruction so the call site can be patched at runtime.
+                let direct_func_name = if let Operand::Value(v) = func_ptr {
+                    let instrs = &self.func_state.as_ref().unwrap().instrs;
+                    let found = instrs.iter().rev().find_map(|inst| {
+                        if let Instruction::GlobalAddr { dest, ref name } = *inst {
+                            if dest == v && self.known_functions.contains(name) {
+                                return Some(name.clone());
+                            }
+                        }
+                        None
+                    });
+                    found
+                } else {
+                    None
+                };
+
+                if let Some(call_name) = direct_func_name {
+                    // Emit a direct call instead of indirect.
+                    let call_name = self.asm_label_map.get(call_name.as_str())
+                        .cloned()
+                        .unwrap_or(call_name);
+                    let sig = self.func_meta.sigs.get(call_name.as_str());
+                    let mut ret_ty = sig.map(|s| s.return_type).unwrap_or(indirect_ret_ty);
+                    if sig.and_then(|s| s.two_reg_ret_size).is_some() {
+                        ret_ty = IrType::I128;
+                    }
+                    if crate::common::types::target_is_32bit() {
+                        if let Some(s) = sig {
+                            if s.sret_size.is_none() && s.two_reg_ret_size.is_none() {
+                                if let Some(ref rc) = s.return_ctype {
+                                    if rc.is_struct_or_union() {
+                                        ret_ty = IrType::I64;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let callee_is_fastcall = self.fastcall_functions.contains(call_name.as_str());
+                    self.emit(Instruction::Call {
+                        func: call_name,
+                        info: CallInfo {
+                            dest: Some(dest), args: arg_vals, arg_types,
+                            return_type: ret_ty, is_variadic, num_fixed_args,
+                            struct_arg_sizes: sas, struct_arg_aligns: saa, struct_arg_classes: sac,
+                            is_sret: sret_size.is_some(), is_fastcall: callee_is_fastcall,
+                        },
+                    });
+                    ret_ty
+                } else {
+                    self.emit(Instruction::CallIndirect {
+                        func_ptr,
+                        info: CallInfo {
+                            dest: Some(dest), args: arg_vals, arg_types,
+                            return_type: indirect_ret_ty, is_variadic, num_fixed_args,
+                            struct_arg_sizes: sas, struct_arg_aligns: saa, struct_arg_classes: sac,
+                            is_sret: sret_size.is_some(), is_fastcall: false,
+                        },
+                    });
+                    indirect_ret_ty
+                }
             }
         }
     }

@@ -84,6 +84,16 @@ impl Lowerer {
                         continue;
                     }
                 }
+                // Skip typeof-declared functions (e.g., `extern typeof(func) alias;`).
+                // Sema correctly identifies these as functions via CType resolution,
+                // so they appear in known_functions. Without this skip, they would
+                // be incorrectly added to the globals map as variables, causing
+                // indirect calls instead of direct calls.
+                if matches!(&decl.type_spec, TypeSpecifier::Typeof(_) | TypeSpecifier::TypeofType(_)) {
+                    if self.known_functions.contains(&declarator.name) {
+                        continue;
+                    }
+                }
             }
 
             // Global register variable: `register <type> <name> __asm__("reg")`
