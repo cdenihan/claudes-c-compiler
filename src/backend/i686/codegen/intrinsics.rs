@@ -32,55 +32,9 @@ impl I686Codegen {
             }
 
             // --- Non-temporal stores ---
-            IntrinsicOp::Movnti => {
-                if let Some(ptr) = dest_ptr {
-                    self.operand_to_eax(&args[0]);
-                    self.state.emit("    movl %eax, %ecx");
-                    self.operand_to_eax(&Operand::Value(*ptr));
-                    self.state.emit("    movnti %ecx, (%eax)");
-                }
-            }
-            IntrinsicOp::Movnti64 => {
-                // On i686, 64-bit non-temporal store needs two 32-bit movnti
-                if let Some(ptr) = dest_ptr {
-                    self.operand_to_eax(&Operand::Value(*ptr));
-                    self.state.emit("    movl %eax, %ecx");
-                    // Load the 64-bit value and store both halves
-                    if let Operand::Value(v) = &args[0] {
-                        if let Some(slot) = self.state.get_slot(v.0) {
-                            emit!(self.state, "    movl {}(%ebp), %eax", slot.0);
-                            self.state.emit("    movnti %eax, (%ecx)");
-                            emit!(self.state, "    movl {}(%ebp), %eax", slot.0 + 4);
-                            self.state.emit("    movnti %eax, 4(%ecx)");
-                        } else {
-                            self.operand_to_eax(&args[0]);
-                            self.state.emit("    movnti %eax, (%ecx)");
-                            self.state.emit("    xorl %eax, %eax");
-                            self.state.emit("    movnti %eax, 4(%ecx)");
-                        }
-                    } else {
-                        self.operand_to_eax(&args[0]);
-                        self.state.emit("    movnti %eax, (%ecx)");
-                        self.state.emit("    xorl %eax, %eax");
-                        self.state.emit("    movnti %eax, 4(%ecx)");
-                    }
-                }
-            }
-            IntrinsicOp::Movntdq => {
-                if let Some(ptr) = dest_ptr {
-                    self.operand_to_eax(&args[0]);
-                    self.state.emit("    movdqu (%eax), %xmm0");
-                    self.operand_to_eax(&Operand::Value(*ptr));
-                    self.state.emit("    movntdq %xmm0, (%eax)");
-                }
-            }
-            IntrinsicOp::Movntpd => {
-                if let Some(ptr) = dest_ptr {
-                    self.operand_to_eax(&args[0]);
-                    self.state.emit("    movupd (%eax), %xmm0");
-                    self.operand_to_eax(&Operand::Value(*ptr));
-                    self.state.emit("    movntpd %xmm0, (%eax)");
-                }
+            IntrinsicOp::Movnti | IntrinsicOp::Movnti64
+            | IntrinsicOp::Movntdq | IntrinsicOp::Movntpd => {
+                self.emit_nontemporal_store(op, dest_ptr, args);
             }
 
             // --- SSE 128-bit load/store ---
@@ -150,48 +104,8 @@ impl I686Codegen {
 
             // --- CRC32 ---
             IntrinsicOp::Crc32_8 | IntrinsicOp::Crc32_16
-            | IntrinsicOp::Crc32_32 => {
-                self.operand_to_eax(&args[0]);
-                self.state.emit("    movl %eax, %ecx");
-                self.operand_to_eax(&args[1]);
-                self.state.emit("    xchgl %eax, %ecx");
-                let inst = match op {
-                    IntrinsicOp::Crc32_8  => "crc32b %cl, %eax",
-                    IntrinsicOp::Crc32_16 => "crc32w %cx, %eax",
-                    IntrinsicOp::Crc32_32 => "crc32l %ecx, %eax",
-                    _ => unreachable!("CRC32 dispatch matched non-CRC32 op: {:?}", op),
-                };
-                self.state.emit_fmt(format_args!("    {}", inst));
-                self.state.reg_cache.invalidate_acc();
-                if let Some(d) = dest {
-                    self.store_eax_to(d);
-                }
-            }
-            IntrinsicOp::Crc32_64 => {
-                // On i686, there's no 64-bit CRC32 instruction; do two 32-bit CRC32s
-                self.operand_to_eax(&args[0]);
-                self.state.emit("    movl %eax, %edx");  // edx = accumulator
-                if let Operand::Value(v) = &args[1] {
-                    if let Some(slot) = self.state.get_slot(v.0) {
-                        emit!(self.state, "    movl {}(%ebp), %ecx", slot.0);
-                        self.state.emit("    movl %edx, %eax");
-                        self.state.emit("    crc32l %ecx, %eax");
-                        emit!(self.state, "    movl {}(%ebp), %ecx", slot.0 + 4);
-                        self.state.emit("    crc32l %ecx, %eax");
-                    } else {
-                        self.operand_to_ecx(&args[1]);
-                        self.state.emit("    movl %edx, %eax");
-                        self.state.emit("    crc32l %ecx, %eax");
-                    }
-                } else {
-                    self.operand_to_ecx(&args[1]);
-                    self.state.emit("    movl %edx, %eax");
-                    self.state.emit("    crc32l %ecx, %eax");
-                }
-                self.state.reg_cache.invalidate_acc();
-                if let Some(d) = dest {
-                    self.store_eax_to(d);
-                }
+            | IntrinsicOp::Crc32_32 | IntrinsicOp::Crc32_64 => {
+                self.emit_crc32_intrinsic(op, dest, args);
             }
 
             // --- Frame and return address ---
@@ -213,17 +127,7 @@ impl I686Codegen {
 
             // --- Floating-point intrinsics via x87 FPU ---
             IntrinsicOp::SqrtF64 => {
-                self.emit_f64_load_to_x87(&args[0]);
-                self.state.emit("    fsqrt");
-                if let Some(d) = dest {
-                    if let Some(slot) = self.state.get_slot(d.0) {
-                        emit!(self.state, "    fstpl {}(%ebp)", slot.0);
-                    } else {
-                        self.state.emit("    fstp %st(0)");
-                    }
-                } else {
-                    self.state.emit("    fstp %st(0)");
-                }
+                self.emit_f64_unary_x87(&args[0], "fsqrt", dest);
             }
             IntrinsicOp::SqrtF32 => {
                 self.emit_f32_load_to_x87(&args[0]);
@@ -231,17 +135,7 @@ impl I686Codegen {
                 self.emit_f32_store_from_x87(dest);
             }
             IntrinsicOp::FabsF64 => {
-                self.emit_f64_load_to_x87(&args[0]);
-                self.state.emit("    fabs");
-                if let Some(d) = dest {
-                    if let Some(slot) = self.state.get_slot(d.0) {
-                        emit!(self.state, "    fstpl {}(%ebp)", slot.0);
-                    } else {
-                        self.state.emit("    fstp %st(0)");
-                    }
-                } else {
-                    self.state.emit("    fstp %st(0)");
-                }
+                self.emit_f64_unary_x87(&args[0], "fabs", dest);
             }
             IntrinsicOp::FabsF32 => {
                 self.emit_f32_load_to_x87(&args[0]);
@@ -449,6 +343,109 @@ impl I686Codegen {
             }
         }
         self.state.reg_cache.invalidate_acc();
+    }
+
+    fn emit_nontemporal_store(&mut self, op: &IntrinsicOp, dest_ptr: &Option<Value>, args: &[Operand]) {
+        let Some(ptr) = dest_ptr else { return };
+        match op {
+            IntrinsicOp::Movnti => {
+                self.operand_to_eax(&args[0]);
+                self.state.emit("    movl %eax, %ecx");
+                self.operand_to_eax(&Operand::Value(*ptr));
+                self.state.emit("    movnti %ecx, (%eax)");
+            }
+            IntrinsicOp::Movnti64 => {
+                self.operand_to_eax(&Operand::Value(*ptr));
+                self.state.emit("    movl %eax, %ecx");
+                if let Operand::Value(v) = &args[0] {
+                    if let Some(slot) = self.state.get_slot(v.0) {
+                        emit!(self.state, "    movl {}(%ebp), %eax", slot.0);
+                        self.state.emit("    movnti %eax, (%ecx)");
+                        emit!(self.state, "    movl {}(%ebp), %eax", slot.0 + 4);
+                        self.state.emit("    movnti %eax, 4(%ecx)");
+                    } else {
+                        self.operand_to_eax(&args[0]);
+                        self.state.emit("    movnti %eax, (%ecx)");
+                        self.state.emit("    xorl %eax, %eax");
+                        self.state.emit("    movnti %eax, 4(%ecx)");
+                    }
+                } else {
+                    self.operand_to_eax(&args[0]);
+                    self.state.emit("    movnti %eax, (%ecx)");
+                    self.state.emit("    xorl %eax, %eax");
+                    self.state.emit("    movnti %eax, 4(%ecx)");
+                }
+            }
+            IntrinsicOp::Movntdq => {
+                self.operand_to_eax(&args[0]);
+                self.state.emit("    movdqu (%eax), %xmm0");
+                self.operand_to_eax(&Operand::Value(*ptr));
+                self.state.emit("    movntdq %xmm0, (%eax)");
+            }
+            IntrinsicOp::Movntpd => {
+                self.operand_to_eax(&args[0]);
+                self.state.emit("    movupd (%eax), %xmm0");
+                self.operand_to_eax(&Operand::Value(*ptr));
+                self.state.emit("    movntpd %xmm0, (%eax)");
+            }
+            _ => {}
+        }
+    }
+
+    fn emit_crc32_intrinsic(&mut self, op: &IntrinsicOp, dest: &Option<Value>, args: &[Operand]) {
+        if *op == IntrinsicOp::Crc32_64 {
+            // On i686, no 64-bit CRC32; do two 32-bit CRC32s
+            self.operand_to_eax(&args[0]);
+            self.state.emit("    movl %eax, %edx");
+            if let Operand::Value(v) = &args[1] {
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    emit!(self.state, "    movl {}(%ebp), %ecx", slot.0);
+                    self.state.emit("    movl %edx, %eax");
+                    self.state.emit("    crc32l %ecx, %eax");
+                    emit!(self.state, "    movl {}(%ebp), %ecx", slot.0 + 4);
+                    self.state.emit("    crc32l %ecx, %eax");
+                } else {
+                    self.operand_to_ecx(&args[1]);
+                    self.state.emit("    movl %edx, %eax");
+                    self.state.emit("    crc32l %ecx, %eax");
+                }
+            } else {
+                self.operand_to_ecx(&args[1]);
+                self.state.emit("    movl %edx, %eax");
+                self.state.emit("    crc32l %ecx, %eax");
+            }
+        } else {
+            self.operand_to_eax(&args[0]);
+            self.state.emit("    movl %eax, %ecx");
+            self.operand_to_eax(&args[1]);
+            self.state.emit("    xchgl %eax, %ecx");
+            let inst = match op {
+                IntrinsicOp::Crc32_8  => "crc32b %cl, %eax",
+                IntrinsicOp::Crc32_16 => "crc32w %cx, %eax",
+                IntrinsicOp::Crc32_32 => "crc32l %ecx, %eax",
+                _ => unreachable!(),
+            };
+            self.state.emit_fmt(format_args!("    {}", inst));
+        }
+        self.state.reg_cache.invalidate_acc();
+        if let Some(d) = dest {
+            self.store_eax_to(d);
+        }
+    }
+
+    /// Apply an x87 unary FPU op on an f64 operand and store the result.
+    fn emit_f64_unary_x87(&mut self, arg: &Operand, x87_op: &str, dest: &Option<Value>) {
+        self.emit_f64_load_to_x87(arg);
+        self.state.emit_fmt(format_args!("    {}", x87_op));
+        if let Some(d) = dest {
+            if let Some(slot) = self.state.get_slot(d.0) {
+                emit!(self.state, "    fstpl {}(%ebp)", slot.0);
+            } else {
+                self.state.emit("    fstp %st(0)");
+            }
+        } else {
+            self.state.emit("    fstp %st(0)");
+        }
     }
 
     /// Emit a binary SSE 128-bit operation: load two 128-bit operands from
