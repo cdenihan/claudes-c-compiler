@@ -150,18 +150,37 @@ impl Lowerer {
             if self.globals.contains_key(&declarator.name) {
                 if declarator.init.is_none() {
                     if self.emitted_global_names.contains(&declarator.name) {
-                        // Even though we skip re-emitting, propagate __weak
-                        // to the already-emitted global if this redeclaration
-                        // carries the weak attribute.
-                        if declarator.attrs.is_weak() {
-                            for g in &mut self.module.globals {
+                        // Check if the previously-emitted global was extern but this
+                        // redeclaration is a tentative definition (not extern).
+                        // In C, `extern __thread T x;` followed by `__thread T x;`
+                        // makes x a defined (non-extern) symbol in this translation unit.
+                        // We must replace the extern IrGlobal with a defined one.
+                        let prior_is_extern = self.module.globals.iter()
+                            .any(|g| g.name == declarator.name && g.is_extern);
+                        if prior_is_extern && !decl.is_extern() {
+                            // Remove old extern entry and re-emit as defined
+                            for g in &self.module.globals {
                                 if g.name == declarator.name {
-                                    g.is_weak = true;
+                                    prior_was_weak = g.is_weak;
                                     break;
                                 }
                             }
+                            self.module.globals.retain(|g| g.name != declarator.name);
+                            self.emitted_global_names.remove(&declarator.name);
+                        } else {
+                            // Even though we skip re-emitting, propagate __weak
+                            // to the already-emitted global if this redeclaration
+                            // carries the weak attribute.
+                            if declarator.attrs.is_weak() {
+                                for g in &mut self.module.globals {
+                                    if g.name == declarator.name {
+                                        g.is_weak = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            continue;
                         }
-                        continue;
                     }
                 } else {
                     // Save the is_weak flag from the previous tentative definition
