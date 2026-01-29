@@ -393,8 +393,13 @@ pub(crate) fn narrow_function(func: &mut IrFunction) -> usize {
                 let new_rhs = if let Some(info) = rhs_cast {
                     if info.from_ty == narrow_ty { info.src } else { continue; }
                 } else if let Operand::Const(c) = rhs {
-                    // Constant: check if it fits in the narrow type
-                    if let Some(narrow_c) = try_narrow_const(c, narrow_ty) {
+                    // Constant: check if it fits in the narrow type.
+                    // Use the comparison-specific variant that requires value
+                    // preservation through zero/sign extension round-trip.
+                    // The general try_narrow_const allows bit-truncation for
+                    // U32 (e.g., I64(-10) -> U32(0xFFFFFFF6)), which is wrong
+                    // for comparisons where the full 64-bit value matters.
+                    if let Some(narrow_c) = try_narrow_const_for_cmp(c, narrow_ty) {
                         Operand::Const(narrow_c)
                     } else {
                         continue;
@@ -548,6 +553,74 @@ fn narrow_operand_by_type(
         Operand::Const(c) => {
             try_narrow_const(c, target_ty).map(Operand::Const)
         }
+    }
+}
+
+/// Narrow a constant for use in a Cmp instruction.
+/// Unlike try_narrow_const (which allows bit-preserving truncation for U32),
+/// this function requires that the constant's value is preserved when extended
+/// back to 64 bits. This is critical for comparisons: if one operand was
+/// zero-extended from U32, the constant must also have zero upper 32 bits.
+/// Otherwise narrowing `Cmp(Eq, zext(x), 0xFFFFFFFF_FFFFFFF6)` to
+/// `Cmp(Eq, x, 0xFFFFFFF6)` would incorrectly match.
+fn try_narrow_const_for_cmp(c: &IrConst, target_ty: IrType) -> Option<IrConst> {
+    let val = match c {
+        IrConst::I64(v) => *v,
+        IrConst::I32(v) => *v as i64,
+        IrConst::I16(v) => *v as i64,
+        IrConst::I8(v) => *v as i64,
+        IrConst::I128(v) => *v as i64,
+        IrConst::Zero => 0,
+        _ => return None,
+    };
+
+    match target_ty {
+        // Signed types: value must round-trip through sign extension
+        IrType::I32 => {
+            if val >= i32::MIN as i64 && val <= i32::MAX as i64 {
+                Some(IrConst::I32(val as i32))
+            } else {
+                None
+            }
+        }
+        // Unsigned types: value must round-trip through zero extension.
+        // Only non-negative values whose upper bits are zero can be narrowed.
+        IrType::U32 => {
+            if val >= 0 && val <= u32::MAX as i64 {
+                Some(IrConst::from_i64(val, IrType::U32))
+            } else {
+                None
+            }
+        }
+        IrType::I16 => {
+            if val >= i16::MIN as i64 && val <= i16::MAX as i64 {
+                Some(IrConst::I16(val as i16))
+            } else {
+                None
+            }
+        }
+        IrType::U16 => {
+            if val >= 0 && val <= u16::MAX as i64 {
+                Some(IrConst::from_i64(val, IrType::U16))
+            } else {
+                None
+            }
+        }
+        IrType::I8 => {
+            if val >= i8::MIN as i64 && val <= i8::MAX as i64 {
+                Some(IrConst::I8(val as i8))
+            } else {
+                None
+            }
+        }
+        IrType::U8 => {
+            if val >= 0 && val <= u8::MAX as i64 {
+                Some(IrConst::from_i64(val, IrType::U8))
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 

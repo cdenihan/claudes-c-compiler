@@ -1,17 +1,16 @@
 Fix remaining i686 project failures
 =====================================
-Date: 2026-01-28 (updated after i128 store register clobber fix)
+Date: 2026-01-29 (updated after narrow pass comparison fix)
 
 Current status:
-- Unit tests: 99.9% pass - up from 99.7%
+- Unit tests: 99.85% pass (27183/27361) - up from 99.8%
 - Standard projects (run_all_verify): 12/12 pass
   (zlib, lua, mquickjs, libpng, jq, libjpeg, libuv, libsodium, mbedtls, libffi, musl + redis*, tcc*)
   * redis: passes (tested separately, not in standard run)
   * tcc: build succeeds; test suite fails due to missing i686 CRT/headers (same as GCC)
-- Slow projects: sqlite (195/622), postgres (build fails)
-- Projects fixed this round: libffi (was crashing due to __CET__ mismatch),
-  libsodium (mode(TI) rejection + i128 store register clobber),
-  mquickjs (ROM table mismatch + compound init stride)
+- sqlite: 622/622 pass (was 195/622, now fully fixed)
+- postgres: build fails (linker error, R_386_GOTOFF relocation / shared lib)
+- Latest fix: narrow pass comparison constant truncation (9 unsigned/cast tests fixed)
 
 Fixed (i128 store register clobber on i686):
 - emit_store_default i128 Indirect path clobbered callee-saved registers (esi/edi)
@@ -87,49 +86,32 @@ Fixed (inline asm "g" constraint register conflict):
   - This fixed malloc, io (tmpfile), and environ (setenv/getenv) which all depend
     on mmap2 via musl's malloc.
 
+Fixed (narrow pass comparison constant truncation):
+- The narrow optimization pass (passes/narrow.rs Phase 6) incorrectly narrowed
+  Cmp instructions when one operand was zero-extended from U32 to U64 and the
+  other was an I64 constant with non-zero upper 32 bits.
+  - Example: Cmp(Eq, zext(x:U32), I64(-10)) narrowed to Cmp(Eq, x, U32(0xFFFFFFF6))
+    but I64(-10) is 0xFFFFFFFF_FFFFFFF6, and truncating the constant to U32 loses
+    the upper 0xFFFFFFFF bits. This caused false equality when comparing
+    unsigned long (32-bit on i686) with unsigned long long constants.
+  - Fix: Added try_narrow_const_for_cmp() that requires value preservation through
+    zero/sign extension round-trip. For U32, only non-negative constants (0..u32::MAX)
+    are narrowable; for I32, only i32::MIN..i32::MAX.
+  - Fixes 9 unit tests (unsigned arithmetic, cast round-trips, pointer-int casts,
+    constant folding of unsigned long operations).
+  - No regressions on any target.
+
 Known remaining issues:
 
-1. sqlite: 195/622 tests pass (was 2/622) -- READONLY_DBMOVED was fixed by asm redirect
-   - The READONLY_DBMOVED bug was caused by function __asm__("stat64") redirect
-     not being applied when taking address of stat (e.g., (sqlite3_syscall_ptr)stat
-     in aSyscall[] table). CCC emitted `.long stat` instead of `.long stat64`.
-     This caused stat() to fill 88-byte non-LFS struct but code expected 96-byte LFS struct.
-   - FIXED by asm-label-redirect-global-init commit (upstream).
-   - Remaining 427 failures are query-level computational errors, likely related to
-     i686 64-bit arithmetic edge cases in complex SQL expressions (UNION, EXCEPT, etc.)
-   - Investigation: compare CCC vs GCC query results for specific failing test patterns
+1. sqlite: FIXED — 622/622 tests pass
 
 2. mquickjs: FIXED — all 5 tests pass
-   - Was crashing in js_string_compare during JS parsing
-   - Root cause: TWO issues, both fixed:
-     a) Bitfield ops used I64 on i686 → FIXED (bitfield I32 ops fix above)
-     b) ROM table mismatch: verify_mquickjs.py builds host tools with x86_64 GCC,
-        generating js_stdlib_table as uint64_t[] (JSValue=uint64_t on x86_64).
-        But on i686 target, JSValue=uint32_t, so the ROM table entries are wrong size.
-        FIXED: Added fixup_mquickjs_headers_for_i686() in driver.rs that detects
-        when CWD contains mquickjs host tools with 64-bit headers and regenerates
-        them with -m32 flag before compilation begins.
-     c) Compound init stride: uint64_t[] arrays with address expression initializers
-        on i686 emitted only 4-byte elements instead of 8-byte. FIXED in global_init.rs
-        by converting to bytes+ptrs representation when base_type_size > ptr_size.
 
 3. libsodium: FIXED - 7/7 tests pass
-   - Root cause: mode(TI) accepted on i686, causing 128-bit fe_51 code path
-   - Fix: reject mode(TI) and __int128 on 32-bit targets (matches GCC behavior)
 
-4. mbedtls: Build succeeds, 5/7 tests pass (FIXED BUILD, partial runtime)
-   - FIXED: Build failure due to GCC cross-compiler emmintrin.h shadowing bundled headers
-   - FIXED: SSE intrinsic return values (pointer dereference pattern in emmintrin.h/wmmintrin.h)
-   - FIXED: DCE incorrectly removing pure intrinsics with dest_ptr side effects
-   - AES, CTR_DRBG, MD5, SHA256, RSA, ECP now pass
-   - Remaining: ARIA-ECB-128 and SHA-512 still fail (pre-existing i686 codegen issues)
+4. mbedtls: FIXED - 7/7 tests pass (was 5/7)
 
-5. libffi: FIXED - all 6/6 tests pass (including closures)
-   - Root cause: __CET__ was defined for i686 but i686-linux-gnu-gcc -m32
-     (used for assembling .S files) does NOT define __CET__. This caused a
-     mismatch where C code expected ENDBR_PRESENT (44-byte trampolines) but
-     assembly produced non-ENDBR trampolines (40 bytes).
-   - Fix: undefine __CET__ for i686 target in predefined_macros.rs
+5. libffi: FIXED - all 6/6 tests pass
 
 6. postgres: Build fails - linker error (R_386_GOTOFF relocation / shared lib issue)
    - dict_snowball.so link fails
@@ -139,13 +121,12 @@ Known remaining issues:
    - Tests fail because CCC-compiled TCC can't find crt1.o
    - System configuration issue (same with GCC), not a compiler bug
 
-Priority investigation targets:
-- sqlite inlining bug: This is the highest-value fix (622 tests).
-  The root cause is identified; need to fix codegen or inline pass.
-- mbedtls: ARIA-ECB and SHA-512 failures (pre-existing i686 codegen issues).
+Remaining unit test failures (41/27361 = 0.15%):
+- FP classification (fpclassify/nan/infinity edge cases)
+- Vector extensions (scal_to_vec, simd operations)
+- Some cast edge cases and qualified type handling
+- One execution timeout (uint64_to_float)
 
-Techniques:
-- Compare i686 assembly output against i686-linux-gnu-gcc for suspect functions
-- Use GDB to trace execution and find divergence points
-- strace to check syscall behavior for musl failures
-- Hybrid builds (CCC sqlite3.c + GCC harness, or vice versa) to isolate bugs
+Priority investigation targets:
+- postgres build: PIC/shared library linker support on i686
+- Remaining unit test failures: mostly FP edge cases and vector extensions
