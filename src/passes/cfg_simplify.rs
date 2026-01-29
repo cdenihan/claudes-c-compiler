@@ -1030,6 +1030,16 @@ fn merge_single_pred_blocks(func: &mut IrFunction) -> usize {
         for_each_terminator_target(&block.terminator, |target| {
             *pred_count.entry(target).or_insert(0) += 1;
         });
+        // Also count asm goto targets as predecessor edges.
+        // An InlineAsm with goto_labels can branch to those target blocks,
+        // so they have an additional predecessor beyond what terminators show.
+        for inst in &block.instructions {
+            if let Instruction::InlineAsm { goto_labels, .. } = inst {
+                for (_, label) in goto_labels {
+                    *pred_count.entry(*label).or_insert(0) += 1;
+                }
+            }
+        }
     }
 
     // Identify which blocks can be merged and build fusion map.
@@ -1106,6 +1116,21 @@ fn merge_single_pred_blocks(func: &mut IrFunction) -> usize {
                 })
             });
             if label_addr_target {
+                continue;
+            }
+            // Check if any block references the successor's label via InlineAsm goto_labels.
+            // Asm goto target blocks must keep their identity so the assembly label
+            // resolves to the correct code.
+            let is_asm_goto_target = func.blocks.iter().any(|b| {
+                b.instructions.iter().any(|inst| {
+                    if let Instruction::InlineAsm { goto_labels, .. } = inst {
+                        goto_labels.iter().any(|(_, label)| *label == *target)
+                    } else {
+                        false
+                    }
+                })
+            });
+            if is_asm_goto_target {
                 continue;
             }
 

@@ -492,16 +492,58 @@ impl Lowerer {
         if self.expr_is_pointer(else_expr) { else_ty = IrType::Ptr; }
         let common_ty = Self::common_type(then_ty, else_ty);
 
+        // Detect struct-typed ternary where branches produce inconsistent
+        // representations: compound literals produce alloca addresses while
+        // function calls returning small (≤8 byte) structs produce packed data
+        // in registers.  When one branch is a compound literal and the other is
+        // not, the join point would mix addresses and data.  Normalize by
+        // loading packed struct data from compound-literal allocas so both
+        // branches produce data values.
+        //
+        // When BOTH branches are compound literals, they both produce alloca
+        // addresses consistently, so no normalization is needed.
+        //
+        // Note: 9-16 byte structs return via unpack_two_reg_return() which
+        // produces an alloca address (not packed data), so both branches
+        // already produce addresses consistently for larger structs.
+        let then_is_struct_cl = self.is_struct_compound_literal(then_expr);
+        let else_is_struct_cl = self.is_struct_compound_literal(else_expr);
+        let needs_struct_load = then_is_struct_cl != else_is_struct_cl;
+        // Use target int type for loading packed small-struct data (≤8 bytes)
+        let effective_ty = if needs_struct_load { crate::common::types::target_int_ir_type() } else { common_ty };
+
         self.emit_ternary_branch(
             cond_val,
-            common_ty,
+            effective_ty,
             |s| {
                 let then_val = s.lower_expr(then_expr);
-                s.emit_implicit_cast(then_val, then_ty, common_ty)
+                if needs_struct_load && then_is_struct_cl {
+                    // Compound literal returned alloca address; load the packed data
+                    if let Operand::Value(ptr) = then_val {
+                        let loaded = s.fresh_value();
+                        s.emit(Instruction::Load { dest: loaded, ptr, ty: effective_ty, seg_override: AddressSpace::Default });
+                        Operand::Value(loaded)
+                    } else {
+                        then_val
+                    }
+                } else {
+                    s.emit_implicit_cast(then_val, then_ty, effective_ty)
+                }
             },
             |s| {
                 let else_val = s.lower_expr(else_expr);
-                s.emit_implicit_cast(else_val, else_ty, common_ty)
+                if needs_struct_load && else_is_struct_cl {
+                    // Compound literal returned alloca address; load the packed data
+                    if let Operand::Value(ptr) = else_val {
+                        let loaded = s.fresh_value();
+                        s.emit(Instruction::Load { dest: loaded, ptr, ty: effective_ty, seg_override: AddressSpace::Default });
+                        Operand::Value(loaded)
+                    } else {
+                        else_val
+                    }
+                } else {
+                    s.emit_implicit_cast(else_val, else_ty, effective_ty)
+                }
             },
         )
     }
@@ -556,6 +598,17 @@ impl Lowerer {
                 s.emit_implicit_cast(else_val, else_ty, common_ty)
             },
         )
+    }
+
+    /// Check if an expression is a struct/union compound literal whose lowered
+    /// form produces an alloca address rather than packed data.  This is used to
+    /// detect ternary branches that need an extra load to normalise the result.
+    fn is_struct_compound_literal(&self, expr: &Expr) -> bool {
+        if let Expr::CompoundLiteral(ref type_spec, _, _) = expr {
+            self.is_type_struct_or_union(type_spec)
+        } else {
+            false
+        }
     }
 
     /// Shared helper for ternary branch patterns (conditional and GNU conditional).

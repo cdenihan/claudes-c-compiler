@@ -562,6 +562,9 @@ impl Lowerer {
                 let decomposes_cd = self.decomposes_complex_double();
                 let decomposes_cf = self.decomposes_complex_float();
                 match ctype {
+                    Some(CType::Struct(_)) | Some(CType::Union(_)) => {
+                        self.struct_value_size(a)
+                    }
                     Some(CType::Vector(_, total_size)) => Some(total_size),
                     Some(CType::ComplexLongDouble) if !decomposes_cld => {
                         Some(CType::ComplexLongDouble.size())
