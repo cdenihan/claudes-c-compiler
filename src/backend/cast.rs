@@ -211,16 +211,6 @@ pub fn classify_float_binop(op: IrBinOp) -> Option<FloatOp> {
 /// Map a float binop mnemonic (fadd/fsub/fmul/fdiv) to the corresponding F128
 /// soft-float libcall. Used by ARM and RISC-V backends (x86 uses x87 for F128).
 /// Returns None for unrecognized mnemonics (caller should fall back to f64 hardware).
-pub fn f128_binop_libcall(mnemonic: &str) -> Option<&'static str> {
-    match mnemonic {
-        "fadd" => Some("__addtf3"),
-        "fsub" => Some("__subtf3"),
-        "fmul" => Some("__multf3"),
-        "fdiv" => Some("__divtf3"),
-        _ => None,
-    }
-}
-
 /// How to interpret an F128 comparison libcall result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum F128CmpKind {

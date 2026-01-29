@@ -1,8 +1,0 @@
-Deduplicate F128 store/load/cast dispatch between ARM and RISC-V backends.
-
-The emit_store, emit_load, emit_store_with_const_offset, emit_load_with_const_offset,
-and emit_cast F128 paths are structurally identical between ARM and RISC-V codegen.rs,
-differing only in register names and instruction mnemonics (~300 lines of duplication).
-
-Plan: extend the existing F128SoftFloat trait with shared orchestration functions for
-the SlotAddr dispatch pattern, then refactor both backends to call these shared functions.

@@ -15,10 +15,11 @@
 //!   from, enabling full-precision reloads for comparisons and casts.
 
 use crate::ir::ir::{Operand, Value};
+use crate::common::types::IrType;
 use crate::backend::state::{StackSlot, SlotAddr};
 use crate::backend::traits::ArchCodegen;
 use crate::backend::f128_softfloat::F128SoftFloat;
-use super::codegen::ArmCodegen;
+use super::codegen::{ArmCodegen, callee_saved_name};
 
 impl F128SoftFloat for ArmCodegen {
     fn state(&mut self) -> &mut crate::backend::state::CodegenState {
@@ -207,6 +208,108 @@ impl F128SoftFloat for ArmCodegen {
         self.state.has_dyn_alloca = val;
         saved
     }
+
+    fn f128_move_callee_reg_to_addr_reg(&mut self, val_id: u32) -> bool {
+        if let Some(&reg) = self.reg_assignments.get(&val_id) {
+            let reg_name = callee_saved_name(reg);
+            self.state.emit_fmt(format_args!("    mov x17, {}", reg_name));
+            true
+        } else {
+            false
+        }
+    }
+
+    fn f128_move_aligned_to_addr_reg(&mut self) {
+        // x9 is the alloca-aligned address register, x17 is the F128 addr register
+        self.state.emit("    mov x17, x9");
+    }
+
+    fn f128_load_indirect_ptr_to_addr_reg(&mut self, slot: StackSlot, _val_id: u32) {
+        self.emit_load_from_sp("x17", slot.0, "ldr");
+    }
+
+    fn f128_load_from_addr_reg_to_acc(&mut self, dest: &Value) {
+        // Load 16 bytes from x17 into q0, convert to f64, store to dest
+        self.state.emit("    ldr q0, [x17]");
+        self.state.emit("    bl __trunctfdf2");
+        self.state.emit("    fmov x0, d0");
+        self.state.reg_cache.invalidate_all();
+        self.store_x0_to(dest);
+    }
+
+    fn f128_load_from_direct_slot_to_acc(&mut self, slot: StackSlot) {
+        self.emit_load_from_sp("q0", slot.0, "ldr");
+    }
+
+    fn f128_store_result_and_truncate(&mut self, dest: &Value) {
+        // Store full f128 from arg1 (q0) to dest slot
+        if let Some(slot) = self.state.get_slot(dest.0) {
+            self.emit_f128_store_q0_to_slot(slot);
+            self.state.track_f128_self(dest.0);
+        }
+        // Produce f64 approximation (do NOT store to slot - that would overwrite f128)
+        self.state.emit("    bl __trunctfdf2");
+        self.state.emit("    fmov x0, d0");
+        self.state.reg_cache.set_acc(dest.0, false);
+    }
+
+    fn f128_move_acc_to_arg0(&mut self) {
+        // On ARM, the accumulator is x0 which is already the first arg register
+    }
+
+    fn f128_move_arg0_to_acc(&mut self) {
+        // On ARM, a0 = x0 = accumulator, so nothing to do
+    }
+
+    fn f128_load_operand_to_acc(&mut self, op: &Operand) {
+        self.operand_to_x0(op);
+    }
+
+    fn f128_sign_extend_acc(&mut self, from_size: usize) {
+        match from_size {
+            1 => self.state.emit("    sxtb x0, w0"),
+            2 => self.state.emit("    sxth x0, w0"),
+            4 => self.state.emit("    sxtw x0, w0"),
+            _ => {}
+        }
+    }
+
+    fn f128_zero_extend_acc(&mut self, from_size: usize) {
+        match from_size {
+            1 => self.state.emit("    and x0, x0, #0xff"),
+            2 => self.state.emit("    and x0, x0, #0xffff"),
+            4 => self.state.emit("    mov w0, w0"),
+            _ => {}
+        }
+    }
+
+    fn f128_narrow_acc(&mut self, to_ty: IrType) {
+        self.emit_cast_instrs(IrType::I64, to_ty);
+    }
+
+    fn f128_extend_float_to_f128(&mut self, from_ty: IrType) {
+        if from_ty == IrType::F32 {
+            self.state.emit("    fmov s0, w0");
+            self.state.emit("    bl __extendsftf2");
+        } else {
+            self.state.emit("    fmov d0, x0");
+            self.state.emit("    bl __extenddftf2");
+        }
+    }
+
+    fn f128_truncate_to_float_acc(&mut self, to_ty: IrType) {
+        if to_ty == IrType::F32 {
+            self.state.emit("    bl __trunctfsf2");
+            self.state.emit("    fmov w0, s0");
+        } else {
+            self.state.emit("    bl __trunctfdf2");
+            self.state.emit("    fmov x0, d0");
+        }
+    }
+
+    fn f128_is_alloca(&self, val_id: u32) -> bool {
+        self.state.is_alloca(val_id)
+    }
 }
 
 // =============================================================================
@@ -219,62 +322,9 @@ impl ArmCodegen {
         crate::backend::f128_softfloat::f128_operand_to_arg1(self, op);
     }
 
-    /// Store an F128 value (16 bytes) to a direct stack slot.
-    pub(super) fn emit_f128_store_to_slot(&mut self, val: &Operand, slot: StackSlot) {
-        crate::backend::f128_softfloat::f128_store_to_slot(self, val, slot);
-    }
-
     /// Store Q0 (16-byte f128) to a stack slot.
     pub(super) fn emit_f128_store_q0_to_slot(&mut self, slot: StackSlot) {
         self.emit_store_to_sp("q0", slot.0, "str");
-    }
-
-    /// Store an F128 value to an address in x17.
-    pub(super) fn emit_f128_store_to_addr_in_x17(&mut self, val: &Operand) {
-        crate::backend::f128_softfloat::f128_store_to_addr_reg(self, val);
-    }
-
-    /// Emit F128 binary operation via soft-float library calls with full precision.
-    pub(super) fn emit_f128_binop_softfloat_full(&mut self, mnemonic: &str, dest: &Value, lhs: &Operand, rhs: &Operand) {
-        let libcall = match crate::backend::cast::f128_binop_libcall(mnemonic) {
-            Some(lc) => lc,
-            None => {
-                self.emit_f128_binop_softfloat(mnemonic);
-                return;
-            }
-        };
-
-        // Use dest slot as temp storage for LHS f128.
-        let dest_slot = self.state.get_slot(dest.0);
-        // Step 1: Load LHS f128 into Q0, save to dest slot (temp).
-        self.emit_f128_operand_to_q0_full(lhs);
-        if let Some(slot) = dest_slot {
-            self.emit_f128_store_q0_to_slot(slot);
-        }
-        // Step 2: Load RHS f128 into Q0, move to Q1.
-        self.emit_f128_operand_to_q0_full(rhs);
-        self.state.emit("    mov v1.16b, v0.16b");
-        // Step 3: Load saved LHS f128 from dest slot back to Q0.
-        if let Some(slot) = dest_slot {
-            self.emit_load_from_sp("q0", slot.0, "ldr");
-        }
-        // Step 4: Call the arithmetic libcall. Result is full f128 in Q0.
-        self.state.emit_fmt(format_args!("    bl {}", libcall));
-        // Step 5: Store full f128 result to dest slot and track it.
-        // This preserves full precision so subsequent uses (return, compare,
-        // further arithmetic) can reload the exact 128-bit value instead of
-        // going through a lossy f64 roundtrip.
-        if let Some(slot) = dest_slot {
-            self.emit_f128_store_q0_to_slot(slot);
-            self.state.track_f128_self(dest.0);
-        }
-        // Step 6: Convert result to f64 approximation for register data flow.
-        // Only update the accumulator cache; do NOT write back to the slot
-        // (that would overwrite the full-precision f128 with 8 bytes of f64).
-        self.state.emit("    bl __trunctfdf2");
-        self.state.emit("    fmov x0, d0");
-        self.state.reg_cache.invalidate_all();
-        self.state.reg_cache.set_acc(dest.0, false);
     }
 
     /// Negate an F128 value with full precision.

@@ -16,7 +16,7 @@ use crate::common::fx_hash::FxHashMap;
 use crate::backend::common::PtrDirective;
 use crate::backend::state::{CodegenState, StackSlot, SlotAddr};
 use crate::backend::traits::ArchCodegen;
-use crate::backend::generation::{is_i128_type, calculate_stack_space_common, find_param_alloca};
+use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
 use crate::backend::call_abi::{CallAbiConfig, CallArgClass, compute_stack_arg_space};
 use crate::backend::call_emit::{ParamClass, classify_params};
 use crate::backend::cast::{CastKind, classify_cast};
@@ -3157,38 +3157,7 @@ impl ArchCodegen for ArmCodegen {
     /// Override emit_store for F128: store full 16-byte IEEE binary128.
     fn emit_store(&mut self, val: &Operand, ptr: &Value, ty: IrType) {
         if ty == IrType::F128 {
-            let is_indirect = !self.state.is_alloca(ptr.0);
-            // Handle register-only pointer values.
-            if let Some(&reg) = self.reg_assignments.get(&ptr.0) {
-                let reg_name = callee_saved_name(reg);
-                self.state.emit_fmt(format_args!("    mov x17, {}", reg_name));
-                self.emit_f128_store_to_addr_in_x17(val);
-                return;
-            }
-            let addr = self.state.resolve_slot_addr(ptr.0);
-            if let Some(addr) = addr {
-                match addr {
-                    SlotAddr::Direct(slot) if !is_indirect => {
-                        // Alloca: the F128 data lives directly at the slot.
-                        self.emit_f128_store_to_slot(val, slot);
-                    }
-                    SlotAddr::Direct(slot) => {
-                        // Non-alloca pointer (e.g. GEP result): the slot holds
-                        // an 8-byte pointer; dereference it to store F128.
-                        self.emit_load_from_sp("x17", slot.0, "ldr");
-                        self.emit_f128_store_to_addr_in_x17(val);
-                    }
-                    SlotAddr::OverAligned(slot, id) => {
-                        self.emit_alloca_aligned_addr(slot, id);
-                        self.state.emit("    mov x17, x9");
-                        self.emit_f128_store_to_addr_in_x17(val);
-                    }
-                    SlotAddr::Indirect(slot) => {
-                        self.emit_load_from_sp("x17", slot.0, "ldr");
-                        self.emit_f128_store_to_addr_in_x17(val);
-                    }
-                }
-            }
+            crate::backend::f128_softfloat::f128_emit_store(self, val, ptr);
             return;
         }
         crate::backend::traits::emit_store_default(self, val, ptr, ty);
@@ -3198,51 +3167,7 @@ impl ArchCodegen for ArmCodegen {
     /// in x0 for normal data flow, and track source for full-precision reload.
     fn emit_load(&mut self, dest: &Value, ptr: &Value, ty: IrType) {
         if ty == IrType::F128 {
-            // Track source alloca for full-precision reload when needed
-            // (comparisons, casts, stores back to memory).
-            self.state.track_f128_load(dest.0, ptr.0, 0);
-            let is_indirect = !self.state.is_alloca(ptr.0);
-
-            // For register-only pointer values, load via the register directly.
-            if let Some(&reg) = self.reg_assignments.get(&ptr.0) {
-                let reg_name = callee_saved_name(reg);
-                self.state.emit_fmt(format_args!("    mov x17, {}", reg_name));
-                self.state.emit("    ldr q0, [x17]");
-            } else {
-                let addr = self.state.resolve_slot_addr(ptr.0);
-                if let Some(addr) = addr {
-                    match addr {
-                        SlotAddr::Direct(slot) if !is_indirect => {
-                            // Alloca: the F128 data lives directly at the slot.
-                            self.emit_load_from_sp("q0", slot.0, "ldr");
-                        }
-                        SlotAddr::Direct(slot) => {
-                            // Non-alloca pointer (e.g. GEP result): the slot holds
-                            // an 8-byte pointer that must be dereferenced to get F128.
-                            self.emit_load_from_sp("x17", slot.0, "ldr");
-                            self.state.emit("    ldr q0, [x17]");
-                        }
-                        SlotAddr::OverAligned(slot, id) => {
-                            self.emit_alloca_aligned_addr(slot, id);
-                            self.state.emit("    mov x17, x9");
-                            self.state.emit("    ldr q0, [x17]");
-                        }
-                        SlotAddr::Indirect(slot) => {
-                            self.emit_load_from_sp("x17", slot.0, "ldr");
-                            self.state.emit("    ldr q0, [x17]");
-                        }
-                    }
-                } else {
-                    // No slot, no register: can't load. Use default.
-                    crate::backend::traits::emit_load_default(self, dest, ptr, ty);
-                    return;
-                }
-            }
-            // Convert f128 to f64 in x0 for register-based data flow.
-            self.state.emit("    bl __trunctfdf2");
-            self.state.emit("    fmov x0, d0");
-            self.state.reg_cache.invalidate_all();
-            self.store_x0_to(dest);
+            crate::backend::f128_softfloat::f128_emit_load(self, dest, ptr);
             return;
         }
         crate::backend::traits::emit_load_default(self, dest, ptr, ty);
@@ -3251,52 +3176,7 @@ impl ArchCodegen for ArmCodegen {
     /// Override emit_store_with_const_offset for F128: store full 16 bytes at offset.
     fn emit_store_with_const_offset(&mut self, val: &Operand, base: &Value, offset: i64, ty: IrType) {
         if ty == IrType::F128 {
-            let is_indirect = !self.state.is_alloca(base.0);
-
-            // Check if the base pointer lives in a callee-saved register.
-            if let Some(&reg) = self.reg_assignments.get(&base.0) {
-                let reg_name = callee_saved_name(reg);
-                self.state.emit_fmt(format_args!("    mov x17, {}", reg_name));
-                if offset != 0 {
-                    self.emit_add_imm_to_x17(offset);
-                }
-                self.emit_f128_store_to_addr_in_x17(val);
-                return;
-            }
-
-            let addr = self.state.resolve_slot_addr(base.0);
-            if let Some(addr) = addr {
-                match addr {
-                    SlotAddr::Direct(slot) if !is_indirect => {
-                        // Alloca: the F128 data lives directly at the slot.
-                        let folded_slot = StackSlot(slot.0 + offset);
-                        self.emit_f128_store_to_slot(val, folded_slot);
-                    }
-                    SlotAddr::Direct(slot) => {
-                        // Non-alloca pointer: dereference, then add offset.
-                        self.emit_load_from_sp("x17", slot.0, "ldr");
-                        if offset != 0 {
-                            self.emit_add_imm_to_x17(offset);
-                        }
-                        self.emit_f128_store_to_addr_in_x17(val);
-                    }
-                    SlotAddr::OverAligned(slot, id) => {
-                        self.emit_alloca_aligned_addr(slot, id);
-                        self.state.emit("    mov x17, x9");
-                        if offset != 0 {
-                            self.emit_add_imm_to_x17(offset);
-                        }
-                        self.emit_f128_store_to_addr_in_x17(val);
-                    }
-                    SlotAddr::Indirect(slot) => {
-                        self.emit_load_from_sp("x17", slot.0, "ldr");
-                        if offset != 0 {
-                            self.emit_add_imm_to_x17(offset);
-                        }
-                        self.emit_f128_store_to_addr_in_x17(val);
-                    }
-                }
-            }
+            crate::backend::f128_softfloat::f128_emit_store_with_offset(self, val, base, offset);
             return;
         }
         // For non-F128, use default path.
@@ -3330,67 +3210,7 @@ impl ArchCodegen for ArmCodegen {
     /// Override emit_load_with_const_offset for F128: load full 16 bytes at offset.
     fn emit_load_with_const_offset(&mut self, dest: &Value, base: &Value, offset: i64, ty: IrType) {
         if ty == IrType::F128 {
-            // Track source for full-precision reload.
-            self.state.track_f128_load(dest.0, base.0, offset);
-            let is_indirect = !self.state.is_alloca(base.0);
-
-            // Check if the base pointer lives in a callee-saved register.
-            // This handles cases where a pointer (e.g. from array indexing) is
-            // register-allocated and we need to load F128 at base+offset.
-            let loaded = if let Some(&reg) = self.reg_assignments.get(&base.0) {
-                let reg_name = callee_saved_name(reg);
-                self.state.emit_fmt(format_args!("    mov x17, {}", reg_name));
-                if offset != 0 {
-                    self.emit_add_imm_to_x17(offset);
-                }
-                self.state.emit("    ldr q0, [x17]");
-                true
-            } else {
-                let addr = self.state.resolve_slot_addr(base.0);
-                if let Some(addr) = addr {
-                    match addr {
-                        SlotAddr::Direct(slot) if !is_indirect => {
-                            // Alloca: the F128 data lives directly at the slot.
-                            let folded_slot = StackSlot(slot.0 + offset);
-                            self.emit_load_from_sp("q0", folded_slot.0, "ldr");
-                        }
-                        SlotAddr::Direct(slot) => {
-                            // Non-alloca pointer: dereference, then add offset.
-                            self.emit_load_from_sp("x17", slot.0, "ldr");
-                            if offset != 0 {
-                                self.emit_add_imm_to_x17(offset);
-                            }
-                            self.state.emit("    ldr q0, [x17]");
-                        }
-                        SlotAddr::OverAligned(slot, id) => {
-                            self.emit_alloca_aligned_addr(slot, id);
-                            self.state.emit("    mov x17, x9");
-                            if offset != 0 {
-                                self.emit_add_imm_to_x17(offset);
-                            }
-                            self.state.emit("    ldr q0, [x17]");
-                        }
-                        SlotAddr::Indirect(slot) => {
-                            self.emit_load_from_sp("x17", slot.0, "ldr");
-                            if offset != 0 {
-                                self.emit_add_imm_to_x17(offset);
-                            }
-                            self.state.emit("    ldr q0, [x17]");
-                        }
-                    }
-                    true
-                } else {
-                    false
-                }
-            };
-            if loaded {
-                // Convert f128 to f64 in x0 for register-based data flow.
-                // Full f128 stays in source alloca, accessible via f128_load_sources.
-                self.state.emit("    bl __trunctfdf2");
-                self.state.emit("    fmov x0, d0");
-                self.state.reg_cache.invalidate_all();
-                self.store_x0_to(dest);
-            }
+            crate::backend::f128_softfloat::f128_emit_load_with_offset(self, dest, base, offset);
             return;
         }
         // Default path for non-F128 types.
@@ -3421,105 +3241,9 @@ impl ArchCodegen for ArmCodegen {
 
     /// Override emit_cast for F128: use soft-float libcalls for full precision.
     fn emit_cast(&mut self, dest: &Value, src: &Operand, from_ty: IrType, to_ty: IrType) {
-        // Intercept casts TO F128 from integer types.
-        if to_ty == IrType::F128 && !from_ty.is_float() && !is_i128_type(from_ty) {
-            // Load source integer into x0.
-            self.operand_to_x0(src);
-            // Sign/zero extend sub-64-bit integers.
-            if from_ty.is_signed() {
-                match from_ty.size() {
-                    1 => self.state.emit("    sxtb x0, w0"),
-                    2 => self.state.emit("    sxth x0, w0"),
-                    4 => self.state.emit("    sxtw x0, w0"),
-                    _ => {}
-                }
-                // Call __floatditf: i64 in x0 -> f128 in q0.
-                self.state.emit("    bl __floatditf");
-            } else {
-                match from_ty.size() {
-                    1 => self.state.emit("    and x0, x0, #0xff"),
-                    2 => self.state.emit("    and x0, x0, #0xffff"),
-                    4 => self.state.emit("    mov w0, w0"), // zero-extend w->x
-                    _ => {}
-                }
-                // Call __floatunditf: u64 in x0 -> f128 in q0.
-                self.state.emit("    bl __floatunditf");
-            }
-            // Result f128 is in Q0. Store the full 16-byte value to dest slot
-            // to preserve full precision (avoids lossy f64 round-trip).
-            self.state.reg_cache.invalidate_all();
-            if let Some(slot) = self.state.get_slot(dest.0) {
-                self.emit_f128_store_q0_to_slot(slot);
-                self.state.track_f128_self(dest.0);
-            }
-            // Produce f64 approximation for register-based data flow only.
-            self.state.emit("    bl __trunctfdf2");
-            self.state.emit("    fmov x0, d0");
-            self.state.reg_cache.set_acc(dest.0, false);
+        if crate::backend::f128_softfloat::f128_emit_cast(self, dest, src, from_ty, to_ty) {
             return;
         }
-
-        // Intercept casts FROM F128 to integer types.
-        if from_ty == IrType::F128 && !to_ty.is_float() && !is_i128_type(to_ty) {
-            // Load full f128 into Q0.
-            self.emit_f128_operand_to_q0_full(src);
-            // Call appropriate soft-float conversion.
-            if to_ty.is_unsigned() || to_ty == IrType::Ptr {
-                self.state.emit("    bl __fixunstfdi");
-            } else {
-                self.state.emit("    bl __fixtfdi");
-            }
-            // Result in x0.
-            self.state.reg_cache.invalidate_all();
-            // Narrow if needed.
-            if to_ty.size() < 8 {
-                self.emit_cast_instrs(IrType::I64, to_ty);
-            }
-            self.store_x0_to(dest);
-            return;
-        }
-
-        // Intercept F128 <-> float casts.
-        if to_ty == IrType::F128 && from_ty.is_float() {
-            // float/double -> F128
-            self.operand_to_x0(src);
-            if from_ty == IrType::F32 {
-                self.state.emit("    fmov s0, w0");
-                self.state.emit("    bl __extendsftf2");
-            } else {
-                // F64 or F128
-                self.state.emit("    fmov d0, x0");
-                self.state.emit("    bl __extenddftf2");
-            }
-            // Result f128 in Q0. Store the full 16-byte value to dest slot
-            // to preserve full precision (avoids lossy f64 round-trip).
-            self.state.reg_cache.invalidate_all();
-            if let Some(slot) = self.state.get_slot(dest.0) {
-                self.emit_f128_store_q0_to_slot(slot);
-                self.state.track_f128_self(dest.0);
-            }
-            // Produce f64 approximation for register-based data flow only.
-            self.state.emit("    bl __trunctfdf2");
-            self.state.emit("    fmov x0, d0");
-            self.state.reg_cache.set_acc(dest.0, false);
-            return;
-        }
-
-        if from_ty == IrType::F128 && to_ty.is_float() {
-            // F128 -> float/double
-            self.emit_f128_operand_to_q0_full(src);
-            if to_ty == IrType::F32 {
-                self.state.emit("    bl __trunctfsf2");
-                self.state.emit("    fmov w0, s0");
-            } else {
-                self.state.emit("    bl __trunctfdf2");
-                self.state.emit("    fmov x0, d0");
-            }
-            self.state.reg_cache.invalidate_all();
-            self.store_x0_to(dest);
-            return;
-        }
-
         // For all other casts, use the default implementation.
         crate::backend::traits::emit_cast_default(self, dest, src, from_ty, to_ty);
     }
@@ -4036,8 +3760,7 @@ impl ArchCodegen for ArmCodegen {
     /// that stores the full 16-byte f128 result to the dest slot.
     fn emit_float_binop(&mut self, dest: &Value, op: crate::backend::cast::FloatOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
         if ty == IrType::F128 {
-            let mnemonic = self.emit_float_binop_mnemonic(op);
-            self.emit_f128_binop_softfloat_full(mnemonic, dest, lhs, rhs);
+            crate::backend::f128_softfloat::f128_emit_binop(self, dest, op, lhs, rhs);
             return;
         }
         // Non-F128: use default path.
@@ -4050,11 +3773,6 @@ impl ArchCodegen for ArmCodegen {
     }
 
     fn emit_float_binop_impl(&mut self, mnemonic: &str, ty: IrType) {
-        if ty == IrType::F128 {
-            // Fallback for old path (should not be reached for F128 due to override above).
-            self.emit_f128_binop_softfloat(mnemonic);
-            return;
-        }
         // secondary = lhs (in x1 via acc_to_secondary = mov x1, x0), acc = rhs (in x0)
         // After the shared default: lhs loaded to acc, pushed to secondary, rhs loaded to acc
         // On ARM, emit_acc_to_secondary does "mov x1, x0" so: x1=lhs, x0=rhs

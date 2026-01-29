@@ -13,10 +13,16 @@
 //!   arg positions is `mv a2, a0; mv a3, a1`. Sign bit flip uses `li`+`slli`+`xor`
 //!   on the high register.
 //!
-//! The `F128SoftFloat` trait captures these ~34 arch-specific primitives, and the
-//! `f128_*` free functions implement the shared orchestration once. This eliminates
-//! ~350 lines of structural duplication between `arm/codegen/f128.rs` and
-//! `riscv/codegen/f128.rs`.
+//! The `F128SoftFloat` trait captures arch-specific primitives, and the `f128_*`
+//! free functions implement the shared orchestration once. This covers:
+//!
+//! - **Operand loading** (`f128_operand_to_arg1`): load F128 with full precision
+//! - **Store/load dispatch** (`f128_emit_store`, `f128_emit_load`, etc.): the
+//!   SlotAddr 4-way dispatch for F128 store/load/store_with_offset/load_with_offset
+//! - **Cast dispatch** (`f128_emit_cast`): int<->F128 and float<->F128 casts
+//! - **Binop dispatch** (`f128_emit_binop`): F128 arithmetic via libcalls
+//! - **Comparison** (`f128_cmp`): F128 comparison via libcalls
+//! - **Negation** (`f128_neg`): sign bit flip
 
 use crate::ir::ir::{
     IrCmpOp,
@@ -24,7 +30,9 @@ use crate::ir::ir::{
     Operand,
     Value,
 };
+use crate::common::types::IrType;
 use crate::backend::state::{StackSlot, SlotAddr};
+use crate::backend::cast::FloatOp;
 
 /// Arch-specific primitives for F128 soft-float operations.
 ///
@@ -180,6 +188,74 @@ pub trait F128SoftFloat {
     /// Has dynamic alloca flag (needed for ARM's SP-relative addressing workaround).
     /// Returns the current value and sets it to the given value.
     fn f128_set_dyn_alloca(&mut self, val: bool) -> bool;
+
+    // --- Store/Load dispatch primitives (used by shared emit_store/emit_load) ---
+
+    /// Move a callee-saved register value into the address register (ARM: x17, RISC-V: t5).
+    /// Called when a pointer is register-allocated.
+    fn f128_move_callee_reg_to_addr_reg(&mut self, val_id: u32) -> bool;
+
+    /// Move the computed aligned address into the address register.
+    /// ARM needs `mov x17, x9` because x9 is the alloca addr register and x17 is the
+    /// F128 addr register. RISC-V uses t5 for both, so this is a no-op.
+    fn f128_move_aligned_to_addr_reg(&mut self) {}
+
+    /// Load a pointer from a (non-alloca) slot into the address register.
+    /// This differs from `f128_load_ptr_to_addr_reg` in that it always
+    /// loads the pointer value, never computes an alloca address.
+    fn f128_load_indirect_ptr_to_addr_reg(&mut self, slot: StackSlot, val_id: u32);
+
+    /// Load f128 from addr_reg, convert to f64 approx, store to dest.
+    /// This is the "load through pointer" path: load 16 bytes from the address
+    /// register, call __trunctfdf2, move result to accumulator, store to dest.
+    fn f128_load_from_addr_reg_to_acc(&mut self, dest: &Value);
+
+    /// Load f128 from a direct alloca slot, convert to f64 approx, store to accumulator.
+    fn f128_load_from_direct_slot_to_acc(&mut self, slot: StackSlot);
+
+    /// Store arg1 (f128 result) to dest slot and produce f64 approximation.
+    /// This is the common epilogue for cast/binop results: store full f128 to
+    /// dest slot, track self, call __trunctfdf2, update cache. Does NOT store
+    /// f64 back to the slot (that would overwrite the full-precision f128).
+    fn f128_store_result_and_truncate(&mut self, dest: &Value);
+
+    /// Load the accumulator value and move it to the first integer argument register.
+    /// (ARM: already in x0; RISC-V: `mv a0, t0`)
+    fn f128_move_acc_to_arg0(&mut self);
+
+    /// Move the f128 return value from arg1 to accumulator as f64 result.
+    /// (ARM: result already in x0 from __fixtfdi; RISC-V: `mv t0, a0`)
+    fn f128_move_arg0_to_acc(&mut self);
+
+    /// Load an operand into the accumulator.
+    /// (ARM: operand_to_x0; RISC-V: operand_to_t0)
+    fn f128_load_operand_to_acc(&mut self, op: &Operand);
+
+    /// Sign-extend a sub-64-bit signed integer in the accumulator.
+    /// (ARM: sxtb/sxth/sxtw; RISC-V: slli+srai/sext.w)
+    fn f128_sign_extend_acc(&mut self, from_size: usize);
+
+    /// Zero-extend a sub-64-bit unsigned integer in the accumulator.
+    /// (ARM: and/mov w0,w0; RISC-V: andi/slli+srli)
+    fn f128_zero_extend_acc(&mut self, from_size: usize);
+
+    /// Narrow the accumulator to a smaller integer type using emit_cast_instrs.
+    fn f128_narrow_acc(&mut self, to_ty: IrType);
+
+    /// Move a float value from the accumulator to the float argument register
+    /// and extend it from F32 to F128 or F64 to F128.
+    /// (ARM: `fmov s0/d0, w0/x0; bl __extendsftf2/__extenddftf2`)
+    /// (RISC-V: `fmv.w.x/fmv.d.x fa0, t0; call __extendsftf2/__extenddftf2`)
+    fn f128_extend_float_to_f128(&mut self, from_ty: IrType);
+
+    /// Convert an F128 in arg1 to F32 or F64 and move to accumulator.
+    /// (ARM: `bl __trunctfsf2; fmov w0, s0` or `bl __trunctfdf2; fmov x0, d0`)
+    /// (RISC-V: `call __trunctfsf2; fmv.x.w t0, fa0` or `call __trunctfdf2; fmv.x.d t0, fa0`)
+    fn f128_truncate_to_float_acc(&mut self, to_ty: IrType);
+
+    /// Check if this backend has the `is_alloca` method accessible.
+    /// Both ARM and RISC-V do, so this just delegates.
+    fn f128_is_alloca(&self, val_id: u32) -> bool;
 }
 
 // =============================================================================
@@ -390,4 +466,321 @@ pub fn f128_cmp<T: F128SoftFloat + ?Sized>(
 
     cg.state().reg_cache.invalidate_all();
     cg.f128_store_acc_to_dest(dest);
+}
+
+// =============================================================================
+// Shared store/load dispatch orchestration
+// =============================================================================
+
+/// F128 store dispatch: resolve the pointer's SlotAddr and store 16 bytes.
+///
+/// Handles four cases: register-allocated pointer, Direct alloca, OverAligned
+/// alloca, and Indirect (non-alloca pointer in slot). Each case resolves to
+/// either a direct slot store or an address-register store.
+pub fn f128_emit_store<T: F128SoftFloat + ?Sized>(
+    cg: &mut T,
+    val: &Operand,
+    ptr: &Value,
+) {
+    let is_indirect = !cg.f128_is_alloca(ptr.0);
+
+    // Check if the pointer lives in a callee-saved register.
+    if cg.f128_move_callee_reg_to_addr_reg(ptr.0) {
+        f128_store_to_addr_reg(cg, val);
+        return;
+    }
+
+    let addr = cg.f128_resolve_slot_addr(ptr.0);
+    if let Some(addr) = addr {
+        match addr {
+            SlotAddr::Direct(slot) if !is_indirect => {
+                f128_store_to_slot(cg, val, slot);
+            }
+            SlotAddr::Direct(slot) | SlotAddr::Indirect(slot) => {
+                cg.f128_load_indirect_ptr_to_addr_reg(slot, ptr.0);
+                f128_store_to_addr_reg(cg, val);
+            }
+            SlotAddr::OverAligned(slot, id) => {
+                cg.f128_alloca_aligned_addr(slot, id);
+                cg.f128_move_aligned_to_addr_reg();
+                f128_store_to_addr_reg(cg, val);
+            }
+        }
+    }
+}
+
+/// F128 load dispatch: resolve the pointer's SlotAddr, load 16 bytes,
+/// convert to f64 approximation, and store to dest.
+///
+/// Also tracks the f128 source for full-precision reloads.
+pub fn f128_emit_load<T: F128SoftFloat + ?Sized>(
+    cg: &mut T,
+    dest: &Value,
+    ptr: &Value,
+) {
+    cg.state().track_f128_load(dest.0, ptr.0, 0);
+    let is_indirect = !cg.f128_is_alloca(ptr.0);
+
+    // Check if the pointer lives in a callee-saved register.
+    if cg.f128_move_callee_reg_to_addr_reg(ptr.0) {
+        cg.f128_load_from_addr_reg_to_acc(dest);
+        return;
+    }
+
+    let addr = cg.f128_resolve_slot_addr(ptr.0);
+    if let Some(addr) = addr {
+        match addr {
+            SlotAddr::Direct(slot) if !is_indirect => {
+                cg.f128_load_from_direct_slot_to_acc(slot);
+            }
+            SlotAddr::Direct(slot) | SlotAddr::Indirect(slot) => {
+                cg.f128_load_indirect_ptr_to_addr_reg(slot, ptr.0);
+                cg.f128_load_from_addr_reg_to_acc(dest);
+                return;
+            }
+            SlotAddr::OverAligned(slot, id) => {
+                cg.f128_alloca_aligned_addr(slot, id);
+                cg.f128_move_aligned_to_addr_reg();
+                cg.f128_load_from_addr_reg_to_acc(dest);
+                return;
+            }
+        }
+    } else {
+        return;
+    }
+    // Convert f128 to f64, store to dest.
+    cg.f128_truncate_result_to_acc();
+    cg.state().reg_cache.invalidate_all();
+    cg.f128_store_acc_to_dest(dest);
+}
+
+/// F128 store with constant offset dispatch.
+///
+/// Resolves the base pointer's SlotAddr and stores 16 bytes at base + offset.
+pub fn f128_emit_store_with_offset<T: F128SoftFloat + ?Sized>(
+    cg: &mut T,
+    val: &Operand,
+    base: &Value,
+    offset: i64,
+) {
+    let is_indirect = !cg.f128_is_alloca(base.0);
+
+    // Check if the base pointer lives in a callee-saved register.
+    if cg.f128_move_callee_reg_to_addr_reg(base.0) {
+        if offset != 0 {
+            cg.f128_add_offset_to_addr_reg(offset);
+        }
+        f128_store_to_addr_reg(cg, val);
+        return;
+    }
+
+    let addr = cg.f128_resolve_slot_addr(base.0);
+    if let Some(addr) = addr {
+        match addr {
+            SlotAddr::Direct(slot) if !is_indirect => {
+                let folded_slot = StackSlot(slot.0 + offset);
+                f128_store_to_slot(cg, val, folded_slot);
+            }
+            SlotAddr::Direct(slot) | SlotAddr::Indirect(slot) => {
+                cg.f128_load_indirect_ptr_to_addr_reg(slot, base.0);
+                if offset != 0 {
+                    cg.f128_add_offset_to_addr_reg(offset);
+                }
+                f128_store_to_addr_reg(cg, val);
+            }
+            SlotAddr::OverAligned(slot, id) => {
+                cg.f128_alloca_aligned_addr(slot, id);
+                cg.f128_move_aligned_to_addr_reg();
+                if offset != 0 {
+                    cg.f128_add_offset_to_addr_reg(offset);
+                }
+                f128_store_to_addr_reg(cg, val);
+            }
+        }
+    }
+}
+
+/// F128 load with constant offset dispatch.
+///
+/// Resolves the base pointer's SlotAddr, loads 16 bytes at base + offset,
+/// converts to f64 approximation, and stores to dest.
+pub fn f128_emit_load_with_offset<T: F128SoftFloat + ?Sized>(
+    cg: &mut T,
+    dest: &Value,
+    base: &Value,
+    offset: i64,
+) {
+    cg.state().track_f128_load(dest.0, base.0, offset);
+    let is_indirect = !cg.f128_is_alloca(base.0);
+
+    // Check if the base pointer lives in a callee-saved register.
+    let loaded = if cg.f128_move_callee_reg_to_addr_reg(base.0) {
+        if offset != 0 {
+            cg.f128_add_offset_to_addr_reg(offset);
+        }
+        cg.f128_load_from_addr_reg_to_acc(dest);
+        return;  // load_from_addr_reg_to_acc handles truncation + store
+    } else {
+        let addr = cg.f128_resolve_slot_addr(base.0);
+        if let Some(addr) = addr {
+            match addr {
+                SlotAddr::Direct(slot) if !is_indirect => {
+                    let folded_slot = StackSlot(slot.0 + offset);
+                    cg.f128_load_from_direct_slot_to_acc(folded_slot);
+                }
+                SlotAddr::Direct(slot) | SlotAddr::Indirect(slot) => {
+                    cg.f128_load_indirect_ptr_to_addr_reg(slot, base.0);
+                    if offset != 0 {
+                        cg.f128_add_offset_to_addr_reg(offset);
+                    }
+                    cg.f128_load_from_addr_reg_to_acc(dest);
+                    return;
+                }
+                SlotAddr::OverAligned(slot, id) => {
+                    cg.f128_alloca_aligned_addr(slot, id);
+                    cg.f128_move_aligned_to_addr_reg();
+                    if offset != 0 {
+                        cg.f128_add_offset_to_addr_reg(offset);
+                    }
+                    cg.f128_load_from_addr_reg_to_acc(dest);
+                    return;
+                }
+            }
+            true
+        } else {
+            false
+        }
+    };
+    if loaded {
+        cg.f128_truncate_result_to_acc();
+        cg.state().reg_cache.invalidate_all();
+        cg.f128_store_acc_to_dest(dest);
+    }
+}
+
+// =============================================================================
+// Shared cast orchestration
+// =============================================================================
+
+/// F128 cast dispatch: handles all F128-related casts (int<->F128, float<->F128).
+///
+/// Returns `true` if the cast was handled, `false` if the caller should use the
+/// default cast path.
+pub fn f128_emit_cast<T: F128SoftFloat + ?Sized>(
+    cg: &mut T,
+    dest: &Value,
+    src: &Operand,
+    from_ty: IrType,
+    to_ty: IrType,
+) -> bool {
+    let is_i128 = |ty: IrType| ty == IrType::I128 || ty == IrType::U128;
+
+    // int -> F128
+    if to_ty == IrType::F128 && !from_ty.is_float() && !is_i128(from_ty) {
+        cg.f128_load_operand_to_acc(src);
+        if from_ty.is_signed() {
+            cg.f128_sign_extend_acc(from_ty.size());
+            cg.f128_move_acc_to_arg0();
+            cg.f128_call("__floatditf");
+        } else {
+            cg.f128_zero_extend_acc(from_ty.size());
+            cg.f128_move_acc_to_arg0();
+            cg.f128_call("__floatunditf");
+        }
+        cg.state().reg_cache.invalidate_all();
+        cg.f128_store_result_and_truncate(dest);
+        return true;
+    }
+
+    // F128 -> int
+    if from_ty == IrType::F128 && !to_ty.is_float() && !is_i128(to_ty) {
+        f128_operand_to_arg1(cg, src);
+        if to_ty.is_unsigned() || to_ty == IrType::Ptr {
+            cg.f128_call("__fixunstfdi");
+        } else {
+            cg.f128_call("__fixtfdi");
+        }
+        cg.f128_move_arg0_to_acc();
+        cg.state().reg_cache.invalidate_all();
+        if to_ty.size() < 8 {
+            cg.f128_narrow_acc(to_ty);
+        }
+        cg.f128_store_acc_to_dest(dest);
+        return true;
+    }
+
+    // float -> F128
+    if to_ty == IrType::F128 && from_ty.is_float() {
+        cg.f128_load_operand_to_acc(src);
+        cg.f128_extend_float_to_f128(from_ty);
+        cg.state().reg_cache.invalidate_all();
+        cg.f128_store_result_and_truncate(dest);
+        return true;
+    }
+
+    // F128 -> float
+    if from_ty == IrType::F128 && to_ty.is_float() {
+        f128_operand_to_arg1(cg, src);
+        cg.f128_truncate_to_float_acc(to_ty);
+        cg.state().reg_cache.invalidate_all();
+        cg.f128_store_acc_to_dest(dest);
+        return true;
+    }
+
+    false
+}
+
+// =============================================================================
+// Shared binop orchestration
+// =============================================================================
+
+/// F128 binary operation via soft-float libcalls with full precision.
+///
+/// 1. Allocate stack temp.
+/// 2. Load LHS f128 into arg1, save to temp.
+/// 3. Load RHS f128 into arg1, move to arg2.
+/// 4. Reload LHS from temp into arg1.
+/// 5. Call arithmetic libcall.
+/// 6. Free temp.
+/// 7. Store full f128 result to dest slot, produce f64 approximation.
+pub fn f128_emit_binop<T: F128SoftFloat + ?Sized>(
+    cg: &mut T,
+    dest: &Value,
+    op: FloatOp,
+    lhs: &Operand,
+    rhs: &Operand,
+) {
+    let libcall = match op {
+        FloatOp::Add => "__addtf3",
+        FloatOp::Sub => "__subtf3",
+        FloatOp::Mul => "__multf3",
+        FloatOp::Div => "__divtf3",
+    };
+
+    // Force frame-pointer-relative addressing during temp allocation.
+    let saved = cg.f128_set_dyn_alloca(true);
+
+    // Step 1: Allocate temp stack space for saving LHS.
+    cg.f128_alloc_temp_16();
+
+    // Step 2: Load LHS f128, save to temp.
+    f128_operand_to_arg1(cg, lhs);
+    cg.f128_save_arg1_to_sp();
+
+    // Step 3: Load RHS f128, move to arg2.
+    f128_operand_to_arg1(cg, rhs);
+    cg.f128_move_arg1_to_arg2();
+
+    // Step 4: Reload LHS from temp.
+    cg.f128_reload_arg1_from_sp();
+
+    // Step 5: Free temp, restore flag.
+    cg.f128_free_temp_16();
+    cg.f128_set_dyn_alloca(saved);
+
+    // Step 6: Call the arithmetic libcall.
+    cg.f128_call(libcall);
+
+    // Step 7: Store full f128 result and produce f64 approximation.
+    cg.f128_store_result_and_truncate(dest);
 }

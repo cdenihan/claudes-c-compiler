@@ -9,10 +9,11 @@
 //! in `backend/f128_softfloat.rs`.
 
 use crate::ir::ir::{Operand, Value};
+use crate::common::types::IrType;
 use crate::backend::state::{StackSlot, SlotAddr};
 use crate::backend::traits::ArchCodegen;
 use crate::backend::f128_softfloat::F128SoftFloat;
-use super::codegen::RiscvCodegen;
+use super::codegen::{RiscvCodegen, callee_saved_name};
 
 impl F128SoftFloat for RiscvCodegen {
     fn state(&mut self) -> &mut crate::backend::state::CodegenState {
@@ -213,6 +214,127 @@ impl F128SoftFloat for RiscvCodegen {
         // dyn_alloca flag doesn't affect addressing. Return false as no-op.
         false
     }
+
+    fn f128_move_callee_reg_to_addr_reg(&mut self, val_id: u32) -> bool {
+        if let Some(&reg) = self.reg_assignments.get(&val_id) {
+            let reg_name = callee_saved_name(reg);
+            self.state.emit_fmt(format_args!("    mv t5, {}", reg_name));
+            true
+        } else {
+            false
+        }
+    }
+
+    // f128_move_aligned_to_addr_reg: RISC-V uses t5 for both alloca-aligned
+    // addr and F128 addr register, so the default no-op is correct.
+
+    fn f128_load_indirect_ptr_to_addr_reg(&mut self, slot: StackSlot, val_id: u32) {
+        self.emit_load_ptr_from_slot(slot, val_id);
+    }
+
+    fn f128_load_from_addr_reg_to_acc(&mut self, dest: &Value) {
+        // Load 16 bytes from t5, convert to f64 via __trunctfdf2, store to dest
+        self.state.emit("    ld a0, 0(t5)");
+        self.state.emit("    ld a1, 8(t5)");
+        self.state.emit("    call __trunctfdf2");
+        self.state.emit("    fmv.x.d t0, fa0");
+        self.state.reg_cache.invalidate_all();
+        self.store_t0_to(dest);
+    }
+
+    fn f128_load_from_direct_slot_to_acc(&mut self, slot: StackSlot) {
+        self.emit_load_from_s0("a0", slot.0, "ld");
+        self.emit_load_from_s0("a1", slot.0 + 8, "ld");
+    }
+
+    fn f128_store_result_and_truncate(&mut self, dest: &Value) {
+        // Store full f128 from arg1 (a0:a1) to dest slot
+        if let Some(slot) = self.state.get_slot(dest.0) {
+            self.emit_store_to_s0("a0", slot.0, "sd");
+            self.emit_store_to_s0("a1", slot.0 + 8, "sd");
+        }
+        // Produce f64 approximation
+        self.state.emit("    call __trunctfdf2");
+        self.state.emit("    fmv.x.d t0, fa0");
+        self.state.reg_cache.invalidate_all();
+        self.state.track_f128_self(dest.0);
+        // Store f64 approx only to register (if register-allocated), not to slot
+        if let Some(&reg) = self.reg_assignments.get(&dest.0) {
+            let reg_name = callee_saved_name(reg);
+            self.state.emit_fmt(format_args!("    mv {}, t0", reg_name));
+        }
+        self.state.reg_cache.set_acc(dest.0, false);
+    }
+
+    fn f128_move_acc_to_arg0(&mut self) {
+        self.state.emit("    mv a0, t0");
+    }
+
+    fn f128_move_arg0_to_acc(&mut self) {
+        self.state.emit("    mv t0, a0");
+    }
+
+    fn f128_load_operand_to_acc(&mut self, op: &Operand) {
+        self.operand_to_t0(op);
+    }
+
+    fn f128_sign_extend_acc(&mut self, from_size: usize) {
+        match from_size {
+            1 => {
+                self.state.emit("    slli t0, t0, 56");
+                self.state.emit("    srai t0, t0, 56");
+            }
+            2 => {
+                self.state.emit("    slli t0, t0, 48");
+                self.state.emit("    srai t0, t0, 48");
+            }
+            4 => self.state.emit("    sext.w t0, t0"),
+            _ => {}
+        }
+    }
+
+    fn f128_zero_extend_acc(&mut self, from_size: usize) {
+        match from_size {
+            1 => self.state.emit("    andi t0, t0, 0xff"),
+            2 => {
+                self.state.emit("    slli t0, t0, 48");
+                self.state.emit("    srli t0, t0, 48");
+            }
+            4 => {
+                self.state.emit("    slli t0, t0, 32");
+                self.state.emit("    srli t0, t0, 32");
+            }
+            _ => {}
+        }
+    }
+
+    fn f128_narrow_acc(&mut self, to_ty: IrType) {
+        self.emit_cast_instrs(IrType::I64, to_ty);
+    }
+
+    fn f128_extend_float_to_f128(&mut self, from_ty: IrType) {
+        if from_ty == IrType::F32 {
+            self.state.emit("    fmv.w.x fa0, t0");
+            self.state.emit("    call __extendsftf2");
+        } else {
+            self.state.emit("    fmv.d.x fa0, t0");
+            self.state.emit("    call __extenddftf2");
+        }
+    }
+
+    fn f128_truncate_to_float_acc(&mut self, to_ty: IrType) {
+        if to_ty == IrType::F32 {
+            self.state.emit("    call __trunctfsf2");
+            self.state.emit("    fmv.x.w t0, fa0");
+        } else {
+            self.state.emit("    call __trunctfdf2");
+            self.state.emit("    fmv.x.d t0, fa0");
+        }
+    }
+
+    fn f128_is_alloca(&self, val_id: u32) -> bool {
+        self.state.is_alloca(val_id)
+    }
 }
 
 // =============================================================================
@@ -225,88 +347,9 @@ impl RiscvCodegen {
         crate::backend::f128_softfloat::f128_operand_to_arg1(self, op);
     }
 
-    /// Store an F128 value (16 bytes) to a direct stack slot.
-    pub(super) fn emit_f128_store_to_slot(&mut self, val: &Operand, slot: StackSlot) {
-        crate::backend::f128_softfloat::f128_store_to_slot(self, val, slot);
-    }
-
-    /// Store an F128 value to an over-aligned alloca slot.
-    pub(super) fn emit_f128_store_to_slot_aligned(&mut self, val: &Operand, slot: StackSlot, id: u32) {
-        self.emit_alloca_aligned_addr(slot, id);
-        // t5 now has the aligned address
-        self.emit_f128_store_to_addr_in_t5(val);
-    }
-
-    /// Store an F128 value to the address in t5.
-    pub(super) fn emit_f128_store_to_addr_in_t5(&mut self, val: &Operand) {
-        crate::backend::f128_softfloat::f128_store_to_addr_reg(self, val);
-    }
-
-    /// Store an F128 value via an indirect pointer (ptr in a slot).
-    pub(super) fn emit_f128_store_indirect(&mut self, val: &Operand, slot: StackSlot, ptr_id: u32) {
-        self.emit_load_ptr_from_slot(slot, ptr_id);
-        // t5 now has the pointer
-        self.emit_f128_store_to_addr_in_t5(val);
-    }
-
-    /// Load an F128 value (16 bytes) from a direct stack slot.
-    /// Loads the 16-byte f128 into a0:a1, calls __trunctfdf2 to get f64 in t0.
-    pub(super) fn emit_f128_load_from_slot(&mut self, slot: StackSlot) {
-        self.emit_load_from_s0("a0", slot.0, "ld");
-        self.emit_load_from_s0("a1", slot.0 + 8, "ld");
-        self.state.emit("    call __trunctfdf2");
-        self.state.emit("    fmv.x.d t0, fa0");
-        self.state.reg_cache.invalidate_all();
-    }
-
-    /// Load an F128 value from the address in t5. Converts f128 to f64 via __trunctfdf2.
-    pub(super) fn emit_f128_load_from_addr_in_t5(&mut self) {
-        self.state.emit("    ld a0, 0(t5)");
-        self.state.emit("    ld a1, 8(t5)");
-        self.state.emit("    call __trunctfdf2");
-        self.state.emit("    fmv.x.d t0, fa0");
-        self.state.reg_cache.invalidate_all();
-    }
-
     /// Negate an F128 value with full precision.
     pub(super) fn emit_f128_neg_full(&mut self, dest: &Value, src: &Operand) {
         crate::backend::f128_softfloat::f128_neg(self, dest, src);
     }
 
-    /// Legacy F128 binop via soft-float, operating on f64 approximations.
-    /// Called when t1 = lhs (f64 bits), t0 = rhs (f64 bits).
-    /// Converts both from f64 to f128, calls libcall, converts result back to f64.
-    pub(super) fn emit_f128_binop_softfloat(&mut self, mnemonic: &str) {
-        let libcall = match crate::backend::cast::f128_binop_libcall(mnemonic) {
-            Some(lc) => lc,
-            None => {
-                // Unknown op: fall back to f64 hardware path
-                self.state.emit("    mv t2, t0");
-                self.state.emit("    fmv.d.x ft0, t1");
-                self.state.emit("    fmv.d.x ft1, t2");
-                self.state.emit_fmt(format_args!("    {}.d ft0, ft0, ft1", mnemonic));
-                self.state.emit("    fmv.x.d t0, ft0");
-                return;
-            }
-        };
-
-        self.emit_addi_sp(-24);
-        self.state.emit("    sd t0, 16(sp)");
-        self.state.emit("    fmv.d.x fa0, t1");
-        self.state.emit("    call __extenddftf2");
-        self.state.emit("    sd a0, 0(sp)");
-        self.state.emit("    sd a1, 8(sp)");
-        self.state.emit("    ld t0, 16(sp)");
-        self.state.emit("    fmv.d.x fa0, t0");
-        self.state.emit("    call __extenddftf2");
-        self.state.emit("    mv a2, a0");
-        self.state.emit("    mv a3, a1");
-        self.state.emit("    ld a0, 0(sp)");
-        self.state.emit("    ld a1, 8(sp)");
-        self.state.emit_fmt(format_args!("    call {}", libcall));
-        self.state.emit("    call __trunctfdf2");
-        self.state.emit("    fmv.x.d t0, fa0");
-        self.emit_addi_sp(24);
-        self.state.reg_cache.invalidate_all();
-    }
 }
