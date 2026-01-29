@@ -1,0 +1,19 @@
+Task: Fix hex character literal sign extension
+Status: in_progress
+
+Problem:
+Character constants with hex escapes like '\xEF' are evaluated as unsigned values
+(e.g., 239) instead of being sign-extended to match signed char behavior (e.g., -17).
+
+This causes comparisons like `char c = '\xEF'; c == '\xEF'` to fail because:
+- c is promoted to int as -17 (sign-extended from signed char)
+- '\xEF' is evaluated as 239 (not sign-extended)
+
+GCC treats '\xEF' as the signed char value -17 promoted to int, giving -17.
+Our compiler treats it as the unsigned value 239.
+
+Impact: Breaks BOM detection in parson JSON library and any code that uses
+hex escape character literals for values > 0x7F.
+
+Fix: In the lexer or constant evaluation, when a char constant has a hex escape
+value > 0x7F and char is signed, sign-extend the value from 8 bits to int.
