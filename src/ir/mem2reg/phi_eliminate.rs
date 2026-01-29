@@ -41,7 +41,7 @@ use crate::ir::ir::*;
 /// Eliminate all phi nodes in the module by lowering them to copies.
 pub fn eliminate_phis(module: &mut IrModule) {
     // Compute the global max block ID across ALL functions to avoid label collisions
-    // when creating trampoline blocks. Labels are module-wide (.L0, .L1, ...).
+    // when creating trampoline blocks. Labels are module-wide (.LBB0, .LBB1, ...).
     let mut next_block_id = 0u32;
     for func in &module.functions {
         for block in &func.blocks {

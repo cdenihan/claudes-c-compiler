@@ -646,7 +646,7 @@ impl ArchCodegen for RiscvCodegen {
     /// uses `j` which can't reach labels >1MB away.
     fn emit_branch_to_block(&mut self, block: BlockId) {
         let out = &mut self.state.out;
-        out.write_str("    jump .L");
+        out.write_str("    jump .LBB");
         out.write_u64(block.0 as u64);
         out.write_str(", t6");
         out.newline();

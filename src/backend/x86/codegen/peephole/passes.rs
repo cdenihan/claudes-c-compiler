@@ -1039,7 +1039,7 @@ fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
     }
 
     // Phase 1: Collect all jump/branch targets using a flat Vec<bool> indexed by
-    // label suffix number (e.g., ".L123" -> index 123). This avoids HashSet heap
+    // label suffix number (e.g., ".LBB123" -> index 123). This avoids HashSet heap
     // allocation for the common case of numeric labels.
     // For non-numeric labels, we fall back to treating them as jump targets.
     let mut max_label_num: u32 = 0;
@@ -1434,17 +1434,17 @@ impl<'a> Iterator for SmallVecIter<'a> {
     }
 }
 
-/// Parse ".L<number>:" label into its number, e.g. ".L123:" -> Some(123)
+/// Parse ".LBB<number>:" label into its number, e.g. ".LBB123:" -> Some(123)
 #[inline]
 fn parse_label_number(label_with_colon: &str) -> Option<u32> {
     let s = label_with_colon.strip_suffix(':')?;
     parse_dotl_number(s)
 }
 
-/// Parse ".L<number>" into its number, e.g. ".L123" -> Some(123)
+/// Parse ".LBB<number>" into its number, e.g. ".LBB123" -> Some(123)
 #[inline]
 fn parse_dotl_number(s: &str) -> Option<u32> {
-    let rest = s.strip_prefix(".L")?;
+    let rest = s.strip_prefix(".LBB")?;
     let b = rest.as_bytes();
     if b.is_empty() || b[0] < b'0' || b[0] > b'9' {
         return None;
@@ -1481,7 +1481,7 @@ fn invalidate_reg_flat(
 
 /// Extract the jump target label from a jump/branch instruction.
 fn extract_jump_target(s: &str) -> Option<&str> {
-    // Handle: jmp .L1, je .L1, jne .L1, etc.
+    // Handle: jmp .LBB1, je .LBB1, jne .LBB1, etc.
     if let Some(rest) = s.strip_prefix("jmp ") {
         return Some(rest.trim());
     }
@@ -1581,13 +1581,13 @@ mod tests {
             "    movq %rax, -24(%rbp)",
             "    movq -24(%rbp), %rax",
             "    testq %rax, %rax",
-            "    jne .L2",
-            "    jmp .L4",
+            "    jne .LBB2",
+            "    jmp .LBB4",
         ].join("\n") + "\n";
         let result = peephole_optimize(asm);
         assert!(result.contains("cmpq %rcx, %rax"), "should keep the cmp");
         // Matched store+load pair → fusion is safe
-        assert!(result.contains("jl .L2"), "should fuse to jl: {}", result);
+        assert!(result.contains("jl .LBB2"), "should fuse to jl: {}", result);
         assert!(!result.contains("setl"), "should eliminate setl");
     }
 
@@ -1598,11 +1598,11 @@ mod tests {
             "    setl %al",
             "    movzbq %al, %rax",
             "    testq %rax, %rax",
-            "    jne .L2",
-            "    jmp .L4",
+            "    jne .LBB2",
+            "    jmp .LBB4",
         ].join("\n") + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("jl .L2"), "should fuse to jl: {}", result);
+        assert!(result.contains("jl .LBB2"), "should fuse to jl: {}", result);
         assert!(!result.contains("setl"), "should eliminate setl");
     }
 
@@ -1678,11 +1678,11 @@ mod tests {
         for (cc, expected_jcc) in &[("e", "je"), ("ne", "jne"), ("l", "jl"), ("g", "jg"),
                                      ("le", "jle"), ("ge", "jge"), ("b", "jb"), ("a", "ja")] {
             let asm = format!(
-                "    cmpq %rcx, %rax\n    set{} %al\n    movzbq %al, %rax\n    testq %rax, %rax\n    jne .L1\n",
+                "    cmpq %rcx, %rax\n    set{} %al\n    movzbq %al, %rax\n    testq %rax, %rax\n    jne .LBB1\n",
                 cc
             );
             let result = peephole_optimize(asm);
-            assert!(result.contains(&format!("{} .L1", expected_jcc)),
+            assert!(result.contains(&format!("{} .LBB1", expected_jcc)),
                 "cc={} should produce {}: {}", cc, expected_jcc, result);
         }
     }
@@ -1784,7 +1784,7 @@ mod tests {
         let info = classify_line(".Lfoo:");
         assert_eq!(info.kind, LineKind::Label);
 
-        let info = classify_line("    jmp .L1");
+        let info = classify_line("    jmp .LBB1");
         assert_eq!(info.kind, LineKind::Jmp);
 
         let info = classify_line("    ret");
@@ -1820,8 +1820,8 @@ mod tests {
             "    movzbq %al, %rax",
             "    movq %rax, -40(%rbp)",   // store for cross-block use (no matching load)
             "    testq %rax, %rax",
-            "    jne .L8",
-            "    jmp .L10",
+            "    jne .LBB8",
+            "    jmp .LBB10",
         ].join("\n") + "\n";
         let result = peephole_optimize(asm);
         // The store must survive: another block reads -40(%rbp).
@@ -1841,7 +1841,7 @@ mod tests {
         let asm = [
             "    movq %rax, -40(%rbp)",
             "    jmp *%rcx",                   // indirect jump via register
-            ".L21:",                            // jump table target
+            ".LBB21:",                          // jump table target
             "    movq -40(%rbp), %rax",        // MUST NOT be eliminated
             "    movq %rax, -160(%rbp)",
         ].join("\n") + "\n";
@@ -1856,7 +1856,7 @@ mod tests {
         let asm = [
             "    movq %rax, -40(%rbp)",
             "    jmpq *%rax",
-            ".L5:",
+            ".LBB5:",
             "    movq -40(%rbp), %rax",
             "    ret",
         ].join("\n") + "\n";

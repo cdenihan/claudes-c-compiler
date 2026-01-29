@@ -3,21 +3,24 @@ use crate::common::types::{AddressSpace, EightbyteClass, IrType};
 
 /// A basic block identifier. Uses a u32 index for zero-cost copies
 /// instead of heap-allocated String labels. The block's assembly label
-/// is generated on-the-fly during codegen as ".L{id}".
+/// is generated on-the-fly during codegen as ".LBB{id}".
+/// We use ".LBB" instead of ".L" to avoid collisions with the GNU
+/// assembler's internal local labels (e.g., .L0, .L1) used for
+/// RISC-V PCREL_HI20/PCREL_LO12 relocation pairs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BlockId(pub u32);
 
 impl BlockId {
-    /// Format this block ID as an assembly label (e.g., ".L5").
+    /// Format this block ID as an assembly label (e.g., ".LBB5").
     #[inline]
     pub fn as_label(&self) -> String {
-        format!(".L{}", self.0)
+        format!(".LBB{}", self.0)
     }
 }
 
 impl std::fmt::Display for BlockId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, ".L{}", self.0)
+        write!(f, ".LBB{}", self.0)
     }
 }
 
@@ -228,7 +231,7 @@ pub struct IrFunction {
     pub uses_sret: bool,
     /// Block IDs referenced by static local variable initializers via &&label.
     /// These blocks must be kept reachable and not merged away by CFG simplify,
-    /// since their labels appear in global data (.quad .L3) and must resolve.
+    /// since their labels appear in global data (.quad .LBB3) and must resolve.
     pub global_init_label_blocks: Vec<BlockId>,
 }
 

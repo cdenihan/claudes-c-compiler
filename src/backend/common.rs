@@ -267,28 +267,28 @@ impl AsmOutput {
     }
 
     /// Emit: `    {mnemonic} ${imm}, {offset}(%rbp)`
-    /// Emit a block label line: `.L{id}:`
+    /// Emit a block label line: `.LBB{id}:`
     #[inline]
     pub fn emit_block_label(&mut self, block_id: u32) {
-        self.buf.push_str(".L");
+        self.buf.push_str(".LBB");
         write_u64_fast(&mut self.buf, block_id as u64);
         self.buf.push(':');
         self.buf.push('\n');
     }
 
-    /// Emit: `    jmp .L{block_id}`
+    /// Emit: `    jmp .LBB{block_id}`
     #[inline]
     pub fn emit_jmp_block(&mut self, block_id: u32) {
-        self.buf.push_str("    jmp .L");
+        self.buf.push_str("    jmp .LBB");
         write_u64_fast(&mut self.buf, block_id as u64);
         self.buf.push('\n');
     }
 
-    /// Emit: `    {jcc} .L{block_id}` (conditional jump to block label)
+    /// Emit: `    {jcc} .LBB{block_id}` (conditional jump to block label)
     #[inline]
     pub fn emit_jcc_block(&mut self, jcc: &str, block_id: u32) {
         self.buf.push_str(jcc);
-        self.buf.push_str(" .L");
+        self.buf.push_str(" .LBB");
         write_u64_fast(&mut self.buf, block_id as u64);
         self.buf.push('\n');
     }

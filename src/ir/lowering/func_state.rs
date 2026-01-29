@@ -150,7 +150,7 @@ pub(super) struct FunctionBuildState {
     pub is_inline_candidate: bool,
     /// Block IDs referenced by static local variable initializers via &&label.
     /// Transferred to IrFunction in finalize_function so CFG simplify can keep
-    /// these blocks reachable (their labels appear in global data like .quad .L3).
+    /// these blocks reachable (their labels appear in global data like .quad .LBB3).
     pub global_init_label_blocks: Vec<BlockId>,
 }
 

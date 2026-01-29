@@ -295,7 +295,7 @@ pub fn run(module: &mut IrModule) -> usize {
         }
     }
 
-    // Compute the module-global max block ID. Block labels (.L{id}) are global in the
+    // Compute the module-global max block ID. Block labels (.LBB{id}) are global in the
     // assembly output, so inlined blocks must use IDs that don't collide with ANY
     // function's block IDs, not just the caller's.
     let mut global_max_block_id: u32 = 0;
@@ -799,13 +799,13 @@ struct InlineCallSite {
     args: Vec<Operand>,
 }
 
-/// Check if a GlobalInit contains references to local labels (`.Lxx`).
+/// Check if a GlobalInit contains references to local labels (`.LBBxx`).
 /// These are produced by `&&label` (label-as-value) in static local initializers.
 fn global_init_contains_local_label(init: &GlobalInit) -> bool {
     match init {
-        GlobalInit::GlobalAddr(label) => label.starts_with(".L"),
+        GlobalInit::GlobalAddr(label) => label.starts_with(".LBB"),
         GlobalInit::GlobalLabelDiff(lab1, lab2, _) => {
-            lab1.starts_with(".L") || lab2.starts_with(".L")
+            lab1.starts_with(".LBB") || lab2.starts_with(".LBB")
         }
         GlobalInit::Compound(inits) => inits.iter().any(global_init_contains_local_label),
         _ => false,

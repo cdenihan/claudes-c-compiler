@@ -121,6 +121,20 @@ impl BitSet {
     }
 }
 
+/// Intermediate state built during Phase 1 (program point assignment and gen/kill).
+struct ProgramPointState {
+    block_start_points: Vec<u32>,
+    block_end_points: Vec<u32>,
+    def_points: Vec<u32>,
+    last_use_points: Vec<u32>,
+    block_gen: Vec<BitSet>,
+    block_kill: Vec<BitSet>,
+    block_id_to_idx: FxHashMap<u32, usize>,
+    setjmp_block_indices: Vec<usize>,
+    call_points: Vec<u32>,
+    num_points: u32,
+}
+
 /// Compute live intervals for all non-alloca values in a function.
 ///
 /// Uses backward dataflow analysis to correctly handle loops:
@@ -136,7 +150,62 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
         return LivenessResult { intervals: Vec::new(), num_points: 0, call_points: Vec::new(), block_loop_depth: Vec::new() };
     }
 
-    // Collect alloca values (not register-allocatable).
+    let alloca_set = collect_alloca_set(func);
+    let (value_ids, id_to_dense) = build_dense_value_map(func, &alloca_set);
+
+    let num_values = value_ids.len();
+    if num_values == 0 {
+        return LivenessResult { intervals: Vec::new(), num_points: 0, call_points: Vec::new(), block_loop_depth: Vec::new() };
+    }
+
+    // Phase 1: Assign program points and build gen/kill sets.
+    let mut ps = assign_program_points(func, num_blocks, num_values, &alloca_set, &id_to_dense);
+
+    // Phase 1b: Extend liveness of GEP base values for GEP folding.
+    extend_gep_base_liveness(func, &alloca_set, &id_to_dense,
+        &mut ps.last_use_points, &mut ps.block_gen);
+
+    // Phase 1c: Extend liveness for F128 source pointers.
+    extend_f128_source_liveness(func, &alloca_set, &id_to_dense,
+        &mut ps.last_use_points, &mut ps.block_gen);
+
+    // Phase 2: Build successor lists for the CFG.
+    let successors = build_successor_lists(func, num_blocks, &ps.block_id_to_idx);
+
+    // Phase 2b: Compute loop nesting depth per block.
+    let block_loop_depth = compute_loop_depth(&successors, num_blocks);
+
+    // Phase 3: Backward dataflow to compute live-in/live-out per block.
+    let (live_in, live_out) = run_backward_dataflow(
+        num_blocks, num_values, &successors, &ps.block_gen, &ps.block_kill,
+    );
+
+    // Phase 4: Extend intervals for values that are live-in or live-out of blocks.
+    extend_intervals_from_liveness(
+        num_blocks, &live_in, &live_out,
+        &ps.block_start_points, &ps.block_end_points,
+        &mut ps.def_points, &mut ps.last_use_points,
+    );
+
+    // Phase 4b: Handle setjmp/longjmp.
+    extend_intervals_for_setjmp(
+        &ps.setjmp_block_indices, ps.num_points, &live_in, &live_out,
+        &mut ps.last_use_points,
+    );
+
+    // Phase 5: Build and sort intervals.
+    let intervals = build_intervals(&value_ids, &ps.def_points, &ps.last_use_points);
+
+    LivenessResult {
+        intervals,
+        num_points: ps.num_points,
+        call_points: ps.call_points,
+        block_loop_depth,
+    }
+}
+
+/// Collect alloca values (not register-allocatable).
+fn collect_alloca_set(func: &IrFunction) -> FxHashSet<u32> {
     let mut alloca_set: FxHashSet<u32> = FxHashSet::default();
     for block in &func.blocks {
         for inst in &block.instructions {
@@ -145,10 +214,12 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
             }
         }
     }
+    alloca_set
+}
 
-    // Collect all non-alloca value IDs referenced in the function and build
-    // a dense remapping: sparse value_id -> dense index in [0..num_values).
-    // This makes bitsets minimal size.
+/// Collect all non-alloca value IDs and build a dense remapping:
+/// sparse value_id -> dense index in [0..num_values).
+fn build_dense_value_map(func: &IrFunction, alloca_set: &FxHashSet<u32>) -> (Vec<u32>, FxHashMap<u32, usize>) {
     let mut value_ids: Vec<u32> = Vec::new();
     let mut seen: FxHashSet<u32> = FxHashSet::default();
 
@@ -161,86 +232,70 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
     for block in &func.blocks {
         for inst in &block.instructions {
             if let Some(dest) = inst.dest() {
-                maybe_add(dest.0, &alloca_set, &mut seen, &mut value_ids);
+                maybe_add(dest.0, alloca_set, &mut seen, &mut value_ids);
             }
             for_each_operand_in_instruction(inst, |op| {
                 if let Operand::Value(v) = op {
-                    maybe_add(v.0, &alloca_set, &mut seen, &mut value_ids);
+                    maybe_add(v.0, alloca_set, &mut seen, &mut value_ids);
                 }
             });
             for_each_value_use_in_instruction(inst, |v| {
-                maybe_add(v.0, &alloca_set, &mut seen, &mut value_ids);
+                maybe_add(v.0, alloca_set, &mut seen, &mut value_ids);
             });
         }
         for_each_operand_in_terminator(&block.terminator, |op| {
             if let Operand::Value(v) = op {
-                maybe_add(v.0, &alloca_set, &mut seen, &mut value_ids);
+                maybe_add(v.0, alloca_set, &mut seen, &mut value_ids);
             }
         });
     }
-    drop(seen);
 
-    let num_values = value_ids.len();
-    if num_values == 0 {
-        return LivenessResult { intervals: Vec::new(), num_points: 0, call_points: Vec::new(), block_loop_depth: Vec::new() };
-    }
-
-    // Build sparse->dense mapping
     let mut id_to_dense: FxHashMap<u32, usize> = FxHashMap::default();
-    id_to_dense.reserve(num_values);
+    id_to_dense.reserve(value_ids.len());
     for (dense_idx, &vid) in value_ids.iter().enumerate() {
         id_to_dense.insert(vid, dense_idx);
     }
 
-    // Phase 1: Assign program points and record per-block information.
+    (value_ids, id_to_dense)
+}
+
+/// Phase 1: Assign sequential program points to all instructions/terminators
+/// and build per-block gen/kill bitsets, def/use point arrays, call points,
+/// and setjmp block indices.
+fn assign_program_points(
+    func: &IrFunction,
+    num_blocks: usize,
+    num_values: usize,
+    alloca_set: &FxHashSet<u32>,
+    id_to_dense: &FxHashMap<u32, usize>,
+) -> ProgramPointState {
     let mut point: u32 = 0;
     let mut block_start_points: Vec<u32> = Vec::with_capacity(num_blocks);
     let mut block_end_points: Vec<u32> = Vec::with_capacity(num_blocks);
-    let mut def_points: Vec<u32> = vec![u32::MAX; num_values]; // dense_idx -> program point
+    let mut def_points: Vec<u32> = vec![u32::MAX; num_values];
     let mut last_use_points: Vec<u32> = vec![u32::MAX; num_values];
-
-    // Per-block gen (used) and kill (defined) sets as bitsets
     let mut block_gen: Vec<BitSet> = Vec::with_capacity(num_blocks);
     let mut block_kill: Vec<BitSet> = Vec::with_capacity(num_blocks);
-
-    // Block ID -> index mapping
     let mut block_id_to_idx: FxHashMap<u32, usize> = FxHashMap::default();
-    for (idx, block) in func.blocks.iter().enumerate() {
-        block_id_to_idx.insert(block.label.0, idx);
-    }
-
-    // Track block indices containing setjmp/_setjmp/sigsetjmp calls.
-    // These "returns twice" functions require that values live at the call point
-    // have their intervals extended so their stack slots are not reused between
-    // the initial return and the longjmp return.
     let mut setjmp_block_indices: Vec<usize> = Vec::new();
-    let mut block_idx_counter: usize = 0;
-
-    // Track program points that are Call or CallIndirect instructions.
-    // The register allocator uses this to only assign callee-saved registers
-    // to values whose live intervals span across a call boundary, since
-    // callee-saved registers only provide benefit for values that survive calls.
     let mut call_points: Vec<u32> = Vec::new();
 
-    for block in &func.blocks {
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        block_id_to_idx.insert(block.label.0, block_idx);
         let block_start = point;
         block_start_points.push(block_start);
         let mut gen = BitSet::new(num_values);
         let mut kill = BitSet::new(num_values);
 
         for inst in &block.instructions {
-            // Detect calls to setjmp and friends (returns-twice functions).
             if is_returns_twice_call(inst) {
-                setjmp_block_indices.push(block_idx_counter);
+                setjmp_block_indices.push(block_idx);
             }
-
-            // Track call instruction program points for register allocation.
             if matches!(inst, Instruction::Call { .. } | Instruction::CallIndirect { .. }) {
                 call_points.push(point);
             }
 
-            // Record uses before defs
-            record_instruction_uses_dense(inst, point, &alloca_set, &id_to_dense, &mut last_use_points);
+            record_instruction_uses_dense(inst, point, alloca_set, id_to_dense, &mut last_use_points);
 
             // Record InlineAsm output definitions BEFORE gen collection so
             // that promoted (non-alloca) outputs are in the kill set and won't
@@ -258,8 +313,7 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
                 }
             }
 
-            // Collect gen/kill for dataflow
-            collect_instruction_gen_dense(inst, &alloca_set, &id_to_dense, &kill, &mut gen);
+            collect_instruction_gen_dense(inst, alloca_set, id_to_dense, &kill, &mut gen);
 
             if let Some(dest) = inst.dest() {
                 if !alloca_set.contains(&dest.0) {
@@ -275,45 +329,36 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
             point += 1;
         }
 
-        // Record uses in terminator.
-        record_terminator_uses_dense(&block.terminator, point, &alloca_set, &id_to_dense, &mut last_use_points);
-        collect_terminator_gen_dense(&block.terminator, &alloca_set, &id_to_dense, &kill, &mut gen);
+        record_terminator_uses_dense(&block.terminator, point, alloca_set, id_to_dense, &mut last_use_points);
+        collect_terminator_gen_dense(&block.terminator, alloca_set, id_to_dense, &kill, &mut gen);
         let block_end = point;
         block_end_points.push(block_end);
         point += 1;
 
         block_gen.push(gen);
         block_kill.push(kill);
-        block_idx_counter += 1;
     }
 
-    let num_points = point;
+    ProgramPointState {
+        block_start_points,
+        block_end_points,
+        def_points,
+        last_use_points,
+        block_gen,
+        block_kill,
+        block_id_to_idx,
+        setjmp_block_indices,
+        call_points,
+        num_points: point,
+    }
+}
 
-    // Phase 1b: Extend liveness of GEP base values for GEP folding.
-    //
-    // When a GEP with constant offset has its result only used as a Load/Store
-    // ptr operand (making it eligible for address-mode folding), the GEP base
-    // value must remain live through the Load/Store use point. Without this
-    // extension, the register allocator might free the base's register between
-    // the GEP definition and the Load/Store that will use the base directly.
-    //
-    // We scan for foldable GEPs with non-alloca bases and extend the base's
-    // last_use_point to cover all Load/Store uses of the GEP result. This also
-    // updates the gen bitsets so the backward dataflow propagates correctly.
-    extend_gep_base_liveness(func, &alloca_set, &id_to_dense,
-        &mut last_use_points, &mut block_gen);
-
-    // Phase 1c: Extend liveness for F128 source pointers.
-    //
-    // When an F128 Load occurs, the codegen records which pointer was used so
-    // that later Call emission can reload the full 128-bit value from memory.
-    // The pointer's stack slot must remain live until the last use of the F128
-    // dest value, otherwise the Tier 3 block-local allocator may reuse the
-    // pointer's slot and overwrite it before the Call reads it back.
-    extend_f128_source_liveness(func, &alloca_set, &id_to_dense,
-        &mut last_use_points, &mut block_gen);
-
-    // Phase 2: Build successor lists for the CFG.
+/// Phase 2: Build successor lists from block terminators.
+fn build_successor_lists(
+    func: &IrFunction,
+    num_blocks: usize,
+    block_id_to_idx: &FxHashMap<u32, usize>,
+) -> Vec<Vec<usize>> {
     let mut successors: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
     for (idx, block) in func.blocks.iter().enumerate() {
         for target_id in terminator_targets(&block.terminator) {
@@ -322,28 +367,25 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
             }
         }
     }
+    successors
+}
 
-    // Phase 2b: Compute loop nesting depth per block.
-    //
-    // Uses a simple DFS-based back-edge detection: an edge src -> dst where dst
-    // is an ancestor in the DFS tree is a back edge, defining a natural loop.
-    // For each back edge, all blocks on any path from dst to src are in the loop.
-    // Loop depth = number of loop bodies a block belongs to.
-    let block_loop_depth = compute_loop_depth(&successors, num_blocks);
-
-    // Phase 3: Backward dataflow to compute live-in/live-out per block.
-    // live_in[B] = gen[B] ∪ (live_out[B] - kill[B])
-    // live_out[B] = ∪ live_in[S] for all successors S of B
-    //
-    // Using bitsets: union = OR, (out - kill) = out AND NOT kill.
+/// Phase 3: Backward dataflow to compute live-in/live-out per block.
+/// live_in[B] = gen[B] ∪ (live_out[B] - kill[B])
+/// live_out[B] = ∪ live_in[S] for all successors S of B
+fn run_backward_dataflow(
+    num_blocks: usize,
+    num_values: usize,
+    successors: &[Vec<usize>],
+    block_gen: &[BitSet],
+    block_kill: &[BitSet],
+) -> (Vec<BitSet>, Vec<BitSet>) {
     let mut live_in: Vec<BitSet> = (0..num_blocks).map(|_| BitSet::new(num_values)).collect();
     let mut live_out: Vec<BitSet> = (0..num_blocks).map(|_| BitSet::new(num_values)).collect();
     let mut tmp_out = BitSet::new(num_values);
 
     // Iterate until fixpoint (backward order converges faster).
-    // For reducible CFGs, convergence is guaranteed in O(loop_nesting_depth) iterations.
-    // MAX_ITERATIONS is a safety bound for pathological irreducible control flow;
-    // if exceeded, liveness is conservative (intervals may be too long but never too short).
+    // MAX_ITERATIONS is a safety bound for pathological irreducible control flow.
     let mut changed = true;
     let mut iteration = 0;
     const MAX_ITERATIONS: u32 = 50;
@@ -352,19 +394,16 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
         iteration += 1;
 
         for idx in (0..num_blocks).rev() {
-            // Compute live_out = union of live_in of all successors
             tmp_out.clear();
             for &succ in &successors[idx] {
                 tmp_out.union_with(&live_in[succ]);
             }
 
-            // Check if live_out changed
             if tmp_out.words != live_out[idx].words {
                 live_out[idx].words.copy_from_slice(&tmp_out.words);
                 changed = true;
             }
 
-            // Compute live_in = gen ∪ (live_out - kill)
             let in_changed = live_in[idx].assign_gen_union_out_minus_kill(
                 &block_gen[idx], &live_out[idx], &block_kill[idx]
             );
@@ -372,25 +411,29 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
         }
     }
 
-    // Phase 4: Extend intervals for values that are live-in or live-out of blocks.
-    // A value that is live-in to a block must have its interval cover the entire
-    // block (from block start to block end). If blocks are not in program-point
-    // order relative to the value's definition (e.g., a value defined in a later
-    // block is live-in to an earlier block due to CFG edges), we must also extend
-    // the interval *start* backward to cover the earlier block.
+    (live_in, live_out)
+}
+
+/// Phase 4: Extend intervals for values that are live-in or live-out of blocks.
+/// A value live-in to a block has its interval cover the entire block.
+fn extend_intervals_from_liveness(
+    num_blocks: usize,
+    live_in: &[BitSet],
+    live_out: &[BitSet],
+    block_start_points: &[u32],
+    block_end_points: &[u32],
+    def_points: &mut [u32],
+    last_use_points: &mut [u32],
+) {
     for idx in 0..num_blocks {
         let start = block_start_points[idx];
         let end = block_end_points[idx];
 
         live_in[idx].for_each_set_bit(|dense_idx| {
-            // Extend interval start: if this block starts before the value's
-            // current def_point, the value is live here so the interval must
-            // begin no later than this block's start.
             let def_entry = &mut def_points[dense_idx];
             if *def_entry == u32::MAX || start < *def_entry {
                 *def_entry = start;
             }
-
             let entry = &mut last_use_points[dense_idx];
             if *entry == u32::MAX {
                 *entry = start;
@@ -401,15 +444,10 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
         });
 
         live_out[idx].for_each_set_bit(|dense_idx| {
-            // Extend interval start for live-out values too: if a value is
-            // live-out of a block that precedes its definition in program
-            // point order, the interval must start no later than this block's
-            // start.
             let def_entry = &mut def_points[dense_idx];
             if *def_entry == u32::MAX || start < *def_entry {
                 *def_entry = start;
             }
-
             let entry = &mut last_use_points[dense_idx];
             if *entry == u32::MAX {
                 *entry = end;
@@ -419,59 +457,49 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
             }
         });
     }
+}
 
-    // Phase 4b: Handle setjmp/longjmp — extend intervals for values live at
-    // setjmp call points. When setjmp returns twice (via longjmp), all values
-    // that were live at the setjmp call must still be available. If their stack
-    // slots were reused by code between the initial setjmp return and the
-    // longjmp, the restored values would be stale. To prevent this, extend the
-    // live intervals of all values live-in to a setjmp-containing block so they
-    // span to the end of the function, ensuring their stack slots are never reused.
-    if !setjmp_block_indices.is_empty() {
-        let func_end = num_points.saturating_sub(1);
-        for &sjb in &setjmp_block_indices {
-            // All values that are live-in to the setjmp block are candidates.
-            // (They were defined before setjmp and may be needed after longjmp.)
-            live_in[sjb].for_each_set_bit(|dense_idx| {
-                let entry = &mut last_use_points[dense_idx];
-                if *entry == u32::MAX || func_end > *entry {
-                    *entry = func_end;
-                }
-            });
-            // Also extend values that are live-out of the setjmp block,
-            // as they survive into the successors (including the longjmp path).
-            live_out[sjb].for_each_set_bit(|dense_idx| {
-                let entry = &mut last_use_points[dense_idx];
-                if *entry == u32::MAX || func_end > *entry {
-                    *entry = func_end;
-                }
-            });
-        }
+/// Phase 4b: Handle setjmp/longjmp — extend intervals for values live at
+/// setjmp call points to the end of the function, preventing slot reuse.
+fn extend_intervals_for_setjmp(
+    setjmp_block_indices: &[usize],
+    num_points: u32,
+    live_in: &[BitSet],
+    live_out: &[BitSet],
+    last_use_points: &mut [u32],
+) {
+    if setjmp_block_indices.is_empty() {
+        return;
     }
+    let func_end = num_points.saturating_sub(1);
+    for &sjb in setjmp_block_indices {
+        live_in[sjb].for_each_set_bit(|dense_idx| {
+            let entry = &mut last_use_points[dense_idx];
+            if *entry == u32::MAX || func_end > *entry {
+                *entry = func_end;
+            }
+        });
+        live_out[sjb].for_each_set_bit(|dense_idx| {
+            let entry = &mut last_use_points[dense_idx];
+            if *entry == u32::MAX || func_end > *entry {
+                *entry = func_end;
+            }
+        });
+    }
+}
 
-    // Phase 5: Build intervals.
+/// Phase 5: Build sorted live intervals from def/use point arrays.
+fn build_intervals(value_ids: &[u32], def_points: &[u32], last_use_points: &[u32]) -> Vec<LiveInterval> {
     let mut intervals: Vec<LiveInterval> = Vec::new();
     for (dense_idx, &vid) in value_ids.iter().enumerate() {
         let start = def_points[dense_idx];
-        if start == u32::MAX { continue; } // no definition found
+        if start == u32::MAX { continue; }
         let end = last_use_points[dense_idx];
         let end = if end == u32::MAX { start } else { end.max(start) };
-        intervals.push(LiveInterval {
-            start,
-            end,
-            value_id: vid,
-        });
+        intervals.push(LiveInterval { start, end, value_id: vid });
     }
-
-    // Sort by start point (required by linear scan).
     intervals.sort_unstable_by_key(|iv| iv.start);
-
-    LivenessResult {
-        intervals,
-        num_points,
-        call_points,
-        block_loop_depth,
-    }
+    intervals
 }
 
 /// Extend liveness of GEP base values so that their registers remain valid

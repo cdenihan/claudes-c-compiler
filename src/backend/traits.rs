@@ -871,7 +871,7 @@ pub trait ArchCodegen {
         let out = &mut self.state().out;
         out.write_str("    ");
         out.write_str(mnemonic);
-        out.write_str(" .L");
+        out.write_str(" .LBB");
         out.write_u64(block.0 as u64);
         out.newline();
     }
