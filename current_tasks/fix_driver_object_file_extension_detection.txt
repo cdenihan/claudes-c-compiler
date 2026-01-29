@@ -1,0 +1,11 @@
+Fix: Driver should recognize non-standard object file extensions
+
+The compiler driver's is_object_or_archive() only recognizes .o, .a, and .so extensions.
+Projects like heatshrink use .os and .od extensions for object files.
+When the compiler encounters these, it tries to read them as C source, which fails.
+
+Fix: Instead of only checking extensions, also check for ELF magic bytes (\x7fELF)
+when the extension isn't a recognized source extension (.c, .h, .i, .s, .S).
+Also add common object file extensions: .os, .od, .lo, .obj.
+
+This will fix the heatshrink project and potentially others.
