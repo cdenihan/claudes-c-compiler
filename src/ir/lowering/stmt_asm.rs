@@ -46,6 +46,17 @@ impl Lowerer {
                         constraint = format!("{}{{{}}}", prefix, asm_reg);
                     }
                 }
+                // Mark local register asm variables as "initialized" when used as
+                // an inline asm output. This ensures subsequent reads of the variable
+                // load from the alloca (which the asm output writes to) instead of
+                // emitting a new inline asm to read the physical hardware register.
+                if let Some(fs) = self.func_state.as_mut() {
+                    if let Some(info) = fs.locals.get_mut(var_name) {
+                        if info.asm_register.is_some() {
+                            info.asm_register_has_init = true;
+                        }
+                    }
+                }
             }
             let out_ty = IrType::from_ctype(&self.expr_ctype(&out.expr));
             // Detect address space for memory operands (e.g., __seg_gs pointer dereferences)

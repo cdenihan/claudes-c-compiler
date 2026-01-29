@@ -265,16 +265,17 @@ impl Lowerer {
             let asm_register = info.asm_register.clone();
             let asm_register_has_init = info.asm_register_has_init;
 
-            // Local register variable WITHOUT initializer: read the hardware register
-            // directly via inline asm. E.g.:
-            //   register unsigned long tp __asm__("tp");
-            //   return tp;  // must read the actual tp hardware register
+            // Local register variable WITHOUT initializer AND not yet written by
+            // inline asm: read the hardware register directly via inline asm.
+            // E.g.:  register unsigned long sp __asm__("rsp"); return sp;
             //
-            // Local register variables WITH initializer (e.g.,
-            //   register long x8 __asm__("x8") = n;
-            // ) are used to bind a value to a specific register for inline asm constraints.
-            // They should read from the alloca like normal variables; the register binding
-            // only affects inline asm constraint resolution.
+            // Local register variables WITH initializer, or that have been written
+            // by an inline asm output, read from their alloca like normal variables.
+            // The register binding only affects inline asm constraint resolution.
+            //
+            // Note: asm_register_has_init is set to true either by the declaration
+            // having an initializer, or by the inline asm lowering when the variable
+            // is used as an output operand (see stmt_asm.rs).
             if let Some(ref reg_name) = asm_register {
                 if !asm_register_has_init {
                     return self.read_global_register(reg_name, ty);

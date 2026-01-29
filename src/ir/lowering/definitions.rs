@@ -79,10 +79,10 @@ pub(super) struct LocalInfo {
     /// For register variables with __asm__("regname"): the specific register name.
     /// Used to rewrite inline asm "r" constraints to specific register constraints.
     pub asm_register: Option<String>,
-    /// Whether this register variable was initialized (e.g., `register long x8 __asm__("x8") = n;`).
-    /// Initialized register variables read from the alloca (like normal vars).
-    /// Uninitialized register variables (e.g., `register unsigned long tp __asm__("tp");`)
-    /// read the hardware register directly.
+    /// Whether this register variable has been "initialized" -- either by a declaration
+    /// initializer (e.g., `register long x8 __asm__("x8") = n;`) or by being used as an
+    /// inline asm output operand. When true, reads come from the alloca; when false,
+    /// reads emit inline asm to sample the physical hardware register.
     pub asm_register_has_init: bool,
     /// __attribute__((cleanup(func))): cleanup function to call with &var when scope exits.
     /// The function is called as func(&var) with a pointer to the variable.
