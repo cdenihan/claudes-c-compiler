@@ -1,0 +1,19 @@
+Fix typeof resolution for nested statement expressions with parent scope
+
+When typeof() wraps a nested statement expression pattern like the kernel's
+atomic_cmpxchg macro:
+  typeof(*({ typeof(&chain->prev) __ai_ptr = &chain->prev; ...; ({ typeof(*__ai_ptr) __ret; ...; __ret; }); }))
+
+The inner StmtExpr declares variables using typeof(*__ai_ptr), but __ai_ptr
+is declared in the OUTER StmtExpr. The build_compound_scope function for the
+inner compound doesn't know about __ai_ptr, causing typeof resolution to fall
+back to 'int'.
+
+This is different from fix_typeof_stmtexpr_compound_local_vars which handles
+the single-level min/max macro pattern. This fix handles the two-level nesting
+pattern used by atomic operations in the kernel.
+
+Fix: Add get_stmt_expr_ctype() helper that propagates scope from outer to inner
+statement expressions, and modify build_compound_scope to accept a parent scope.
+
+Status: in_progress
