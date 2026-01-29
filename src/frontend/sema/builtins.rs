@@ -215,6 +215,15 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     // Prefetch (no-op, handled separately in lowering)
     m.insert("__builtin_prefetch", BuiltinInfo::intrinsic(BuiltinIntrinsic::Nop));
 
+    // CPU feature detection builtins
+    // __builtin_cpu_init() initializes CPU feature detection; on glibc systems
+    // this is automatic, so we emit it as a no-op.
+    m.insert("__builtin_cpu_init", BuiltinInfo::intrinsic(BuiltinIntrinsic::CpuInit));
+    // __builtin_cpu_supports("feature") returns nonzero if the CPU supports
+    // the named feature. We conservatively return 0 (not supported) so that
+    // code always takes the safe fallback path.
+    m.insert("__builtin_cpu_supports", BuiltinInfo::intrinsic(BuiltinIntrinsic::CpuSupports));
+
     // Cache flush - maps to __clear_cache runtime function (provided by libgcc/glibc).
     // On x86 this is a no-op (cache coherent), on ARM/RISC-V it flushes icache.
     m.insert("__builtin___clear_cache", BuiltinInfo::simple("__clear_cache"));
@@ -387,6 +396,10 @@ pub enum BuiltinIntrinsic {
     ClassifyType,
     /// No-op builtin (evaluates args, returns 0)
     Nop,
+    /// __builtin_cpu_init() - no-op, glibc handles CPU feature detection init
+    CpuInit,
+    /// __builtin_cpu_supports("feature") - conservatively returns 0 (unsupported)
+    CpuSupports,
     /// __builtin_add_overflow(a, b, result_ptr) -> bool (1 if overflow)
     AddOverflow,
     /// __builtin_sub_overflow(a, b, result_ptr) -> bool (1 if overflow)

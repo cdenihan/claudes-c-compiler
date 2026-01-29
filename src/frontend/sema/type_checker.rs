@@ -821,7 +821,11 @@ impl<'a> ExprTypeChecker<'a> {
             "__builtin_va_start" | "__builtin_va_end" | "__builtin_va_copy"
             | "__builtin_abort" | "__builtin_exit" | "__builtin_trap"
             | "__builtin_unreachable" | "__builtin_prefetch"
-            | "__builtin___clear_cache" => Some(CType::Void),
+            | "__builtin___clear_cache"
+            | "__builtin_cpu_init" => Some(CType::Void),
+
+            // CPU feature detection
+            "__builtin_cpu_supports" => Some(CType::Int),
 
             _ => None,
         }

@@ -338,6 +338,9 @@ impl Lowerer {
             // Complex argument
             "carg" | "__builtin_carg" => Some(IrType::F64),
             "cargf" | "__builtin_cargf" => Some(IrType::F32),
+            // CPU feature detection builtins return int
+            "__builtin_cpu_init" => Some(IrType::I32),
+            "__builtin_cpu_supports" => Some(IrType::I32),
             _ => None,
         }
     }

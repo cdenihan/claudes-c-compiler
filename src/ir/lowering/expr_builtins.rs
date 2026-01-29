@@ -467,6 +467,19 @@ impl Lowerer {
                 }
                 Some(Operand::Const(IrConst::I64(0)))
             }
+            // __builtin_cpu_init() - no-op on glibc systems (auto-initialized)
+            BuiltinIntrinsic::CpuInit => {
+                Some(Operand::Const(IrConst::I32(0)))
+            }
+            // __builtin_cpu_supports("feature") - conservatively return 0 (unsupported).
+            // This ensures code takes the safe non-optimized fallback path.
+            BuiltinIntrinsic::CpuSupports => {
+                // Evaluate the string argument for side effects (though it's always a literal)
+                for arg in args {
+                    self.lower_expr(arg);
+                }
+                Some(Operand::Const(IrConst::I32(0)))
+            }
             // X86 SSE fence/barrier operations (no dest, no meaningful return)
             BuiltinIntrinsic::X86Lfence => {
                 self.emit(Instruction::Intrinsic { dest: None, op: IntrinsicOp::Lfence, dest_ptr: None, args: vec![] });
