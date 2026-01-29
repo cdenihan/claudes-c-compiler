@@ -1,0 +1,23 @@
+Task: Fix RISC-V inline asm register allocation to avoid stack spills between CSR writes
+
+Problem: The register allocator excludes all inline asm operands from register
+allocation (regalloc.rs lines 400-411), forcing all inline asm input/output values
+to live on the stack. The inline asm emitter always loads inputs from stack and
+stores outputs to stack.
+
+This causes a fatal crash in the RISC-V kernel's set_satp_mode() function during
+defconfig boot. The function changes the SATP register (which controls page tables)
+and our compiler generates stack stores between consecutive CSR writes:
+  csrw satp, t0       # Activates new page table (only maps this function's PMD)
+  sd t0, offset(s0)   # FAULT: stack isn't mapped by new page table!
+
+GCC avoids this by keeping values in registers between the CSR writes.
+
+Fix: Allow inline asm operands to be register-allocated by:
+1. Removing the blanket exclusion in regalloc.rs
+2. Making the inline asm emitter (asm_emitter.rs) check reg_assignments before
+   falling back to stack access for load_input_to_reg and store_output_from_reg
+
+Impact: Enables RISC-V defconfig kernel boot (currently only tinyconfig works).
+
+Status: in_progress
