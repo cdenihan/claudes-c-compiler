@@ -1,0 +1,18 @@
+Fix zero-size struct argument passing in function call ABI
+
+Bug: When passing a zero-size struct (e.g., `struct { char x[0]; }`) as a function
+argument, the compiler incorrectly allocates a GP register for it, consuming a register
+slot that should belong to the next real argument. This causes subsequent arguments to
+be read from the wrong positions.
+
+This manifests as incorrect behavior in va_arg when a zero-size struct precedes real
+arguments in a variadic call -- the va_list gets out of sync because the caller passed
+the zero-size struct in a register, shifting all subsequent arguments.
+
+Fix: In classify_call_args(), skip zero-size struct arguments entirely (don't assign
+them any register or stack slot). Also ensure the caller-side lowering doesn't emit
+any load/pass for zero-size struct arguments.
+
+Affects test: gcc_torture_va_arg_22 (passes various sized structs 0..72 via va_arg).
+
+Status: in_progress
