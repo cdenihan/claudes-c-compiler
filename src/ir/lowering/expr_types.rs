@@ -1095,8 +1095,15 @@ impl Lowerer {
             }
             Expr::UnaryOp(UnaryOp::Plus, inner, _)
             | Expr::UnaryOp(UnaryOp::Neg, inner, _)
-            | Expr::UnaryOp(UnaryOp::PreInc, inner, _)
+            | Expr::UnaryOp(UnaryOp::BitNot, inner, _) => {
+                // C11 6.5.3.3: integer promotions apply to the operand of
+                // unary +, -, and ~.  The result type is the promoted type.
+                let ct = self.get_expr_ctype(inner);
+                ct.map(|c| if c.is_integer() { Self::integer_promote_ctype(&c) } else { c })
+            }
+            Expr::UnaryOp(UnaryOp::PreInc, inner, _)
             | Expr::UnaryOp(UnaryOp::PreDec, inner, _) => {
+                // PreInc/PreDec return the operand's own type (no promotion).
                 self.get_expr_ctype(inner)
             }
             Expr::PostfixOp(_, inner, _) => self.get_expr_ctype(inner),
@@ -1231,9 +1238,6 @@ impl Lowerer {
                     Some(CType::ULong)
                 }
             }
-            // Unary bitwise NOT (~x) has the same type as the operand after
-            // integer promotion. For typeof resolution, infer from the operand.
-            Expr::UnaryOp(UnaryOp::BitNot, inner, _) => self.get_expr_ctype(inner),
             _ => None,
         }
     }

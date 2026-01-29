@@ -1,0 +1,17 @@
+Fix compound literal pointer arithmetic in global initializers.
+
+Problem: Global variable initializers of the form:
+  var x = (type*)((char*)(compound_literal) + offset);
+produce NULL instead of the correct address.
+
+The issue is in eval_global_addr_expr() which encounters CompoundLiteral nodes
+but can only look for addresses *within* the initializer (for patterns like
+struct wrappers around function pointers). For bare array/struct compound
+literals used as the base of pointer arithmetic, it needs to materialize
+them as anonymous globals first.
+
+Fix: Add a pre-processing step in lower_global_init_expr that materializes
+compound literals embedded in arithmetic expressions as anonymous globals,
+then let eval_global_addr_expr resolve the full address expression.
+
+This fixes the cello project.
