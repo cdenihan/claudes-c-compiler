@@ -34,14 +34,14 @@ pub(crate) fn eliminate_dead_code(func: &mut IrFunction) -> usize {
     let mut use_count: Vec<u32> = vec![0; max_id + 1];
     for block in &func.blocks {
         for inst in &block.instructions {
-            for_each_instruction_use(inst, |id| {
+            inst.for_each_used_value(|id| {
                 let idx = id as usize;
                 if idx < use_count.len() {
                     use_count[idx] += 1;
                 }
             });
         }
-        for_each_terminator_use(&block.terminator, |id| {
+        block.terminator.for_each_used_value(|id| {
             let idx = id as usize;
             if idx < use_count.len() {
                 use_count[idx] += 1;
@@ -83,7 +83,7 @@ pub(crate) fn eliminate_dead_code(func: &mut IrFunction) -> usize {
     while let Some((bi, ii)) = worklist.pop() {
         let inst = &func.blocks[bi as usize].instructions[ii as usize];
         // Decrement use-counts of this instruction's operands.
-        for_each_instruction_use(inst, |id| {
+        inst.for_each_used_value(|id| {
             let idx = id as usize;
             if idx < use_count.len() {
                 use_count[idx] = use_count[idx].saturating_sub(1);
@@ -153,14 +153,14 @@ fn eliminate_dead_code_simple(func: &mut IrFunction, max_id: usize) -> usize {
         }
         for block in &func.blocks {
             for inst in &block.instructions {
-                for_each_instruction_use(inst, |id| {
+                inst.for_each_used_value(|id| {
                     let idx = id as usize;
                     if idx < used.len() {
                         used[idx] = true;
                     }
                 });
             }
-            for_each_terminator_use(&block.terminator, |id| {
+            block.terminator.for_each_used_value(|id| {
                 let idx = id as usize;
                 if idx < used.len() {
                     used[idx] = true;
@@ -216,176 +216,6 @@ fn is_live(inst: &Instruction, used: &[bool]) -> bool {
             id < used.len() && used[id]
         }
         None => true,
-    }
-}
-
-// ==========================================================================
-// Unified instruction/terminator use-visitor
-// ==========================================================================
-//
-// All use-analysis in DCE (use-counting, bitvector marking, decrementing)
-// goes through these two visitor functions. This ensures a single match
-// block per IR structure (Instruction and Terminator), avoiding the
-// maintenance burden of keeping multiple match blocks in sync.
-
-/// Call `f(value_id)` for every Value ID used as an operand in `inst`.
-#[inline]
-fn for_each_instruction_use(inst: &Instruction, mut f: impl FnMut(u32)) {
-    #[inline(always)]
-    fn visit_operand(op: &Operand, f: &mut impl FnMut(u32)) {
-        if let Operand::Value(v) = op {
-            f(v.0);
-        }
-    }
-
-    match inst {
-        Instruction::Alloca { .. } => {}
-        Instruction::DynAlloca { size, .. } => {
-            visit_operand(size, &mut f);
-        }
-        Instruction::Store { val, ptr, .. } => {
-            visit_operand(val, &mut f);
-            f(ptr.0);
-        }
-        Instruction::Load { ptr, .. } => {
-            f(ptr.0);
-        }
-        Instruction::BinOp { lhs, rhs, .. } => {
-            visit_operand(lhs, &mut f);
-            visit_operand(rhs, &mut f);
-        }
-        Instruction::UnaryOp { src, .. } => {
-            visit_operand(src, &mut f);
-        }
-        Instruction::Cmp { lhs, rhs, .. } => {
-            visit_operand(lhs, &mut f);
-            visit_operand(rhs, &mut f);
-        }
-        Instruction::Call { info, .. } => {
-            for arg in &info.args {
-                visit_operand(arg, &mut f);
-            }
-        }
-        Instruction::CallIndirect { func_ptr, info } => {
-            visit_operand(func_ptr, &mut f);
-            for arg in &info.args {
-                visit_operand(arg, &mut f);
-            }
-        }
-        Instruction::GetElementPtr { base, offset, .. } => {
-            f(base.0);
-            visit_operand(offset, &mut f);
-        }
-        Instruction::Cast { src, .. } => {
-            visit_operand(src, &mut f);
-        }
-        Instruction::Copy { src, .. } => {
-            visit_operand(src, &mut f);
-        }
-        Instruction::GlobalAddr { .. } => {}
-        Instruction::Memcpy { dest, src, .. } => {
-            f(dest.0);
-            f(src.0);
-        }
-        Instruction::VaArg { va_list_ptr, .. } => {
-            f(va_list_ptr.0);
-        }
-        Instruction::VaStart { va_list_ptr } => {
-            f(va_list_ptr.0);
-        }
-        Instruction::VaEnd { va_list_ptr } => {
-            f(va_list_ptr.0);
-        }
-        Instruction::VaCopy { dest_ptr, src_ptr } => {
-            f(dest_ptr.0);
-            f(src_ptr.0);
-        }
-        Instruction::VaArgStruct { dest_ptr, va_list_ptr, .. } => {
-            f(dest_ptr.0);
-            f(va_list_ptr.0);
-        }
-        Instruction::AtomicRmw { ptr, val, .. } => {
-            visit_operand(ptr, &mut f);
-            visit_operand(val, &mut f);
-        }
-        Instruction::AtomicCmpxchg { ptr, expected, desired, .. } => {
-            visit_operand(ptr, &mut f);
-            visit_operand(expected, &mut f);
-            visit_operand(desired, &mut f);
-        }
-        Instruction::AtomicLoad { ptr, .. } => {
-            visit_operand(ptr, &mut f);
-        }
-        Instruction::AtomicStore { ptr, val, .. } => {
-            visit_operand(ptr, &mut f);
-            visit_operand(val, &mut f);
-        }
-        Instruction::Fence { .. } => {}
-        Instruction::Phi { incoming, .. } => {
-            for (op, _label) in incoming {
-                visit_operand(op, &mut f);
-            }
-        }
-        Instruction::Select { cond, true_val, false_val, .. } => {
-            visit_operand(cond, &mut f);
-            visit_operand(true_val, &mut f);
-            visit_operand(false_val, &mut f);
-        }
-        Instruction::LabelAddr { .. } => {}
-        Instruction::GetReturnF64Second { .. } => {}
-        Instruction::GetReturnF32Second { .. } => {}
-        Instruction::GetReturnF128Second { .. } => {}
-        Instruction::SetReturnF64Second { src } => {
-            visit_operand(src, &mut f);
-        }
-        Instruction::SetReturnF32Second { src } => {
-            visit_operand(src, &mut f);
-        }
-        Instruction::SetReturnF128Second { src } => {
-            visit_operand(src, &mut f);
-        }
-        Instruction::InlineAsm { outputs, inputs, .. } => {
-            for (_, ptr, _) in outputs {
-                f(ptr.0);
-            }
-            for (_, op, _) in inputs {
-                visit_operand(op, &mut f);
-            }
-        }
-        Instruction::Intrinsic { dest_ptr, args, .. } => {
-            if let Some(ptr) = dest_ptr {
-                f(ptr.0);
-            }
-            for arg in args {
-                visit_operand(arg, &mut f);
-            }
-        }
-        Instruction::StackSave { .. } => {}
-        Instruction::StackRestore { ptr } => {
-            f(ptr.0);
-        }
-        Instruction::ParamRef { .. } => {}
-    }
-}
-
-/// Call `f(value_id)` for every Value ID used as an operand in a terminator.
-#[inline]
-fn for_each_terminator_use(term: &Terminator, mut f: impl FnMut(u32)) {
-    #[inline(always)]
-    fn visit_operand(op: &Operand, f: &mut impl FnMut(u32)) {
-        if let Operand::Value(v) = op {
-            f(v.0);
-        }
-    }
-
-    match term {
-        Terminator::Return(Some(val)) => visit_operand(val, &mut f),
-        Terminator::Return(None) => {}
-        Terminator::Branch(_) => {}
-        Terminator::CondBranch { cond, .. } => visit_operand(cond, &mut f),
-        Terminator::IndirectBranch { target, .. } => visit_operand(target, &mut f),
-        Terminator::Switch { val, .. } => visit_operand(val, &mut f),
-        Terminator::Unreachable => {}
     }
 }
 

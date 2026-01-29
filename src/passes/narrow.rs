@@ -122,17 +122,17 @@ pub(crate) fn narrow_function(func: &mut IrFunction) -> usize {
     let mut use_counts: Vec<u32> = vec![0; max_id + 1];
     for block in &func.blocks {
         for inst in &block.instructions {
-            for_each_used_value(inst, &mut |v: Value| {
-                let id = v.0 as usize;
-                if id < use_counts.len() {
-                    use_counts[id] = use_counts[id].saturating_add(1);
+            inst.for_each_used_value(|id| {
+                let idx = id as usize;
+                if idx < use_counts.len() {
+                    use_counts[idx] = use_counts[idx].saturating_add(1);
                 }
             });
         }
-        for_each_used_value_terminator(&block.terminator, &mut |v: Value| {
-            let id = v.0 as usize;
-            if id < use_counts.len() {
-                use_counts[id] = use_counts[id].saturating_add(1);
+        block.terminator.for_each_used_value(|id| {
+            let idx = id as usize;
+            if idx < use_counts.len() {
+                use_counts[idx] = use_counts[idx].saturating_add(1);
             }
         });
     }
@@ -562,86 +562,6 @@ fn try_narrow_const(c: &IrConst, target_ty: IrType) -> Option<IrConst> {
 /// `Cmp(Eq, x, 0xFFFFFFF6)` which would incorrectly match.
 fn try_narrow_const_for_cmp(c: &IrConst, target_ty: IrType) -> Option<IrConst> {
     try_narrow_const_core(c, target_ty, true)
-}
-
-/// Helper to call f for a Value if the operand is a Value.
-#[inline]
-fn visit_operand(op: &Operand, f: &mut impl FnMut(Value)) {
-    if let Operand::Value(v) = op {
-        f(*v);
-    }
-}
-
-/// Call a function for each Value used (read) by an instruction.
-fn for_each_used_value(inst: &Instruction, f: &mut impl FnMut(Value)) {
-    match inst {
-        Instruction::Alloca { .. } | Instruction::GlobalAddr { .. }
-        | Instruction::LabelAddr { .. } | Instruction::StackSave { .. }
-        | Instruction::Fence { .. } | Instruction::GetReturnF64Second { .. }
-        | Instruction::GetReturnF32Second { .. }
-        | Instruction::GetReturnF128Second { .. } => {}
-
-        Instruction::DynAlloca { size, .. } => visit_operand(size, f),
-        Instruction::Store { val, ptr, .. } => { visit_operand(val, f); f(*ptr); }
-        Instruction::Load { ptr, .. } => f(*ptr),
-        Instruction::BinOp { lhs, rhs, .. } => { visit_operand(lhs, f); visit_operand(rhs, f); }
-        Instruction::UnaryOp { src, .. } => visit_operand(src, f),
-        Instruction::Cmp { lhs, rhs, .. } => { visit_operand(lhs, f); visit_operand(rhs, f); }
-        Instruction::Call { info, .. } => { for a in &info.args { visit_operand(a, f); } }
-        Instruction::CallIndirect { func_ptr, info } => {
-            visit_operand(func_ptr, f);
-            for a in &info.args { visit_operand(a, f); }
-        }
-        Instruction::GetElementPtr { base, offset, .. } => { f(*base); visit_operand(offset, f); }
-        Instruction::Cast { src, .. } | Instruction::Copy { src, .. } => visit_operand(src, f),
-        Instruction::Memcpy { dest, src, .. } => { f(*dest); f(*src); }
-        Instruction::VaArg { va_list_ptr, .. } | Instruction::VaStart { va_list_ptr }
-        | Instruction::VaEnd { va_list_ptr } => f(*va_list_ptr),
-        Instruction::VaCopy { dest_ptr, src_ptr } => { f(*dest_ptr); f(*src_ptr); }
-        Instruction::VaArgStruct { dest_ptr, va_list_ptr, .. } => { f(*dest_ptr); f(*va_list_ptr); }
-        Instruction::AtomicRmw { ptr, val, .. } => { visit_operand(ptr, f); visit_operand(val, f); }
-        Instruction::AtomicCmpxchg { ptr, expected, desired, .. } => {
-            visit_operand(ptr, f); visit_operand(expected, f); visit_operand(desired, f);
-        }
-        Instruction::AtomicLoad { ptr, .. } => visit_operand(ptr, f),
-        Instruction::AtomicStore { ptr, val, .. } => { visit_operand(ptr, f); visit_operand(val, f); }
-        Instruction::Phi { incoming, .. } => {
-            for (op, _) in incoming { visit_operand(op, f); }
-        }
-        Instruction::SetReturnF64Second { src } | Instruction::SetReturnF32Second { src } | Instruction::SetReturnF128Second { src } => visit_operand(src, f),
-        Instruction::InlineAsm { outputs, inputs, .. } => {
-            for (_, ptr, _) in outputs { f(*ptr); }
-            for (_, op, _) in inputs { visit_operand(op, f); }
-        }
-        Instruction::Intrinsic { dest_ptr, args, .. } => {
-            if let Some(ptr) = dest_ptr { f(*ptr); }
-            for a in args { visit_operand(a, f); }
-        }
-        Instruction::Select { cond, true_val, false_val, .. } => {
-            visit_operand(cond, f); visit_operand(true_val, f); visit_operand(false_val, f);
-        }
-        Instruction::StackRestore { ptr } => f(*ptr),
-        Instruction::ParamRef { .. } => {}
-    }
-}
-
-/// Call a function for each Value used by a terminator.
-fn for_each_used_value_terminator(term: &Terminator, f: &mut impl FnMut(Value)) {
-    match term {
-        Terminator::Return(Some(op)) => {
-            if let Operand::Value(v) = op { f(*v); }
-        }
-        Terminator::CondBranch { cond, .. } => {
-            if let Operand::Value(v) = cond { f(*v); }
-        }
-        Terminator::IndirectBranch { target, .. } => {
-            if let Operand::Value(v) = target { f(*v); }
-        }
-        Terminator::Switch { val, .. } => {
-            if let Operand::Value(v) = val { f(*v); }
-        }
-        Terminator::Return(None) | Terminator::Branch(_) | Terminator::Unreachable => {}
-    }
 }
 
 #[cfg(test)]
