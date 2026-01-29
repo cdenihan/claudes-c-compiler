@@ -1233,9 +1233,15 @@ impl ArchCodegen for ArmCodegen {
 
     fn emit_switch_case_branch(&mut self, case_val: i64, label: &str) {
         // Load case value into x1, compare, and branch if equal.
+        // Use relaxed branch sequence: b.cond has +-1MB range which can be
+        // exceeded in large switch statements (e.g. PostgreSQL's gram.c).
+        // Invert to b.ne over a short skip, then use unconditional b (+-128MB).
         self.emit_load_imm64("x1", case_val);
         self.state.emit("    cmp x0, x1");
-        self.state.emit_fmt(format_args!("    b.eq {}", label));
+        let skip = self.state.fresh_label("skip");
+        self.state.emit_fmt(format_args!("    b.ne {}", skip));
+        self.state.emit_fmt(format_args!("    b {}", label));
+        self.state.emit_fmt(format_args!("{}:", skip));
     }
 
     fn emit_switch_jump_table(&mut self, val: &Operand, cases: &[(i64, BlockId)], default: &BlockId) {
@@ -1265,7 +1271,12 @@ impl ArchCodegen for ArmCodegen {
             self.load_large_imm("x17", range as i64);
             self.state.emit("    cmp x0, x17");
         }
-        self.state.emit_fmt(format_args!("    b.hs {}", default_label));
+        // Use relaxed branch: b.hs has +-1MB range which can be exceeded
+        // in large functions. Invert to b.lo skip, then unconditional b (+-128MB).
+        let range_skip = self.state.fresh_label("range_ok");
+        self.state.emit_fmt(format_args!("    b.lo {}", range_skip));
+        self.state.emit_fmt(format_args!("    b {}", default_label));
+        self.state.emit_fmt(format_args!("{}:", range_skip));
 
         // Always use relative 32-bit offsets for jump tables on AArch64.
         // Absolute .xword entries produce R_AARCH64_ABS64 relocations in .rodata
