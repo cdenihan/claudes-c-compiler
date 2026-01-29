@@ -16,3 +16,4 @@ musl - ARM: pass, x86: pass, riscv: pass, i686: fail. Notes: pre-existing i686 f
 tcc - ARM: pass, x86: pass, riscv: pass, i686: pass. Notes: tiny C compiler
 fastlz - ARM: pass, x86: pass, riscv: pass, i686: pass. Notes: FIXED i686 - was failing due to F64 skip-slot bug
 mruby - ARM: pass, x86: pass, riscv: pass, i686: pass. Notes: FIXED - build scripts rewrote to not need ruby/rake (was setup_deps failure)
+spng - ARM: pass, x86: pass, riscv: pass, i686: pass. Notes: PNG library. x86 script needs direct compile instead of CMake (see diff below)
