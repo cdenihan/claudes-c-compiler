@@ -1,7 +1,0 @@
-Cleanup passes/ module: split mod.rs, deduplicate utilities
-
-1. Extract eliminate_dead_static_functions into passes/dead_statics.rs (~400 lines)
-2. Extract resolve_inline_asm_symbols into passes/resolve_asm.rs (~130 lines)
-3. Deduplicate truncate_to_cmp_type across cfg_simplify.rs and constant_fold.rs
-4. Deduplicate comparison evaluation logic (eval_cmp helper)
-5. Update passes/README.md to reflect new module structure

@@ -1274,6 +1274,46 @@ pub enum IrCmpOp {
     Uge,
 }
 
+impl IrCmpOp {
+    /// Evaluate this comparison on two i64 operands.
+    ///
+    /// Signed comparisons use Rust's native i64 ordering.
+    /// Unsigned comparisons reinterpret the bits as u64.
+    pub fn eval_i64(self, lhs: i64, rhs: i64) -> bool {
+        match self {
+            IrCmpOp::Eq => lhs == rhs,
+            IrCmpOp::Ne => lhs != rhs,
+            IrCmpOp::Slt => lhs < rhs,
+            IrCmpOp::Sle => lhs <= rhs,
+            IrCmpOp::Sgt => lhs > rhs,
+            IrCmpOp::Sge => lhs >= rhs,
+            IrCmpOp::Ult => (lhs as u64) < (rhs as u64),
+            IrCmpOp::Ule => (lhs as u64) <= (rhs as u64),
+            IrCmpOp::Ugt => (lhs as u64) > (rhs as u64),
+            IrCmpOp::Uge => (lhs as u64) >= (rhs as u64),
+        }
+    }
+
+    /// Evaluate this comparison on two i128 operands.
+    ///
+    /// Signed comparisons use Rust's native i128 ordering.
+    /// Unsigned comparisons reinterpret the bits as u128.
+    pub fn eval_i128(self, lhs: i128, rhs: i128) -> bool {
+        match self {
+            IrCmpOp::Eq => lhs == rhs,
+            IrCmpOp::Ne => lhs != rhs,
+            IrCmpOp::Slt => lhs < rhs,
+            IrCmpOp::Sle => lhs <= rhs,
+            IrCmpOp::Sgt => lhs > rhs,
+            IrCmpOp::Sge => lhs >= rhs,
+            IrCmpOp::Ult => (lhs as u128) < (rhs as u128),
+            IrCmpOp::Ule => (lhs as u128) <= (rhs as u128),
+            IrCmpOp::Ugt => (lhs as u128) > (rhs as u128),
+            IrCmpOp::Uge => (lhs as u128) >= (rhs as u128),
+        }
+    }
+}
+
 /// Target-independent intrinsic operation kinds.
 /// Named after their semantic operation rather than any specific architecture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

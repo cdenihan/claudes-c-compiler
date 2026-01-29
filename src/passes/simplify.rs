@@ -316,7 +316,7 @@ fn fold_const_cast(c: &IrConst, from_ty: IrType, to_ty: IrType) -> Option<IrCons
     if let Some(raw_val) = c.to_i64() {
         // Normalize source value according to from_ty signedness.
         // Signed types sign-extend; unsigned types zero-extend.
-        let val = normalize_int_for_cast(raw_val, from_ty);
+        let val = from_ty.truncate_i64(raw_val);
         return fold_int_cast(val, from_ty, to_ty);
     }
 
@@ -330,19 +330,6 @@ fn fold_const_cast(c: &IrConst, from_ty: IrType, to_ty: IrType) -> Option<IrCons
     }
 
     None
-}
-
-/// Normalize an i64 value according to source type signedness for casting.
-fn normalize_int_for_cast(raw_val: i64, from_ty: IrType) -> i64 {
-    match from_ty {
-        IrType::I8 => raw_val as i8 as i64,
-        IrType::U8 => raw_val as u8 as i64,
-        IrType::I16 => raw_val as i16 as i64,
-        IrType::U16 => raw_val as u16 as i64,
-        IrType::I32 => raw_val as i32 as i64,
-        IrType::U32 => raw_val as u32 as i64,
-        _ => raw_val,
-    }
 }
 
 /// Convert an i128 constant to the target type.

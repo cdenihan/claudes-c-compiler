@@ -186,8 +186,8 @@ fn try_fold_with_map(inst: &Instruction, const_map: &[Option<ConstMapEntry>]) ->
             // variants (e.g., a U32 value stored as IrConst::I32) and to_i64()
             // sign-extends them. Operations like LShr and UDiv are sensitive
             // to upper bits, so we must normalize first.
-            let lhs_trunc = truncate_to_type(lhs_const, *ty);
-            let rhs_trunc = truncate_to_type(rhs_const, *ty);
+            let lhs_trunc = ty.truncate_i64(lhs_const);
+            let rhs_trunc = ty.truncate_i64(rhs_const);
             let result = fold_binop(*op, lhs_trunc, rhs_trunc, *ty)?;
             Some(Instruction::Copy {
                 dest: *dest,
@@ -260,7 +260,7 @@ fn try_fold_with_map(inst: &Instruction, const_map: &[Option<ConstMapEntry>]) ->
                 let rc = resolve_const(rhs, const_map)?;
                 let l = lc.to_i128()?;
                 let r = rc.to_i128()?;
-                let result = fold_cmp_i128(*op, l, r);
+                let result = op.eval_i128(l, r);
                 return Some(Instruction::Copy {
                     dest: *dest,
                     src: Operand::Const(IrConst::I32(result as i32)),
@@ -293,9 +293,7 @@ fn try_fold_with_map(inst: &Instruction, const_map: &[Option<ConstMapEntry>]) ->
             // variants (e.g., a U32 value stored as IrConst::I32) and to_i64()
             // sign-extends them. By truncating to the comparison type, we ensure
             // bit-level equality is correct regardless of storage representation.
-            let lhs_trunc = truncate_to_type(lhs_const, *ty);
-            let rhs_trunc = truncate_to_type(rhs_const, *ty);
-            let result = fold_cmp(*op, lhs_trunc, rhs_trunc);
+            let result = op.eval_i64(ty.truncate_i64(lhs_const), ty.truncate_i64(rhs_const));
             Some(Instruction::Copy {
                 dest: *dest,
                 src: Operand::Const(IrConst::I32(result as i32)),
@@ -678,22 +676,6 @@ fn fold_binop_i128(op: IrBinOp, lhs: i128, rhs: i128) -> Option<i128> {
     })
 }
 
-/// Evaluate a comparison on two constant 128-bit integers.
-fn fold_cmp_i128(op: IrCmpOp, lhs: i128, rhs: i128) -> bool {
-    match op {
-        IrCmpOp::Eq => lhs == rhs,
-        IrCmpOp::Ne => lhs != rhs,
-        IrCmpOp::Slt => lhs < rhs,
-        IrCmpOp::Sle => lhs <= rhs,
-        IrCmpOp::Sgt => lhs > rhs,
-        IrCmpOp::Sge => lhs >= rhs,
-        IrCmpOp::Ult => (lhs as u128) < (rhs as u128),
-        IrCmpOp::Ule => (lhs as u128) <= (rhs as u128),
-        IrCmpOp::Ugt => (lhs as u128) > (rhs as u128),
-        IrCmpOp::Uge => (lhs as u128) >= (rhs as u128),
-    }
-}
-
 /// Fold a cast involving 128-bit types.
 fn fold_cast_i128(src: &IrConst, from_ty: IrType, to_ty: IrType) -> Option<IrConst> {
     let val = src.to_i128()?;
@@ -844,72 +826,14 @@ fn fold_unaryop(op: IrUnaryOp, src: i64, ty: IrType) -> Option<i64> {
     })
 }
 
-/// Truncate an i64 value to the width of the given type, with proper
-/// sign/zero extension back to i64. This ensures that constants stored
-/// in wider IrConst variants are properly normalized before comparison.
-///
-/// For unsigned types, the value is masked to the type's bit width and
-/// zero-extended. For signed types, the value is truncated and sign-extended.
-/// This matches the semantics of `fold_cast` for same-width reinterpretation.
-fn truncate_to_type(val: i64, ty: IrType) -> i64 {
-    match ty {
-        IrType::I8 => val as i8 as i64,
-        IrType::U8 => val as u8 as i64,
-        IrType::I16 => val as i16 as i64,
-        IrType::U16 => val as u16 as i64,
-        IrType::I32 => val as i32 as i64,
-        IrType::U32 => val as u32 as i64,
-        // I64/U64/Ptr: no truncation needed, value is already 64-bit
-        _ => val,
-    }
-}
-
-/// Evaluate a comparison on two constant integers.
-fn fold_cmp(op: IrCmpOp, lhs: i64, rhs: i64) -> bool {
-    match op {
-        IrCmpOp::Eq => lhs == rhs,
-        IrCmpOp::Ne => lhs != rhs,
-        IrCmpOp::Slt => lhs < rhs,
-        IrCmpOp::Sle => lhs <= rhs,
-        IrCmpOp::Sgt => lhs > rhs,
-        IrCmpOp::Sge => lhs >= rhs,
-        IrCmpOp::Ult => (lhs as u64) < (rhs as u64),
-        IrCmpOp::Ule => (lhs as u64) <= (rhs as u64),
-        IrCmpOp::Ugt => (lhs as u64) > (rhs as u64),
-        IrCmpOp::Uge => (lhs as u64) >= (rhs as u64),
-    }
-}
-
 /// Evaluate a type cast on a constant.
 ///
 /// For signed source types, we sign-extend to get the correct i64 representation.
 /// For unsigned source types, we zero-extend (mask to type width).
 /// Same logic applies to the target type.
 fn fold_cast(val: i64, from_ty: crate::common::types::IrType, to_ty: crate::common::types::IrType) -> i64 {
-    use crate::common::types::IrType;
-
-    // First, normalize the value to the source type's width and signedness.
-    // Signed types sign-extend; unsigned types zero-extend.
-    let src_val = match from_ty {
-        IrType::I8 => val as i8 as i64,
-        IrType::U8 => val as u8 as i64,
-        IrType::I16 => val as i16 as i64,
-        IrType::U16 => val as u16 as i64,
-        IrType::I32 => val as i32 as i64,
-        IrType::U32 => val as u32 as i64,
-        _ => val,
-    };
-
-    // Then convert to target type width and signedness.
-    match to_ty {
-        IrType::I8 => src_val as i8 as i64,
-        IrType::U8 => src_val as u8 as i64,
-        IrType::I16 => src_val as i16 as i64,
-        IrType::U16 => src_val as u16 as i64,
-        IrType::I32 => src_val as i32 as i64,
-        IrType::U32 => src_val as u32 as i64,
-        _ => src_val,
-    }
+    // Normalize source to its width/signedness, then convert to target.
+    to_ty.truncate_i64(from_ty.truncate_i64(val))
 }
 
 #[cfg(test)]
@@ -988,12 +912,12 @@ mod tests {
 
     #[test]
     fn test_fold_cmp() {
-        assert!(fold_cmp(IrCmpOp::Eq, 5, 5));
-        assert!(!fold_cmp(IrCmpOp::Eq, 5, 6));
-        assert!(fold_cmp(IrCmpOp::Slt, -1, 0));
+        assert!(IrCmpOp::Eq.eval_i64(5, 5));
+        assert!(!IrCmpOp::Eq.eval_i64(5, 6));
+        assert!(IrCmpOp::Slt.eval_i64(-1, 0));
         // -1 as u64 is large, so unsigned comparison flips
-        assert!(!fold_cmp(IrCmpOp::Ult, -1i64, 0));
-        assert!(fold_cmp(IrCmpOp::Ugt, -1i64, 0));
+        assert!(!IrCmpOp::Ult.eval_i64(-1i64, 0));
+        assert!(IrCmpOp::Ugt.eval_i64(-1i64, 0));
     }
 
     #[test]

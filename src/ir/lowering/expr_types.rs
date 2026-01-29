@@ -282,6 +282,35 @@ impl Lowerer {
         || name == "__sync_val_compare_and_swap"
     }
 
+    /// Compute the composite type for a conditional (ternary) expression.
+    /// For sizeof/typeof purposes, when one branch is void* and the other is T*,
+    /// we use T* to match GCC behavior. This is required for Linux kernel patterns
+    /// like __builtin_choose_expr that rely on sizeof(*(cond ? (void*)x : (T*)y))
+    /// returning sizeof(T), not 1.
+    /// Note: strict C11 6.5.15p6 would use void*, but GCC uses T* for sizeof/typeof.
+    fn composite_conditional_type(then_ct: Option<CType>, else_ct: Option<CType>) -> Option<CType> {
+        match (then_ct, else_ct) {
+            (Some(t), Some(e)) => {
+                // GCC: prefer typed pointer over void* for sizeof/typeof resolution
+                if let (CType::Pointer(ref inner_t, _), CType::Pointer(ref inner_e, _)) = (&t, &e) {
+                    if matches!(inner_t.as_ref(), CType::Void) && !matches!(inner_e.as_ref(), CType::Void) {
+                        return Some(e);
+                    }
+                    if matches!(inner_e.as_ref(), CType::Void) && !matches!(inner_t.as_ref(), CType::Void) {
+                        return Some(t);
+                    }
+                    // Both are the same pointer type or both void*
+                    return Some(t);
+                }
+                // For non-pointer types, prefer the wider/then type (usual arithmetic conversions)
+                Some(t)
+            }
+            (Some(t), None) => Some(t),
+            (None, Some(e)) => Some(e),
+            (None, None) => None,
+        }
+    }
+
     /// Return the IR type for known builtins that return float or specific types.
     /// Returns None for builtins without special return type handling.
     pub(super) fn builtin_return_type(name: &str) -> Option<IrType> {
@@ -1146,13 +1175,19 @@ impl Lowerer {
                 self.sizeof_binop(op, lhs, rhs)
             }
 
-            // Conditional: common type of both branches
+            // Conditional: use composite type for accurate sizeof
             Expr::Conditional(_, then_e, else_e, _) => {
+                if let Some(ctype) = self.get_expr_ctype(expr) {
+                    return self.ctype_size(&ctype);
+                }
                 let ts = self.sizeof_expr(then_e);
                 let es = self.sizeof_expr(else_e);
                 ts.max(es)
             }
             Expr::GnuConditional(cond, else_e, _) => {
+                if let Some(ctype) = self.get_expr_ctype(expr) {
+                    return self.ctype_size(&ctype);
+                }
                 let cs = self.sizeof_expr(cond);
                 let es = self.sizeof_expr(else_e);
                 cs.max(es)
@@ -1546,6 +1581,10 @@ impl Lowerer {
                         variadic: func_info.variadic,
                     })));
                 }
+                // Enum constants have type int in C
+                if self.types.enum_constants.contains_key(name) {
+                    return Some(CType::Int);
+                }
                 None
             }
             Expr::Deref(inner, _) => {
@@ -1606,8 +1645,16 @@ impl Lowerer {
             Expr::Assign(lhs, _, _) | Expr::CompoundAssign(_, lhs, _, _) => {
                 self.get_expr_ctype(lhs)
             }
-            Expr::Conditional(_, then_expr, _, _) => self.get_expr_ctype(then_expr),
-            Expr::GnuConditional(cond, _, _) => self.get_expr_ctype(cond),
+            Expr::Conditional(_, then_expr, else_expr, _) => {
+                let then_ct = self.get_expr_ctype(then_expr);
+                let else_ct = self.get_expr_ctype(else_expr);
+                Self::composite_conditional_type(then_ct, else_ct)
+            }
+            Expr::GnuConditional(cond, else_expr, _) => {
+                let cond_ct = self.get_expr_ctype(cond);
+                let else_ct = self.get_expr_ctype(else_expr);
+                Self::composite_conditional_type(cond_ct, else_ct)
+            }
             Expr::Comma(_, last, _) => self.get_expr_ctype(last),
             Expr::StringLiteral(_, _) => {
                 // String literals have type char[] which decays to char*
@@ -1732,33 +1779,46 @@ impl Lowerer {
                         if let Some(ctype) = self.get_expr_ctype(expr) {
                             return Some(ctype);
                         }
-                        // If the last expr is an identifier not in lowerer locals
-                        // (e.g., inside typeof where the stmt expr was never lowered),
-                        // resolve it from declarations within this compound statement.
-                        // We must resolve declarations in order because later declarations
-                        // may use typeof() referencing earlier declarations (e.g., the
-                        // kernel's xchg macro: typeof(&field) ptr = ...; __typeof__(*ptr) ret = ...;)
-                        if let Expr::Identifier(name, _) = expr {
-                            return self.resolve_var_type_from_compound(compound, name);
+                        // If the last expr references variables declared in this compound
+                        // statement (e.g., inside typeof where the stmt expr was never
+                        // lowered), build a local scope from the declarations and resolve.
+                        // This handles both simple identifiers and complex expressions
+                        // like ternaries referencing compound-local variables (e.g.,
+                        // kernel's min/max/clamp macros: __x < __y ? __x : __y).
+                        let scope = self.build_compound_scope(compound);
+                        if !scope.is_empty() {
+                            if let Some(ctype) = self.get_expr_ctype_with_scope(expr, &scope) {
+                                return Some(ctype);
+                            }
                         }
                     }
                 }
                 None
             }
+            // sizeof and alignof always produce size_t (unsigned long on 64-bit,
+            // unsigned int on 32-bit). This is needed so typeof(sizeof(...)) resolves
+            // correctly in kernel macros.
+            Expr::Sizeof(_, _) | Expr::Alignof(_, _) | Expr::AlignofExpr(_, _)
+            | Expr::GnuAlignof(_, _) | Expr::GnuAlignofExpr(_, _) => {
+                if crate::common::types::target_is_32bit() {
+                    Some(CType::UInt)
+                } else {
+                    Some(CType::ULong)
+                }
+            }
+            // Unary bitwise NOT (~x) has the same type as the operand after
+            // integer promotion. For typeof resolution, infer from the operand.
+            Expr::UnaryOp(UnaryOp::BitNot, inner, _) => self.get_expr_ctype(inner),
             _ => None,
         }
     }
 
-    /// Resolve the CType of a variable declared within a compound statement.
+    /// Build a local scope from declarations in a compound statement.
     ///
-    /// When a statement expression's type depends on declarations inside it
-    /// (e.g., `({ typeof(&s->field) p = ...; __typeof__(*p) ret = ...; ret; })`),
-    /// the normal `build_full_ctype` can't resolve typeof expressions that reference
-    /// variables from the same compound statement (they aren't in lowerer locals).
-    ///
-    /// This method scans declarations in order, building a local scope so that
-    /// later typeof references can resolve against earlier declarations.
-    fn resolve_var_type_from_compound(&self, compound: &CompoundStmt, target_name: &str) -> Option<CType> {
+    /// Scans declarations in order, resolving typeof expressions against earlier
+    /// declarations. This is needed for statement expressions inside typeof where
+    /// the variables haven't been lowered yet (e.g., kernel min/max/clamp macros).
+    fn build_compound_scope(&self, compound: &CompoundStmt) -> FxHashMap<String, CType> {
         let mut local_scope: FxHashMap<String, CType> = FxHashMap::default();
 
         for item in &compound.items {
@@ -1771,15 +1831,11 @@ impl Lowerer {
                     // for typeof expressions that reference earlier declarations.
                     let resolved_ts = self.resolve_typeof_with_scope(&decl.type_spec, &local_scope);
                     let ctype = self.build_full_ctype(&resolved_ts, &declarator.derived);
-
-                    if declarator.name == target_name {
-                        return Some(ctype);
-                    }
                     local_scope.insert(declarator.name.clone(), ctype);
                 }
             }
         }
-        None
+        local_scope
     }
 
     /// Resolve a TypeSpecifier by replacing Typeof nodes with concrete type specs,
@@ -1841,6 +1897,27 @@ impl Lowerer {
             Expr::Cast(type_spec, _, _) => {
                 // typeof((type)expr) = type
                 Some(self.type_spec_to_ctype(type_spec))
+            }
+            // Conditional: use the then-branch type (matches get_expr_ctype behavior)
+            Expr::Conditional(_, then_expr, _, _) => {
+                self.get_expr_ctype(then_expr)
+                    .or_else(|| self.get_expr_ctype_with_scope(then_expr, scope))
+            }
+            // Binary ops: try to infer from operands using scope
+            Expr::BinaryOp(_, lhs, rhs, _) => {
+                let lhs_ct = self.get_expr_ctype(lhs)
+                    .or_else(|| self.get_expr_ctype_with_scope(lhs, scope));
+                let rhs_ct = self.get_expr_ctype(rhs)
+                    .or_else(|| self.get_expr_ctype_with_scope(rhs, scope));
+                // Return the wider type (simple heuristic matching usual arithmetic conversions)
+                match (lhs_ct, rhs_ct) {
+                    (Some(l), Some(r)) => {
+                        if l.size() >= r.size() { Some(l) } else { Some(r) }
+                    }
+                    (Some(l), None) => Some(l),
+                    (None, Some(r)) => Some(r),
+                    (None, None) => None,
+                }
             }
             _ => None,
         }
