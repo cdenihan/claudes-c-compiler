@@ -5,7 +5,12 @@
 //! calling conventions (cdecl, ILP32).
 
 use std::borrow::Cow;
-use crate::ir::ir::*;
+use crate::ir::ir::{
+    BlockId,
+    IrConst,
+    Operand,
+    Value,
+};
 use crate::common::types::IrType;
 use crate::backend::state::CodegenState;
 use crate::backend::inline_asm::{InlineAsmEmitter, AsmOperandKind, AsmOperand};

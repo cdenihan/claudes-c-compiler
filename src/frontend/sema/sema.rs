@@ -20,7 +20,24 @@ use crate::common::symbol_table::{Symbol, SymbolTable, StorageClass};
 use crate::common::type_builder;
 use crate::common::types::{AddressSpace, CType, FunctionType, StructLayout};
 use crate::common::source::Span;
-use crate::frontend::parser::ast::*;
+use crate::frontend::parser::ast::{
+    BlockItem,
+    CompoundStmt,
+    Declaration,
+    DerivedDeclarator,
+    Designator,
+    EnumVariant,
+    Expr,
+    ExprId,
+    ExternalDecl,
+    ForInit,
+    FunctionDef,
+    Initializer,
+    Stmt,
+    StructFieldDecl,
+    TranslationUnit,
+    TypeSpecifier,
+};
 use crate::frontend::sema::builtins;
 use super::type_context::{TypeContext, FunctionTypedefInfo};
 use super::const_eval::{SemaConstEval, ConstMap};

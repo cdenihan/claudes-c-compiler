@@ -9,7 +9,17 @@
 //! These functions are arch-independent — they use the `ArchCodegen` trait to call
 //! into the backend-specific implementations.
 
-use crate::ir::ir::*;
+use crate::ir::ir::{
+    BasicBlock,
+    GlobalInit,
+    Instruction,
+    IrConst,
+    IrFunction,
+    IrModule,
+    Operand,
+    Terminator,
+    Value,
+};
 use crate::common::types::{AddressSpace, IrType};
 use crate::common::source::{Span, SourceManager};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};

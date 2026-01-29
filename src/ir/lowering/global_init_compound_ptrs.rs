@@ -10,8 +10,13 @@
 //! - `lower_struct_array_with_ptrs` — single-dimension struct arrays
 //! - `fill_composite_or_array_with_ptrs` — nested composite/array dispatch
 
-use crate::frontend::parser::ast::*;
-use crate::ir::ir::*;
+use crate::frontend::parser::ast::{
+    Designator,
+    Expr,
+    Initializer,
+    InitializerItem,
+};
+use crate::ir::ir::{GlobalInit};
 use crate::common::types::{AddressSpace, IrType, CType, InitFieldResolution};
 use super::lowering::Lowerer;
 use super::global_init_helpers as h;

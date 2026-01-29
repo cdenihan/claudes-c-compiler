@@ -9,8 +9,19 @@
 //! - `expr_calls`: function call lowering, arguments, dispatch
 //! - `expr_assign`: assignment, compound assignment, bitfield helpers
 
-use crate::frontend::parser::ast::*;
-use crate::ir::ir::*;
+use crate::frontend::parser::ast::{
+    BinOp,
+    Expr,
+    UnaryOp,
+};
+use crate::ir::ir::{
+    Instruction,
+    IrBinOp,
+    IrCmpOp,
+    IrConst,
+    Operand,
+    Value,
+};
 use crate::common::types::{AddressSpace, IrType, CType};
 use super::lowering::Lowerer;
 use super::definitions::GlobalInfo;

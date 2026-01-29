@@ -12,8 +12,14 @@
 //! - `&((type*)0)->member` patterns (resolved via offsetof in const_eval.rs)
 //! - Pointer arithmetic on global addresses (`&x + n`, `arr - n`)
 
-use crate::frontend::parser::ast::*;
-use crate::ir::ir::*;
+use crate::frontend::parser::ast::{
+    BinOp,
+    Expr,
+    Initializer,
+    TypeSpecifier,
+    UnaryOp,
+};
+use crate::ir::ir::{GlobalInit, IrConst};
 use crate::common::types::{CType, StructLayout};
 use super::lowering::Lowerer;
 

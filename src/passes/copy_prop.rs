@@ -16,7 +16,14 @@
 //! FxHashMap, since Value IDs are dense sequential u32s. This eliminates hashing
 //! overhead and gives O(1) lookups with better cache locality.
 
-use crate::ir::ir::*;
+use crate::ir::ir::{
+    Instruction,
+    IrFunction,
+    IrModule,
+    Operand,
+    Terminator,
+    Value,
+};
 
 /// Run copy propagation on the entire module.
 /// Returns the number of operand replacements made.

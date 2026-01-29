@@ -11,7 +11,16 @@
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
-use crate::ir::ir::*;
+use crate::ir::ir::{
+    BlockId,
+    Instruction,
+    IrConst,
+    IrFunction,
+    IrModule,
+    Operand,
+    Terminator,
+    Value,
+};
 use crate::ir::analysis;
 use crate::common::types::IrType;
 

@@ -38,7 +38,17 @@
 //! - Cmp(op, x, x) => constant -- self-comparison
 
 use crate::common::types::IrType;
-use crate::ir::ir::*;
+use crate::ir::ir::{
+    Instruction,
+    IntrinsicOp,
+    IrBinOp,
+    IrCmpOp,
+    IrConst,
+    IrFunction,
+    IrModule,
+    Operand,
+    Value,
+};
 
 /// Run algebraic simplification on the module.
 /// Returns the number of instructions simplified.

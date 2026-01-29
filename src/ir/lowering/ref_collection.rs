@@ -9,7 +9,17 @@
 
 use std::collections::VecDeque;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::frontend::parser::ast::*;
+use crate::frontend::parser::ast::{
+    BlockItem,
+    CompoundStmt,
+    Expr,
+    ExternalDecl,
+    ForInit,
+    FunctionDef,
+    Initializer,
+    Stmt,
+    TranslationUnit,
+};
 use super::lowering::Lowerer;
 
 impl Lowerer {

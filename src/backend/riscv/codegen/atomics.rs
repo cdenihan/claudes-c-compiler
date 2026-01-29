@@ -8,7 +8,7 @@
 //! zeros, count trailing zeros, byte swap, and population count for targets that
 //! lack the Zbb extension.
 
-use crate::ir::ir::*;
+use crate::ir::ir::{AtomicOrdering, AtomicRmwOp};
 use crate::common::types::IrType;
 use crate::backend::state::CodegenState;
 use super::codegen::RiscvCodegen;

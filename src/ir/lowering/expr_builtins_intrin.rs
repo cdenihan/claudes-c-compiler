@@ -4,8 +4,15 @@
 //! __builtin_bswap, __builtin_popcount, and __builtin_parity (plus their
 //! l/ll suffix variants).
 
-use crate::frontend::parser::ast::*;
-use crate::ir::ir::*;
+use crate::frontend::parser::ast::Expr;
+use crate::ir::ir::{
+    Instruction,
+    IrBinOp,
+    IrCmpOp,
+    IrConst,
+    IrUnaryOp,
+    Operand,
+};
 use crate::common::types::{IrType, target_int_ir_type};
 use super::lowering::Lowerer;
 

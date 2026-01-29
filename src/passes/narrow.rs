@@ -24,7 +24,14 @@
 //! the same type can be narrowed, since sign/zero extension preserves
 //! the ordering of values.
 
-use crate::ir::ir::*;
+use crate::ir::ir::{
+    Instruction,
+    IrBinOp,
+    IrCmpOp,
+    IrConst,
+    IrFunction,
+    Operand,
+};
 use crate::common::types::IrType;
 
 /// Information about a Cast instruction (widening).

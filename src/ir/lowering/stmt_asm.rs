@@ -9,8 +9,13 @@
 //! - Address space detection for segment-override operands
 //! - Goto label resolution
 
-use crate::frontend::parser::ast::*;
-use crate::ir::ir::*;
+use crate::frontend::parser::ast::{AsmOperand, Expr};
+use crate::ir::ir::{
+    BlockId,
+    Instruction,
+    Operand,
+    Value,
+};
 use crate::common::types::{AddressSpace, IrType};
 use super::lowering::Lowerer;
 use super::definitions::LValue;

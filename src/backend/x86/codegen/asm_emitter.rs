@@ -1,7 +1,12 @@
 //! x86-64 InlineAsmEmitter implementation: constraint classification, register
 //! allocation, operand loading/storing, and template substitution for inline asm.
 
-use crate::ir::ir::*;
+use crate::ir::ir::{
+    BlockId,
+    IrConst,
+    Operand,
+    Value,
+};
 use crate::common::types::IrType;
 use crate::backend::state::CodegenState;
 use crate::backend::inline_asm::{InlineAsmEmitter, AsmOperandKind, AsmOperand};

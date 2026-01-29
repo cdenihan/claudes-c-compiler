@@ -5,8 +5,17 @@
 //! `_Generic` selections, `sizeof` computation, and CType-level expression type resolution.
 
 use crate::common::fx_hash::FxHashMap;
-use crate::frontend::parser::ast::*;
-use crate::ir::ir::*;
+use crate::frontend::parser::ast::{
+    BinOp,
+    BlockItem,
+    CompoundStmt,
+    Expr,
+    GenericAssociation,
+    Stmt,
+    TypeSpecifier,
+    UnaryOp,
+};
+use crate::ir::ir::IrConst;
 use crate::common::types::{AddressSpace, CType, IrType, target_int_ir_type};
 use super::lowering::Lowerer;
 

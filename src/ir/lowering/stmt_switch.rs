@@ -5,8 +5,16 @@
 //! and emitting the dispatch chain (Switch terminator for exact cases, if-else chain
 //! for GNU case ranges).
 
-use crate::frontend::parser::ast::*;
-use crate::ir::ir::*;
+use crate::frontend::parser::ast::{Expr, Stmt};
+use crate::ir::ir::{
+    BlockId,
+    Instruction,
+    IrCmpOp,
+    IrConst,
+    Operand,
+    Terminator,
+    Value,
+};
 use crate::common::types::{AddressSpace, IrType};
 use super::lowering::Lowerer;
 use super::definitions::SwitchFrame;

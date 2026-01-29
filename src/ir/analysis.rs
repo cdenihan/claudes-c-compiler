@@ -12,7 +12,7 @@
 //! if_convert, and mem2reg.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::ir::ir::*;
+use crate::ir::ir::{BlockId, IrFunction, Terminator};
 
 // ── Flat adjacency list (CSR format) ──────────────────────────────────────────
 

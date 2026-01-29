@@ -1,5 +1,17 @@
-use crate::frontend::parser::ast::*;
-use crate::ir::ir::*;
+use crate::frontend::parser::ast::{
+    BinOp,
+    Declaration,
+    Expr,
+    StructFieldDecl,
+    TypeSpecifier,
+    UnaryOp,
+};
+use crate::ir::ir::{
+    Instruction,
+    IrConst,
+    Operand,
+    Value,
+};
 use std::rc::Rc;
 use crate::common::types::{AddressSpace, IrType, StructLayout, RcLayout, CType};
 use super::lowering::Lowerer;

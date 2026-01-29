@@ -11,7 +11,12 @@
 //! - Extra assembler/linker flags
 
 use std::process::Command;
-use crate::ir::ir::*;
+use crate::ir::ir::{
+    GlobalInit,
+    IrConst,
+    IrGlobal,
+    IrModule,
+};
 use crate::common::types::IrType;
 
 /// Configuration for an external assembler.

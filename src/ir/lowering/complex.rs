@@ -10,8 +10,17 @@
 //!   - _Complex long double: [f128 real, f128 imag] = 32 bytes, align 16 (x86-64)
 //!     24 bytes, align 4  (i686)
 
-use crate::frontend::parser::ast::*;
-use crate::ir::ir::*;
+use crate::frontend::parser::ast::{BinOp, Expr, UnaryOp};
+use crate::ir::ir::{
+    GlobalInit,
+    Instruction,
+    IrBinOp,
+    IrCmpOp,
+    IrConst,
+    IrUnaryOp,
+    Operand,
+    Value,
+};
 use crate::common::types::{AddressSpace, IrType, CType};
 use super::lowering::Lowerer;
 

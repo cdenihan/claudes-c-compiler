@@ -5,7 +5,14 @@
 //! the TypeConvertContext trait implementation.
 
 use crate::common::type_builder;
-use crate::frontend::parser::ast::*;
+use crate::frontend::parser::ast::{
+    DerivedDeclarator,
+    EnumVariant,
+    Expr,
+    ParamDecl,
+    StructFieldDecl,
+    TypeSpecifier,
+};
 use crate::common::types::{AddressSpace, StructField, StructLayout, CType};
 use super::lowering::Lowerer;
 

@@ -5,7 +5,12 @@
 //! These include designator inspection, field resolution, anonymous member
 //! drilling, and init item classification utilities.
 
-use crate::frontend::parser::ast::*;
+use crate::frontend::parser::ast::{
+    Designator,
+    Expr,
+    Initializer,
+    InitializerItem,
+};
 use crate::common::types::{CType, StructLayout, StructLayoutProvider, RcLayout};
 use crate::common::fx_hash::FxHashMap;
 

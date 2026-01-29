@@ -1,5 +1,26 @@
-use crate::frontend::parser::ast::*;
-use crate::ir::ir::*;
+use crate::frontend::parser::ast::{
+    BlockItem,
+    CompoundStmt,
+    Declaration,
+    DerivedDeclarator,
+    Designator,
+    Expr,
+    InitDeclarator,
+    Initializer,
+    InitializerItem,
+    Stmt,
+    TypeSpecifier,
+};
+use crate::ir::ir::{
+    GlobalInit,
+    Instruction,
+    IrBinOp,
+    IrConst,
+    IrGlobal,
+    Operand,
+    Terminator,
+    Value,
+};
 use crate::common::types::{AddressSpace, IrType, CType, StructLayout, target_int_ir_type};
 use super::lowering::Lowerer;
 use super::definitions::{LocalInfo, GlobalInfo, DeclAnalysis, FuncSig};

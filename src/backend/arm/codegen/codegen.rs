@@ -1,4 +1,16 @@
-use crate::ir::ir::*;
+use crate::ir::ir::{
+    AtomicOrdering,
+    AtomicRmwOp,
+    BlockId,
+    Instruction,
+    IntrinsicOp,
+    IrBinOp,
+    IrCmpOp,
+    IrConst,
+    IrFunction,
+    Operand,
+    Value,
+};
 use crate::common::types::IrType;
 use crate::common::fx_hash::FxHashMap;
 use crate::backend::common::PtrDirective;

@@ -7,9 +7,19 @@
 //! - expr_builtins_overflow.rs: overflow-checking arithmetic
 //! - expr_builtins_fpclass.rs: FP classification (fpclassify, isnan, isinf, etc.)
 
-use crate::frontend::parser::ast::*;
+use crate::frontend::parser::ast::Expr;
 use crate::frontend::sema::builtins::{self, BuiltinKind, BuiltinIntrinsic};
-use crate::ir::ir::*;
+use crate::ir::ir::{
+    CallInfo,
+    Instruction,
+    IntrinsicOp,
+    IrBinOp,
+    IrCmpOp,
+    IrConst,
+    IrUnaryOp,
+    Operand,
+    Terminator,
+};
 use crate::common::types::{AddressSpace, IrType, CType};
 use super::lowering::Lowerer;
 

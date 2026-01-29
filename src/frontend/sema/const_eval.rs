@@ -23,7 +23,15 @@ use crate::common::types::AddressSpace;
 use crate::common::const_arith;
 use crate::common::const_eval as shared_const_eval;
 use crate::ir::ir::IrConst;
-use crate::frontend::parser::ast::*;
+use crate::frontend::parser::ast::{
+    DerivedDeclarator,
+    Expr,
+    ExprId,
+    SizeofArg,
+    StructFieldDecl,
+    TypeSpecifier,
+    UnaryOp,
+};
 use super::type_context::TypeContext;
 use super::sema::FunctionInfo;
 use crate::common::symbol_table::SymbolTable;

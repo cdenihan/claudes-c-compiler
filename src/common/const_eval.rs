@@ -19,7 +19,7 @@
 //! respective callers.
 
 use crate::ir::ir::IrConst;
-use crate::frontend::parser::ast::*;
+use crate::frontend::parser::ast::{BinOp, Expr};
 use super::const_arith;
 
 /// Evaluate a literal expression to an IrConst.

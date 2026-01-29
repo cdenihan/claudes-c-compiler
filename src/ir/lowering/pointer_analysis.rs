@@ -4,7 +4,13 @@
 //! their pointee sizes (for pointer arithmetic scaling), and resolving pointee
 //! IR types (for correct loads/stores through pointer dereference and subscript).
 
-use crate::frontend::parser::ast::*;
+use crate::frontend::parser::ast::{
+    BinOp,
+    DerivedDeclarator,
+    Expr,
+    TypeSpecifier,
+    UnaryOp,
+};
 use crate::common::types::{AddressSpace, IrType, RcLayout, CType, target_ptr_size};
 use super::lowering::Lowerer;
 

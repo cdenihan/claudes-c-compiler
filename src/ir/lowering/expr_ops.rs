@@ -3,8 +3,22 @@
 //!
 //! Extracted from expr.rs to keep expression lowering manageable.
 
-use crate::frontend::parser::ast::*;
-use crate::ir::ir::*;
+use crate::frontend::parser::ast::{
+    BinOp,
+    Expr,
+    PostfixOp,
+    UnaryOp,
+};
+use crate::ir::ir::{
+    Instruction,
+    IrBinOp,
+    IrCmpOp,
+    IrConst,
+    IrUnaryOp,
+    Operand,
+    Terminator,
+    Value,
+};
 use crate::common::types::{AddressSpace, IrType, CType, widened_op_type};
 use super::lowering::Lowerer;
 

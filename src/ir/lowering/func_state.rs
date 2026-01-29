@@ -11,7 +11,12 @@
 
 use crate::common::fx_hash::FxHashMap;
 use crate::common::source::Span;
-use crate::ir::ir::*;
+use crate::ir::ir::{
+    BasicBlock,
+    BlockId,
+    Instruction,
+    Value,
+};
 use crate::common::types::{IrType, CType};
 use super::definitions::{LocalInfo, SwitchFrame};
 

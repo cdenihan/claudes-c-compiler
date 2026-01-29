@@ -19,7 +19,16 @@
 
 use crate::common::fx_hash::FxHashMap;
 use crate::common::types::{AddressSpace, IrType};
-use crate::ir::ir::*;
+use crate::ir::ir::{
+    ConstHashKey,
+    Instruction,
+    IrBinOp,
+    IrCmpOp,
+    IrFunction,
+    IrUnaryOp,
+    Operand,
+    Value,
+};
 use crate::ir::analysis;
 
 /// A value number expression key. Two instructions with the same ExprKey

@@ -5,8 +5,15 @@
 //! arithmetic operation, store the result through a pointer, and return
 //! 1 (bool true) if the operation overflowed.
 
-use crate::frontend::parser::ast::*;
-use crate::ir::ir::*;
+use crate::frontend::parser::ast::{Expr};
+use crate::ir::ir::{
+    Instruction,
+    IrBinOp,
+    IrCmpOp,
+    IrConst,
+    Operand,
+    Value,
+};
 use crate::common::types::{AddressSpace, IrType, CType, target_int_ir_type, target_is_32bit};
 use super::lowering::Lowerer;
 

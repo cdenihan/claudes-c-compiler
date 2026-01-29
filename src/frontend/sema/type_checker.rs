@@ -17,7 +17,19 @@
 use crate::common::types::{AddressSpace, CType, FunctionType};
 use crate::common::symbol_table::SymbolTable;
 use crate::common::fx_hash::FxHashMap;
-use crate::frontend::parser::ast::*;
+use crate::frontend::parser::ast::{
+    BinOp,
+    BlockItem,
+    CompoundStmt,
+    DerivedDeclarator,
+    Expr,
+    ExprId,
+    GenericAssociation,
+    Stmt,
+    StructFieldDecl,
+    TypeSpecifier,
+    UnaryOp,
+};
 use super::type_context::TypeContext;
 use super::sema::FunctionInfo;
 

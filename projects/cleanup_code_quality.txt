@@ -63,3 +63,14 @@ Items a Rust expert would flag, roughly ordered by impact:
    - emit_operand_common: shared logic for %n/%c/%P/memory/$symbol/$imm
    - Both backends now delegate through thin wrappers to x86_common
    - ~400 lines removed, zero functional changes
+
+9. [DONE] Wildcard imports replaced with explicit imports
+   - Was 124 `use ...::*` statements across 90 files
+   - Replaced all `use crate::ir::ir::*` (72 files) with explicit imports
+     listing only the types/enums/functions actually used in each file
+   - Replaced all `use crate::frontend::parser::ast::*` (42 files) likewise
+   - Removed 87 false-positive imports that the initial pass included
+   - 114 files updated total, zero functional changes
+   - Remaining: 10 module-internal wildcards (parser `super::ast::*`,
+     peephole `super::types::*`, lowering `super::definitions::*`) are
+     standard Rust patterns for closely-coupled module internals

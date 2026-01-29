@@ -1,8 +1,12 @@
 //! Control flow statement lowering: if/else, loops (while/for/do-while),
 //! break/continue, goto (direct and computed), and labels.
 
-use crate::frontend::parser::ast::*;
-use crate::ir::ir::*;
+use crate::frontend::parser::ast::{
+    Expr,
+    ForInit,
+    Stmt,
+};
+use crate::ir::ir::{BlockId, Instruction, Terminator};
 use super::lowering::Lowerer;
 
 impl Lowerer {

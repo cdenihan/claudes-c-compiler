@@ -1,5 +1,11 @@
-use crate::frontend::parser::ast::*;
-use crate::ir::ir::*;
+use crate::frontend::parser::ast::{Expr, TypeSpecifier, UnaryOp};
+use crate::ir::ir::{
+    Instruction,
+    IrBinOp,
+    IrConst,
+    Operand,
+    Value,
+};
 use crate::common::types::{AddressSpace, IrType, CType};
 use super::lowering::Lowerer;
 use super::definitions::LValue;

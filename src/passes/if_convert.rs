@@ -33,7 +33,15 @@
 //! or memory operations). This ensures the Select semantics (evaluate both
 //! operands) match the original branch semantics.
 
-use crate::ir::ir::*;
+use crate::ir::ir::{
+    BasicBlock,
+    BlockId,
+    Instruction,
+    IrFunction,
+    Operand,
+    Terminator,
+    Value,
+};
 use crate::ir::analysis;
 use crate::common::types::IrType;
 use crate::common::fx_hash::FxHashMap;

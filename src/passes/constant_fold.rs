@@ -4,7 +4,17 @@
 //! replacing the instruction with the computed constant. This eliminates
 //! redundant computation and enables further optimizations (DCE, etc.).
 
-use crate::ir::ir::*;
+use crate::ir::ir::{
+    Instruction,
+    IrBinOp,
+    IrCmpOp,
+    IrConst,
+    IrFunction,
+    IrModule,
+    IrUnaryOp,
+    Operand,
+    Value,
+};
 use crate::common::types::IrType;
 
 /// Run constant folding on the entire module.

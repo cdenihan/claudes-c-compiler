@@ -11,7 +11,7 @@
 //! emit_load_operand path that assumes values fit in a single register.
 
 use crate::backend::traits::ArchCodegen;
-use crate::ir::ir::*;
+use crate::ir::ir::{Operand, Value};
 use crate::common::types::IrType;
 use crate::emit;
 use super::codegen::I686Codegen;

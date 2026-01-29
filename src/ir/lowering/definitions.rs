@@ -6,7 +6,13 @@
 //! metadata, and typedef helpers.
 
 use crate::common::fx_hash::FxHashMap;
-use crate::ir::ir::*;
+use crate::ir::ir::{
+    BlockId,
+    GlobalInit,
+    IrConst,
+    IrParam,
+    Value,
+};
 use crate::common::types::{AddressSpace, IrType, RcLayout, CType};
 
 /// Type metadata shared between local and global variables.

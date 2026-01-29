@@ -26,7 +26,13 @@
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::analysis;
-use crate::ir::ir::*;
+use crate::ir::ir::{
+    Instruction,
+    IrFunction,
+    Operand,
+    Terminator,
+    Value,
+};
 use super::loop_analysis::{self, NaturalLoop};
 
 /// Run LICM using pre-computed CFG analysis (avoids redundant analysis when

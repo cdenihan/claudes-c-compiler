@@ -14,8 +14,18 @@
 //! The main entry point is `emit_struct_init`, which dispatches to per-field-type
 //! helpers to keep each case manageable.
 
-use crate::frontend::parser::ast::*;
-use crate::ir::ir::*;
+use crate::frontend::parser::ast::{
+    Designator,
+    Expr,
+    Initializer,
+    InitializerItem,
+};
+use crate::ir::ir::{
+    Instruction,
+    IrConst,
+    Operand,
+    Value,
+};
 use crate::common::types::{AddressSpace, IrType, CType, StructLayout, StructFieldLayout, InitFieldResolution};
 use super::lowering::Lowerer;
 

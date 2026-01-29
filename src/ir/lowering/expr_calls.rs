@@ -7,8 +7,16 @@
 //! - `classify_struct_return`: shared sret/two-reg classification logic
 //! - Helpers: maybe_narrow_call_result, is_function_variadic, get_func_ptr_return_ir_type
 
-use crate::frontend::parser::ast::*;
-use crate::ir::ir::*;
+use crate::frontend::parser::ast::Expr;
+use crate::ir::ir::{
+    CallInfo,
+    Instruction,
+    IrBinOp,
+    IrConst,
+    Operand,
+    Terminator,
+    Value,
+};
 use crate::common::types::{AddressSpace, IrType, CType, target_int_ir_type};
 use super::lowering::Lowerer;
 

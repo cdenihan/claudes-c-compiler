@@ -11,8 +11,26 @@
 //! Also handles VLA parameter stride computation and dimension collection.
 
 use crate::common::fx_hash::FxHashMap;
-use crate::frontend::parser::ast::*;
-use crate::ir::ir::*;
+use crate::frontend::parser::ast::{
+    BlockItem,
+    CompoundStmt,
+    Expr,
+    ForInit,
+    FunctionDef,
+    ParamDecl,
+    Stmt,
+    TypeSpecifier,
+};
+use crate::ir::ir::{
+    Instruction,
+    IrBinOp,
+    IrConst,
+    IrFunction,
+    IrParam,
+    Operand,
+    Terminator,
+    Value,
+};
 use crate::common::types::{AddressSpace, IrType, CType};
 use super::lowering::Lowerer;
 use super::definitions::{LocalInfo, VarInfo, FuncSig, IrParamBuildResult, ParamKind, VlaDimInfo};

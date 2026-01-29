@@ -25,7 +25,12 @@
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
-use crate::ir::ir::*;
+use crate::ir::ir::{
+    Instruction,
+    IrConst,
+    IrFunction,
+    Operand,
+};
 use super::liveness::{LiveInterval, LivenessResult, compute_live_intervals, for_each_operand_in_instruction, for_each_operand_in_terminator};
 
 /// A physical register assignment.

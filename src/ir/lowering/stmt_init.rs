@@ -4,8 +4,23 @@
 //! lowering `Initializer::Expr` and `Initializer::List` for local variable
 //! declarations, plus helpers for registering block-scope function declarations.
 
-use crate::frontend::parser::ast::*;
-use crate::ir::ir::*;
+use crate::frontend::parser::ast::{
+    Declaration,
+    DerivedDeclarator,
+    Designator,
+    Expr,
+    InitDeclarator,
+    Initializer,
+    InitializerItem,
+    ParamDecl,
+    TypeSpecifier,
+};
+use crate::ir::ir::{
+    Instruction,
+    IrConst,
+    Operand,
+    Value,
+};
 use crate::common::types::{AddressSpace, IrType, CType};
 use super::lowering::Lowerer;
 use super::definitions::{GlobalInfo, DeclAnalysis, FuncSig};

@@ -14,7 +14,7 @@
 //! - f128_load_sources tracks which alloca/offset each F128 value was loaded
 //!   from, enabling full-precision reloads for comparisons and casts.
 
-use crate::ir::ir::*;
+use crate::ir::ir::{Operand, Value};
 use crate::backend::state::{StackSlot, SlotAddr};
 use crate::backend::traits::ArchCodegen;
 use crate::backend::f128_softfloat::F128SoftFloat;

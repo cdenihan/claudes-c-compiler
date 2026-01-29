@@ -5,8 +5,16 @@
 //! __builtin_isinf_sign. Uses bit manipulation for F32/F64 and
 //! delegates to libc for F128 (long double).
 
-use crate::frontend::parser::ast::*;
-use crate::ir::ir::*;
+use crate::frontend::parser::ast::{Expr};
+use crate::ir::ir::{
+    CallInfo,
+    Instruction,
+    IrBinOp,
+    IrCmpOp,
+    IrConst,
+    Operand,
+    Value,
+};
 use crate::common::types::{AddressSpace, IrType};
 use super::lowering::Lowerer;
 

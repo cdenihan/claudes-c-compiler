@@ -17,7 +17,19 @@ use crate::backend::generation::{is_i128_type, calculate_stack_space_common,
                                   find_param_alloca, collect_inline_asm_callee_saved};
 use crate::backend::call_abi;
 use crate::backend::call_emit::{ParamClass, classify_params};
-use crate::ir::ir::*;
+use crate::ir::ir::{
+    AtomicOrdering,
+    AtomicRmwOp,
+    BlockId,
+    IntrinsicOp,
+    IrBinOp,
+    IrCmpOp,
+    IrConst,
+    IrFunction,
+    IrUnaryOp,
+    Operand,
+    Value,
+};
 use crate::common::types::{AddressSpace, IrType};
 use crate::common::fx_hash::FxHashMap;
 use crate::{emit};

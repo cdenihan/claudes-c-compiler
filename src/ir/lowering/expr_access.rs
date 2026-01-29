@@ -4,8 +4,27 @@
 //!
 //! Extracted from expr.rs to keep expression lowering manageable.
 
-use crate::frontend::parser::ast::*;
-use crate::ir::ir::*;
+use crate::frontend::parser::ast::{
+    BlockItem,
+    CompoundStmt,
+    Designator,
+    Expr,
+    GenericAssociation,
+    Initializer,
+    InitializerItem,
+    SizeofArg,
+    Stmt,
+    TypeSpecifier,
+};
+use crate::ir::ir::{
+    Instruction,
+    IrBinOp,
+    IrCmpOp,
+    IrConst,
+    Operand,
+    Terminator,
+    Value,
+};
 use crate::common::types::{AddressSpace, IrType, CType};
 use super::lowering::Lowerer;
 

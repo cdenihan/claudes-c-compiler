@@ -4,7 +4,13 @@
 //! extracted from expr_types.rs for maintainability. Includes sizeof_expr, alignof_expr,
 //! preferred_alignof_expr, and their helper functions.
 
-use crate::frontend::parser::ast::*;
+use crate::frontend::parser::ast::{
+    BinOp,
+    Expr,
+    Initializer,
+    TypeSpecifier,
+    UnaryOp,
+};
 use crate::common::types::CType;
 use super::lowering::Lowerer;
 

@@ -10,7 +10,19 @@
 //! the shared framework express the algorithm once while backends only provide the
 //! instruction-level differences.
 
-use crate::ir::ir::*;
+use crate::ir::ir::{
+    AtomicOrdering,
+    AtomicRmwOp,
+    BlockId,
+    IntrinsicOp,
+    IrBinOp,
+    IrCmpOp,
+    IrConst,
+    IrFunction,
+    IrUnaryOp,
+    Operand,
+    Value,
+};
 use crate::common::types::{AddressSpace, IrType};
 use super::common::PtrDirective;
 use super::regalloc::PhysReg;

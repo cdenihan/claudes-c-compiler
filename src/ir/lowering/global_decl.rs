@@ -6,8 +6,14 @@
 //!   computing type properties, array/pointer info, struct layout, etc.
 //! - `fixup_unsized_array`: resolves unsized array declarations from initializer size.
 
-use crate::frontend::parser::ast::*;
-use crate::ir::ir::*;
+use crate::frontend::parser::ast::{
+    Declaration,
+    DerivedDeclarator,
+    Expr,
+    Initializer,
+    TypeSpecifier,
+};
+use crate::ir::ir::{GlobalInit, IrGlobal};
 use crate::common::types::{IrType, CType};
 use super::lowering::Lowerer;
 use super::definitions::{GlobalInfo, DeclAnalysis};

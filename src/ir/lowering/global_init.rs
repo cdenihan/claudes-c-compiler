@@ -12,8 +12,15 @@
 //! The top-level entry point `lower_global_init` dispatches to focused helpers
 //! for each initializer category, keeping each function short and readable.
 
-use crate::frontend::parser::ast::*;
-use crate::ir::ir::*;
+use crate::frontend::parser::ast::{
+    BinOp,
+    Designator,
+    Expr,
+    Initializer,
+    InitializerItem,
+    TypeSpecifier,
+};
+use crate::ir::ir::{GlobalInit, IrConst, IrGlobal};
 
 /// Kind of string literal for extract_string_literal helper.
 enum StringLitKind {

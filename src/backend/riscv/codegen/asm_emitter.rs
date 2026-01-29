@@ -1,7 +1,12 @@
 //! RISC-V InlineAsmEmitter implementation: constraint classification, scratch
 //! register allocation, operand loading/storing, and template substitution.
 
-use crate::ir::ir::*;
+use crate::ir::ir::{
+    BlockId,
+    IrConst,
+    Operand,
+    Value,
+};
 use crate::common::types::IrType;
 use crate::backend::state::CodegenState;
 use crate::backend::inline_asm::{InlineAsmEmitter, AsmOperandKind, AsmOperand};

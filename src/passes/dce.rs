@@ -12,7 +12,10 @@
 //! for removal), giving O(n) complexity instead of O(n*k) where k is the
 //! maximum dead chain length.
 
-use crate::ir::ir::*;
+use crate::ir::ir::{
+    Instruction,
+    IrFunction,
+};
 
 /// Eliminate dead code in a single function using use-count-based worklist DCE.
 ///

@@ -7,8 +7,14 @@
 //! - Bitfield helpers: resolve_bitfield_lvalue, store_bitfield, extract_bitfield
 //! - Arithmetic conversion helpers: usual_arithmetic_conversions, promote_for_op, narrow_from_op
 
-use crate::frontend::parser::ast::*;
-use crate::ir::ir::*;
+use crate::frontend::parser::ast::{BinOp, Expr};
+use crate::ir::ir::{
+    Instruction,
+    IrBinOp,
+    IrConst,
+    Operand,
+    Value,
+};
 use crate::common::types::{AddressSpace, CType, IrType, widened_op_type};
 use super::lowering::Lowerer;
 

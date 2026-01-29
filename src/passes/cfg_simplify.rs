@@ -14,7 +14,16 @@
 //! Phi nodes in successor blocks are updated when edges are redirected.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::ir::ir::*;
+use crate::ir::ir::{
+    BasicBlock,
+    BlockId,
+    Instruction,
+    IrConst,
+    IrFunction,
+    Operand,
+    Terminator,
+    Value,
+};
 
 /// Maximum depth for resolving transitive jump chains (A→B→C→...),
 /// to prevent pathological cases.

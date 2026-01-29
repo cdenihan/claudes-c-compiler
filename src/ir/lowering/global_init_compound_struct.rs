@@ -8,8 +8,13 @@
 //! - Sub-struct compound vs byte-level selection
 //! - Nested compound flattening and bytes+ptrs merging
 
-use crate::frontend::parser::ast::*;
-use crate::ir::ir::*;
+use crate::frontend::parser::ast::{
+    Designator,
+    Expr,
+    Initializer,
+    InitializerItem,
+};
+use crate::ir::ir::{GlobalInit, IrConst};
 use crate::common::types::{IrType, StructLayout, CType, InitFieldResolution};
 use super::lowering::Lowerer;
 use super::global_init_helpers as h;

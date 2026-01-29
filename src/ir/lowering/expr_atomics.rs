@@ -9,8 +9,18 @@
 //! - lock operations, fences, lock-free queries
 //! - Helper: parse_ordering, emit_post_rmw_compute, emit_atomic_xchg, etc.
 
-use crate::frontend::parser::ast::*;
-use crate::ir::ir::*;
+use crate::frontend::parser::ast::Expr;
+use crate::ir::ir::{
+    AtomicOrdering,
+    AtomicRmwOp,
+    Instruction,
+    IrBinOp,
+    IrCmpOp,
+    IrConst,
+    IrUnaryOp,
+    Operand,
+    Value,
+};
 use crate::common::types::{AddressSpace, IrType};
 use super::lowering::Lowerer;
 

@@ -19,7 +19,14 @@
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
-use crate::ir::ir::*;
+use crate::ir::ir::{
+    Instruction,
+    IrConst,
+    IrFunction,
+    Operand,
+    Terminator,
+    Value,
+};
 
 /// A live interval for an IR value: [start, end] in program point numbering.
 /// start = the point where the value is defined

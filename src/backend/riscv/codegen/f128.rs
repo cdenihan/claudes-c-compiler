@@ -8,7 +8,7 @@
 //! mnemonics, S0-relative addressing). The shared orchestration logic lives
 //! in `backend/f128_softfloat.rs`.
 
-use crate::ir::ir::*;
+use crate::ir::ir::{Operand, Value};
 use crate::backend::state::{StackSlot, SlotAddr};
 use crate::backend::traits::ArchCodegen;
 use crate::backend::f128_softfloat::F128SoftFloat;

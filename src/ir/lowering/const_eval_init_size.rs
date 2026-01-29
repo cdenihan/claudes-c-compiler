@@ -7,7 +7,12 @@
 //! - Flat initialization of struct arrays (field-by-field without braces)
 //! - String literal special cases that consume entire char array fields
 
-use crate::frontend::parser::ast::*;
+use crate::frontend::parser::ast::{
+    Designator,
+    Expr,
+    Initializer,
+    InitializerItem,
+};
 use crate::common::types::{CType, IrType, StructLayout};
 use super::lowering::Lowerer;
 

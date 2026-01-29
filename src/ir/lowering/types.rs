@@ -5,7 +5,12 @@
 //! TypeConvertContext trait impl live in types_ctype.rs.
 
 use std::rc::Rc;
-use crate::frontend::parser::ast::*;
+use crate::frontend::parser::ast::{
+    DerivedDeclarator,
+    Expr,
+    StructFieldDecl,
+    TypeSpecifier,
+};
 use crate::common::types::{IrType, StructField, StructLayout, RcLayout, CType};
 use super::lowering::Lowerer;
 

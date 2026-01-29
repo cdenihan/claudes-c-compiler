@@ -6,7 +6,7 @@
 //! atomic exclusive access instructions (ldxr/stxr) and atomic RMW operations.
 
 use std::fmt::Write;
-use crate::ir::ir::*;
+use crate::ir::ir::{AtomicOrdering, AtomicRmwOp};
 use crate::common::types::IrType;
 use crate::backend::state::CodegenState;
 use super::codegen::ArmCodegen;

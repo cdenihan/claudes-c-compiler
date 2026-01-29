@@ -35,7 +35,14 @@
 //!   TODO: Support negative divisors via negation of the positive-divisor result.
 
 use crate::common::types::IrType;
-use crate::ir::ir::*;
+use crate::ir::ir::{
+    Instruction,
+    IrBinOp,
+    IrConst,
+    IrFunction,
+    Operand,
+    Value,
+};
 
 /// Transform division/modulo by constants in a single function.
 pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {

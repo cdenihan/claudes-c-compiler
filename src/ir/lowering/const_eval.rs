@@ -9,8 +9,15 @@
 //! binary operation arithmetic) lives in `common::const_eval` and `common::const_arith`,
 //! called by both this module and `sema::const_eval`.
 
-use crate::frontend::parser::ast::*;
-use crate::ir::ir::*;
+use crate::frontend::parser::ast::{
+    BinOp,
+    Expr,
+    Initializer,
+    SizeofArg,
+    TypeSpecifier,
+    UnaryOp,
+};
+use crate::ir::ir::{GlobalInit, IrConst};
 use crate::common::types::{CType, IrType};
 use crate::common::const_arith;
 use crate::common::const_eval as shared_const_eval;

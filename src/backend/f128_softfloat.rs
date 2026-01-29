@@ -18,7 +18,12 @@
 //! ~350 lines of structural duplication between `arm/codegen/f128.rs` and
 //! `riscv/codegen/f128.rs`.
 
-use crate::ir::ir::*;
+use crate::ir::ir::{
+    IrCmpOp,
+    IrConst,
+    Operand,
+    Value,
+};
 use crate::backend::state::{StackSlot, SlotAddr};
 
 /// Arch-specific primitives for F128 soft-float operations.

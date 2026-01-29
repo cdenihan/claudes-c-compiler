@@ -36,7 +36,16 @@
 //! the phi copies and branches unconditionally to the target.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::ir::ir::*;
+use crate::ir::ir::{
+    BasicBlock,
+    BlockId,
+    Instruction,
+    IrFunction,
+    IrModule,
+    Operand,
+    Terminator,
+    Value,
+};
 
 /// Eliminate all phi nodes in the module by lowering them to copies.
 pub fn eliminate_phis(module: &mut IrModule) {

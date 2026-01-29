@@ -4,8 +4,14 @@
 //! match arm was 194 lines handling sret, two-register returns, complex returns,
 //! and scalar-to-complex conversions. This module breaks that into focused helpers.
 
-use crate::frontend::parser::ast::*;
-use crate::ir::ir::*;
+use crate::frontend::parser::ast::{BinOp, Expr};
+use crate::ir::ir::{
+    Instruction,
+    IrBinOp,
+    IrConst,
+    Operand,
+    Value,
+};
 use crate::common::types::{AddressSpace, IrType, CType};
 use super::lowering::Lowerer;
 

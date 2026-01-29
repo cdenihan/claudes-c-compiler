@@ -2,7 +2,7 @@
 //! (128-bit bitwise, byte compare, saturating subtract, pmovmskb) using scalar
 //! RISC-V instructions, plus hardware intrinsics (fences, CRC32, sqrt, fabs).
 
-use crate::ir::ir::*;
+use crate::ir::ir::{IntrinsicOp, Operand, Value};
 use super::codegen::RiscvCodegen;
 
 impl RiscvCodegen {

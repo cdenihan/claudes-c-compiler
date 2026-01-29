@@ -17,9 +17,29 @@ use std::mem::Discriminant;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::error::DiagnosticEngine;
 use crate::common::source::Span;
-use crate::frontend::parser::ast::*;
+use crate::frontend::parser::ast::{
+    DerivedDeclarator,
+    Expr,
+    ExprId,
+    ExternalDecl,
+    ParamDecl,
+    TranslationUnit,
+    TypeSpecifier,
+};
 use crate::frontend::sema::{FunctionInfo, ExprTypeMap, ConstMap};
-use crate::ir::ir::*;
+use crate::ir::ir::{
+    BasicBlock,
+    BlockId,
+    CallInfo,
+    Instruction,
+    IrBinOp,
+    IrCmpOp,
+    IrConst,
+    IrModule,
+    Operand,
+    Terminator,
+    Value,
+};
 use crate::common::types::{AddressSpace, IrType, CType};
 use crate::backend::Target;
 use super::definitions::*;
