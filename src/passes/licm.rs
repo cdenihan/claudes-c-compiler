@@ -29,24 +29,6 @@ use crate::ir::analysis;
 use crate::ir::ir::*;
 use super::loop_analysis::{self, NaturalLoop};
 
-/// Run LICM on the entire module.
-/// Returns the number of instructions hoisted.
-pub fn run(module: &mut IrModule) -> usize {
-    module.for_each_function(licm_function)
-}
-
-/// Run LICM on a single function.
-pub(crate) fn licm_function(func: &mut IrFunction) -> usize {
-    let num_blocks = func.blocks.len();
-    if num_blocks < 2 {
-        return 0; // Need at least 2 blocks for a loop
-    }
-
-    // Build CFG and dominator tree
-    let cfg = analysis::CfgAnalysis::build(func);
-    licm_with_analysis(func, &cfg)
-}
-
 /// Run LICM using pre-computed CFG analysis (avoids redundant analysis when
 /// called from a pipeline that shares analysis across GVN, LICM, IVSR).
 pub(crate) fn licm_with_analysis(func: &mut IrFunction, cfg: &analysis::CfgAnalysis) -> usize {

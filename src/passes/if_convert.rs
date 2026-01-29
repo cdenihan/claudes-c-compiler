@@ -38,12 +38,6 @@ use crate::ir::analysis;
 use crate::common::types::IrType;
 use crate::common::fx_hash::FxHashMap;
 
-/// Run if-conversion on the entire module.
-/// Returns the number of diamonds converted.
-pub fn run(module: &mut IrModule) -> usize {
-    module.for_each_function(if_convert_function)
-}
-
 /// Run if-conversion on a single function.
 pub(crate) fn if_convert_function(func: &mut IrFunction) -> usize {
     let num_blocks = func.blocks.len();

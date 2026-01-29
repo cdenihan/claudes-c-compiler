@@ -37,12 +37,6 @@
 use crate::common::types::IrType;
 use crate::ir::ir::*;
 
-/// Run division-by-constant strength reduction on the module.
-/// Returns the number of instructions transformed.
-pub fn run(module: &mut IrModule) -> usize {
-    module.for_each_function(div_by_const_function)
-}
-
 /// Transform division/modulo by constants in a single function.
 pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
     let mut changes = 0;

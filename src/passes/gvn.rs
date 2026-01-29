@@ -264,12 +264,6 @@ struct ScopeCheckpoint {
     saved_load_generation: u32,
 }
 
-/// Run dominator-based GVN on the entire module.
-/// Returns the number of instructions eliminated.
-pub fn run(module: &mut IrModule) -> usize {
-    module.for_each_function(run_gvn_function)
-}
-
 /// Run dominator-based GVN on a single function.
 pub(crate) fn run_gvn_function(func: &mut IrFunction) -> usize {
     let num_blocks = func.blocks.len();
@@ -551,7 +545,7 @@ mod tests {
             char16_string_literals: vec![],
         };
 
-        let eliminated = run(&mut module);
+        let eliminated = module.for_each_function(run_gvn_function);
         assert_eq!(eliminated, 1);
 
         // Second instruction should be a Copy
@@ -624,7 +618,7 @@ mod tests {
             char16_string_literals: vec![],
         };
 
-        let eliminated = run(&mut module);
+        let eliminated = module.for_each_function(run_gvn_function);
         assert_eq!(eliminated, 0);
     }
 
@@ -688,7 +682,7 @@ mod tests {
             char16_string_literals: vec![],
         };
 
-        let eliminated = run(&mut module);
+        let eliminated = module.for_each_function(run_gvn_function);
         assert_eq!(eliminated, 1);
     }
 
@@ -758,7 +752,7 @@ mod tests {
             char16_string_literals: vec![],
         };
 
-        let eliminated = run(&mut module);
+        let eliminated = module.for_each_function(run_gvn_function);
         assert_eq!(eliminated, 1);
 
         match &module.functions[0].blocks[0].instructions[1] {
@@ -828,7 +822,7 @@ mod tests {
             char16_string_literals: vec![],
         };
 
-        let eliminated = run(&mut module);
+        let eliminated = module.for_each_function(run_gvn_function);
         assert_eq!(eliminated, 1);
     }
 
@@ -903,7 +897,7 @@ mod tests {
             char16_string_literals: vec![],
         };
 
-        let eliminated = run(&mut module);
+        let eliminated = module.for_each_function(run_gvn_function);
         assert_eq!(eliminated, 1);
 
         // The expression in block1 should be replaced with a Copy
@@ -1007,7 +1001,7 @@ mod tests {
             char16_string_literals: vec![],
         };
 
-        let eliminated = run(&mut module);
+        let eliminated = module.for_each_function(run_gvn_function);
         // Neither branch dominates the other, so NO CSE should happen
         assert_eq!(eliminated, 0);
 
@@ -1088,7 +1082,7 @@ mod tests {
         }], 3);
 
         let mut module = make_module(func);
-        let eliminated = run(&mut module);
+        let eliminated = module.for_each_function(run_gvn_function);
         assert_eq!(eliminated, 1);
 
         // Second load should be replaced with Copy
@@ -1131,7 +1125,7 @@ mod tests {
         }], 3);
 
         let mut module = make_module(func);
-        let eliminated = run(&mut module);
+        let eliminated = module.for_each_function(run_gvn_function);
         assert_eq!(eliminated, 0); // No CSE: store invalidates the load
     }
 
@@ -1174,7 +1168,7 @@ mod tests {
         }], 4);
 
         let mut module = make_module(func);
-        let eliminated = run(&mut module);
+        let eliminated = module.for_each_function(run_gvn_function);
         assert_eq!(eliminated, 0); // No CSE: call may modify memory
     }
 
@@ -1212,7 +1206,7 @@ mod tests {
         ], 3);
 
         let mut module = make_module(func);
-        let eliminated = run(&mut module);
+        let eliminated = module.for_each_function(run_gvn_function);
         assert_eq!(eliminated, 1);
 
         match &module.functions[0].blocks[1].instructions[0] {
@@ -1285,7 +1279,7 @@ mod tests {
         ], 4);
 
         let mut module = make_module(func);
-        let eliminated = run(&mut module);
+        let eliminated = module.for_each_function(run_gvn_function);
         // Load in block3 should NOT be CSE'd because block3 is a merge point
         // and block1 (a predecessor) stores to memory.
         assert_eq!(eliminated, 0);

@@ -14,12 +14,6 @@
 
 use crate::ir::ir::*;
 
-/// Run dead code elimination on the entire module.
-/// Returns the number of instructions removed.
-pub fn run(module: &mut IrModule) -> usize {
-    module.for_each_function(eliminate_dead_code)
-}
-
 /// Eliminate dead code in a single function using use-count-based worklist DCE.
 ///
 /// Algorithm:

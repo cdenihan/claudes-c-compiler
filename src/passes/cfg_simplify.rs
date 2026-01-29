@@ -31,12 +31,6 @@ const MAX_GLOBAL_RESOLVE_DEPTH: usize = 16;
 // Public entry points
 // ---------------------------------------------------------------------------
 
-/// Run CFG simplification on the entire module.
-/// Returns the number of simplifications made.
-pub fn run(module: &mut IrModule) -> usize {
-    module.for_each_function(simplify_cfg)
-}
-
 /// Per-function entry point for dirty-tracking pipeline.
 pub(crate) fn run_function(func: &mut IrFunction) -> usize {
     simplify_cfg(func)

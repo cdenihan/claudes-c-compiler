@@ -27,12 +27,6 @@
 use crate::ir::ir::*;
 use crate::common::types::IrType;
 
-/// Run integer narrowing on the entire module.
-/// Returns the number of instructions narrowed.
-pub fn run(module: &mut IrModule) -> usize {
-    module.for_each_function(narrow_function)
-}
-
 /// Information about a Cast instruction (widening).
 #[derive(Clone)]
 struct CastInfo {

@@ -36,12 +36,6 @@ const MAX_IV_STRIDE: i64 = 1024;
 /// malformed IR with cycles.
 const MAX_CAST_CHAIN_LENGTH: usize = 10;
 
-/// Run IVSR on the entire module.
-/// Returns the number of strength reductions applied.
-pub fn run(module: &mut IrModule) -> usize {
-    module.for_each_function(ivsr_function)
-}
-
 /// A basic induction variable: %iv = phi(init, %iv_next) where %iv_next = %iv + step.
 struct BasicIV {
     /// The Phi destination value
