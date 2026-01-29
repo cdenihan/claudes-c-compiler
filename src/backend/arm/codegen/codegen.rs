@@ -1222,9 +1222,30 @@ impl ArmCodegen {
                 }
             }
         } else {
-            self.operand_to_x0(arg);
-            if dest != "x0" {
-                self.state.emit_fmt(format_args!("    mov {}, x0", dest));
+            // For Value operands, load directly into dest to avoid clobbering x0.
+            // The operand_to_x0 path unconditionally uses x0 as scratch, which
+            // can destroy previously-loaded argument registers (e.g., when struct
+            // arguments are reordered in a call like check(y, x)).
+            match arg {
+                Operand::Value(v) => {
+                    if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                        self.state.emit_fmt(format_args!("    mov {}, {}", dest, callee_saved_name(reg)));
+                    } else if let Some(slot) = self.state.get_slot(v.0) {
+                        if self.state.is_alloca(v.0) {
+                            self.emit_add_sp_offset(dest, slot.0);
+                        } else {
+                            self.emit_load_from_sp(dest, slot.0, "ldr");
+                        }
+                    } else {
+                        self.state.emit_fmt(format_args!("    mov {}, #0", dest));
+                    }
+                }
+                Operand::Const(_) => {
+                    self.operand_to_x0(arg);
+                    if dest != "x0" {
+                        self.state.emit_fmt(format_args!("    mov {}, x0", dest));
+                    }
+                }
             }
         }
     }

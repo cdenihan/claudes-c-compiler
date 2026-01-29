@@ -35,6 +35,43 @@ impl ArmCodegen {
         self.state.emit("    str q0, [x0]");
     }
 
+    /// Store a scalar result from x0 (or w0) into the dest stack slot.
+    fn store_scalar_dest(&mut self, dest: &Option<Value>, reg: &str) {
+        if let Some(d) = dest {
+            if let Some(slot) = self.state.get_slot(d.0) {
+                self.emit_store_to_sp(reg, slot.0, "str");
+            }
+        }
+    }
+
+    /// Emit a unary F64 operation: fmov to d0, apply `op_inst`, fmov back, store result.
+    fn emit_f64_unary_neon(&mut self, dest: &Option<Value>, args: &[Operand], op_inst: &str) {
+        self.operand_to_x0(&args[0]);
+        self.state.emit("    fmov d0, x0");
+        self.state.emit_fmt(format_args!("    {} d0, d0", op_inst));
+        self.state.emit("    fmov x0, d0");
+        self.store_scalar_dest(dest, "x0");
+    }
+
+    /// Emit a unary F32 operation: fmov to s0, apply `op_inst`, fmov back, store result.
+    fn emit_f32_unary_neon(&mut self, dest: &Option<Value>, args: &[Operand], op_inst: &str) {
+        self.operand_to_x0(&args[0]);
+        self.state.emit("    fmov s0, w0");
+        self.state.emit_fmt(format_args!("    {} s0, s0", op_inst));
+        self.state.emit("    fmov w0, s0");
+        self.store_scalar_dest(dest, "w0");
+    }
+
+    /// Emit a non-temporal store: load value from args[0], store to dest_ptr.
+    fn emit_nontemporal_store(&mut self, dest_ptr: &Option<Value>, args: &[Operand], save_reg: &str, val_reg: &str) {
+        if let Some(ptr) = dest_ptr {
+            self.operand_to_x0(&args[0]);
+            self.state.emit_fmt(format_args!("    mov {}, {}", save_reg, val_reg));
+            self.load_ptr_to_reg(ptr, "x0");
+            self.state.emit_fmt(format_args!("    str {}, [x0]", save_reg));
+        }
+    }
+
     pub(super) fn emit_intrinsic_arm(&mut self, dest: &Option<Value>, op: &IntrinsicOp, dest_ptr: &Option<Value>, args: &[Operand]) {
         match op {
             IntrinsicOp::Lfence | IntrinsicOp::Mfence => {
@@ -52,22 +89,10 @@ impl ArmCodegen {
                 self.state.emit("    dc civac, x0");
             }
             IntrinsicOp::Movnti => {
-                // Non-temporal 32-bit store: dest_ptr = target address, args[0] = value
-                if let Some(ptr) = dest_ptr {
-                    self.operand_to_x0(&args[0]);
-                    self.state.emit("    mov w9, w0");
-                    self.load_ptr_to_reg(ptr, "x0");
-                    self.state.emit("    str w9, [x0]");
-                }
+                self.emit_nontemporal_store(dest_ptr, args, "w9", "w0");
             }
             IntrinsicOp::Movnti64 => {
-                // Non-temporal 64-bit store
-                if let Some(ptr) = dest_ptr {
-                    self.operand_to_x0(&args[0]);
-                    self.state.emit("    mov x9, x0");
-                    self.load_ptr_to_reg(ptr, "x0");
-                    self.state.emit("    str x9, [x0]");
-                }
+                self.emit_nontemporal_store(dest_ptr, args, "x9", "x0");
             }
             IntrinsicOp::Movntdq | IntrinsicOp::Movntpd => {
                 // Non-temporal 128-bit store: dest_ptr = target, args[0] = source ptr
@@ -98,7 +123,6 @@ impl ArmCodegen {
             }
             IntrinsicOp::Pcmpeqb128 => {
                 if let Some(dptr) = dest_ptr {
-                    // cmeq compares and sets all bits in each lane on equality
                     self.emit_neon_binary_128(dptr, args, "cmeq");
                 }
             }
@@ -143,45 +167,29 @@ impl ArmCodegen {
                 // Extract the high bit of each byte in a 128-bit vector into a 16-bit mask.
                 // NEON has no pmovmskb equivalent, so we use a multi-step sequence:
                 //   1. Load 128-bit data into v0
-                //   2. Shift right each byte by 7 to isolate the sign bit (ushr v0.16b, v0.16b, #7)
-                //   3. Collect bits using successive narrowing and shifts
-                // Efficient approach: multiply by power-of-2 bit positions, then add across lanes.
+                //   2. Shift right each byte by 7 to isolate the sign bit
+                //   3. Multiply by power-of-2 bit positions, then add across lanes
                 self.operand_to_x0(&args[0]);
                 self.state.emit("    ldr q0, [x0]");
-                // Shift right by 7 to get 0 or 1 in each byte lane
                 self.state.emit("    ushr v0.16b, v0.16b, #7");
-                // Load the bit position constants: [1,2,4,8,16,32,64,128, 1,2,4,8,16,32,64,128]
-                // 0x8040201008040201 loaded via movz/movk sequence
+                // Load bit position constants: [1,2,4,8,16,32,64,128] repeated
                 self.state.emit("    movz x0, #0x0201");
                 self.state.emit("    movk x0, #0x0804, lsl #16");
                 self.state.emit("    movk x0, #0x2010, lsl #32");
                 self.state.emit("    movk x0, #0x8040, lsl #48");
                 self.state.emit("    fmov d1, x0");
                 self.state.emit("    mov v1.d[1], x0");
-                // Multiply each byte: v0[i] * v1[i] gives the bit contribution
                 self.state.emit("    mul v0.16b, v0.16b, v1.16b");
-                // Now sum bytes 0-7 into low byte, and bytes 8-15 into high byte
-                // addv sums all lanes into a scalar - but we need two separate sums
-                // Use ext to split, then addv each half
+                // Split and sum each half
                 self.state.emit("    ext v1.16b, v0.16b, v0.16b, #8");
-                // v0 has low 8 bytes, v1 has high 8 bytes (shifted)
-                // Sum low 8 bytes
                 self.state.emit("    addv b0, v0.8b");
                 self.state.emit("    umov w0, v0.b[0]");
-                // Sum high 8 bytes
                 self.state.emit("    addv b1, v1.8b");
                 self.state.emit("    umov w1, v1.b[0]");
-                // Combine: result = low_sum | (high_sum << 8)
                 self.state.emit("    orr w0, w0, w1, lsl #8");
-                // Store scalar result
-                if let Some(d) = dest {
-                    if let Some(slot) = self.state.get_slot(d.0) {
-                        self.emit_store_to_sp("x0", slot.0, "str");
-                    }
-                }
+                self.store_scalar_dest(dest, "x0");
             }
             IntrinsicOp::SetEpi8 => {
-                // Splat a byte value to all 16 bytes: args[0] = byte value
                 if let Some(dptr) = dest_ptr {
                     self.operand_to_x0(&args[0]);
                     self.state.emit("    dup v0.16b, w0");
@@ -190,7 +198,6 @@ impl ArmCodegen {
                 }
             }
             IntrinsicOp::SetEpi32 => {
-                // Splat a 32-bit value to all 4 lanes: args[0] = 32-bit value
                 if let Some(dptr) = dest_ptr {
                     self.operand_to_x0(&args[0]);
                     self.state.emit("    dup v0.4s, w0");
@@ -206,82 +213,28 @@ impl ArmCodegen {
                     IntrinsicOp::Crc32_16 => ("w9", "crc32ch w9, w9, w0"),
                     IntrinsicOp::Crc32_32 => ("w9", "crc32cw w9, w9, w0"),
                     IntrinsicOp::Crc32_64 => ("x9", "crc32cx w9, w9, x0"),
-                    _ => unreachable!("CRC32 dispatch matched non-CRC32 op: {:?}", op),
+                    _ => unreachable!(),
                 };
                 self.operand_to_x0(&args[0]);
                 self.state.emit_fmt(format_args!("    mov {}, {}", save_reg, if is_64 { "x0" } else { "w0" }));
                 self.operand_to_x0(&args[1]);
                 self.state.emit_fmt(format_args!("    {}", crc_inst));
                 self.state.emit("    mov x0, x9");
-                if let Some(d) = dest {
-                    if let Some(slot) = self.state.get_slot(d.0) {
-                        self.emit_store_to_sp("x0", slot.0, "str");
-                    }
-                }
+                self.store_scalar_dest(dest, "x0");
             }
             IntrinsicOp::FrameAddress => {
-                // __builtin_frame_address(0): return current frame pointer (x29)
                 self.state.emit("    mov x0, x29");
-                if let Some(d) = dest {
-                    if let Some(slot) = self.state.get_slot(d.0) {
-                        self.emit_store_to_sp("x0", slot.0, "str");
-                    }
-                }
+                self.store_scalar_dest(dest, "x0");
             }
             IntrinsicOp::ReturnAddress => {
-                // __builtin_return_address(0): return address saved at [x29, #8]
                 // x30 (lr) is clobbered by bl instructions, so read from stack
                 self.state.emit("    ldr x0, [x29, #8]");
-                if let Some(d) = dest {
-                    if let Some(slot) = self.state.get_slot(d.0) {
-                        self.emit_store_to_sp("x0", slot.0, "str");
-                    }
-                }
+                self.store_scalar_dest(dest, "x0");
             }
-            IntrinsicOp::SqrtF64 => {
-                self.operand_to_x0(&args[0]);
-                self.state.emit("    fmov d0, x0");
-                self.state.emit("    fsqrt d0, d0");
-                self.state.emit("    fmov x0, d0");
-                if let Some(d) = dest {
-                    if let Some(slot) = self.state.get_slot(d.0) {
-                        self.emit_store_to_sp("x0", slot.0, "str");
-                    }
-                }
-            }
-            IntrinsicOp::SqrtF32 => {
-                self.operand_to_x0(&args[0]);
-                self.state.emit("    fmov s0, w0");
-                self.state.emit("    fsqrt s0, s0");
-                self.state.emit("    fmov w0, s0");
-                if let Some(d) = dest {
-                    if let Some(slot) = self.state.get_slot(d.0) {
-                        self.emit_store_to_sp("w0", slot.0, "str");
-                    }
-                }
-            }
-            IntrinsicOp::FabsF64 => {
-                self.operand_to_x0(&args[0]);
-                self.state.emit("    fmov d0, x0");
-                self.state.emit("    fabs d0, d0");
-                self.state.emit("    fmov x0, d0");
-                if let Some(d) = dest {
-                    if let Some(slot) = self.state.get_slot(d.0) {
-                        self.emit_store_to_sp("x0", slot.0, "str");
-                    }
-                }
-            }
-            IntrinsicOp::FabsF32 => {
-                self.operand_to_x0(&args[0]);
-                self.state.emit("    fmov s0, w0");
-                self.state.emit("    fabs s0, s0");
-                self.state.emit("    fmov w0, s0");
-                if let Some(d) = dest {
-                    if let Some(slot) = self.state.get_slot(d.0) {
-                        self.emit_store_to_sp("w0", slot.0, "str");
-                    }
-                }
-            }
+            IntrinsicOp::SqrtF64 => self.emit_f64_unary_neon(dest, args, "fsqrt"),
+            IntrinsicOp::SqrtF32 => self.emit_f32_unary_neon(dest, args, "fsqrt"),
+            IntrinsicOp::FabsF64 => self.emit_f64_unary_neon(dest, args, "fabs"),
+            IntrinsicOp::FabsF32 => self.emit_f32_unary_neon(dest, args, "fabs"),
             // x86-specific SSE/AES-NI/CLMUL intrinsics - these are x86-only and should
             // not appear in ARM codegen in practice. Cross-compiled code that conditionally
             // uses these behind #ifdef __x86_64__ will have the calls dead-code eliminated.
