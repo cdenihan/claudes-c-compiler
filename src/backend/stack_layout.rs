@@ -803,6 +803,29 @@ pub fn calculate_stack_space_common(
         copy_alias.retain(|dest_id, root_id| {
             !alloca_ids.contains(root_id) && !alloca_ids.contains(dest_id)
         });
+
+        // Remove copy aliases for values used as InlineAsm output pointers.
+        // InlineAsm Phase 4 reads output pointer values from stack slots AFTER
+        // the asm instruction executes. If an output pointer value is copy-aliased,
+        // it shares the root's stack slot. But the root's lifetime ends at the
+        // Copy instruction (before the InlineAsm), so the slot may be reused for
+        // another value (e.g., an input operand) between the Copy and the InlineAsm.
+        // Phase 4 then reads the corrupted slot, causing miscompilation.
+        // Breaking the alias forces the output pointer to get its own slot with
+        // a lifetime that correctly extends past the InlineAsm instruction.
+        let mut asm_output_ptrs: FxHashSet<u32> = FxHashSet::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::InlineAsm { outputs, .. } = inst {
+                    for (_, v, _) in outputs {
+                        asm_output_ptrs.insert(v.0);
+                    }
+                }
+            }
+        }
+        if !asm_output_ptrs.is_empty() {
+            copy_alias.retain(|dest_id, _| !asm_output_ptrs.contains(dest_id));
+        }
     }
 
     // ── Propagate copy-alias uses into use_blocks_map ─────────────────
@@ -1048,6 +1071,33 @@ pub fn calculate_stack_space_common(
                         last_use.insert(v.0, inst_idx);
                     }
                 });
+                // InlineAsm output pointer values are read from stack slots
+                // during Phase 4 (output stores) AFTER the asm instruction.
+                // Extend their last_use past the InlineAsm instruction so
+                // greedy coloring won't reuse their slots for values defined
+                // at or before the InlineAsm (e.g., other output pointers or
+                // input values loaded during Phase 2).
+                //
+                // When an output pointer is copy-aliased (v_out = Copy v_root),
+                // v_out shares v_root's stack slot. We must also extend v_root's
+                // last_use, otherwise greedy coloring may reuse v_root's slot
+                // for a value defined before the InlineAsm, corrupting the
+                // output pointer that Phase 4 reads.
+                if let Instruction::InlineAsm { outputs, .. } = inst {
+                    for (_, v, _) in outputs {
+                        let extended = inst_idx + 1;
+                        if block_local_set.contains(&v.0) {
+                            last_use.insert(v.0, extended);
+                        }
+                        // Also extend the copy-alias root, which holds the
+                        // actual stack slot that will be read during Phase 4.
+                        if let Some(&root) = copy_alias.get(&v.0) {
+                            if block_local_set.contains(&root) {
+                                last_use.insert(root, extended);
+                            }
+                        }
+                    }
+                }
             }
             // Also check terminator for uses
             for_each_operand_in_terminator(&block.terminator, |op| {
