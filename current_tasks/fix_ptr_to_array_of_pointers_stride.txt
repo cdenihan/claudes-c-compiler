@@ -1,0 +1,21 @@
+Task: Fix pointer-to-array-of-pointers stride computation
+Status: in_progress
+
+Problem: For types like `Node* (*p)[2]` (pointer to array of 2 Node pointers),
+the compiler used stride sizeof(Node*) = 8 instead of sizeof(Node*[2]) = 16
+when indexing p[i]. This caused p[0] and p[1] to overlap, corrupting data.
+
+Root cause: In compute_decl_info(), the ptr_count >= 2 check counted ALL Pointer
+entries in derived declarators, including those that are part of the element type.
+For `Node* (*p)[2]`, derived = [Pointer, Array(2), Pointer] has 2 Pointer entries,
+but only the trailing one is the actual indirection level. The leading Pointer is
+from `Node*` (the element type), not an extra pointer-to-pointer level.
+
+Fix: Count only trailing consecutive Pointer entries (the actual indirection levels),
+not all Pointer entries in derived. Also collect array dims from the non-trailing
+portion of derived, and detect when the non-trailing part has Pointer entries
+(indicating the element type is a pointer, so base_elem_size = ptr_sz).
+
+Impact: Fixes zopfli project (was failing on all architectures due to wrong
+Huffman code lengths from katajainen.c). Also potentially fixes other projects
+using pointer-to-array-of-pointers types.
