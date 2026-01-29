@@ -505,6 +505,7 @@ impl Lowerer {
             || is_gnu_inline_no_extern_def;
         let next_val = self.func_mut().next_value;
         let param_alloca_vals = std::mem::take(&mut self.func_mut().param_alloca_values);
+        let global_init_labels = std::mem::take(&mut self.func_mut().global_init_label_blocks);
         let ir_func = IrFunction {
             name: func.name.clone(), return_type, params,
             blocks: std::mem::take(&mut self.func_mut().blocks),
@@ -522,6 +523,7 @@ impl Lowerer {
             param_alloca_values: param_alloca_vals,
             uses_sret,
             is_fastcall: func.attrs.is_fastcall(),
+            global_init_label_blocks: global_init_labels,
         };
         self.module.functions.push(ir_func);
         self.pop_scope();

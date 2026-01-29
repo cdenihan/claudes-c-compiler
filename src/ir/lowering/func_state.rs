@@ -148,6 +148,10 @@ pub(super) struct FunctionBuildState {
     /// expressions resolve immediately to 0. In inline candidates, they emit IsConstant
     /// instructions that can be resolved to 1 after inlining if the argument becomes constant.
     pub is_inline_candidate: bool,
+    /// Block IDs referenced by static local variable initializers via &&label.
+    /// Transferred to IrFunction in finalize_function so CFG simplify can keep
+    /// these blocks reachable (their labels appear in global data like .quad .L3).
+    pub global_init_label_blocks: Vec<BlockId>,
 }
 
 impl FunctionBuildState {
@@ -180,6 +184,7 @@ impl FunctionBuildState {
             instr_spans: Vec::new(),
             current_span: Span::dummy(),
             is_inline_candidate: false,
+            global_init_label_blocks: Vec::new(),
         }
     }
 

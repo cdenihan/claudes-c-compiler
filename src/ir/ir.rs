@@ -226,6 +226,10 @@ pub struct IrFunction {
     /// On i386 SysV ABI, such functions must use `ret $4` to pop the hidden
     /// pointer argument from the caller's stack.
     pub uses_sret: bool,
+    /// Block IDs referenced by static local variable initializers via &&label.
+    /// These blocks must be kept reachable and not merged away by CFG simplify,
+    /// since their labels appear in global data (.quad .L3) and must resolve.
+    pub global_init_label_blocks: Vec<BlockId>,
 }
 
 /// A function parameter.
@@ -1647,6 +1651,7 @@ impl IrFunction {
             param_alloca_values: Vec::new(),
             uses_sret: false,
             is_fastcall: false,
+            global_init_label_blocks: Vec::new(),
         }
     }
 

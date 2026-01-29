@@ -275,6 +275,10 @@ impl Lowerer {
         if let Expr::LabelAddr(label_name, _) = expr {
             // GCC &&label extension: emit label address as GlobalAddr
             let scoped_label = self.get_or_create_user_label(label_name);
+            // Record this block ID so CFG simplify keeps it reachable
+            if let Some(ref mut fs) = self.func_state {
+                fs.global_init_label_blocks.push(scoped_label);
+            }
             elements.push(GlobalInit::GlobalAddr(scoped_label.as_label()));
         } else if let Expr::StringLiteral(s, _) = expr {
             let label = self.intern_string_literal(s);
@@ -301,6 +305,10 @@ impl Lowerer {
         // GCC &&label extension: label address in a pointer field
         if let Expr::LabelAddr(label_name, _) = expr {
             let scoped_label = self.get_or_create_user_label(label_name);
+            // Record this block ID so CFG simplify keeps it reachable
+            if let Some(ref mut fs) = self.func_state {
+                fs.global_init_label_blocks.push(scoped_label);
+            }
             return Some(GlobalInit::GlobalAddr(scoped_label.as_label()));
         }
         // String literal: create a .rodata entry and reference it

@@ -1300,6 +1300,10 @@ impl Lowerer {
                 } else if let Expr::LabelAddr(label_name, _) = expr {
                     // GCC &&label extension: emit label address as GlobalAddr
                     let scoped_label = self.get_or_create_user_label(label_name);
+                    // Record this block ID so CFG simplify keeps it reachable
+                    if let Some(ref mut fs) = self.func_state {
+                        fs.global_init_label_blocks.push(scoped_label);
+                    }
                     elements.push(GlobalInit::GlobalAddr(scoped_label.as_label()));
                 } else if let Some(val) = self.eval_const_expr(expr) {
                     // Promote narrow integer constants to match element size.
@@ -1356,6 +1360,11 @@ impl Lowerer {
             if let (Expr::LabelAddr(lab1, _), Expr::LabelAddr(lab2, _)) = (lhs_inner, rhs_inner) {
                 let scoped1 = self.get_or_create_user_label(lab1);
                 let scoped2 = self.get_or_create_user_label(lab2);
+                // Record these block IDs so CFG simplify keeps them reachable
+                if let Some(ref mut fs) = self.func_state {
+                    fs.global_init_label_blocks.push(scoped1);
+                    fs.global_init_label_blocks.push(scoped2);
+                }
                 return Some(GlobalInit::GlobalLabelDiff(
                     scoped1.as_label(),
                     scoped2.as_label(),

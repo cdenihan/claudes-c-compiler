@@ -890,6 +890,16 @@ fn remove_dead_blocks(func: &mut IrFunction) -> usize {
 
     // BFS from entry block
     let mut worklist = vec![entry];
+
+    // Blocks referenced by static local initializers via &&label must be reachable.
+    // These label addresses appear in global data (e.g., .quad .L3) and are not
+    // visible as Instruction::LabelAddr since they're in GlobalInit::GlobalAddr.
+    for &block_id in &func.global_init_label_blocks {
+        if reachable.insert(block_id) {
+            worklist.push(block_id);
+        }
+    }
+
     while let Some(block_id) = worklist.pop() {
         if let Some(&idx) = block_map.get(&block_id) {
             // Successor blocks from terminator (no Vec allocation)
@@ -1116,6 +1126,13 @@ fn merge_single_pred_blocks(func: &mut IrFunction) -> usize {
                 })
             });
             if label_addr_target {
+                continue;
+            }
+            // Check if the successor's label is referenced by a static local
+            // variable initializer via &&label (GlobalInit::GlobalAddr).
+            // These blocks must keep their identity so the assembly label
+            // in global data (e.g., .quad .L3) resolves correctly.
+            if func.global_init_label_blocks.contains(target) {
                 continue;
             }
             // Check if any block references the successor's label via InlineAsm goto_labels.
