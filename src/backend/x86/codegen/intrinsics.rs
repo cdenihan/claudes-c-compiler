@@ -70,6 +70,35 @@ impl X86Codegen {
         }
     }
 
+    fn emit_nontemporal_store(&mut self, op: &IntrinsicOp, dest_ptr: &Option<Value>, args: &[Operand]) {
+        let Some(ptr) = dest_ptr else { return };
+        match op {
+            IntrinsicOp::Movnti => {
+                self.operand_to_reg(&args[0], "rcx");
+                self.value_to_reg(ptr, "rax");
+                self.state.emit("    movnti %ecx, (%rax)");
+            }
+            IntrinsicOp::Movnti64 => {
+                self.operand_to_reg(&args[0], "rcx");
+                self.value_to_reg(ptr, "rax");
+                self.state.emit("    movnti %rcx, (%rax)");
+            }
+            IntrinsicOp::Movntdq => {
+                self.operand_to_reg(&args[0], "rcx");
+                self.state.emit("    movdqu (%rcx), %xmm0");
+                self.value_to_reg(ptr, "rax");
+                self.state.emit("    movntdq %xmm0, (%rax)");
+            }
+            IntrinsicOp::Movntpd => {
+                self.operand_to_reg(&args[0], "rcx");
+                self.state.emit("    movupd (%rcx), %xmm0");
+                self.value_to_reg(ptr, "rax");
+                self.state.emit("    movntpd %xmm0, (%rax)");
+            }
+            _ => {}
+        }
+    }
+
     /// Emit SSE binary 128-bit op: load xmm0 from arg0 ptr, xmm1 from arg1 ptr,
     /// apply the given SSE instruction, store result xmm0 to dest_ptr.
     fn emit_sse_binary_128(&mut self, dest_ptr: &Value, args: &[Operand], sse_inst: &str) {
@@ -115,35 +144,9 @@ impl X86Codegen {
                 self.operand_to_reg(&args[0], "rax");
                 self.state.emit("    clflush (%rax)");
             }
-            IntrinsicOp::Movnti => {
-                if let Some(ptr) = dest_ptr {
-                    self.operand_to_reg(&args[0], "rcx");
-                    self.value_to_reg(ptr, "rax");
-                    self.state.emit("    movnti %ecx, (%rax)");
-                }
-            }
-            IntrinsicOp::Movnti64 => {
-                if let Some(ptr) = dest_ptr {
-                    self.operand_to_reg(&args[0], "rcx");
-                    self.value_to_reg(ptr, "rax");
-                    self.state.emit("    movnti %rcx, (%rax)");
-                }
-            }
-            IntrinsicOp::Movntdq => {
-                if let Some(ptr) = dest_ptr {
-                    self.operand_to_reg(&args[0], "rcx");
-                    self.state.emit("    movdqu (%rcx), %xmm0");
-                    self.value_to_reg(ptr, "rax");
-                    self.state.emit("    movntdq %xmm0, (%rax)");
-                }
-            }
-            IntrinsicOp::Movntpd => {
-                if let Some(ptr) = dest_ptr {
-                    self.operand_to_reg(&args[0], "rcx");
-                    self.state.emit("    movupd (%rcx), %xmm0");
-                    self.value_to_reg(ptr, "rax");
-                    self.state.emit("    movntpd %xmm0, (%rax)");
-                }
+            IntrinsicOp::Movnti | IntrinsicOp::Movnti64
+            | IntrinsicOp::Movntdq | IntrinsicOp::Movntpd => {
+                self.emit_nontemporal_store(op, dest_ptr, args);
             }
             IntrinsicOp::Loaddqu => {
                 if let Some(dptr) = dest_ptr {
