@@ -1,6 +1,0 @@
-Task: Verify new untested projects and update tracker
-Status: in_progress
-Started: 2026-01-30
-
-Testing previously untested projects from /other_deps and recording results.
-Projects tested: R, Duktape, STREAM, 2048.c, Elk, FSE, Io, Icon, MuJS, CHICKEN_Scheme
