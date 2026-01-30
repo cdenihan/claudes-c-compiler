@@ -309,10 +309,15 @@ impl Preprocessor {
 
         self.includes.push(include_path.clone());
 
-        // Inject declarations for well-known standard headers
-        self.inject_header_declarations(&include_path);
+        // Always inject compiler-builtin macros for well-known headers
+        // (e.g., stdarg.h's va_start/va_end, stdbool.h's true/false).
+        // These use compiler builtins and should always be available.
+        self.inject_builtin_macros_for_header(&include_path);
 
         if !self.resolve_includes {
+            // When not resolving includes, inject all fallback declarations
+            // since we won't have any real headers to provide them.
+            self.inject_fallback_declarations_for_header(&include_path);
             return None;
         }
 
@@ -383,12 +388,18 @@ impl Preprocessor {
                 }
                 Err(_) => {
                     // Silently skip unresolvable includes (many system headers
-                    // may not be needed if builtins provide their macros)
+                    // may not be needed if builtins provide their macros).
+                    // Inject fallback declarations since the real header failed to load.
+                    self.inject_fallback_declarations_for_header(&include_path);
                     None
                 }
             }
         } else {
-            // Header not found - emit a fatal error with source location.
+            // Header not found - inject fallback type/extern declarations for
+            // well-known standard headers so compilation can still proceed.
+            self.inject_fallback_declarations_for_header(&include_path);
+
+            // Emit a fatal error with source location.
             // Compute approximate column of the include path for better diagnostics.
             // The include path token is at col (of '#') + len("include") + whitespace.
             let include_path_col = col + "include ".len();
@@ -672,56 +683,26 @@ impl Preprocessor {
         None
     }
 
-    /// Inject essential declarations for standard library headers.
-    /// Since we don't read actual system headers, we inject the key
-    /// type definitions and extern variable declarations that C code
-    /// commonly uses from these headers.
-    pub(super) fn inject_header_declarations(&mut self, header: &str) {
+    /// Inject compiler-builtin macros for well-known standard headers.
+    /// These are always injected regardless of whether the real header is found,
+    /// because they expand to compiler builtins (`__builtin_*`) that only our
+    /// compiler understands.
+    fn inject_builtin_macros_for_header(&mut self, header: &str) {
         match header {
-            "stdio.h" => {
-                // FILE type and standard streams
-                self.pending_injections.push("typedef struct _IO_FILE FILE;\n".to_string());
-                self.pending_injections.push("extern FILE *stdin;\n".to_string());
-                self.pending_injections.push("extern FILE *stdout;\n".to_string());
-                self.pending_injections.push("extern FILE *stderr;\n".to_string());
-            }
-            "errno.h" => {
-                // errno is typically a macro expanding to (*__errno_location())
-                // but for our purposes, treat it as an extern int
-                self.pending_injections.push("extern int errno;\n".to_string());
-            }
             "stdbool.h" => {
                 // Define true/false macros only when stdbool.h is explicitly included
                 crate::frontend::preprocessor::builtin_macros::define_stdbool_true_false(&mut self.macros);
             }
             "complex.h" => {
-                // C99 <complex.h> support
-                // Define standard complex macros
+                // C99 <complex.h> support - define standard complex macros
                 self.macros.define(parse_define("complex _Complex").expect("static define"));
                 self.macros.define(parse_define("_Complex_I (__extension__ 1.0fi)").expect("static define"));
                 self.macros.define(parse_define("I _Complex_I").expect("static define"));
                 self.macros.define(parse_define("__STDC_IEC_559_COMPLEX__ 1").expect("static define"));
-                // Declare complex math functions
-                self.pending_injections.push(concat!(
-                    "double creal(double _Complex __z);\n",
-                    "float crealf(float _Complex __z);\n",
-                    "long double creall(long double _Complex __z);\n",
-                    "double cimag(double _Complex __z);\n",
-                    "float cimagf(float _Complex __z);\n",
-                    "long double cimagl(long double _Complex __z);\n",
-                    "double _Complex conj(double _Complex __z);\n",
-                    "float _Complex conjf(float _Complex __z);\n",
-                    "long double _Complex conjl(long double _Complex __z);\n",
-                    "double cabs(double _Complex __z);\n",
-                    "float cabsf(float _Complex __z);\n",
-                    "double carg(double _Complex __z);\n",
-                    "float cargf(float _Complex __z);\n",
-                ).to_string());
             }
             "stdarg.h" => {
                 // Define va_start/va_arg/va_end/va_copy as macros expanding to builtins.
-                // This ensures variadic function support works even if the system stdarg.h
-                // is not found (e.g., missing GCC cross-compiler include path).
+                // These are always needed because they expand to __builtin_* forms.
                 self.pending_injections.push("typedef __builtin_va_list va_list;\n".to_string());
                 self.macros.define(MacroDef {
                     name: "va_start".to_string(),
@@ -760,6 +741,47 @@ impl Preprocessor {
                 });
                 // Also define __gnuc_va_list as a typedef
                 self.pending_injections.push("typedef __builtin_va_list __gnuc_va_list;\n".to_string());
+            }
+            _ => {}
+        }
+    }
+
+    /// Inject fallback type definitions and extern declarations for standard
+    /// headers. Only called when no real header file was found, to provide
+    /// minimal definitions so compilation can proceed. When the project provides
+    /// its own headers (e.g., dietlibc, musl), these are NOT injected to avoid
+    /// conflicting type definitions.
+    fn inject_fallback_declarations_for_header(&mut self, header: &str) {
+        match header {
+            "stdio.h" => {
+                // FILE type and standard streams (fallback only)
+                self.pending_injections.push("typedef struct _IO_FILE FILE;\n".to_string());
+                self.pending_injections.push("extern FILE *stdin;\n".to_string());
+                self.pending_injections.push("extern FILE *stdout;\n".to_string());
+                self.pending_injections.push("extern FILE *stderr;\n".to_string());
+            }
+            "errno.h" => {
+                // errno is typically a macro expanding to (*__errno_location())
+                // but for our purposes, treat it as an extern int
+                self.pending_injections.push("extern int errno;\n".to_string());
+            }
+            "complex.h" => {
+                // Declare complex math functions (fallback only)
+                self.pending_injections.push(concat!(
+                    "double creal(double _Complex __z);\n",
+                    "float crealf(float _Complex __z);\n",
+                    "long double creall(long double _Complex __z);\n",
+                    "double cimag(double _Complex __z);\n",
+                    "float cimagf(float _Complex __z);\n",
+                    "long double cimagl(long double _Complex __z);\n",
+                    "double _Complex conj(double _Complex __z);\n",
+                    "float _Complex conjf(float _Complex __z);\n",
+                    "long double _Complex conjl(long double _Complex __z);\n",
+                    "double cabs(double _Complex __z);\n",
+                    "float cabsf(float _Complex __z);\n",
+                    "double carg(double _Complex __z);\n",
+                    "float cargf(float _Complex __z);\n",
+                ).to_string());
             }
             _ => {}
         }
