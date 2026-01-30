@@ -1,0 +1,15 @@
+Task: Fix CHICKEN_Scheme build scripts for ARM/RISC-V/i686
+Status: in_progress
+
+The check_arm.sh, check_riscv.sh, and check_i686.sh build scripts derive the
+LIBRARIAN (ar tool) name from the compiler name using:
+  ARCHPREFIX=$(echo "$COMPILER" | sed 's/\(.*-\)[^-]*$/\1/')
+  LIBRARIAN="${ARCHPREFIX}ar"
+
+For ccc-arm this produces "ccc-ar" which doesn't exist. The fix is to hardcode
+the correct cross-compilation ar tools:
+  ARM: aarch64-linux-gnu-ar
+  RISC-V: riscv64-linux-gnu-ar
+  i686: i686-linux-gnu-ar
+
+This is a build script bug, not a compiler bug.
