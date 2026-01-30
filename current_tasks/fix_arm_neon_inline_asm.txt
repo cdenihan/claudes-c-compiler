@@ -1,0 +1,13 @@
+Task: Fix ARM NEON inline assembly issues (braces + register naming)
+Status: in_progress
+
+Two issues causing ~20 ARM inline asm test failures:
+
+1. expand_dialect_alternatives() strips literal braces from inline asm templates.
+   ARM NEON instructions like `ld1 {v0.4s}, [x9]` need literal braces, but they
+   get stripped because the function treats all braces as GCC dialect alternatives.
+   Fix: Only strip braces when there IS a pipe `|` separator.
+
+2. ARM FP scratch registers use `d` prefix (d16, d17...) but unmodified `%0` in
+   templates like `eor %0.16b, %1.16b, %2.16b` needs `v` prefix (v16.16b).
+   Fix: Change ARM FP scratch to use `v` prefix and update all related code.
