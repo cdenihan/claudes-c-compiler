@@ -60,6 +60,9 @@ pub struct I686Codegen {
     fastcall_stack_cleanup: usize,
     /// For fastcall functions, how many leading params are passed in registers (0, 1, or 2).
     fastcall_reg_param_count: usize,
+    /// Whether the __x86.get_pc_thunk.bx helper needs to be emitted.
+    /// Set to true when any function uses PIC mode and references globals.
+    needs_pc_thunk_bx: bool,
 }
 
 // Callee-saved physical register indices for i686
@@ -111,6 +114,7 @@ impl I686Codegen {
             is_fastcall: false,
             fastcall_stack_cleanup: 0,
             fastcall_reg_param_count: 0,
+            needs_pc_thunk_bx: false,
         }
     }
 
@@ -1220,6 +1224,13 @@ impl ArchCodegen for I686Codegen {
             i686_constraint_to_phys,
             i686_clobber_to_phys,
         );
+        // In PIC mode, %ebx (PhysReg(0)) is reserved as the GOT base pointer.
+        // Exclude it from register allocation so no values are assigned to it.
+        if self.state.pic_mode {
+            if !asm_clobbered_regs.contains(&PhysReg(0)) {
+                asm_clobbered_regs.push(PhysReg(0));
+            }
+        }
         let available_regs = filter_available_regs(I686_CALLEE_SAVED, &asm_clobbered_regs);
 
         // No caller-saved registers on i686 (eax/ecx/edx are all scratch)
@@ -1230,6 +1241,14 @@ impl ArchCodegen for I686Codegen {
             &mut self.reg_assignments, &mut self.used_callee_saved,
             false, // i686 asm emitter does not yet check reg_assignments
         );
+
+        // In PIC mode, %ebx is used as the GOT base pointer and must be
+        // saved/restored as a callee-saved register. Add it to used_callee_saved
+        // if not already present (it won't be, since we excluded it from allocation).
+        if self.state.pic_mode && !self.used_callee_saved.contains(&PhysReg(0)) {
+            // Insert at position 0 so it's the first register pushed (and last popped)
+            self.used_callee_saved.insert(0, PhysReg(0));
+        }
 
         // Calculate stack space using the shared framework.
         // i686 uses negative offsets from ebp, 4-byte minimum alignment.
@@ -1288,6 +1307,19 @@ impl ArchCodegen for I686Codegen {
         for &reg in self.used_callee_saved.iter() {
             let name = phys_reg_name(reg);
             emit!(self.state, "    pushl %{}", name);
+        }
+
+        // In PIC mode, set up %ebx as the GOT base register.
+        // %ebx is callee-saved, so it was already saved above (we force-add it
+        // to used_callee_saved in calculate_stack_space). We set it up after
+        // callee-saved saves but before stack allocation so it's available for
+        // the entire function body.
+        if self.state.pic_mode {
+            debug_assert!(self.used_callee_saved.contains(&PhysReg(0)),
+                "PIC mode requires ebx in used_callee_saved");
+            self.state.emit("    call __x86.get_pc_thunk.bx");
+            self.state.emit("    addl $_GLOBAL_OFFSET_TABLE_, %ebx");
+            self.needs_pc_thunk_bx = true;
         }
 
         // Allocate stack space for locals
@@ -1847,20 +1879,48 @@ impl ArchCodegen for I686Codegen {
     // --- Global address ---
 
     fn emit_global_addr(&mut self, dest: &Value, name: &str) {
-        // Always use absolute addressing on i686.
-        // Proper i686 PIC requires setting up %ebx as the GOT base register
-        // via __x86.get_pc_thunk, which is not yet implemented. Since we link
-        // with -no-pie, absolute addressing works correctly — the linker resolves
-        // all relocations at link time.
-        emit!(self.state, "    movl ${}, %eax", name);
+        if self.state.pic_mode {
+            if self.state.needs_got(name) {
+                // External symbol: load address from GOT entry
+                // The GOT entry contains the absolute address, filled by the dynamic linker.
+                emit!(self.state, "    movl {}@GOT(%ebx), %eax", name);
+            } else {
+                // Local symbol (static or hidden): compute address relative to GOT base.
+                // @GOTOFF gives the offset from _GLOBAL_OFFSET_TABLE_ to the symbol.
+                emit!(self.state, "    leal {}@GOTOFF(%ebx), %eax", name);
+            }
+        } else {
+            // Non-PIC: use absolute addressing. The linker resolves all
+            // relocations at link time when using -no-pie.
+            emit!(self.state, "    movl ${}, %eax", name);
+        }
+        self.state.reg_cache.invalidate_acc();
+        self.store_eax_to(dest);
+    }
+
+    fn emit_label_addr(&mut self, dest: &Value, label: &str) {
+        if self.state.pic_mode {
+            // Labels are always local; use @GOTOFF for PIC-safe addressing.
+            emit!(self.state, "    leal {}@GOTOFF(%ebx), %eax", label);
+        } else {
+            // Non-PIC: absolute address
+            emit!(self.state, "    movl ${}, %eax", label);
+        }
         self.state.reg_cache.invalidate_acc();
         self.store_eax_to(dest);
     }
 
     fn emit_tls_global_addr(&mut self, dest: &Value, name: &str) {
-        // TLS local exec: %gs:0 + offset
-        self.state.emit("    movl %gs:0, %eax");
-        emit!(self.state, "    addl ${}@NTPOFF, %eax", name);
+        if self.state.pic_mode {
+            // TLS Initial Exec model for PIC: load GOT offset, then add TLS base.
+            // @GOTNTPOFF gives the GOT entry containing the negative TP offset.
+            emit!(self.state, "    movl {}@GOTNTPOFF(%ebx), %eax", name);
+            self.state.emit("    addl %gs:0, %eax");
+        } else {
+            // TLS Local Exec: %gs:0 + offset
+            self.state.emit("    movl %gs:0, %eax");
+            emit!(self.state, "    addl ${}@NTPOFF, %eax", name);
+        }
         self.state.reg_cache.invalidate_acc();
         self.store_eax_to(dest);
     }
@@ -2533,7 +2593,11 @@ impl ArchCodegen for I686Codegen {
     fn emit_call_instruction(&mut self, direct_name: Option<&str>, func_ptr: Option<&Operand>,
                              indirect: bool, _stack_arg_space: usize) {
         if let Some(name) = direct_name {
-            emit!(self.state, "    call {}", name);
+            if self.state.needs_plt(name) {
+                emit!(self.state, "    call {}@PLT", name);
+            } else {
+                emit!(self.state, "    call {}", name);
+            }
         } else if indirect {
             if let Some(fptr) = func_ptr {
                 self.operand_to_eax(fptr);
@@ -3801,7 +3865,11 @@ impl ArchCodegen for I686Codegen {
         self.emit_load_acc_pair(lhs);
         self.state.emit("    pushl %edx");  // lhs_hi
         self.state.emit("    pushl %eax");  // lhs_lo
-        emit!(self.state, "    call {}", di_func);
+        if self.state.needs_plt(di_func) {
+            emit!(self.state, "    call {}@PLT", di_func);
+        } else {
+            emit!(self.state, "    call {}", di_func);
+        }
         self.state.emit("    addl $16, %esp");
         // Result is in eax:edx (64-bit return value)
     }
@@ -4022,6 +4090,26 @@ impl ArchCodegen for I686Codegen {
     }
 
     fn emit_runtime_stubs(&mut self) {
+        // Emit __x86.get_pc_thunk.bx for PIC mode.
+        // This is a small helper that loads the return address (PC) into %ebx,
+        // enabling position-independent code on i686 where there's no RIP-relative
+        // addressing. The thunk is emitted as a hidden comdat function so each
+        // compilation unit can provide it without multiple-definition errors.
+        if self.needs_pc_thunk_bx {
+            let s = &mut self.state;
+            s.emit("");
+            s.emit(".section .text.__x86.get_pc_thunk.bx,\"axG\",@progbits,__x86.get_pc_thunk.bx,comdat");
+            s.emit(".globl __x86.get_pc_thunk.bx");
+            s.emit(".hidden __x86.get_pc_thunk.bx");
+            s.emit(".type __x86.get_pc_thunk.bx, @function");
+            s.emit("__x86.get_pc_thunk.bx:");
+            s.emit("    movl (%esp), %ebx");
+            s.emit("    ret");
+            s.emit(".size __x86.get_pc_thunk.bx, .-__x86.get_pc_thunk.bx");
+            // Return to .text section
+            s.emit(".text");
+        }
+
         if !self.state.needs_divdi3_helpers {
             return;
         }

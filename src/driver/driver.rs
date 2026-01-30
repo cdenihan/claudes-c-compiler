@@ -452,7 +452,17 @@ impl Driver {
                 // Machine/target flags
                 "-mfunction-return=thunk-extern" => self.function_return_thunk = true,
                 "-mindirect-branch=thunk-extern" => self.indirect_branch_thunk = true,
-                "-m16" | "-m32" => self.gcc_fallback = true,
+                "-m16" => self.gcc_fallback = true,
+                "-m32" => {
+                    // When USE_MY_32=1 environment variable is set, use our i686 backend
+                    // instead of falling back to GCC. This allows iterative testing of
+                    // 32-bit kernel compilation with our compiler.
+                    if std::env::var("USE_MY_32").as_deref() == Ok("1") {
+                        self.target = Target::I686;
+                    } else {
+                        self.gcc_fallback = true;
+                    }
+                }
                 "-mno-sse" | "-mno-sse2" | "-mno-mmx" | "-mno-sse3" | "-mno-ssse3"
                 | "-mno-sse4" | "-mno-sse4.1" | "-mno-sse4.2" | "-mno-avx"
                 | "-mno-avx2" | "-mno-avx512f" | "-mno-3dnow" => {
