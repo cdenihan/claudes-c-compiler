@@ -309,6 +309,64 @@ pub fn constraint_needs_address(constraint: &str, is_riscv: bool, is_arm: bool) 
     false
 }
 
+/// Expand GCC dialect alternatives in an inline assembly template string.
+///
+/// GCC inline assembly supports dialect alternatives: `{att|intel}` where the
+/// first alternative is AT&T syntax and the second is Intel syntax. Since our
+/// compiler always emits AT&T syntax, we select the first alternative from each
+/// `{...|...}` group.
+///
+/// Examples:
+///   `pushf{l|d}`           -> `pushfl`
+///   `mov{l}\t{%0, %1|%1, %0}` -> `movl\t%0, %1`
+///   `pop{l}\t%0`           -> `popl\t%0`
+///   `no_braces`            -> `no_braces`    (unchanged)
+///
+/// This handles the syntax used in GCC's `<cpuid.h>` for i686 CPUID detection.
+pub fn expand_dialect_alternatives(template: &str) -> Cow<'_, str> {
+    // Fast path: if there are no braces, return as-is
+    if !template.contains('{') {
+        return Cow::Borrowed(template);
+    }
+
+    let mut result = String::with_capacity(template.len());
+    let chars: Vec<char> = template.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '{' {
+            // Found the start of a dialect alternatives group.
+            // Extract the first alternative (AT&T syntax, before '|').
+            i += 1; // skip '{'
+            let start = i;
+            let mut depth = 1;
+            let mut pipe_pos = None;
+            // Find the matching '}' and the '|' separator
+            while i < chars.len() && depth > 0 {
+                if chars[i] == '{' {
+                    depth += 1;
+                } else if chars[i] == '}' {
+                    depth -= 1;
+                    if depth == 0 { break; }
+                } else if chars[i] == '|' && depth == 1 && pipe_pos.is_none() {
+                    pipe_pos = Some(i);
+                }
+                i += 1;
+            }
+            // Extract the first alternative (before '|')
+            let end = if let Some(p) = pipe_pos { p } else { i };
+            let alt: String = chars[start..end].iter().collect();
+            result.push_str(&alt);
+            if i < chars.len() && chars[i] == '}' {
+                i += 1; // skip '}'
+            }
+        } else {
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+    Cow::Owned(result)
+}
+
 /// Shared inline assembly emission logic. All four backends call this from their
 /// `emit_inline_asm` implementation, providing an `InlineAsmEmitter` to handle
 /// arch-specific details.
@@ -352,7 +410,9 @@ pub fn emit_inline_asm_common_impl(
     load_inputs(emitter, &operands, outputs, inputs);
 
     // Phase 3: Substitute operand references in template and emit
-    let lines: Vec<&str> = template.split('\n').collect();
+    // First, expand GCC dialect alternatives {att|intel} -> att
+    let expanded = expand_dialect_alternatives(template);
+    let lines: Vec<&str> = expanded.split('\n').collect();
     for line in &lines {
         let line = line.trim().trim_start_matches('\t').trim();
         if line.is_empty() {

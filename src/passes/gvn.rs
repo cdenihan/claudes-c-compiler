@@ -17,7 +17,7 @@
 //! - Load (redundant load elimination within dominator scope, invalidated
 //!   by stores, calls, and other memory-clobbering instructions)
 
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::ir::{
     ConstHashKey,
@@ -105,11 +105,17 @@ struct GvnState {
     vn_log: Vec<(usize, u32)>,
     /// Total instructions eliminated across all blocks.
     total_eliminated: usize,
+    /// Set of param alloca Value IDs whose address has escaped (used in
+    /// non-Load/Store contexts). Store-to-load forwarding is disabled for
+    /// these allocas because the backend's ParamRef optimization reads
+    /// parameter values from the alloca slot, which may be modified by
+    /// stores through aliased pointers.
+    escaped_param_allocas: FxHashSet<u32>,
 }
 
 impl GvnState {
     /// Create a new GVN state sized for `max_value_id` values.
-    fn new(max_value_id: usize) -> Self {
+    fn new(max_value_id: usize, escaped_param_allocas: FxHashSet<u32>) -> Self {
         Self {
             value_numbers: vec![u32::MAX; max_value_id + 1],
             next_vn: 0,
@@ -122,6 +128,7 @@ impl GvnState {
             store_fwd_rollback_log: Vec::new(),
             vn_log: Vec::new(),
             total_eliminated: 0,
+            escaped_param_allocas,
         }
     }
 
@@ -307,6 +314,64 @@ struct ScopeCheckpoint {
     saved_load_generation: u32,
 }
 
+/// Find param allocas whose address has escaped (used in non-Load/Store contexts).
+///
+/// When a param alloca's address is taken (e.g., via `&x` which becomes a GEP
+/// then gets simplified to a Copy), the alloca can be modified through aliased
+/// pointers. Store-to-load forwarding must be disabled for these allocas because
+/// the backend's ParamRef optimization reads parameter values from the alloca
+/// slot at point of use, not at point of definition. If an aliased store
+/// modifies the alloca between the original store and the forwarded use, the
+/// read will return the wrong value.
+fn find_escaped_param_allocas(func: &IrFunction) -> FxHashSet<u32> {
+    let param_alloca_set: FxHashSet<u32> = func.param_alloca_values.iter().map(|v| v.0).collect();
+    if param_alloca_set.is_empty() {
+        return FxHashSet::default();
+    }
+
+    let mut escaped = FxHashSet::default();
+
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                // Load from param alloca is fine - it reads the value
+                Instruction::Load { ptr, .. } => {
+                    // ptr is the alloca value itself, this is a normal use
+                    let _ = ptr;
+                }
+                // Store TO param alloca is fine - it writes to the alloca
+                Instruction::Store { ptr, val, .. } => {
+                    // ptr is the alloca, this is fine
+                    let _ = ptr;
+                    // But if the alloca value is used as a stored VALUE
+                    // (i.e., its address is being stored somewhere), it escapes
+                    if let Operand::Value(v) = val {
+                        if param_alloca_set.contains(&v.0) {
+                            escaped.insert(v.0);
+                        }
+                    }
+                }
+                // Copy of param alloca = address taken (e.g., simplified &x GEP)
+                Instruction::Copy { src: Operand::Value(v), .. } => {
+                    if param_alloca_set.contains(&v.0) {
+                        escaped.insert(v.0);
+                    }
+                }
+                // Any other instruction using the alloca value means escape
+                _ => {
+                    inst.for_each_used_value(|vid| {
+                        if param_alloca_set.contains(&vid) {
+                            escaped.insert(vid);
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    escaped
+}
+
 /// Run dominator-based GVN on a single function.
 pub(crate) fn run_gvn_function(func: &mut IrFunction) -> usize {
     let num_blocks = func.blocks.len();
@@ -314,9 +379,11 @@ pub(crate) fn run_gvn_function(func: &mut IrFunction) -> usize {
         return 0;
     }
 
+    let escaped = find_escaped_param_allocas(func);
+
     // Fast path for single-block functions: skip CFG/dominator computation.
     if num_blocks == 1 {
-        let mut state = GvnState::new(func.max_value_id() as usize);
+        let mut state = GvnState::new(func.max_value_id() as usize, escaped);
         return process_block(0, func, &mut state);
     }
 
@@ -333,13 +400,15 @@ pub(crate) fn run_gvn_with_analysis(func: &mut IrFunction, cfg: &analysis::CfgAn
         return 0;
     }
 
+    let escaped = find_escaped_param_allocas(func);
+
     // Fast path for single-block functions.
     if num_blocks == 1 {
-        let mut state = GvnState::new(func.max_value_id() as usize);
+        let mut state = GvnState::new(func.max_value_id() as usize, escaped);
         return process_block(0, func, &mut state);
     }
 
-    let mut state = GvnState::new(func.max_value_id() as usize);
+    let mut state = GvnState::new(func.max_value_id() as usize, escaped);
 
     // DFS over the dominator tree
     gvn_dfs(0, func, &cfg.dom_children, &cfg.preds, &mut state);
@@ -456,13 +525,20 @@ fn process_block(
         // This happens AFTER the generation bump (since Store itself clobbers memory),
         // so the stored value is recorded at the new generation and will be visible
         // to subsequent loads (which haven't bumped the generation yet).
+        //
+        // Skip forwarding for stores to escaped param allocas: the backend's
+        // ParamRef optimization reads from the alloca slot at point of use, so
+        // forwarding a ParamRef through an escaped alloca is unsound when an
+        // aliased pointer may write to the same slot.
         if is_forwardable_store(&inst) {
             if let Instruction::Store { val, ptr, ty, .. } = &inst {
-                let ptr_vn = state.operand_to_vn(&Operand::Value(*ptr));
-                let fwd_key = StoreFwdKey { ptr_vn, ty: *ty };
-                let fwd_key_for_log = fwd_key.clone();
-                let old_val = state.store_fwd_map.insert(fwd_key, (val.clone(), state.load_generation));
-                state.store_fwd_rollback_log.push((fwd_key_for_log, old_val));
+                if !state.escaped_param_allocas.contains(&ptr.0) {
+                    let ptr_vn = state.operand_to_vn(&Operand::Value(*ptr));
+                    let fwd_key = StoreFwdKey { ptr_vn, ty: *ty };
+                    let fwd_key_for_log = fwd_key.clone();
+                    let old_val = state.store_fwd_map.insert(fwd_key, (val.clone(), state.load_generation));
+                    state.store_fwd_rollback_log.push((fwd_key_for_log, old_val));
+                }
             }
             // Store has no dest, so no VN to assign. Just keep the instruction.
             new_instructions.push(inst);
