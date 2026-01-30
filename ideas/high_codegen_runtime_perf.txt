@@ -11,11 +11,16 @@ Remaining bottlenecks (profiled on zlib vs GCC -O2):
    Fix: Loop strength reduction pass (iv_strength_reduce.rs exists but
    may need extension for pointer-based induction variables).
 
-2. REDUNDANT SIGN EXTENSIONS
+2. REDUNDANT SIGN EXTENSIONS (partially addressed)
    The lowering emits Cast i32->i64 for array indices even when the
    value is already 64-bit. Codegen emits redundant movslq/cltq.
    The peephole catches some but not all cases.
-   Fix: Track value widths in the IR and eliminate redundant casts.
+   DONE: Narrow pass now handles AShr/LShr shift narrowing (eliminates
+   widen-shift-narrow pattern for right shifts, e.g. DOOM's fixed-point
+   frac>>16 pattern). Reduced DOOM text by ~6KB, movslq by ~390.
+   Remaining: Array index casts for pointer arithmetic (no narrowing
+   cast follows, so the narrow pass can't help). Would need either IR-level
+   analysis or backend-level elimination of redundant sign extensions.
 
 3. REDUNDANT REGISTER-REGISTER MOVES
    Patterns like: movq %rax, %r14; movq %r14, %r15

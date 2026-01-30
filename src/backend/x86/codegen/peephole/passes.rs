@@ -125,7 +125,14 @@ pub fn peephole_optimize(asm: String) -> String {
         }
     }
 
-    // Phase 5: Eliminate unused callee-saved register saves/restores.
+    // Phase 5: Global dead store elimination for never-read stack slots.
+    // After global_store_forwarding converts loads to register-to-register moves
+    // or NOPs, many stores to stack slots become dead because the slot is never
+    // loaded from anywhere in the function. This pass scans each function to find
+    // stack slots that are never read and eliminates stores to them.
+    eliminate_never_read_stores(&store, &mut infos);
+
+    // Phase 6: Eliminate unused callee-saved register saves/restores.
     // After all optimization passes, some callee-saved registers that were
     // allocated by the register allocator may have had all their body uses
     // eliminated by earlier peephole passes. Detect these and remove the
@@ -1484,6 +1491,213 @@ fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -> bool {
     }
 
     changed
+}
+
+// ── Global dead store elimination for never-read stack slots ─────────────────
+//
+// After global_store_forwarding converts loads to register-to-register moves
+// or NOPs, many stores to stack slots become dead because the slot is never
+// loaded from anywhere in the function. The local eliminate_dead_stores pass
+// only catches stores overwritten within a 16-instruction window. This pass
+// does a whole-function analysis: if a stack slot is never read from (no LoadRbp,
+// no Other instruction referencing its %rbp offset), the store is dead.
+//
+// Safety: we conservatively treat any %rbp reference in an Other instruction
+// as a "read" of that slot (even if it's a leaq taking the address). If any
+// instruction has has_indirect_mem (e.g., inline asm, rep movsb), we bail out
+// for the entire function since indirect memory accesses could read any slot.
+// Callee-saved register saves (in the prologue) are preserved.
+
+fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineInfo]) {
+    let len = store.len();
+    if len == 0 {
+        return;
+    }
+
+    // Process each function independently. Functions are delimited by the
+    // prologue pattern: pushq %rbp; movq %rsp, %rbp; subq $N, %rsp.
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+        // Look for function prologue: pushq %rbp
+        if !matches!(infos[i].kind, LineKind::Push { reg: 5 }) {
+            i += 1;
+            continue;
+        }
+
+        // Next non-nop should be "movq %rsp, %rbp"
+        let mut j = next_non_nop(infos, i + 1, len);
+        if j >= len {
+            i = j;
+            continue;
+        }
+        let mov_line = infos[j].trimmed(store.get(j));
+        if mov_line != "movq %rsp, %rbp" {
+            i = j + 1;
+            continue;
+        }
+        j += 1;
+
+        // Next non-nop should be "subq $N, %rsp"
+        j = next_non_nop(infos, j, len);
+        if j >= len {
+            i = j;
+            continue;
+        }
+        let subq_line = infos[j].trimmed(store.get(j));
+        let is_subq = if let Some(rest) = subq_line.strip_prefix("subq $") {
+            rest.strip_suffix(", %rsp").and_then(|v| v.parse::<i64>().ok()).is_some()
+        } else {
+            false
+        };
+        if !is_subq {
+            i = j + 1;
+            continue;
+        }
+        j += 1;
+
+        // Skip callee-saved register saves (immediately after subq)
+        j = next_non_nop(infos, j, len);
+        let mut callee_save_end = j;
+        while callee_save_end < len {
+            if infos[callee_save_end].is_nop() {
+                callee_save_end += 1;
+                continue;
+            }
+            if let LineKind::StoreRbp { reg, size: MoveSize::Q, .. } = infos[callee_save_end].kind {
+                if is_callee_saved_reg(reg) {
+                    callee_save_end += 1;
+                    continue;
+                }
+            }
+            break;
+        }
+        let body_start = callee_save_end;
+
+        // Find the end of this function (.size directive)
+        let mut func_end = len;
+        for k in body_start..len {
+            if infos[k].is_nop() {
+                continue;
+            }
+            let line = infos[k].trimmed(store.get(k));
+            if line.starts_with(".size ") {
+                func_end = k + 1;
+                break;
+            }
+        }
+
+        // Phase 1: Collect all "read" byte ranges on the stack in this function.
+        // A byte range [offset, offset+size) is "read" if ANY non-store instruction
+        // accesses it. We store (offset, byte_size) pairs and check for overlap.
+        //
+        // We check every line type that could possibly access memory:
+        //   - LoadRbp: direct load (pre-parsed offset and size)
+        //   - Other: pre-parsed rbp_offset (covers leaq, movq, etc.)
+        //   - All other instruction types: parse raw text for %rbp references
+        // If any instruction has has_indirect_mem, bail out for safety.
+        let mut has_indirect = false;
+        // Read ranges: (start_offset, byte_size) pairs
+        let mut read_ranges: Vec<(i32, i32)> = Vec::new();
+
+        for k in body_start..func_end {
+            if infos[k].is_nop() {
+                continue;
+            }
+
+            if infos[k].has_indirect_mem {
+                has_indirect = true;
+                break;
+            }
+
+            match infos[k].kind {
+                // StoreRbp: this is what we're trying to eliminate; don't count as read
+                LineKind::StoreRbp { .. } => {}
+                // LoadRbp: direct load - record the full byte range
+                LineKind::LoadRbp { offset, size, .. } => {
+                    read_ranges.push((offset, size.byte_size()));
+                }
+                // Other: has pre-parsed rbp_offset.
+                // Special case: `leaq N(%rbp), %reg` takes the ADDRESS of a
+                // stack slot, meaning the pointer escapes. Bail out.
+                // For all other instructions, use a conservative 32-byte access
+                // size to cover SSE (16B), x87 (10-16B), and complex (32B) ops.
+                LineKind::Other { .. } => {
+                    let rbp_off = infos[k].rbp_offset;
+                    if rbp_off != RBP_OFFSET_NONE {
+                        let line = infos[k].trimmed(store.get(k));
+                        if line.starts_with("leaq ") {
+                            // Address of stack slot escapes - bail out
+                            has_indirect = true;
+                            break;
+                        }
+                        // Other instructions can have varying access sizes:
+                        // - Standard GP ops: 1-8 bytes
+                        // - SSE ops (movdqa etc.): 16 bytes
+                        // - x87/long double ops: 10-16 bytes
+                        // - Complex number ops: up to 32 bytes
+                        // Use 32 bytes as conservative upper bound to cover
+                        // all possible access patterns.
+                        read_ranges.push((rbp_off, 32));
+                    } else {
+                        // rbp_offset is RBP_OFFSET_NONE: either no %rbp ref,
+                        // or multiple different offsets. If the line text contains
+                        // (%rbp), we can't determine which slot(s) are referenced,
+                        // so bail out for safety.
+                        let line = infos[k].trimmed(store.get(k));
+                        if line.contains("(%rbp)") {
+                            has_indirect = true;
+                            break;
+                        }
+                    }
+                }
+                // Lines that can't reference %rbp memory operands
+                LineKind::Nop | LineKind::Empty | LineKind::SelfMove
+                | LineKind::Label | LineKind::Jmp | LineKind::CondJmp
+                | LineKind::JmpIndirect | LineKind::Ret | LineKind::Directive => {}
+                // All other types (Cmp, Push, Pop, SetCC, Call): parse raw text
+                // for %rbp references to be safe (assume 8-byte access)
+                _ => {
+                    let line = infos[k].trimmed(store.get(k));
+                    let rbp_off = parse_rbp_offset(line);
+                    if rbp_off != RBP_OFFSET_NONE {
+                        read_ranges.push((rbp_off, 8));
+                    } else if line.contains("(%rbp)") {
+                        // Multiple or unparseable %rbp references - bail out
+                        has_indirect = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if has_indirect {
+            i = func_end;
+            continue;
+        }
+
+        // Phase 2: Eliminate stores to slots whose byte range doesn't overlap
+        // with any read range.
+        for k in body_start..func_end {
+            if infos[k].is_nop() {
+                continue;
+            }
+            if let LineKind::StoreRbp { offset, size, .. } = infos[k].kind {
+                let store_bytes = size.byte_size();
+                let is_read = read_ranges.iter().any(|&(r_off, r_sz)| {
+                    ranges_overlap(offset, store_bytes, r_off, r_sz)
+                });
+                if !is_read {
+                    mark_nop(&mut infos[k]);
+                }
+            }
+        }
+
+        i = func_end;
+    }
 }
 
 // ── Global store forwarding across basic block boundaries ─────────────────────
