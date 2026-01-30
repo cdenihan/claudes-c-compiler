@@ -1143,21 +1143,21 @@ impl Lowerer {
             return Operand::Value(dest);
         }
 
-        // On x86-64, ALL structs use VaArgStruct for correct ABI handling.
-        // The SysV ABI requires that multi-eightbyte structs are passed entirely
-        // in registers OR entirely on the stack - never split across the boundary.
-        // By using VaArgStruct with eightbyte classification, the backend can
-        // atomically check if all required register slots are available and fall
-        // back to the overflow area if not.
-        if self.target == Target::X86_64 {
-            let eightbyte_classes = if struct_size <= 16 {
+        // On x86-64 and AArch64, structs use VaArgStruct for correct ABI handling.
+        // Both the SysV x86-64 ABI and AAPCS64 require that multi-register structs
+        // are passed entirely in registers OR entirely on the stack - never split
+        // across the boundary. By using VaArgStruct, the backend can atomically
+        // check if all required register slots are available and fall back to the
+        // overflow/stack area if not.
+        if self.target == Target::X86_64 || self.target == Target::Aarch64 {
+            let eightbyte_classes = if self.target == Target::X86_64 && struct_size <= 16 {
                 if let Some(layout) = self.get_struct_layout_for_ctype(ctype) {
                     layout.classify_sysv_eightbytes(&*self.types.borrow_struct_layouts())
                 } else {
                     Vec::new()
                 }
             } else {
-                Vec::new() // >16 bytes = MEMORY class, always overflow
+                Vec::new() // AArch64 or >16 bytes on x86 = no eightbyte classes needed
             };
 
             let ap_val = self.lower_va_list_pointer(ap_expr);
