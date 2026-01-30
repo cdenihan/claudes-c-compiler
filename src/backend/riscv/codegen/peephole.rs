@@ -1024,33 +1024,52 @@ fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: us
         }
     }
 
-    // Phase 1: Collect all offsets that are loaded from
-    let mut loaded_offsets = std::collections::HashSet::new();
+    // Phase 1: Collect all (offset, size) byte ranges that are loaded from.
+    // We must use byte-range overlap (not exact offset match) because a wide
+    // store (e.g. `sd` at offset -24, 8 bytes) can be partially read by a
+    // narrower load at a different offset (e.g. `lwu` at offset -20, 4 bytes).
+    let mut loaded_ranges: Vec<(i32, i32)> = Vec::new(); // (offset, size)
     for i in 0..n {
         match kinds[i] {
-            LineKind::LoadS0 { offset, .. } => {
-                loaded_offsets.insert(offset);
+            LineKind::LoadS0 { offset, is_word, .. } => {
+                let size = if is_word { 4 } else { 8 };
+                loaded_ranges.push((offset, size));
             }
             _ => {
                 // Check for loads in Other/Alu instructions that reference s0 offsets
                 let trimmed = lines[i].trim();
-                if (trimmed.starts_with("ld") || trimmed.starts_with("lw") ||
-                    trimmed.starts_with("lb") || trimmed.starts_with("lh") ||
-                    trimmed.starts_with("lbu") || trimmed.starts_with("lhu") ||
-                    trimmed.starts_with("lwu")) && trimmed.contains("(s0)") {
-                    if let Some(off) = extract_s0_offset_from_line(trimmed) {
-                        loaded_offsets.insert(off);
+                let load_size = if trimmed.starts_with("ld ") {
+                    Some(8)
+                } else if trimmed.starts_with("lw ") || trimmed.starts_with("lwu ") {
+                    Some(4)
+                } else if trimmed.starts_with("lh ") || trimmed.starts_with("lhu ") {
+                    Some(2)
+                } else if trimmed.starts_with("lb ") || trimmed.starts_with("lbu ") {
+                    Some(1)
+                } else {
+                    None
+                };
+                if let Some(sz) = load_size {
+                    if trimmed.contains("(s0)") {
+                        if let Some(off) = extract_s0_offset_from_line(trimmed) {
+                            loaded_ranges.push((off, sz));
+                        }
                     }
                 }
             }
         }
     }
 
-    // Phase 2: Remove stores to offsets that are never loaded
+    // Phase 2: Remove stores whose byte range does not overlap any load range
     let mut changed = false;
     for i in 0..n {
-        if let LineKind::StoreS0 { offset, .. } = kinds[i] {
-            if !loaded_offsets.contains(&offset) {
+        if let LineKind::StoreS0 { offset, is_word, .. } = kinds[i] {
+            let store_size = if is_word { 4 } else { 8 };
+            let overlaps_any_load = loaded_ranges.iter().any(|&(load_off, load_sz)| {
+                // Two ranges [a, a+as) and [b, b+bs) overlap iff a < b+bs && b < a+as
+                offset < load_off + load_sz && load_off < offset + store_size
+            });
+            if !overlaps_any_load {
                 kinds[i] = LineKind::Nop;
                 changed = true;
             }
