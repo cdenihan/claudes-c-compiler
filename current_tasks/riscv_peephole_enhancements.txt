@@ -1,0 +1,15 @@
+Task: RISC-V Peephole Optimizer Enhancements
+Status: in_progress
+Started: 2026-01-30
+
+Adding several peephole optimizations to the RISC-V backend that x86 and ARM
+already have, to generate faster code:
+
+1. Register copy propagation - propagate mov reg copies into subsequent
+   instructions to eliminate redundant moves
+2. Global store forwarding - track slot→register mappings across basic blocks
+   to convert redundant loads into register moves
+3. Branch-over-branch fusion - convert bCC .skip; j .target; .skip: into
+   b!CC .target
+4. Global dead store elimination - eliminate stores to stack slots that are
+   never loaded (similar to ARM's implementation)
