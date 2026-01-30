@@ -316,10 +316,12 @@ impl Driver {
                 "-mindirect-branch=thunk-extern" => self.indirect_branch_thunk = true,
                 "-m16" => self.gcc_fallback = true, // TODO: replace with I686 once -m32 working
                 "-m32" => {
-                    // When USE_MY_32=1 environment variable is set, use our i686 backend
-                    // instead of falling back to GCC. This allows iterative testing of
-                    // 32-bit kernel compilation with our compiler.
-                    if std::env::var("USE_MY_32").as_deref() == Ok("1") {
+                    // If we're already targeting i686 (e.g. invoked as ccc-i686),
+                    // -m32 is a no-op. Otherwise, use our i686 backend when
+                    // USE_MY_32=1 is set, or fall back to GCC.
+                    if self.target == Target::I686 {
+                        // Already 32-bit, nothing to do
+                    } else if std::env::var("USE_MY_32").as_deref() == Ok("1") {
                         self.target = Target::I686;
                     } else {
                         self.gcc_fallback = true;
