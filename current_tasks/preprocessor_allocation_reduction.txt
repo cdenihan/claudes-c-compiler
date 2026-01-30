@@ -1,0 +1,13 @@
+Reduce preprocessor heap allocations in hot paths
+
+Goal: Reduce String/Vec heap allocations in the macro expansion hot paths
+to improve compile speed on header-heavy files (e.g., kernel).
+
+Changes planned:
+1. Make extract_trailing_ident() return &str instead of String
+2. Add set_file() to MacroTable (like set_line()) to avoid MacroDef alloc per #include
+3. Avoid MacroDef::clone() in expand_trailing_func_macros and try_resolve_objlike_to_funclike
+4. Add reusable FxHashSet to Preprocessor for handle_if/handle_elif expand_line calls
+5. Avoid double String alloc in MacroTable::define() by taking the name from MacroDef
+
+Status: in_progress
