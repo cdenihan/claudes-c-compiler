@@ -1,0 +1,19 @@
+Fix &"string_literal"[index] in static/global initializers
+
+Problem: The expression &"hello"[2] used in a global struct array initializer
+is not being correctly evaluated as a constant address expression. Instead of
+producing a pointer to offset 2 within the interned string literal, the compiler
+produces a NULL pointer, causing the array to appear truncated.
+
+Root cause: eval_string_literal_addr_expr() handles "str" + N and "str" - N
+but does not handle AddressOf(ArraySubscript(StringLiteral, index)) which is
+the equivalent expression &"str"[N].
+
+Fix: Add an Expr::AddressOf arm to eval_string_literal_addr_expr() that
+recognizes the ArraySubscript(StringLiteral, index) inner pattern and
+delegates to eval_string_literal_with_offset().
+
+Affected project: json-c (test_parse uses &"null123"[4] style expressions
+in static struct array initializers).
+
+Status: in_progress
