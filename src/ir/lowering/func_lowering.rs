@@ -490,12 +490,15 @@ impl Lowerer {
         let entry_allocas = std::mem::take(&mut self.func_mut().entry_allocas);
         if !entry_allocas.is_empty() {
             if let Some(entry_block) = self.func_mut().blocks.first_mut() {
-                // Find the insertion point: right after the last Alloca instruction
-                // in the entry block (these are parameter allocas).
+                // Find the insertion point: right after the initial contiguous run
+                // of Alloca instructions at the start of the entry block (parameter allocas).
+                // We must NOT use rposition (last alloca anywhere in the block) because
+                // SSE intrinsic lowering emits inline allocas deep in the block via
+                // self.emit(Alloca), and placing deferred allocas after those would put
+                // them after their uses, violating dominance.
                 let insert_pos = entry_block.instructions.iter()
-                    .rposition(|inst| matches!(inst, Instruction::Alloca { .. }))
-                    .map(|pos| pos + 1)
-                    .unwrap_or(0);
+                    .position(|inst| !matches!(inst, Instruction::Alloca { .. }))
+                    .unwrap_or(entry_block.instructions.len());
                 // Splice deferred allocas at the insertion point.
                 let num_allocas = entry_allocas.len();
                 entry_block.instructions.splice(insert_pos..insert_pos, entry_allocas);

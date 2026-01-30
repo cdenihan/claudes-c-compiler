@@ -284,6 +284,20 @@ _mm_cmpgt_epi8(__m128i __a, __m128i __b)
     return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_pcmpgtb128(__a, __b));
 }
 
+/* === 32-bit Unsigned Multiply === */
+
+/* _mm_mul_epu32: Multiply the low unsigned 32-bit integers from each
+ * 64-bit element of __a and __b, producing two unsigned 64-bit results. */
+static __inline__ __m128i __attribute__((__always_inline__))
+_mm_mul_epu32(__m128i __a, __m128i __b)
+{
+    unsigned long long __a0 = (unsigned long long)(unsigned int)__a.__val[0];
+    unsigned long long __b0 = (unsigned long long)(unsigned int)__b.__val[0];
+    unsigned long long __a1 = (unsigned long long)(unsigned int)__a.__val[1];
+    unsigned long long __b1 = (unsigned long long)(unsigned int)__b.__val[1];
+    return (__m128i){ { (long long)(__a0 * __b0), (long long)(__a1 * __b1) } };
+}
+
 /* === 64-bit Arithmetic === */
 
 static __inline__ __m128i __attribute__((__always_inline__))
@@ -475,6 +489,13 @@ static __inline__ __m128i __attribute__((__always_inline__))
 _mm_set1_epi64x(long long __q)
 {
     return (__m128i){ { __q, __q } };
+}
+
+/* _mm_set_epi64x: set two 64-bit integers (high, low order) */
+static __inline__ __m128i __attribute__((__always_inline__))
+_mm_set_epi64x(long long __q1, long long __q0)
+{
+    return (__m128i){ { __q0, __q1 } };
 }
 
 /* === Insert / Extract === */

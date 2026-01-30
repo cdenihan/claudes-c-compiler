@@ -116,9 +116,12 @@ fn analyze_allocas(func: &IrFunction) -> AllocaAnalysis {
     let mut alloca_values = FxHashSet::default();
     let mut address_taken = FxHashSet::default();
 
-    // Collect all alloca values from the entry block.
-    if !func.blocks.is_empty() {
-        for inst in &func.blocks[0].instructions {
+    // Collect all alloca values from every block. After inlining, allocas
+    // from callee entry blocks appear in non-entry blocks of the caller.
+    // All such allocas must be tracked so that LICM correctly identifies
+    // intrinsic instructions that read from loop-modified alloca memory.
+    for block in &func.blocks {
+        for inst in &block.instructions {
             if let Instruction::Alloca { dest, .. } = inst {
                 alloca_values.insert(dest.0);
             }

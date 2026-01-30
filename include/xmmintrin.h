@@ -262,6 +262,46 @@ _mm_movemask_ps(__m128 __a)
     return __r;
 }
 
+/* === Prefetch === */
+
+/* Prefetch hint constants */
+#define _MM_HINT_T0  3
+#define _MM_HINT_T1  2
+#define _MM_HINT_T2  1
+#define _MM_HINT_NTA 0
+
+/* _mm_prefetch: hint to prefetch data into cache.
+ * In our implementation this is a no-op since we don't emit prefetch
+ * instructions, but it must be defined for source compatibility. */
+#define _mm_prefetch(P, I) ((void)(P), (void)(I))
+
+/* === Aligned memory allocation === */
+
+static __inline__ void *__attribute__((__always_inline__))
+_mm_malloc(unsigned long __size, unsigned long __align)
+{
+    void *__ptr;
+    if (__align <= sizeof(void *))
+        return __builtin_malloc(__size);
+    /* Use posix_memalign for aligned allocation */
+    if (__size == 0)
+        return (void *)0;
+    /* Manually align: allocate extra space for alignment and store original pointer */
+    void *__raw = __builtin_malloc(__size + __align + sizeof(void *));
+    if (!__raw)
+        return (void *)0;
+    __ptr = (void *)(((unsigned long)((char *)__raw + sizeof(void *) + __align - 1)) & ~(__align - 1));
+    ((void **)__ptr)[-1] = __raw;
+    return __ptr;
+}
+
+static __inline__ void __attribute__((__always_inline__))
+_mm_free(void *__ptr)
+{
+    if (__ptr)
+        __builtin_free(((void **)__ptr)[-1]);
+}
+
 /* === Fence === */
 
 static __inline__ void __attribute__((__always_inline__))
