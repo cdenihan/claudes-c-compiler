@@ -5,8 +5,8 @@ pub(crate) mod state;       // CodegenState, StackSlot, SlotAddr
 pub(crate) mod traits;      // ArchCodegen trait with default implementations
 pub(crate) mod generation;    // Module/function/instruction dispatch
 pub(crate) mod stack_layout;  // Stack layout: slot assignment, alloca coalescing, regalloc helpers
-pub(crate) mod call_abi;    // Call argument classification and stack computation
-pub(crate) mod call_emit;   // Callee-side parameter classification (shared by emit_store_params)
+pub(crate) mod call_abi;    // Unified ABI classification: call args + callee params, stack computation
+pub(crate) mod call_emit;   // Re-exports from call_abi for backward compatibility
 pub(crate) mod cast;        // Cast and float operation classification
 pub(crate) mod f128_softfloat; // Shared F128 soft-float orchestration (ARM + RISC-V)
 pub(crate) mod inline_asm;  // InlineAsmEmitter trait and shared framework
