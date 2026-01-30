@@ -1,0 +1,23 @@
+Task: Fix inline asm scratch register allocation clobbering callee-saved registers
+Status: in_progress
+Started: 2026-01-30
+
+Problem:
+When inline assembly has a "=qm" output constraint, the scratch register allocator can
+fall through from the caller-saved pool (rcx, rdx, rsi, rdi, r8-r11) to callee-saved
+registers (r12-r15) if the caller-saved pool appears exhausted. This causes the inline
+asm template (e.g., "setc %0") to write to a callee-saved register that's holding a live
+value from the main register allocator, corrupting it.
+
+This bug manifests in the Linux kernel's test_bit/variable_test_bit inline assembly,
+causing do_wp_page to crash with a page fault when the setc instruction clobbers R15
+which holds &vmf->page.
+
+Root cause: assign_scratch_reg() in x86/codegen/asm_emitter.rs falls through to r12-r15
+when the main scratch pool is exhausted, but doesn't check if those callee-saved registers
+are in use by the main register allocator.
+
+Fix: Never use callee-saved registers as inline asm scratch. When the caller-saved pool
+is exhausted and the constraint has a memory alternative ("=qm"), fall back to memory.
+When no memory alternative exists, reuse a caller-saved register rather than touching
+callee-saved ones.
