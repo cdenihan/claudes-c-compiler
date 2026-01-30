@@ -1,0 +1,17 @@
+Fix __builtin_offsetof constant folding in IR lowering
+
+Bug: __builtin_offsetof(type, member) expands to ((unsigned long)&((type*)0)->member)
+but lower_address_of() was not recognizing the &((type*)0)->member pattern for constant
+folding. The offsetof value was computed at runtime (xor+lea) instead of being folded
+to a compile-time constant integer.
+
+This caused BUILD_BUG_ON(offsetof(...) != N) in the Linux kernel to leave undefined
+references to __compiletime_assert_NNN symbols, since the dead branch (if(0) call())
+was not eliminated.
+
+Fix: In lower_address_of(), try eval_offsetof_pattern() first. When the inner expression
+matches the &((type*)0)->member pattern, return the constant offset directly instead of
+generating runtime pointer arithmetic.
+
+Status: in_progress
+Started: 2026-01-30
