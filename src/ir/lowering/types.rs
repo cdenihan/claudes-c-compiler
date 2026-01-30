@@ -193,7 +193,12 @@ impl Lowerer {
             TypeSpecifier::Pointer(_, _) => IrType::Ptr,
             TypeSpecifier::Array(_, _) => IrType::Ptr,
             TypeSpecifier::Struct(..) | TypeSpecifier::Union(..) => IrType::Ptr,
-            TypeSpecifier::Enum(_, _, false) => IrType::I32,
+            TypeSpecifier::Enum(_, _, false) => {
+                // Non-packed enum: resolve to CType to get correct size and signedness.
+                // Enums with values like `1U << 31` (0x80000000) are unsigned 32-bit.
+                let ctype = self.type_spec_to_ctype(ts);
+                IrType::from_ctype(&ctype)
+            }
             TypeSpecifier::Enum(_, _, true) => {
                 // Packed enum: resolve to CType to get the correct IR type
                 let ctype = self.type_spec_to_ctype(ts);

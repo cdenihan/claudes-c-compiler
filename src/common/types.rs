@@ -253,9 +253,14 @@ impl EnumType {
     /// smallest integer type that can represent all variant values.
     pub fn packed_size(&self) -> usize {
         if !self.is_packed {
-            // GCC extension: if any variant value exceeds int range,
-            // the enum size grows to 8 bytes (long long)
-            if self.variants.iter().any(|(_, v)| *v > i32::MAX as i64 || *v < i32::MIN as i64) {
+            // Non-packed enum: 4 bytes if all values fit in int or unsigned int,
+            // otherwise 8 bytes (GCC extension for values exceeding 32-bit range).
+            // Values like `1U << 31` (0x80000000) fit in unsigned int (u32) even
+            // though they exceed signed int (i32) range.
+            let exceeds_32bit = self.variants.iter().any(|(_, v)| {
+                *v > u32::MAX as i64 || *v < i32::MIN as i64
+            });
+            if exceeds_32bit {
                 return 8;
             }
             return 4;
@@ -1819,7 +1824,15 @@ impl IrType {
                             IrType::U64
                         }
                     }
-                    _ => IrType::I32,
+                    _ => {
+                        // 4-byte enum: unsigned if any value exceeds i32 range
+                        // (e.g., 1U << 31 = 0x80000000 fits in u32 but not i32)
+                        if e.variants.iter().any(|(_, v)| *v > i32::MAX as i64) {
+                            IrType::U32
+                        } else {
+                            IrType::I32
+                        }
+                    }
                 }
             }
             CType::UInt => IrType::U32,
