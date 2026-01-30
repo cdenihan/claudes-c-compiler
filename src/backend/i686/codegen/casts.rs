@@ -482,8 +482,25 @@ impl I686Codegen {
         match classify_cast(from_ty, to_ty) {
             CastKind::Noop | CastKind::UnsignedToSignedSameSize { .. } => {}
 
-            CastKind::IntNarrow { .. } => {
-                // Truncation: no-op on x86 (use sub-register)
+            CastKind::IntNarrow { to_ty } => {
+                // Truncation to a narrower type: sign-extend or zero-extend
+                // the sub-register to fill all of %eax. Without this, the
+                // upper bits of %eax retain stale data from the wider
+                // computation, which corrupts truthiness checks (testl %eax)
+                // and other 32-bit operations on the narrowed value.
+                if to_ty.is_signed() {
+                    match to_ty {
+                        IrType::I8 => self.state.emit("    movsbl %al, %eax"),
+                        IrType::I16 => self.state.emit("    movswl %ax, %eax"),
+                        _ => {} // I32: no-op (already 32-bit)
+                    }
+                } else {
+                    match to_ty {
+                        IrType::U8 => self.state.emit("    movzbl %al, %eax"),
+                        IrType::U16 => self.state.emit("    movzwl %ax, %eax"),
+                        _ => {} // U32: no-op
+                    }
+                }
             }
 
             CastKind::IntWiden { from_ty, .. } => {

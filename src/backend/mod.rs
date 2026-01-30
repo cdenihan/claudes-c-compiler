@@ -206,11 +206,12 @@ impl Target {
                 cg.apply_options(opts);
                 cg.state.function_sections = opts.function_sections;
                 cg.state.data_sections = opts.data_sections;
-                let asm = generation::generate_module_with_debug(&mut cg, module, opts.debug_info, source_mgr);
+                let raw = generation::generate_module_with_debug(&mut cg, module, opts.debug_info, source_mgr);
+                let optimized = i686::codegen::peephole::peephole_optimize(raw);
                 if opts.code16gcc {
-                    format!(".code16gcc\n{}", asm)
+                    format!(".code16gcc\n{}", optimized)
                 } else {
-                    asm
+                    optimized
                 }
             }
             Target::Aarch64 => {
