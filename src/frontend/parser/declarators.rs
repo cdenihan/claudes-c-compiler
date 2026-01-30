@@ -589,7 +589,7 @@ impl Parser {
             }
             name
         } else if let TokenKind::Identifier(_) = self.peek() {
-            // Parenthesized name: (name) or (name)(params)
+            // Parenthesized name: (name), (name)(params), or (name(params))
             let name = if let TokenKind::Identifier(ref n) = self.peek() {
                 let n = n.clone();
                 self.advance();
@@ -597,12 +597,22 @@ impl Parser {
             } else {
                 None
             };
+            // Check for function parameter list INSIDE the outer parens:
+            // E.g., `int (fn_op(void *, object, object))` where the parameter list
+            // is inside the parenthesized declarator. This declares fn_op as having
+            // function type `int(void *, object, object)` which decays to a function
+            // pointer per C11 6.7.6.3p8.
+            if matches!(self.peek(), TokenKind::LParen) {
+                *is_func_ptr = true;
+                let (fp_params, _variadic) = self.parse_param_list();
+                *fptr_params = Some(fp_params);
+            }
             self.expect(&TokenKind::RParen);
             self.skip_array_dimensions();
-            // Trailing (params) means function-type parameter decay to pointer.
+            // Trailing (params) outside the parens means function-type parameter decay.
             // E.g., `int (f)(int)` → f has function type, decays to function pointer.
             // Parse the param list to preserve function type information.
-            if matches!(self.peek(), TokenKind::LParen) {
+            if !*is_func_ptr && matches!(self.peek(), TokenKind::LParen) {
                 *is_func_ptr = true;
                 let (fp_params, _variadic) = self.parse_param_list();
                 *fptr_params = Some(fp_params);

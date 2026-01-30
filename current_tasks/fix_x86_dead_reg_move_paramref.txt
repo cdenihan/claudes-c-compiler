@@ -1,0 +1,10 @@
+Fix x86 dead register move elimination defense-in-depth + ParamRef slot-reuse optimization
+
+- Add defense-in-depth check in eliminate_dead_reg_moves: after is_read_modify_write returns false,
+  also check if the dest register appears in the source/address part of the instruction. Catches
+  any instruction pattern where the dest reg is used as a base/index in the source operand.
+- Fix emit_param_ref_impl: skip redundant load+store when dest and alloca share the same stack slot.
+  Previously emitted `movq -16(%rbp), %rax; movq %rax, -16(%rbp)` which is a no-op.
+- Add regression test for the LEA dead-move elimination pattern.
+
+Status: in_progress

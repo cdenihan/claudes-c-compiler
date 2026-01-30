@@ -1,9 +1,0 @@
-Fix parser: function types as parameter declarations inside parentheses
-
-Pattern: int (fn_op(void *, object, object)) where the function parameter list
-is inside the parenthesized declarator. This is valid C that declares fn_op as
-having function type which decays to a function pointer per C11 6.7.6.3p8.
-
-Needed for Cyclone Scheme project.
-
-Status: in_progress
