@@ -564,17 +564,19 @@ impl Parser {
             let d_section = self.attrs.parsing_section.take().or_else(|| section.clone());
             let d_cleanup_fn = self.attrs.parsing_cleanup_fn.take();
             let d_used = self.attrs.parsing_used();
+            let d_noreturn = self.attrs.parsing_noreturn();
+            let d_error_attr = self.attrs.parsing_error_attr();
             self.attrs.set_weak(false);
             self.attrs.set_used(false);
             self.attrs.set_fastcall(false);
             self.attrs.set_naked(false);
+            self.attrs.set_noreturn(false);
+            self.attrs.set_error_attr(false);
             let dinit = if self.consume_if(&TokenKind::Assign) {
                 Some(self.parse_initializer())
             } else {
                 None
             };
-            let d_error_attr = self.attrs.parsing_error_attr();
-            let d_noreturn = self.attrs.parsing_noreturn();
             let d_fastcall = self.attrs.parsing_fastcall();
             declarators.push(InitDeclarator {
                 name: dname.unwrap_or_default(),

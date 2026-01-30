@@ -666,6 +666,26 @@ fn retarget_move_imm(line: &str, new_dst: u8) -> Option<String> {
 // This is a very common pattern from the codegen: it emits a conditional branch
 // to skip over an unconditional branch.
 
+/// Estimate the distance (in instructions) from position `from` to the label
+/// `target` in the assembly. Returns `None` if the label is not found.
+fn estimate_branch_distance(lines: &[String], kinds: &[LineKind], from: usize, target: &str) -> Option<usize> {
+    // Search both forward and backward for the target label
+    let target_with_colon = format!("{}:", target);
+    for idx in 0..lines.len() {
+        if kinds[idx] == LineKind::Label && lines[idx].trim() == target_with_colon {
+            // Count non-Nop lines between from and idx (each is one 4-byte instruction)
+            let (lo, hi) = if from < idx { (from, idx) } else { (idx, from) };
+            let count = (lo..hi).filter(|&p| kinds[p] != LineKind::Nop && kinds[p] != LineKind::Label).count();
+            return Some(count);
+        }
+    }
+    None
+}
+
+/// Maximum number of instructions a b.cond can reach (±1MB = ±262144 instructions).
+/// Use a conservative threshold of 200,000 to leave margin.
+const COND_BRANCH_SAFE_DISTANCE: usize = 200_000;
+
 fn fuse_branch_over_branch(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
     let mut i = 0;
@@ -697,14 +717,19 @@ fn fuse_branch_over_branch(lines: &mut [String], kinds: &mut [LineKind], n: usiz
                     label_name(&lines[k]),
                 ) {
                     if skip_target == lbl {
-                        if let Some(inv_cc) = invert_condition(cc) {
-                            // Replace conditional branch with inverted condition to real target
-                            lines[i] = format!("    b.{} {}", inv_cc, real_target);
-                            // kinds[i] stays as CondBranch
-                            // Remove the unconditional branch
-                            kinds[j] = LineKind::Nop;
-                            // Keep the label (might be targeted by other branches)
-                            changed = true;
+                        // Check if the real target is within safe b.cond range
+                        let in_range = estimate_branch_distance(lines, kinds, i, real_target)
+                            .map_or(false, |d| d < COND_BRANCH_SAFE_DISTANCE);
+                        if in_range {
+                            if let Some(inv_cc) = invert_condition(cc) {
+                                // Replace conditional branch with inverted condition to real target
+                                lines[i] = format!("    b.{} {}", inv_cc, real_target);
+                                // kinds[i] stays as CondBranch
+                                // Remove the unconditional branch
+                                kinds[j] = LineKind::Nop;
+                                // Keep the label (might be targeted by other branches)
+                                changed = true;
+                            }
                         }
                     }
                 }
