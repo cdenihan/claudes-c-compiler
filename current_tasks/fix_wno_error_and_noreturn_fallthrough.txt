@@ -1,0 +1,15 @@
+Task: Fix -Wno-error flag handling and noreturn fall-through analysis
+Status: in_progress
+Started: 2026-01-30
+
+Problem:
+1. The -Wno-error flag (without =name) is silently ignored by WarningConfig::process_flag(),
+   meaning -Werror cannot be disabled. This breaks projects like http-parser that use
+   -Werror in their Makefile and -Wno-error in extra flags.
+2. The sema fall-through analysis does not recognize calls to noreturn functions
+   (abort(), exit(), etc.) as non-returning, causing false -Wreturn-type warnings.
+
+Fix:
+1. Add "no-error" case to process_flag() that sets werror_all = false
+2. Enhance stmt_can_fall_through() to detect expression statements that are
+   calls to noreturn functions
