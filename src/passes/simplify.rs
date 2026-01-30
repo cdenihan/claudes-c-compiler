@@ -52,6 +52,10 @@
 //! - Cmp(Ule, x, 0) => Cmp(Eq, x, 0) -- unsigned x <= 0 is x == 0
 //! - Cmp(Ugt, x, 0) => Cmp(Ne, x, 0) -- unsigned x > 0 is x != 0
 //!
+//! Operand canonicalization (for better codegen):
+//! - Cmp(op, Const, Value) => Cmp(swapped_op, Value, Const)
+//! - BinOp(commutative_op, Const, Value) => BinOp(op, Value, Const)
+//!
 //! Select simplification:
 //! - select cond, x, x => x (both arms same)
 //! - select Const(0), a, b => b (constant false condition)
@@ -674,6 +678,22 @@ fn simplify_cmp(
         }
     }
 
+    // Operand canonicalization: if the constant is on the LHS, rewrite to place it
+    // on the RHS with the comparison operator swapped. This enables the backend to
+    // use immediate-form compare instructions (e.g., `cmp $imm, %reg` or
+    // `test %reg, %reg` for zero) instead of loading the constant into a register.
+    // Only rewrite when the instruction actually has the constant on the LHS.
+    if matches!(lhs, Operand::Const(_)) && matches!(rhs, Operand::Value(_)) {
+        let swapped_op = swap_cmp_op(op);
+        return Some(Instruction::Cmp {
+            dest,
+            op: swapped_op,
+            lhs: *rhs,
+            rhs: *lhs,
+            ty,
+        });
+    }
+
     None
 }
 
@@ -1007,6 +1027,16 @@ fn simplify_binop(
                 return Some(inst);
             }
         }
+    }
+
+    // Commutative operand canonicalization: for commutative operations
+    // (Add, Mul, And, Or, Xor), place the constant on the RHS so the backend
+    // can use immediate-form instructions (e.g., `addq $imm, %reg` instead of
+    // loading the constant into a register first).
+    if op.is_commutative() && matches!(lhs, Operand::Const(_)) && matches!(rhs, Operand::Value(_)) {
+        return Some(Instruction::BinOp {
+            dest, op, lhs: *rhs, rhs: *lhs, ty,
+        });
     }
 
     None
@@ -2795,5 +2825,117 @@ mod tests {
             }
             _ => panic!("Expected Cmp(Ne, V1, 0), got {:?}", result),
         }
+    }
+
+    // === Operand canonicalization tests ===
+
+    #[test]
+    fn test_cmp_canonicalize_const_lhs_slt() {
+        // Cmp(Slt, Const(5), Value(1)) => Cmp(Sgt, Value(1), Const(5))
+        let inst = Instruction::Cmp {
+            dest: Value(2), op: IrCmpOp::Slt,
+            lhs: Operand::Const(IrConst::I32(5)),
+            rhs: Operand::Value(Value(1)),
+            ty: IrType::I32,
+        };
+        let result = simplify_default(&inst).unwrap();
+        match result {
+            Instruction::Cmp { op: IrCmpOp::Sgt, lhs: Operand::Value(v), rhs: Operand::Const(IrConst::I32(5)), .. } => {
+                assert_eq!(v.0, 1);
+            }
+            _ => panic!("Expected Cmp(Sgt, V1, I32(5)), got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_cmp_canonicalize_const_lhs_eq() {
+        // Cmp(Eq, Const(42), Value(1)) => Cmp(Eq, Value(1), Const(42))
+        // Eq is symmetric so swap_cmp_op returns Eq
+        let inst = Instruction::Cmp {
+            dest: Value(2), op: IrCmpOp::Eq,
+            lhs: Operand::Const(IrConst::I64(42)),
+            rhs: Operand::Value(Value(1)),
+            ty: IrType::I64,
+        };
+        let result = simplify_default(&inst).unwrap();
+        match result {
+            Instruction::Cmp { op: IrCmpOp::Eq, lhs: Operand::Value(v), rhs: Operand::Const(IrConst::I64(42)), .. } => {
+                assert_eq!(v.0, 1);
+            }
+            _ => panic!("Expected Cmp(Eq, V1, I64(42)), got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_cmp_no_canonicalize_already_canonical() {
+        // Cmp(Slt, Value(1), Const(5)) - already canonical, no change
+        let inst = Instruction::Cmp {
+            dest: Value(2), op: IrCmpOp::Slt,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I32(5)),
+            ty: IrType::I32,
+        };
+        assert!(simplify_default(&inst).is_none());
+    }
+
+    #[test]
+    fn test_binop_canonicalize_commutative_add() {
+        // BinOp(Add, Const(10), Value(1)) => BinOp(Add, Value(1), Const(10))
+        let inst = Instruction::BinOp {
+            dest: Value(2), op: IrBinOp::Add,
+            lhs: Operand::Const(IrConst::I32(10)),
+            rhs: Operand::Value(Value(1)),
+            ty: IrType::I32,
+        };
+        let result = simplify_default(&inst).unwrap();
+        match result {
+            Instruction::BinOp { op: IrBinOp::Add, lhs: Operand::Value(v), rhs: Operand::Const(IrConst::I32(10)), .. } => {
+                assert_eq!(v.0, 1);
+            }
+            _ => panic!("Expected BinOp(Add, V1, I32(10)), got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_binop_canonicalize_commutative_and() {
+        // BinOp(And, Const(0xFF), Value(1)) => BinOp(And, Value(1), Const(0xFF))
+        let inst = Instruction::BinOp {
+            dest: Value(2), op: IrBinOp::And,
+            lhs: Operand::Const(IrConst::I64(0xFF)),
+            rhs: Operand::Value(Value(1)),
+            ty: IrType::I64,
+        };
+        let result = simplify_default(&inst).unwrap();
+        match result {
+            Instruction::BinOp { op: IrBinOp::And, lhs: Operand::Value(v), rhs: Operand::Const(IrConst::I64(0xFF)), .. } => {
+                assert_eq!(v.0, 1);
+            }
+            _ => panic!("Expected BinOp(And, V1, I64(0xFF)), got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_binop_no_canonicalize_non_commutative() {
+        // BinOp(Sub, Const(10), Value(1)) - Sub is NOT commutative, should NOT swap
+        let inst = Instruction::BinOp {
+            dest: Value(2), op: IrBinOp::Sub,
+            lhs: Operand::Const(IrConst::I32(10)),
+            rhs: Operand::Value(Value(1)),
+            ty: IrType::I32,
+        };
+        // Sub has its own simplifications (x-0, x-x, reassoc) but NOT canonicalization
+        assert!(simplify_default(&inst).is_none());
+    }
+
+    #[test]
+    fn test_binop_no_canonicalize_already_canonical() {
+        // BinOp(Add, Value(1), Const(10)) - already canonical, no change
+        let inst = Instruction::BinOp {
+            dest: Value(2), op: IrBinOp::Add,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I32(10)),
+            ty: IrType::I32,
+        };
+        assert!(simplify_default(&inst).is_none());
     }
 }
