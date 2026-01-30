@@ -1,0 +1,23 @@
+Fix switch exhaustiveness analysis in -Wreturn-type
+
+The -Wreturn-type warning treats ALL switch statements as potentially falling
+through (line 911 of sema.rs: `Stmt::Switch(_, _, _) => true`). This causes
+false positives for switch statements where every case (including default)
+returns a value. This is the critical blocker for the Linux kernel build.
+
+Examples from the kernel:
+  - sigisemptyset() in include/linux/signal.h (switch with default, all cases return)
+  - op_is_zone_mgmt() in include/linux/blk_types.h (switch with default, all cases return)
+  - __screen_info_video_type() in include/linux/screen_info.h (switch with default, all cases return)
+
+Fix: Add switch exhaustiveness analysis to stmt_can_fall_through() that checks
+if the switch has a default case and ALL case groups (segments of consecutive
+case labels followed by statements) either return, break, goto, or otherwise
+diverge.
+
+NOTE: This overlaps with fix_wreturn_type_comprehensive and
+fix_wreturn_type_switch_false_positive which were locked but not completed.
+This fix covers only the switch exhaustiveness portion.
+
+Status: in_progress
+Started: 2026-01-30
