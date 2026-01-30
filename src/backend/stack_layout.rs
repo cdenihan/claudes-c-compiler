@@ -1032,8 +1032,20 @@ fn classify_instructions(
                 // Promoted InlineAsm output values need stack slots to hold
                 // the output register value. These are "direct" slots (like
                 // allocas) -- the slot contains the value itself, not a pointer.
+                //
+                // Skip alloca values (they already have slots) and register-
+                // assigned values. Register-assigned outputs are pointer
+                // dereference outputs like "=r"(*out): the output value is
+                // the pointer itself, which lives in a callee-saved register.
+                // store_output_from_reg handles these via the register-
+                // allocated pointer path (loading from the callee-saved reg
+                // and storing through it). Marking them as asm_output_values
+                // would incorrectly make is_direct_slot() return true, causing
+                // the result to be stored to a stack slot instead of through
+                // the pointer.
                 for (out_idx, (_, out_val, _)) in outputs.iter().enumerate() {
                     if !state.alloca_values.contains(&out_val.0)
+                        && !reg_assigned.contains(&out_val.0)
                         && collected_values.insert(out_val.0)
                     {
                         let slot_size: i64 = if out_idx < operand_types.len() {

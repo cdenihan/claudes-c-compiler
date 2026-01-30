@@ -1,0 +1,9 @@
+Task: Add peephole optimizer for RISC-V backend
+Status: in_progress
+Description: The RISC-V backend has no peephole optimization, while x86 has a mature
+3300-line peephole optimizer. Adding peephole passes to RISC-V will improve code quality
+significantly. Starting with the highest-impact optimizations:
+1. Adjacent store/load elimination (sd/ld at same s0 offset)
+2. Redundant jump elimination (jump to next label)
+3. Self-move elimination (mv t0, t0)
+4. Dead store elimination
