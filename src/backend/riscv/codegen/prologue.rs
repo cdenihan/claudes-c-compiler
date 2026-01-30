@@ -191,19 +191,24 @@ impl RiscvCodegen {
 
             match class {
                 ParamClass::IntReg { reg_idx } => {
-                    // GP register param - load from save area if F128 regs were saved.
+                    // GP register param - extend sub-64-bit values to full
+                    // 64 bits and store with sd so the entire 8-byte slot is
+                    // valid for subsequent ld loads (e.g. from Copy values
+                    // sharing the slot via slot coalescing).
                     if has_f128_reg_params && !func.is_variadic {
                         let off = f128_save_offset + (reg_idx as i64) * 8;
-                        self.state.emit_fmt(format_args!("    ld t0, {}(sp)", off));
-                        let store_instr = Self::store_for_type(ty);
-                        self.emit_store_to_s0("t0", slot.0, store_instr);
+                        let load_instr = Self::load_for_type(ty);
+                        self.state.emit_fmt(format_args!("    {} t0, {}(sp)", load_instr, off));
+                        self.emit_store_to_s0("t0", slot.0, "sd");
                     } else if func.is_variadic {
-                        // For variadic, use register directly (already saved to save area).
-                        let store_instr = Self::store_for_type(ty);
-                        self.emit_store_to_s0(RISCV_ARG_REGS[reg_idx], slot.0, store_instr);
+                        // For variadic, load from save area with extending load.
+                        let save_off = (reg_idx as i64) * 8;
+                        let load_instr = Self::load_for_type(ty);
+                        self.emit_load_from_s0("t0", save_off, load_instr);
+                        self.emit_store_to_s0("t0", slot.0, "sd");
                     } else {
-                        let store_instr = Self::store_for_type(ty);
-                        self.emit_store_to_s0(RISCV_ARG_REGS[reg_idx], slot.0, store_instr);
+                        Self::emit_extend_reg(&mut self.state, RISCV_ARG_REGS[reg_idx], "t0", ty);
+                        self.emit_store_to_s0("t0", slot.0, "sd");
                     }
                 }
                 ParamClass::FloatReg { reg_idx } => {
@@ -306,10 +311,12 @@ impl RiscvCodegen {
                     self.emit_store_to_s0("t0", slot.0 + 8, "sd");
                 }
                 ParamClass::StackScalar { offset } => {
+                    // Load with extending load so the full 8-byte dest
+                    // slot is valid for subsequent ld loads.
                     let src = stack_base + offset;
-                    self.emit_load_from_s0("t0", src, "ld");
-                    let store_instr = Self::store_for_type(ty);
-                    self.emit_store_to_s0("t0", slot.0, store_instr);
+                    let load_instr = Self::load_for_type(ty);
+                    self.emit_load_from_s0("t0", src, load_instr);
+                    self.emit_store_to_s0("t0", slot.0, "sd");
                 }
                 ParamClass::StructStack { offset, size } | ParamClass::LargeStructStack { offset, size } => {
                     let src = stack_base + offset;
@@ -459,6 +466,52 @@ impl RiscvCodegen {
         // Clean up the F128 save area.
         if has_f128_reg_params && !func.is_variadic {
             self.state.emit("    addi sp, sp, 128");
+        }
+    }
+
+    /// Sign/zero-extend a GP register value to 64 bits for sub-64-bit types.
+    /// For 64-bit or larger types, just moves src to dest.
+    fn emit_extend_reg(state: &mut crate::backend::state::CodegenState, src: &str, dest: &str, ty: IrType) {
+        match ty {
+            IrType::I8 => {
+                if src != dest {
+                    state.emit_fmt(format_args!("    mv {}, {}", dest, src));
+                }
+                state.emit_fmt(format_args!("    slli {}, {}, 56", dest, dest));
+                state.emit_fmt(format_args!("    srai {}, {}, 56", dest, dest));
+            }
+            IrType::U8 => {
+                state.emit_fmt(format_args!("    andi {}, {}, 0xff", dest, src));
+            }
+            IrType::I16 => {
+                if src != dest {
+                    state.emit_fmt(format_args!("    mv {}, {}", dest, src));
+                }
+                state.emit_fmt(format_args!("    slli {}, {}, 48", dest, dest));
+                state.emit_fmt(format_args!("    srai {}, {}, 48", dest, dest));
+            }
+            IrType::U16 => {
+                if src != dest {
+                    state.emit_fmt(format_args!("    mv {}, {}", dest, src));
+                }
+                state.emit_fmt(format_args!("    slli {}, {}, 48", dest, dest));
+                state.emit_fmt(format_args!("    srli {}, {}, 48", dest, dest));
+            }
+            IrType::I32 => {
+                state.emit_fmt(format_args!("    sext.w {}, {}", dest, src));
+            }
+            IrType::U32 | IrType::F32 => {
+                if src != dest {
+                    state.emit_fmt(format_args!("    mv {}, {}", dest, src));
+                }
+                state.emit_fmt(format_args!("    slli {}, {}, 32", dest, dest));
+                state.emit_fmt(format_args!("    srli {}, {}, 32", dest, dest));
+            }
+            _ => {
+                if src != dest {
+                    state.emit_fmt(format_args!("    mv {}, {}", dest, src));
+                }
+            }
         }
     }
 

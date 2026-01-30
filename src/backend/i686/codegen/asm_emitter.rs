@@ -24,7 +24,7 @@ impl InlineAsmEmitter for I686Codegen {
     fn asm_state(&mut self) -> &mut CodegenState { &mut self.state }
 
     fn classify_constraint(&self, constraint: &str) -> AsmOperandKind {
-        let c = constraint.trim_start_matches(['=', '+', '&']);
+        let c = constraint.trim_start_matches(['=', '+', '&', '%']);
         // Explicit register constraint: {regname}
         if c.starts_with('{') && c.ends_with('}') {
             let reg_name = &c[1..c.len()-1];

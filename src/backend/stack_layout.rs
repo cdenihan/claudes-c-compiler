@@ -461,7 +461,7 @@ fn collect_inline_asm_callee_saved_inner(
         for inst in &block.instructions {
             if let Instruction::InlineAsm { outputs, inputs, clobbers, .. } = inst {
                 for (constraint, _, _) in outputs {
-                    let c = constraint.trim_start_matches(['=', '+', '&']);
+                    let c = constraint.trim_start_matches(['=', '+', '&', '%']);
                     if let Some(phys) = constraint_to_phys(c) {
                         if already.insert(phys.0) { used.push(phys); }
                     } else if !all_callee_saved.is_empty() && is_generic_gp_constraint(c) {
@@ -474,7 +474,7 @@ fn collect_inline_asm_callee_saved_inner(
                     }
                 }
                 for (constraint, _, _) in inputs {
-                    let c = constraint.trim_start_matches(['=', '+', '&']);
+                    let c = constraint.trim_start_matches(['=', '+', '&', '%']);
                     if let Some(phys) = constraint_to_phys(c) {
                         if already.insert(phys.0) { used.push(phys); }
                     } else if !all_callee_saved.is_empty() && is_generic_gp_constraint(c) {

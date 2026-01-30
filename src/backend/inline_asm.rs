@@ -193,7 +193,7 @@ pub trait InlineAsmEmitter {
 /// Other architecture-specific immediate letters (e.g., x86 'N', 'e') are handled
 /// separately by each backend's `classify_constraint`.
 pub fn constraint_has_immediate_alt(constraint: &str) -> bool {
-    let stripped = constraint.trim_start_matches(['=', '+', '&']);
+    let stripped = constraint.trim_start_matches(['=', '+', '&', '%']);
     // Named tied operands ("[name]") don't have immediates
     if stripped.starts_with('[') && stripped.ends_with(']') {
         return false;
@@ -220,7 +220,7 @@ pub fn constraint_has_immediate_alt(constraint: &str) -> bool {
 /// If the constraint contains 'i' or 'n', any constant fits. Otherwise, the value
 /// must fit the range of at least one uppercase immediate letter present.
 pub fn constant_fits_immediate_constraint(constraint: &str, value: i64) -> bool {
-    let stripped = constraint.trim_start_matches(['=', '+', '&']);
+    let stripped = constraint.trim_start_matches(['=', '+', '&', '%']);
     // If constraint has 'i' or 'n', any constant value is accepted
     if stripped.contains('i') || stripped.contains('n') {
         return true;
@@ -250,7 +250,7 @@ pub fn constant_fits_immediate_constraint(constraint: &str, value: i64) -> bool 
 /// Also recognizes "Q" which is an AArch64-specific memory constraint meaning
 /// "a memory address with a single base register" (used for atomic ops like ldaxr/stlxr).
 pub fn constraint_has_memory_alt(constraint: &str) -> bool {
-    let stripped = constraint.trim_start_matches(['=', '+', '&']);
+    let stripped = constraint.trim_start_matches(['=', '+', '&', '%']);
     // Named tied operands ("[name]") are not memory constraints
     if stripped.starts_with('[') && stripped.ends_with(']') {
         return false;
@@ -271,7 +271,7 @@ pub fn constraint_has_memory_alt(constraint: &str) -> bool {
 /// - On x86/x86-64: 'Q' = legacy byte register (rax/rbx/rcx/rdx with %h form)
 /// - On RISC-V: 'Q' is not a standard constraint
 pub fn constraint_is_memory_only(constraint: &str, is_arm: bool) -> bool {
-    let stripped = constraint.trim_start_matches(['=', '+', '&']);
+    let stripped = constraint.trim_start_matches(['=', '+', '&', '%']);
     // Named tied operands ("[name]") are never memory-only
     if stripped.starts_with('[') && stripped.ends_with(']') {
         return false;
@@ -311,7 +311,7 @@ pub fn constraint_needs_address(constraint: &str, is_riscv: bool, is_arm: bool) 
     }
     // RISC-V "A" constraint: address for AMO/LR/SC instructions
     if is_riscv {
-        let stripped = constraint.trim_start_matches(['=', '+', '&']);
+        let stripped = constraint.trim_start_matches(['=', '+', '&', '%']);
         if stripped == "A" {
             return true;
         }

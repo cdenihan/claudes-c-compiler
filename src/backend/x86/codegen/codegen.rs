@@ -582,7 +582,10 @@ impl X86Codegen {
 
     /// Load a Value into a named register. For allocas, loads the address (leaq);
     /// for register-allocated values, copies from the callee-saved register;
-    /// for regular values, loads the data (movq) from the stack slot.
+    /// for regular values, loads the full 8 bytes from the stack slot with movq.
+    ///
+    /// The prologue ensures that sub-64-bit parameters are sign/zero-extended
+    /// to 64 bits before being stored, so movq always reads valid data.
     pub(super) fn value_to_reg(&mut self, val: &Value, reg: &str) {
         // Check register allocation first (allocas are never register-allocated)
         if let Some(&phys_reg) = self.reg_assignments.get(&val.0) {

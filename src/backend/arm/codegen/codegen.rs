@@ -346,7 +346,7 @@ impl ArmCodegen {
                     let mut gp_scratch_needed = 0usize;
 
                     for (constraint, _, _) in outputs {
-                        let c = constraint.trim_start_matches(['=', '+', '&']);
+                        let c = constraint.trim_start_matches(['=', '+', '&', '%']);
                         if c.starts_with('{') && c.ends_with('}') {
                             let reg_name = &c[1..c.len()-1];
                             // Normalize rN -> xN (GCC AArch64 alias)
@@ -375,7 +375,7 @@ impl ArmCodegen {
                         let mut plus_idx = 0;
                         for (constraint, _, _) in outputs.iter() {
                             if constraint.contains('+') {
-                                let c = constraint.trim_start_matches(['=', '+', '&']);
+                                let c = constraint.trim_start_matches(['=', '+', '&', '%']);
                                 // Synthetic input inherits constraint with '+' stripped
                                 // "+r" → "r" (GpReg, consumes scratch), "+m" → "m" (Memory, skip)
                                 if c != "m" && c != "Q" && !c.contains('Q') && !c.contains('m') && c != "w"
@@ -395,7 +395,7 @@ impl ArmCodegen {
                         if i < num_plus {
                             continue;
                         }
-                        let c = constraint.trim_start_matches(['=', '+', '&']);
+                        let c = constraint.trim_start_matches(['=', '+', '&', '%']);
                         if c.starts_with('{') && c.ends_with('}') {
                             let reg_name = &c[1..c.len()-1];
                             // Normalize rN -> xN (GCC AArch64 alias)
@@ -1666,10 +1666,12 @@ impl ArmCodegen {
                 }
                 ParamClass::StackScalar { offset } => {
                     let caller_offset = frame_size + offset;
-                    self.emit_load_from_sp("x0", caller_offset, "ldr");
-                    let store_instr = Self::str_for_type(ty);
-                    let reg = Self::reg_for_type("x0", ty);
-                    self.emit_store_to_sp(reg, slot.0, store_instr);
+                    // Load from caller stack with extending load, then store
+                    // full 64 bits so the slot is valid for any later ldr.
+                    let load_instr = self.load_instr_for_type_impl(ty);
+                    let (arm_load, dest_reg) = Self::arm_parse_load(load_instr);
+                    self.emit_load_from_sp(dest_reg, caller_offset, arm_load);
+                    self.emit_store_to_sp("x0", slot.0, "str");
                 }
                 ParamClass::LargeStructByRefStack { offset, size } => {
                     let caller_offset = frame_size + offset;

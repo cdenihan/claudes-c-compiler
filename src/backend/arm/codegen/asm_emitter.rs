@@ -29,7 +29,7 @@ impl InlineAsmEmitter for ArmCodegen {
     // Priority: specific register > GP register > FP register > memory > immediate.
     // Registers are preferred over memory for performance.
     fn classify_constraint(&self, constraint: &str) -> AsmOperandKind {
-        let c = constraint.trim_start_matches(['=', '+', '&']);
+        let c = constraint.trim_start_matches(['=', '+', '&', '%']);
         // Explicit register constraint from register variable: {regname}
         if c.starts_with('{') && c.ends_with('}') {
             let reg_name = &c[1..c.len()-1];
@@ -367,7 +367,7 @@ impl InlineAsmEmitter for ArmCodegen {
     ///   'I' - unsigned 12-bit immediate (0..4095) for add/sub instructions
     ///   'L' - logical immediate for 32-bit operations (32-bit bitmask pattern)
     fn constant_fits_immediate(&self, constraint: &str, value: i64) -> bool {
-        let stripped = constraint.trim_start_matches(['=', '+', '&']);
+        let stripped = constraint.trim_start_matches(['=', '+', '&', '%']);
         // If constraint has 'i' or 'n', any constant value is accepted
         if stripped.contains('i') || stripped.contains('n') {
             return true;

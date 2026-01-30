@@ -23,7 +23,7 @@ impl InlineAsmEmitter for RiscvCodegen {
     fn classify_constraint(&self, constraint: &str) -> AsmOperandKind {
         // TODO: RISC-V =@cc not fully implemented — needs SLTU/SEQZ/etc. in store_output_from_reg.
         // Currently stores incorrect results (just a GP register value, no condition capture).
-        let c = constraint.trim_start_matches(['=', '+', '&']);
+        let c = constraint.trim_start_matches(['=', '+', '&', '%']);
         // Explicit register constraint from register variable: {regname}
         if c.starts_with('{') && c.ends_with('}') {
             let reg_name = &c[1..c.len()-1];
@@ -380,7 +380,7 @@ impl InlineAsmEmitter for RiscvCodegen {
     /// Without this override, values like 128 would be incorrectly emitted as
     /// immediates in CSR instructions, causing assembler errors.
     fn constant_fits_immediate(&self, constraint: &str, value: i64) -> bool {
-        let stripped = constraint.trim_start_matches(['=', '+', '&']);
+        let stripped = constraint.trim_start_matches(['=', '+', '&', '%']);
         // If constraint has 'i' or 'n', any constant value is accepted
         if stripped.contains('i') || stripped.contains('n') {
             return true;

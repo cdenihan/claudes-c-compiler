@@ -231,6 +231,39 @@ impl Lowerer {
                 }
             }
 
+            // Brace elision for struct/union fields: when a scalar expression (not a
+            // braced list) targets a struct/union field, pass the remaining items through
+            // so multiple items can fill the sub-struct's fields (C11 6.7.9p13-17).
+            if matches!(&sub_item.init, Initializer::Expr(_)) {
+                let sub_layout_info = match field.ty {
+                    CType::Struct(ref key) | CType::Union(ref key) => {
+                        let layouts = self.types.borrow_struct_layouts();
+                        layouts.get(&**key).map(|l| {
+                            let cloned = l.clone();
+                            let has_ptrs = cloned.has_pointer_fields(&*layouts);
+                            (cloned, has_ptrs)
+                        })
+                    }
+                    _ => None,
+                };
+                if let Some((sub_layout, has_ptrs)) = sub_layout_info {
+                    if has_ptrs {
+                        let consumed = self.fill_nested_struct_brace_elided(
+                            &sub_items[item_idx..], &sub_layout, field_offset, bytes, ptr_ranges,
+                        );
+                        item_idx += consumed;
+                    } else {
+                        let consumed = self.fill_composite_field(
+                            &sub_items[item_idx..], &sub_layout, bytes, field_offset,
+                        );
+                        item_idx += consumed;
+                    }
+                    current_field_idx = field_idx + 1;
+                    if layout.is_union && desig_name.is_none() { break; }
+                    continue;
+                }
+            }
+
             self.emit_struct_field_init_compound(
                 sub_item, field, field_offset,
                 bytes, ptr_ranges,
@@ -820,5 +853,122 @@ impl Lowerer {
             // Non-composite, non-array field: write scalar values
             self.fill_scalar_array_with_ptrs(items, field_ty, offset, bytes, ptr_ranges);
         }
+    }
+
+    /// Brace-elided initialization of a struct/union field from remaining items.
+    /// When a scalar expression targets a struct/union field without braces, this
+    /// distributes consecutive items across the sub-struct's fields (C11 6.7.9p13-17).
+    /// Uses the pointer-aware path for sub-fields that may contain pointer types.
+    /// Returns the number of items consumed.
+    fn fill_nested_struct_brace_elided(
+        &mut self,
+        items: &[InitializerItem],
+        sub_layout: &crate::common::types::StructLayout,
+        base_offset: usize,
+        bytes: &mut [u8],
+        ptr_ranges: &mut Vec<(usize, GlobalInit)>,
+    ) -> usize {
+        match &items[0].init {
+            Initializer::List(sub_items) => {
+                self.fill_nested_struct_with_ptrs(
+                    sub_items, sub_layout, base_offset, bytes, ptr_ranges,
+                );
+                1
+            }
+            Initializer::Expr(expr) => {
+                // Unwrap compound literal: (type){ init_list } -> use inner init_list
+                if let Expr::CompoundLiteral(_, ref cl_init, _) = expr {
+                    if let Initializer::List(sub_items) = cl_init.as_ref() {
+                        self.fill_nested_struct_with_ptrs(
+                            sub_items, sub_layout, base_offset, bytes, ptr_ranges,
+                        );
+                        return 1;
+                    }
+                }
+                // Brace-elided: pass remaining items to fill_nested_struct_with_ptrs
+                // which will consume items field-by-field for the sub-struct.
+                let consumed = self.fill_nested_struct_with_ptrs_count(
+                    items, sub_layout, base_offset, bytes, ptr_ranges,
+                );
+                if consumed == 0 { 1 } else { consumed }
+            }
+        }
+    }
+
+    /// Like fill_nested_struct_with_ptrs but returns the number of items consumed.
+    /// Used for brace-elided initialization where we need to know how many items
+    /// were used to fill the sub-struct.
+    fn fill_nested_struct_with_ptrs_count(
+        &mut self,
+        items: &[InitializerItem],
+        sub_layout: &crate::common::types::StructLayout,
+        base_offset: usize,
+        bytes: &mut [u8],
+        ptr_ranges: &mut Vec<(usize, GlobalInit)>,
+    ) -> usize {
+        let mut current_field_idx = 0usize;
+        let mut item_idx = 0usize;
+        while item_idx < items.len() {
+            let inner_item = &items[item_idx];
+            let desig_name = h::first_field_designator(inner_item);
+            let resolution = sub_layout.resolve_init_field(desig_name, current_field_idx, &*self.types.borrow_struct_layouts());
+            let field_idx = match &resolution {
+                Some(InitFieldResolution::Direct(idx)) => *idx,
+                Some(InitFieldResolution::AnonymousMember { anon_field_idx, inner_name }) => {
+                    let anon_field = &sub_layout.fields[*anon_field_idx];
+                    let anon_offset = base_offset + anon_field.offset;
+                    if let Some(anon_layout) = self.get_struct_layout_for_ctype(&anon_field.ty) {
+                        let sub_item = InitializerItem {
+                            designators: vec![Designator::Field(inner_name.clone())],
+                            init: inner_item.init.clone(),
+                        };
+                        self.fill_nested_struct_with_ptrs(
+                            &[sub_item], &anon_layout, anon_offset, bytes, ptr_ranges);
+                    }
+                    current_field_idx = *anon_field_idx + 1;
+                    item_idx += 1;
+                    if sub_layout.is_union && desig_name.is_none() { break; }
+                    continue;
+                }
+                None => break,
+            };
+
+            let field = &sub_layout.fields[field_idx];
+            let field_abs_offset = base_offset + field.offset;
+
+            // Brace elision for array fields within the sub-struct
+            if matches!(&inner_item.init, Initializer::Expr(_)) {
+                if let CType::Array(ref elem_ty, Some(arr_size)) = field.ty {
+                    let is_char_array_str = matches!(elem_ty.as_ref(), CType::Char | CType::UChar)
+                        && matches!(&inner_item.init, Initializer::Expr(Expr::StringLiteral(..)));
+                    if !is_char_array_str {
+                        let consumed = self.fill_flat_array_field_with_ptrs(
+                            &items[item_idx..], elem_ty, arr_size,
+                            field_abs_offset, bytes, ptr_ranges,
+                        );
+                        item_idx += consumed;
+                        current_field_idx = field_idx + 1;
+                        if sub_layout.is_union && desig_name.is_none() { break; }
+                        continue;
+                    }
+                }
+            }
+
+            if let Initializer::Expr(ref expr) = inner_item.init {
+                self.write_expr_to_bytes_or_ptrs(
+                    expr, &field.ty, field_abs_offset,
+                    field.bit_offset, field.bit_width,
+                    bytes, ptr_ranges,
+                );
+            } else if let Initializer::List(ref nested_items) = inner_item.init {
+                self.fill_composite_or_array_with_ptrs(
+                    nested_items, &field.ty, field_abs_offset, bytes, ptr_ranges,
+                );
+            }
+            current_field_idx = field_idx + 1;
+            item_idx += 1;
+            if sub_layout.is_union && desig_name.is_none() { break; }
+        }
+        item_idx
     }
 }

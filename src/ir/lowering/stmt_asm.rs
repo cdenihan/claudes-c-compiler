@@ -45,9 +45,9 @@ impl Lowerer {
             // Rewrite output constraint for register variables with __asm__("regname")
             if let Expr::Identifier(ref var_name, _) = out.expr {
                 if let Some(asm_reg) = self.get_asm_register(var_name) {
-                    let stripped = constraint.trim_start_matches(['=', '+', '&']);
+                    let stripped = constraint.trim_start_matches(['=', '+', '&', '%']);
                     if stripped.contains('r') || stripped == "g" {
-                        let prefix: String = constraint.chars().take_while(|c| *c == '=' || *c == '+' || *c == '&').collect();
+                        let prefix: String = constraint.chars().take_while(|c| *c == '=' || *c == '+' || *c == '&' || *c == '%').collect();
                         constraint = format!("{}{{{}}}", prefix, asm_reg);
                     }
                 }
@@ -182,7 +182,7 @@ impl Lowerer {
             // when the constraint allows "r", pin to the exact requested register.
             if let Expr::Identifier(ref var_name, _) = inp.expr {
                 if let Some(asm_reg) = self.get_asm_register(var_name) {
-                    let stripped = constraint.trim_start_matches(['=', '+', '&']);
+                    let stripped = constraint.trim_start_matches(['=', '+', '&', '%']);
                     if stripped.contains('r') || stripped == "g" {
                         constraint = format!("{{{}}}", asm_reg);
                     }
