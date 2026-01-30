@@ -1,0 +1,22 @@
+Task: Fix IVSR (Induction Variable Strength Reduction) causing 1000+ test failures
+Status: in_progress
+Agent: Claude (Claude Opus 4.6)
+Date: 2026-01-30
+
+Problem:
+The IVSR pass is causing massive regressions (~1000+ test failures on x86).
+When IVSR transforms array access loops to use pointer increment patterns,
+the generated code has incorrect GEP base addresses. The codegen fails to
+load the IVSR-created phi pointer value before computing the increment,
+resulting in using stale/wrong register values and causing SIGSEGV crashes.
+
+Example: for (int i = 0; i < 3; i++) printf("%d\n", arr[i]);
+After IVSR, the pointer increment GEP uses the loop counter value instead
+of the pointer phi value, producing accesses to absolute addresses ~5-7
+instead of actual array addresses.
+
+Root cause analysis in progress - likely an issue with how IVSR places
+the increment GEP or how the register allocator/liveness handles the
+new IVSR-created values.
+
+With CCC_DISABLE_PASSES=ivsr, pass rate goes from 81.1% to 98.3%.
