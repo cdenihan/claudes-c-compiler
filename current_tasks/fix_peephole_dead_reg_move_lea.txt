@@ -1,0 +1,17 @@
+Task: Fix peephole dead reg move elimination incorrectly removing moves before LEA instructions
+Status: in_progress
+
+Bug: The x86 peephole optimizer's eliminate_dead_reg_moves pass treats LEA instructions as
+write-only for the destination register. But LEA can read the destination register as part of
+the address computation (e.g., `leaq 208(%rax), %rax` reads rax in the address expression and
+writes the result to rax). When this happens, a preceding `movq %rdi, %rax` is incorrectly
+eliminated as dead, causing the leaq to use an uninitialized rax.
+
+This causes SIGSEGV crashes in all x86 projects (zlib, jq, sqlite, etc.) when the pattern
+occurs in struct member access through pointer parameters.
+
+Root cause: is_read_modify_write() in peephole/passes/helpers.rs returns false for all LEA
+instructions, but should return true when the source address uses the destination register.
+
+Fix: Make is_read_modify_write return true for LEA (conservative but correct), or check whether
+the LEA source uses the destination register.
