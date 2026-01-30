@@ -1288,10 +1288,17 @@ impl Lowerer {
     // --- String and array init helpers ---
 
     /// Copy a string literal's bytes into an alloca at a given byte offset,
-    /// followed by a null terminator.
-    pub(super) fn emit_string_to_alloca(&mut self, alloca: Value, s: &str, base_offset: usize) {
+    /// followed by a null terminator (if it fits within `max_bytes`).
+    ///
+    /// Per C11 6.7.9 p14, when a char array is initialized from a string literal
+    /// that is exactly one byte longer than the array (due to the implicit NUL
+    /// terminator), the trailing NUL is silently dropped. This function respects
+    /// that rule by only writing up to `max_bytes` total bytes.
+    pub(super) fn emit_string_to_alloca(&mut self, alloca: Value, s: &str, base_offset: usize, max_bytes: usize) {
         let str_bytes: Vec<u8> = s.chars().map(|c| c as u8).collect();
-        for (j, &byte) in str_bytes.iter().enumerate() {
+        let bytes_to_copy = str_bytes.len().min(max_bytes);
+        for j in 0..bytes_to_copy {
+            let byte = str_bytes[j];
             let val = Operand::Const(IrConst::I8(byte as i8));
             let offset = Operand::Const(IrConst::ptr_int((base_offset + j) as i64));
             let addr = self.fresh_value();
@@ -1300,14 +1307,17 @@ impl Lowerer {
             });
             self.emit(Instruction::Store { val, ptr: addr, ty: IrType::I8 , seg_override: AddressSpace::Default });
         }
-        // Null terminator
-        let null_offset = Operand::Const(IrConst::ptr_int((base_offset + str_bytes.len()) as i64));
-        let null_addr = self.fresh_value();
-        self.emit(Instruction::GetElementPtr {
-            dest: null_addr, base: alloca, offset: null_offset, ty: IrType::I8,
-        });
-        self.emit(Instruction::Store { val: Operand::Const(IrConst::I8(0)), ptr: null_addr, ty: IrType::I8,
-         seg_override: AddressSpace::Default });
+        // Null terminator -- only write if there's room within max_bytes
+        let null_pos = str_bytes.len();
+        if null_pos < max_bytes {
+            let null_offset = Operand::Const(IrConst::ptr_int((base_offset + null_pos) as i64));
+            let null_addr = self.fresh_value();
+            self.emit(Instruction::GetElementPtr {
+                dest: null_addr, base: alloca, offset: null_offset, ty: IrType::I8,
+            });
+            self.emit(Instruction::Store { val: Operand::Const(IrConst::I8(0)), ptr: null_addr, ty: IrType::I8,
+             seg_override: AddressSpace::Default });
+        }
     }
 
     /// Emit a wide string (L"...") to a local alloca. Each character is stored as I32 (wchar_t).

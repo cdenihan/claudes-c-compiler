@@ -830,10 +830,19 @@ fn emit_init_data(out: &mut AsmOutput, init: &GlobalInit, fallback_ty: IrType, t
             }
         }
         GlobalInit::String(s) => {
-            out.emit_fmt(format_args!("    .asciz \"{}\"", escape_string(s)));
-            let string_bytes = s.chars().count() + 1; // string chars + null terminator (use chars().count() not len() since non-ASCII chars take 2+ UTF-8 bytes in Rust but emit 1 byte each via .asciz)
-            if total_size > string_bytes {
-                out.emit_fmt(format_args!("    .zero {}", total_size - string_bytes));
+            let string_chars = s.chars().count();
+            let string_bytes_with_nul = string_chars + 1;
+            if string_bytes_with_nul <= total_size {
+                // NUL terminator fits: use .asciz (emits string + NUL)
+                out.emit_fmt(format_args!("    .asciz \"{}\"", escape_string(s)));
+                if total_size > string_bytes_with_nul {
+                    out.emit_fmt(format_args!("    .zero {}", total_size - string_bytes_with_nul));
+                }
+            } else {
+                // NUL terminator doesn't fit (C11 6.7.9 p14): truncate to array size.
+                // Use .ascii (no implicit NUL) with the string truncated to total_size chars.
+                let truncated: String = s.chars().take(total_size).collect();
+                out.emit_fmt(format_args!("    .ascii \"{}\"", escape_string(&truncated)));
             }
         }
         GlobalInit::WideString(chars) => {

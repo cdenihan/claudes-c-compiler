@@ -273,7 +273,7 @@ impl Lowerer {
         // copy the string bytes directly instead of storing a pointer.
         if elem_size == 1 && items.len() == 1 && items[0].designators.is_empty() {
             if let Initializer::Expr(Expr::StringLiteral(ref s, _)) = items[0].init {
-                self.emit_string_to_alloca(alloca, s, 0);
+                self.emit_string_to_alloca(alloca, s, 0, size);
                 return;
             }
         }
@@ -639,7 +639,7 @@ impl Lowerer {
                 };
                 if is_char_array {
                     if let Expr::StringLiteral(ref s, _) = expr {
-                        self.emit_string_to_alloca(alloca, s, 0);
+                        self.emit_string_to_alloca(alloca, s, 0, size);
                     } else {
                         let val = self.lower_expr(expr);
                         self.emit(Instruction::Store { val, ptr: alloca, ty , seg_override: AddressSpace::Default });

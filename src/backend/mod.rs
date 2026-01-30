@@ -87,6 +87,11 @@ pub(crate) struct CodegenOptions {
     /// (e.g., `.data.varname`, `.rodata.varname`, `.bss.varname`).
     /// This enables the linker's `--gc-sections` to discard unreferenced data.
     pub(crate) data_sections: bool,
+    /// Whether to prepend `.code16gcc` to the assembly output (-m16).
+    /// When true, the GNU assembler treats the 32-bit instructions as code
+    /// that will run in 16-bit real mode, adding operand/address-size override
+    /// prefixes as needed. Used by the Linux kernel boot code.
+    pub(crate) code16gcc: bool,
 }
 
 /// Target architecture.
@@ -191,7 +196,12 @@ impl Target {
                 cg.apply_options(opts);
                 cg.state.function_sections = opts.function_sections;
                 cg.state.data_sections = opts.data_sections;
-                generation::generate_module_with_debug(&mut cg, module, opts.debug_info, source_mgr)
+                let asm = generation::generate_module_with_debug(&mut cg, module, opts.debug_info, source_mgr);
+                if opts.code16gcc {
+                    format!(".code16gcc\n{}", asm)
+                } else {
+                    asm
+                }
             }
             Target::Aarch64 => {
                 let mut cg = arm::ArmCodegen::new();

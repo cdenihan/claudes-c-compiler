@@ -699,7 +699,7 @@ impl Lowerer {
                         let is_char_array = matches!(**elem_ty, CType::Char | CType::UChar);
                         if is_char_array {
                             if let Expr::StringLiteral(ref s, _) = e {
-                                self.emit_string_to_alloca(base, s, field_offset);
+                                self.emit_string_to_alloca(base, s, field_offset, arr_size);
                                 // Zero-fill remaining bytes if string is shorter than array
                                 let str_len = s.chars().count() + 1; // +1 for null terminator
                                 for i in str_len..arr_size {
@@ -807,7 +807,11 @@ impl Lowerer {
                 let is_char_array = matches!(**elem_ty, CType::Char | CType::UChar);
                 if is_char_array && items.len() == 1 {
                     if let Initializer::Expr(Expr::StringLiteral(ref s, _)) = items[0].init {
-                        self.emit_string_to_alloca(base, s, 0);
+                        let max_bytes = match arr_size_opt {
+                            Some(sz) => *sz,
+                            None => usize::MAX,
+                        };
+                        self.emit_string_to_alloca(base, s, 0, max_bytes);
                         // Zero-fill remaining bytes if string is shorter than array
                         if let Some(arr_size) = arr_size_opt {
                             let str_len = s.chars().count() + 1; // +1 for null terminator
@@ -946,7 +950,7 @@ impl Lowerer {
                     Initializer::Expr(e) => {
                         if base_ty == IrType::I8 || base_ty == IrType::U8 {
                             if let Expr::StringLiteral(s, _) = e {
-                                self.emit_string_to_alloca(alloca, s, target_flat * elem_size);
+                                self.emit_string_to_alloca(alloca, s, target_flat * elem_size, sub_elem_count * elem_size);
                                 *flat_index = target_flat + sub_elem_count;
                                 continue;
                             }
@@ -988,7 +992,8 @@ impl Lowerer {
                     // String literal fills a sub-array in char arrays
                     if base_ty == IrType::I8 || base_ty == IrType::U8 {
                         if let Expr::StringLiteral(s, _) = e {
-                            self.emit_string_to_alloca(alloca, s, *flat_index * elem_size);
+                            let max_str_bytes = sub_elem_count * elem_size;
+                            self.emit_string_to_alloca(alloca, s, *flat_index * elem_size, max_str_bytes);
                             let string_stride = if array_dim_strides.len() >= 2 {
                                 array_dim_strides[array_dim_strides.len() - 2]
                             } else {

@@ -404,10 +404,10 @@ impl Lowerer {
         match expr {
             Expr::StringLiteral(s, _) | Expr::WideStringLiteral(s, _)
             | Expr::Char16StringLiteral(s, _) => {
-                self.emit_string_to_alloca(alloca, s, 0);
+                let arr_size = da.alloc_size;
+                self.emit_string_to_alloca(alloca, s, 0, arr_size);
                 // Zero-fill remaining bytes if string is shorter than array
                 let str_len = s.chars().count() + 1; // +1 for null terminator
-                let arr_size = da.alloc_size;
                 for i in str_len..arr_size {
                     let val = Operand::Const(IrConst::I8(0));
                     self.emit_store_at_offset(alloca, i, val, IrType::I8);
@@ -968,7 +968,7 @@ impl Lowerer {
             if let Some(e) = init_expr {
                 if !da.is_array_of_pointers && (da.elem_ir_ty == IrType::I8 || da.elem_ir_ty == IrType::U8) {
                     if let Expr::StringLiteral(s, _) = e {
-                        self.emit_string_to_alloca(alloca, s, current_idx * da.elem_size);
+                        self.emit_string_to_alloca(alloca, s, current_idx * da.elem_size, da.elem_size);
                         current_idx += 1;
                         continue;
                     }

@@ -6,7 +6,7 @@
 ///
 /// Submodules handle distinct concerns:
 /// - `cli.rs`: GCC-compatible CLI argument parsing
-/// - `external_tools.rs`: assembler, linker, and GCC fallback invocation
+/// - `external_tools.rs`: assembler, linker, and dependency file invocation
 /// - `file_types.rs`: input file classification by extension/magic bytes
 
 use crate::backend::Target;
@@ -145,14 +145,11 @@ pub struct Driver {
     /// the input source as a dependency of the output object. Used by the Linux
     /// kernel build system (fixdep) to track header dependencies.
     pub(super) dep_file: Option<String>,
-    /// When true, delegate compilation to the system GCC instead of compiling
-    /// ourselves. Set when -m16 or -m32 is passed, since we only support x86-64
-    /// code generation. The kernel uses -m16 for boot/realmode code that runs in
-    /// 16-bit real mode (with .code16gcc), which requires 32-bit ELF output.
-    pub(super) gcc_fallback: bool,
-    /// The original command-line arguments (excluding argv[0]), saved so we can
-    /// forward them verbatim to GCC when gcc_fallback is true.
-    pub(super) original_args: Vec<String>,
+    /// Whether to prepend `.code16gcc` to the assembly output (-m16).
+    /// When true, generated 32-bit i686 code is prefixed with `.code16gcc` so
+    /// the assembler adds operand/address-size override prefixes for 16-bit
+    /// real mode execution. Used by the Linux kernel boot code.
+    pub(super) code16gcc: bool,
     /// Whether to suppress line markers in preprocessor output (-P flag).
     /// When true, `# <line> "<file>"` directives are stripped from -E output.
     /// Used by the Linux kernel's cc-version.sh to detect the compiler.
@@ -237,8 +234,7 @@ impl Driver {
             explicit_language: None,
             assembler_extra_args: Vec::new(),
             dep_file: None,
-            gcc_fallback: false,
-            original_args: Vec::new(),
+            code16gcc: false,
             suppress_line_markers: false,
             nostdinc: false,
             undef_macros: Vec::new(),
@@ -270,13 +266,6 @@ impl Driver {
         crate::common::types::set_target_long_double_is_f128(
             matches!(self.target, Target::Aarch64 | Target::Riscv64)
         );
-
-        // When -m16 or -m32 is passed, we don't support 32-bit/16-bit x86 codegen.
-        // Delegate the entire compilation to the system GCC, forwarding all original args.
-        // This is needed for the Linux kernel's boot/realmode code which uses -m16.
-        if self.gcc_fallback {
-            return self.run_gcc_fallback();
-        }
 
         match self.mode {
             CompileMode::PreprocessOnly => self.run_preprocess_only(),
@@ -898,6 +887,7 @@ impl Driver {
             debug_info: self.debug_info,
             function_sections: self.function_sections,
             data_sections: self.data_sections,
+            code16gcc: self.code16gcc,
         };
         let asm = self.target.generate_assembly_with_opts_and_debug(
             &module, &opts, source_manager.as_ref(),

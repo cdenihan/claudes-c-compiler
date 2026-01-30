@@ -8,7 +8,7 @@ Orchestrates the compilation pipeline from command-line arguments through to fin
 |------|---------|
 | `driver.rs` | `Driver` struct, `new()`, `run()`, compilation pipeline (`compile_to_assembly`), run modes |
 | `cli.rs` | GCC-compatible CLI argument parsing (`parse_cli_args`) |
-| `external_tools.rs` | External tool invocation: assembler, linker, GCC fallback, dependency files |
+| `external_tools.rs` | External tool invocation: assembler, linker, dependency files |
 | `file_types.rs` | Input file classification by extension or magic bytes |
 
 ## Why This Split

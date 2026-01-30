@@ -41,9 +41,6 @@ impl Driver {
             return Ok(true);
         }
 
-        // Save original args (excluding argv[0]) for gcc_fallback mode
-        self.original_args = args[1..].to_vec();
-
         self.parse_main_args(&args[1..])?;
 
         // Special case: no input files but -Wl,--version is present.
@@ -314,17 +311,19 @@ impl Driver {
                 // Machine/target flags
                 "-mfunction-return=thunk-extern" => self.function_return_thunk = true,
                 "-mindirect-branch=thunk-extern" => self.indirect_branch_thunk = true,
-                "-m16" => self.gcc_fallback = true, // TODO: replace with I686 once -m32 working
+                "-m16" => {
+                    // -m16 generates i386 code with .code16gcc prepended so the
+                    // GNU assembler adds operand/address-size override prefixes
+                    // for 16-bit real mode execution. Used by the Linux kernel
+                    // boot code (arch/x86/boot/).
+                    self.target = Target::I686;
+                    self.code16gcc = true;
+                }
                 "-m32" => {
-                    // If we're already targeting i686 (e.g. invoked as ccc-i686),
-                    // -m32 is a no-op. Otherwise, use our i686 backend when
-                    // USE_MY_32=1 is set, or fall back to GCC.
-                    if self.target == Target::I686 {
-                        // Already 32-bit, nothing to do
-                    } else if std::env::var("USE_MY_32").as_deref() == Ok("1") {
+                    // Switch to 32-bit i686 target. If already targeting i686
+                    // (e.g. invoked as ccc-i686), this is a no-op.
+                    if self.target != Target::I686 {
                         self.target = Target::I686;
-                    } else {
-                        self.gcc_fallback = true;
                     }
                 }
                 "-mno-sse" | "-mno-sse2" | "-mno-mmx" | "-mno-sse3" | "-mno-ssse3"
