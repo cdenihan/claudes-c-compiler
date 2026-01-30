@@ -4202,6 +4202,13 @@ impl ArchCodegen for I686Codegen {
         // if linked. All functions use cdecl calling convention:
         //   args: 4(%esp)=lhs_lo, 8(%esp)=lhs_hi, 12(%esp)=rhs_lo, 16(%esp)=rhs_hi
         //   return: edx:eax (64-bit result)
+        //
+        // Switch to .text explicitly: the last function in the module may have been
+        // in a custom section (e.g. .init.text), and without this directive the
+        // helper stubs would inherit that section.  The Linux kernel's modpost
+        // check rejects .text -> .init.text cross-references, so these must live
+        // in .text.
+        self.state.emit(".text");
 
         self.emit_udivdi3_stub();
         self.emit_umoddi3_stub();
