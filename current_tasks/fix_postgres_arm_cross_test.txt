@@ -1,6 +1,0 @@
-Task: Fix postgres ARM cross-compilation testing
-Status: in_progress
-Description: The verify_postgres.py script fails for cross-arch (ARM, RISC-V) because
-`make check` tries to run ARM binaries natively (gets "Exec format error").
-Fix: Modify verify_postgres.py to use QEMU wrapper scripts for cross-arch testing,
-similar to how other verify scripts handle cross-compilation.
