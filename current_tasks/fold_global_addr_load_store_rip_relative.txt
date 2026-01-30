@@ -1,0 +1,16 @@
+Fold GlobalAddr + Load/Store into direct RIP-relative memory access
+
+Enable the existing kernel-only optimization that folds GlobalAddr + Load/Store
+into direct symbol(%rip) accesses for the default (small) code model on x86-64.
+
+Previously, loading a global variable like `int x;` generated:
+  leaq x(%rip), %rax     # compute address
+  movq %rax, -0x20(%rbp) # spill to stack
+  movq %rax, %rcx        # copy to temp
+  movslq (%rcx), %rax    # load through pointer
+
+Now generates:
+  movslq x(%rip), %rax   # direct RIP-relative load
+
+Also eliminates dead GlobalAddr instructions when all uses are folded.
+Measured 4.2% text segment reduction on DOOM (67KB saved).
