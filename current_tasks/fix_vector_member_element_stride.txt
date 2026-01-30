@@ -1,0 +1,19 @@
+Fix vector element stride for struct/union member vector subscript
+
+Bug: When accessing elements of a vector type that is a struct/union member
+(e.g., s.a[3] where a is float __attribute__((vector_size(16)))), the element
+stride is computed as pointer size (8 bytes on x86-64) instead of the actual
+element size (4 bytes for float). This causes out-of-bounds memory access.
+
+Root cause: get_member_array_elem_size() in lvalue.rs handles CType::Array
+and CType::Pointer but not CType::Vector. When the field type is Vector,
+it returns None, causing fallback to target_ptr_size() (8).
+
+Fix: Add CType::Vector(elem_ty, _) case to get_member_array_elem_size()
+that returns the vector element size.
+
+Also needs the same fix in get_array_elem_size() legacy fallback and
+get_subscript_type() MemberAccess fallback.
+
+Affects: gifsicle (segfault on resize), likely other projects using SIMD vectors.
+Status: in_progress

@@ -70,18 +70,20 @@ _mm_store_si128(__m128i *__p, __m128i __b)
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_set1_epi8(char __b)
 {
-    return __CCC_M128I_FROM_BUILTIN(
-        __builtin_ia32_vec_init_v16qi(__b, __b, __b, __b,
-                                      __b, __b, __b, __b,
-                                      __b, __b, __b, __b,
-                                      __b, __b, __b, __b));
+    unsigned char __ub = (unsigned char)__b;
+    long long __q = (long long)__ub;
+    __q |= __q << 8;
+    __q |= __q << 16;
+    __q |= __q << 32;
+    return (__m128i){ { __q, __q } };
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_set1_epi32(int __i)
 {
-    return __CCC_M128I_FROM_BUILTIN(
-        __builtin_ia32_vec_init_v4si(__i, __i, __i, __i));
+    long long __q = (long long)(unsigned int)__i
+                  | ((long long)(unsigned int)__i << 32);
+    return (__m128i){ { __q, __q } };
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
@@ -230,28 +232,98 @@ _mm_unpackhi_epi16(__m128i __a, __m128i __b)
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_set1_epi16(short __w)
 {
-    return __CCC_M128I_FROM_BUILTIN(
-        __builtin_ia32_vec_init_v8hi(__w, __w, __w, __w,
-                                     __w, __w, __w, __w));
+    unsigned short __uw = (unsigned short)__w;
+    long long __q = (long long)__uw | ((long long)__uw << 16)
+                  | ((long long)__uw << 32) | ((long long)__uw << 48);
+    return (__m128i){ { __q, __q } };
 }
 
-// TODO: _mm_setr_epi16 and _mm_setr_epi32 rely on vec_init builtins that are
-// currently stubbed as Nop. They will produce zeroed vectors instead of the
-// correct result. Implement proper vec_init codegen to fix these.
+/* _mm_setr_epi16: set 8 x 16-bit lanes in natural (low-to-high) order */
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_setr_epi16(short __w0, short __w1, short __w2, short __w3,
                short __w4, short __w5, short __w6, short __w7)
 {
-    return __CCC_M128I_FROM_BUILTIN(
-        __builtin_ia32_vec_init_v8hi(__w0, __w1, __w2, __w3,
-                                     __w4, __w5, __w6, __w7));
+    long long __lo = (long long)(unsigned short)__w0
+                   | ((long long)(unsigned short)__w1 << 16)
+                   | ((long long)(unsigned short)__w2 << 32)
+                   | ((long long)(unsigned short)__w3 << 48);
+    long long __hi = (long long)(unsigned short)__w4
+                   | ((long long)(unsigned short)__w5 << 16)
+                   | ((long long)(unsigned short)__w6 << 32)
+                   | ((long long)(unsigned short)__w7 << 48);
+    return (__m128i){ { __lo, __hi } };
 }
 
+/* _mm_set_epi16: set 8 x 16-bit lanes in reverse (high-to-low) order */
+static __inline__ __m128i __attribute__((__always_inline__))
+_mm_set_epi16(short __w7, short __w6, short __w5, short __w4,
+              short __w3, short __w2, short __w1, short __w0)
+{
+    return _mm_setr_epi16(__w0, __w1, __w2, __w3, __w4, __w5, __w6, __w7);
+}
+
+/* _mm_setr_epi32: set 4 x 32-bit lanes in natural (low-to-high) order */
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_setr_epi32(int __i0, int __i1, int __i2, int __i3)
 {
-    return __CCC_M128I_FROM_BUILTIN(
-        __builtin_ia32_vec_init_v4si(__i0, __i1, __i2, __i3));
+    long long __lo = (long long)(unsigned int)__i0
+                   | ((long long)(unsigned int)__i1 << 32);
+    long long __hi = (long long)(unsigned int)__i2
+                   | ((long long)(unsigned int)__i3 << 32);
+    return (__m128i){ { __lo, __hi } };
+}
+
+/* _mm_set_epi32: set 4 x 32-bit lanes in reverse (high-to-low) order */
+static __inline__ __m128i __attribute__((__always_inline__))
+_mm_set_epi32(int __i3, int __i2, int __i1, int __i0)
+{
+    return _mm_setr_epi32(__i0, __i1, __i2, __i3);
+}
+
+/* _mm_set_epi8: set 16 x 8-bit lanes in reverse (high-to-low) order */
+static __inline__ __m128i __attribute__((__always_inline__))
+_mm_set_epi8(char __b15, char __b14, char __b13, char __b12,
+             char __b11, char __b10, char __b9, char __b8,
+             char __b7, char __b6, char __b5, char __b4,
+             char __b3, char __b2, char __b1, char __b0)
+{
+    long long __lo = (long long)(unsigned char)__b0
+                   | ((long long)(unsigned char)__b1 << 8)
+                   | ((long long)(unsigned char)__b2 << 16)
+                   | ((long long)(unsigned char)__b3 << 24)
+                   | ((long long)(unsigned char)__b4 << 32)
+                   | ((long long)(unsigned char)__b5 << 40)
+                   | ((long long)(unsigned char)__b6 << 48)
+                   | ((long long)(unsigned char)__b7 << 56);
+    long long __hi = (long long)(unsigned char)__b8
+                   | ((long long)(unsigned char)__b9 << 8)
+                   | ((long long)(unsigned char)__b10 << 16)
+                   | ((long long)(unsigned char)__b11 << 24)
+                   | ((long long)(unsigned char)__b12 << 32)
+                   | ((long long)(unsigned char)__b13 << 40)
+                   | ((long long)(unsigned char)__b14 << 48)
+                   | ((long long)(unsigned char)__b15 << 56);
+    return (__m128i){ { __lo, __hi } };
+}
+
+/* _mm_setr_epi8: set 16 x 8-bit lanes in natural (low-to-high) order */
+static __inline__ __m128i __attribute__((__always_inline__))
+_mm_setr_epi8(char __b0, char __b1, char __b2, char __b3,
+              char __b4, char __b5, char __b6, char __b7,
+              char __b8, char __b9, char __b10, char __b11,
+              char __b12, char __b13, char __b14, char __b15)
+{
+    return _mm_set_epi8(__b15, __b14, __b13, __b12,
+                        __b11, __b10, __b9, __b8,
+                        __b7, __b6, __b5, __b4,
+                        __b3, __b2, __b1, __b0);
+}
+
+/* _mm_set1_epi64x: broadcast 64-bit integer to both lanes */
+static __inline__ __m128i __attribute__((__always_inline__))
+_mm_set1_epi64x(long long __q)
+{
+    return (__m128i){ { __q, __q } };
 }
 
 /* === Insert / Extract === */
