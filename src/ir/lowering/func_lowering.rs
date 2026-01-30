@@ -519,16 +519,19 @@ impl Lowerer {
         //   inline + gnu_inline (no extern) = external definition → global (GNU89 semantics)
         //   plain inline (no extern, no gnu_inline) = inline definition only → static (C99)
         //   extern inline (no gnu_inline) = external definition → global (C99)
+        //
+        // C99 6.7.4p7 additional rule: if ANY file-scope declaration of the function
+        // does NOT include `inline`, then the definition provides an external definition.
+        // This handles cases like jq's tsd_dtoa_context_get() where the header declares
+        // the function without `inline` and the .c file defines it with `inline`.
         let is_gnu_inline_no_extern_def = func.attrs.is_gnu_inline() && func.attrs.is_inline()
             && func.attrs.is_extern();
         // C99 6.7.4p7: A plain `inline` definition (without `extern`) does not
-        // provide an external definition. Emit with weak linkage so that:
-        // - multiple TUs including the same inline header don't cause
-        //   multiple definition errors (linker deduplicates weak symbols)
-        // - the symbol is still externally visible for cross-TU references
-        //   (important since we don't perform cross-function inlining)
+        // provide an external definition ONLY if ALL file-scope declarations include
+        // `inline`. If any declaration lacks `inline`, this is an external definition.
         let is_c99_inline_def = func.attrs.is_inline() && !func.attrs.is_extern()
-            && !func.attrs.is_static() && !func.attrs.is_gnu_inline();
+            && !func.attrs.is_static() && !func.attrs.is_gnu_inline()
+            && !self.has_non_inline_decl.contains(&func.name);
         let is_static = func.attrs.is_static() || self.static_functions.contains(&func.name)
             || is_gnu_inline_no_extern_def
             || is_c99_inline_def;

@@ -180,6 +180,10 @@ pub mod decl_flag {
     pub const THREAD_LOCAL: u16      = 1 << 6;
     /// `__attribute__((transparent_union))` applied to a typedef.
     pub const TRANSPARENT_UNION: u16 = 1 << 7;
+    /// `inline` function specifier on a declaration (not a definition).
+    /// Used to implement C99 6.7.4p7: a function provides an external definition
+    /// only if not ALL file-scope declarations include `inline`.
+    pub const INLINE: u16            = 1 << 8;
 }
 
 /// A variable/type declaration.
@@ -225,6 +229,7 @@ impl Declaration {
     #[inline] pub fn is_common(&self) -> bool             { self.flags & decl_flag::COMMON != 0 }
     #[inline] pub fn is_thread_local(&self) -> bool       { self.flags & decl_flag::THREAD_LOCAL != 0 }
     #[inline] pub fn is_transparent_union(&self) -> bool  { self.flags & decl_flag::TRANSPARENT_UNION != 0 }
+    #[inline] pub fn is_inline(&self) -> bool              { self.flags & decl_flag::INLINE != 0 }
 
     // --- flag setters ---
 
@@ -236,6 +241,7 @@ impl Declaration {
     #[inline] pub fn set_common(&mut self, v: bool)             { self.set_flag(decl_flag::COMMON, v) }
     #[inline] pub fn set_thread_local(&mut self, v: bool)       { self.set_flag(decl_flag::THREAD_LOCAL, v) }
     #[inline] pub fn set_transparent_union(&mut self, v: bool)  { self.set_flag(decl_flag::TRANSPARENT_UNION, v) }
+    #[inline] pub fn set_inline(&mut self, v: bool)             { self.set_flag(decl_flag::INLINE, v) }
 
     #[inline]
     fn set_flag(&mut self, mask: u16, v: bool) {

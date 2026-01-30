@@ -593,6 +593,7 @@ impl Parser {
         d.set_common(ctx.is_common);
         d.set_thread_local(self.attrs.parsing_thread_local());
         d.set_transparent_union(is_transparent_union);
+        d.set_inline(self.attrs.parsing_inline());
         Some(ExternalDecl::Declaration(d))
     }
 

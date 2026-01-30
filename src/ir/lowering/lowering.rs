@@ -75,6 +75,11 @@ pub struct Lowerer {
     /// Set of function names declared with __attribute__((fastcall)).
     /// On i386, these use ecx/edx for the first two integer/pointer args.
     pub(super) fastcall_functions: FxHashSet<String>,
+    /// Set of function names that have at least one file-scope declaration
+    /// without the `inline` specifier. Per C99 6.7.4p7, if ANY file-scope
+    /// declaration of a function lacks `inline`, the `inline` definition
+    /// provides an external definition (not an inline-only definition).
+    pub(super) has_non_inline_decl: FxHashSet<String>,
     /// Type-system state (struct layouts, typedefs, enum constants, type caches)
     pub(super) types: TypeContext,
     /// Metadata about known functions (consolidated FuncSig)
@@ -188,6 +193,7 @@ impl Lowerer {
             error_functions: FxHashSet::default(),
             noreturn_functions: FxHashSet::default(),
             fastcall_functions: FxHashSet::default(),
+            has_non_inline_decl: FxHashSet::default(),
             types: type_context,
             func_meta: FunctionMeta::default(),
             emitted_global_names: FxHashSet::default(),
@@ -510,6 +516,13 @@ impl Lowerer {
                             &declarator.name, &decl.type_spec, ptr_count,
                             &params, variadic, decl.is_static(), false,
                         );
+                        // C99 6.7.4p7: Track function declarations that lack `inline`.
+                        // If ANY file-scope declaration of a function does not include
+                        // `inline`, then the `inline` definition in this TU provides
+                        // an external definition (not just an inline definition).
+                        if !decl.is_inline() && !declarator.name.is_empty() {
+                            self.has_non_inline_decl.insert(declarator.name.clone());
+                        }
                     } else if declarator.derived.is_empty() {
                         // Check if the base type is a function typedef
                         // (e.g., `func_t add;` where func_t is typedef int func_t(int);)

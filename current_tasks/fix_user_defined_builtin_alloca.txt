@@ -1,0 +1,8 @@
+Task: Fix user-defined functions with builtin names being treated as builtins
+Status: in_progress
+Description: When a user defines a function body for a name that matches a compiler
+builtin (e.g., __builtin_alloca), the compiler incorrectly uses the builtin instead
+of calling the user's function. This commonly occurs when <alloca.h> macro-expands
+`alloca` to `__builtin_alloca` but the user also defines `static double *alloca() { ... }`.
+Fix: Check sema's is_defined flag in try_lower_builtin_call to prefer user-defined
+functions over builtins.
