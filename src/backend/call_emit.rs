@@ -48,6 +48,9 @@ pub enum ParamClass {
     F128Stack { offset: i64 },
     /// Small struct that overflowed to the stack.
     StructStack { offset: i64, size: usize },
+    /// Small struct split across the last GP register and the stack.
+    /// RISC-V psABI: first XLEN bytes in `reg_idx`, remaining bytes at `stack_offset`.
+    StructSplitRegStack { reg_idx: usize, stack_offset: i64, size: usize },
     /// Large struct (>16 bytes) passed on the stack.
     LargeStructStack { offset: i64, size: usize },
     /// Large struct (>16 bytes) passed by reference in a GP register (AAPCS64).
@@ -62,13 +65,14 @@ pub enum ParamClass {
 }
 
 impl ParamClass {
-    /// Returns true if this parameter is passed on the stack.
+    /// Returns true if this parameter is passed on the stack (fully or partially).
     pub fn is_stack(&self) -> bool {
         matches!(self,
             ParamClass::StackScalar { .. } | ParamClass::I128Stack { .. } |
             ParamClass::F128Stack { .. } | ParamClass::F128AlwaysStack { .. } |
             ParamClass::StructStack { .. } | ParamClass::LargeStructStack { .. } |
-            ParamClass::LargeStructByRefStack { .. }
+            ParamClass::LargeStructByRefStack { .. } |
+            ParamClass::StructSplitRegStack { .. }
         )
     }
 
@@ -78,7 +82,8 @@ impl ParamClass {
             ParamClass::IntReg { .. } | ParamClass::I128RegPair { .. } |
             ParamClass::StructByValReg { .. } | ParamClass::F128GpPair { .. } |
             ParamClass::LargeStructByRefReg { .. } |
-            ParamClass::StructMixedIntSseReg { .. } | ParamClass::StructMixedSseIntReg { .. }
+            ParamClass::StructMixedIntSseReg { .. } | ParamClass::StructMixedSseIntReg { .. } |
+            ParamClass::StructSplitRegStack { .. }
         )
     }
 
@@ -94,6 +99,11 @@ impl ParamClass {
             ParamClass::F128Stack { .. } => 16,
             ParamClass::F128AlwaysStack { .. } => if slot_size == 4 { 12 } else { 16 },
             ParamClass::StructStack { size, .. } => (*size + align_mask) & !align_mask,
+            ParamClass::StructSplitRegStack { size, .. } => {
+                // Only the portion beyond the first register goes on the stack.
+                let stack_part = size - slot_size;
+                (stack_part + align_mask) & !align_mask
+            }
             ParamClass::LargeStructStack { size, .. } => (*size + align_mask) & !align_mask,
             ParamClass::LargeStructByRefStack { .. } => slot_size, // pointer on stack
             _ => 0, // register-passed params don't consume stack space
@@ -113,6 +123,7 @@ impl ParamClass {
             }
             ParamClass::F128GpPair { .. } => 2,
             ParamClass::StructMixedIntSseReg { .. } | ParamClass::StructMixedSseIntReg { .. } => 1,
+            ParamClass::StructSplitRegStack { .. } => 1, // only 1 GP reg used (the rest on stack)
             ParamClass::StructSseReg { .. } => 0, // all SSE, no GP regs
             _ => 0, // FP regs and stack don't consume GP regs
         }
@@ -247,6 +258,17 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
                             size,
                         });
                         int_reg_idx += regs_needed;
+                    } else if regs_needed == 2 && int_reg_idx < config.max_int_regs && config.allow_struct_split_reg_stack {
+                        // RISC-V psABI: split the struct -- first XLEN bytes in the last GP
+                        // register, remaining bytes on the stack.
+                        result.push(ParamClass::StructSplitRegStack {
+                            reg_idx: int_reg_idx,
+                            stack_offset,
+                            size,
+                        });
+                        let stack_part = size - slot_size;
+                        stack_offset += (stack_part as i64 + slot_align_mask) & !slot_align_mask;
+                        int_reg_idx = config.max_int_regs;
                     } else {
                         result.push(ParamClass::StructStack {
                             offset: stack_offset,

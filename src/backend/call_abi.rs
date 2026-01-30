@@ -32,6 +32,9 @@ pub enum CallArgClass {
     StructMixedSseIntReg { fp_reg_idx: usize, int_reg_idx: usize, size: usize },
     /// Small struct (<=16 bytes) that overflows to the stack.
     StructByValStack { size: usize },
+    /// Small struct split across the last GP register and the stack.
+    /// RISC-V psABI: first XLEN bytes in `reg_idx`, remaining bytes on the stack.
+    StructSplitRegStack { reg_idx: usize, size: usize },
     /// Large struct (>16 bytes) passed on the stack (MEMORY class).
     LargeStructStack { size: usize },
     /// Argument overflows to the stack (normal 8-byte).
@@ -50,7 +53,8 @@ impl CallArgClass {
     pub fn is_stack(&self) -> bool {
         matches!(self, CallArgClass::Stack | CallArgClass::F128Stack |
                  CallArgClass::I128Stack | CallArgClass::StructByValStack { .. } |
-                 CallArgClass::LargeStructStack { .. })
+                 CallArgClass::LargeStructStack { .. } |
+                 CallArgClass::StructSplitRegStack { .. })
     }
 
     /// Returns the stack space consumed by this argument (0 if register).
@@ -62,6 +66,11 @@ impl CallArgClass {
             CallArgClass::I128Stack => 16,
             CallArgClass::StructByValStack { size } | CallArgClass::LargeStructStack { size } => {
                 (*size + align_mask) & !align_mask
+            }
+            CallArgClass::StructSplitRegStack { size, .. } => {
+                // Only the portion beyond the first register goes on the stack.
+                let stack_part = size - slot_size;
+                (stack_part + align_mask) & !align_mask
             }
             CallArgClass::Stack => slot_size,
             _ => 0,
@@ -94,6 +103,10 @@ pub struct CallAbiConfig {
     /// When true, small structs with float/double fields are passed in FP registers
     /// per the RISC-V psABI.
     pub use_riscv_float_struct_classification: bool,
+    /// Whether 2-register structs can be split across the last GP register and the stack.
+    /// RISC-V psABI: if a 2×XLEN struct has only 1 GP register left, the first XLEN bytes
+    /// go in that register and the rest go on the stack. ARM AAPCS64 does NOT split.
+    pub allow_struct_split_reg_stack: bool,
 }
 
 /// Result of SysV per-eightbyte struct classification.
@@ -285,6 +298,11 @@ pub fn classify_call_args(
                     if int_idx + regs_needed <= config.max_int_regs {
                         result.push(CallArgClass::StructByValReg { base_reg_idx: int_idx, size });
                         int_idx += regs_needed;
+                    } else if regs_needed == 2 && int_idx < config.max_int_regs && config.allow_struct_split_reg_stack {
+                        // RISC-V psABI: split the struct -- first XLEN bytes in the last GP
+                        // register, remaining bytes on the stack.
+                        result.push(CallArgClass::StructSplitRegStack { reg_idx: int_idx, size });
+                        int_idx = config.max_int_regs;
                     } else {
                         result.push(CallArgClass::StructByValStack { size });
                         int_idx = config.max_int_regs;

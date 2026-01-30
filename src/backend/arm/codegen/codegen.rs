@@ -2719,6 +2719,7 @@ impl ArchCodegen for ArmCodegen {
             large_struct_by_ref: true, // AAPCS64: composites > 16 bytes passed by reference
             use_sysv_struct_classification: false, // ARM uses AAPCS64, not SysV
             use_riscv_float_struct_classification: false,
+            allow_struct_split_reg_stack: false, // AAPCS64: structs don't split across reg/stack
         }
     }
 

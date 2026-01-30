@@ -1100,6 +1100,31 @@ impl ArchCodegen for RiscvCodegen {
                         self.emit_store_to_s0("t0", dst_off, "sd");
                     }
                 }
+                ParamClass::StructSplitRegStack { reg_idx, stack_offset, size } => {
+                    // RISC-V psABI: first 8 bytes in GP register, remaining bytes on the stack.
+                    if func.is_variadic {
+                        // Variadic: load first half from register save area
+                        let off = (reg_idx as i64) * 8;
+                        self.emit_load_from_s0("t0", off, "ld");
+                        self.emit_store_to_s0("t0", slot.0, "sd");
+                    } else if has_f128_reg_params {
+                        let off = f128_save_offset + (reg_idx as i64) * 8;
+                        self.state.emit_fmt(format_args!("    ld t0, {}(sp)", off));
+                        self.emit_store_to_s0("t0", slot.0, "sd");
+                    } else {
+                        self.emit_store_to_s0(RISCV_ARG_REGS[reg_idx], slot.0, "sd");
+                    }
+                    // Second half from the caller's stack
+                    let src = stack_base + stack_offset;
+                    let remaining = size - 8;
+                    let n_dwords = remaining.div_ceil(8);
+                    for qi in 0..n_dwords {
+                        let src_off = src + (qi as i64 * 8);
+                        let dst_off = slot.0 + 8 + (qi as i64 * 8);
+                        self.emit_load_from_s0("t0", src_off, "ld");
+                        self.emit_store_to_s0("t0", dst_off, "sd");
+                    }
+                }
                 // F128 in FP reg doesn't happen on RISC-V.
                 ParamClass::F128FpReg { .. } |
                 ParamClass::ZeroSizeSkip => {}
@@ -1862,6 +1887,7 @@ impl ArchCodegen for RiscvCodegen {
             large_struct_by_ref: true, // RISC-V LP64: composites > 16 bytes passed by reference (pointer in GP reg)
             use_sysv_struct_classification: false, // RISC-V uses its own ABI, not SysV
             use_riscv_float_struct_classification: true, // RISC-V LP64D: structs with float fields use FP registers
+            allow_struct_split_reg_stack: true, // RISC-V psABI: 2×XLEN structs split across last GP reg and stack
         }
     }
 
@@ -1996,6 +2022,35 @@ impl ArchCodegen for RiscvCodegen {
                             }
                         }
                         offset += 16;
+                    }
+                    CallArgClass::StructSplitRegStack { size, .. } => {
+                        // RISC-V psABI: the stack portion is the second XLEN bytes of the struct.
+                        // First XLEN bytes go in the last GP register (handled in emit_call_reg_args).
+                        match arg {
+                            Operand::Value(v) => {
+                                if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                                    let reg_name = callee_saved_name(reg);
+                                    self.state.emit_fmt(format_args!("    mv t0, {}", reg_name));
+                                } else if let Some(slot) = self.state.get_slot(v.0) {
+                                    if self.state.is_alloca(v.0) {
+                                        self.emit_addi_s0("t0", slot.0);
+                                    } else {
+                                        self.emit_load_from_s0("t0", slot.0, "ld");
+                                    }
+                                } else {
+                                    self.state.emit("    li t0, 0");
+                                }
+                            }
+                            Operand::Const(_) => { self.operand_to_t0(arg); }
+                        }
+                        // Copy the stack portion: bytes 8..size from the struct pointer
+                        let stack_dwords = (size - 8).div_ceil(8);
+                        for qi in 0..stack_dwords {
+                            let src_off = 8 + (qi * 8) as i64;
+                            Self::emit_load_from_reg(&mut self.state, "t1", "t0", src_off, "ld");
+                            self.emit_store_to_sp("t1", offset as i64 + (qi * 8) as i64, "sd");
+                        }
+                        offset += stack_dwords * 8;
                     }
                     CallArgClass::Stack => {
                         self.operand_to_t0(arg);
@@ -2132,6 +2187,31 @@ impl ArchCodegen for RiscvCodegen {
                 if regs_needed > 1 {
                     self.state.emit_fmt(format_args!("    ld {}, 8(t0)", RISCV_ARG_REGS[base_reg_idx + 1]));
                 }
+            }
+        }
+
+        // Load split struct register args: first 8 bytes of a split struct go in the last GP register.
+        for (i, arg) in args.iter().enumerate() {
+            if let CallArgClass::StructSplitRegStack { reg_idx, .. } = arg_classes[i] {
+                match arg {
+                    Operand::Value(v) => {
+                        if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                            let reg_name = callee_saved_name(reg);
+                            self.state.emit_fmt(format_args!("    mv t0, {}", reg_name));
+                        } else if let Some(slot) = self.state.get_slot(v.0) {
+                            if self.state.is_alloca(v.0) {
+                                self.emit_addi_s0("t0", slot.0);
+                            } else {
+                                self.emit_load_from_s0("t0", slot.0, "ld");
+                            }
+                        } else {
+                            self.state.emit("    li t0, 0");
+                        }
+                    }
+                    Operand::Const(_) => { self.operand_to_t0(arg); }
+                }
+                // Load first 8 bytes of the struct into the last GP register
+                self.state.emit_fmt(format_args!("    ld {}, 0(t0)", RISCV_ARG_REGS[reg_idx]));
             }
         }
 

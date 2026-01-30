@@ -1449,9 +1449,10 @@ impl ArchCodegen for X86Codegen {
                         self.state.out.emit_instr_reg_rbp("    movq", "rax", dst_off);
                     }
                 }
-                // These variants don't occur for x86 (no F128 in FP/GP pair regs, no by-ref structs).
+                // These variants don't occur for x86 (no F128 in FP/GP pair regs, no by-ref structs, no split).
                 ParamClass::F128FpReg { .. } | ParamClass::F128GpPair { .. } | ParamClass::F128Stack { .. } |
                 ParamClass::LargeStructByRefReg { .. } | ParamClass::LargeStructByRefStack { .. } |
+                ParamClass::StructSplitRegStack { .. } |
                 ParamClass::ZeroSizeSkip => {}
             }
         }
@@ -2568,6 +2569,7 @@ impl ArchCodegen for X86Codegen {
             large_struct_by_ref: false, // x86-64 SysV: large structs passed on stack by value
             use_sysv_struct_classification: true, // x86-64 SysV: per-eightbyte SSE/INTEGER classification
             use_riscv_float_struct_classification: false,
+            allow_struct_split_reg_stack: false, // x86-64 SysV doesn't split structs across reg/stack
         }
     }
 
