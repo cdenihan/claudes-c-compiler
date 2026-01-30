@@ -1269,6 +1269,10 @@ impl SemanticAnalyzer {
             }
             // Cast to another type preserves truthiness
             Expr::Cast(_, inner, _) => self.try_eval_constant_bool(inner),
+            // Enum constants (e.g., kernel's `true` defined as `enum { false = 0, true = 1 }`)
+            Expr::Identifier(name, _) => {
+                self.result.type_context.enum_constants.get(name).map(|&val| val != 0)
+            }
             _ => None,
         }
     }

@@ -19,5 +19,8 @@ NOTE: This overlaps with fix_wreturn_type_comprehensive and
 fix_wreturn_type_switch_false_positive which were locked but not completed.
 This fix covers only the switch exhaustiveness portion.
 
-Status: in_progress
+Status: completed
 Started: 2026-01-30
+Completed: 2026-01-30
+Note: Fixed by upstream commits f251ff09 and 98549707.
+Remaining: enum constant evaluation in try_eval_constant_bool (handled separately).

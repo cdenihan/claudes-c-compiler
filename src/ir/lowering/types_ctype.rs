@@ -187,8 +187,15 @@ impl Lowerer {
             }
         }
 
-        // Default: use the standard type_spec_to_ctype
-        self.type_spec_to_ctype(&param.type_spec)
+        // Default: use the standard type_spec_to_ctype, then apply parameter adjustments.
+        let ctype = self.type_spec_to_ctype(&param.type_spec);
+        // C11 6.7.6.3p7: "A declaration of a parameter as 'array of type' shall be
+        // adjusted to 'qualified pointer to type'". This handles typedef'd array types
+        // like `typedef struct S name[1]` used as function parameters.
+        if let CType::Array(elem, _) = ctype {
+            return CType::Pointer(elem, AddressSpace::Default);
+        }
+        ctype
     }
 
     /// Check if a typedef name refers to a function pointer type.
