@@ -168,6 +168,9 @@ impl Lowerer {
             // Emit cleanup calls for all scopes being exited by break
             let cleanups = self.collect_scope_cleanup_vars_above_depth(scope_depth);
             self.emit_cleanup_calls(&cleanups);
+            // Restore the stack pointer for VLA deallocation when breaking out
+            // of scopes that contain VLAs. Without this, VLA stack space leaks.
+            self.emit_vla_restore_for_scope_exit(scope_depth);
             self.terminate(Terminator::Branch(label));
             let dead = self.fresh_label();
             self.start_block(dead);
@@ -179,9 +182,33 @@ impl Lowerer {
             // Emit cleanup calls for all scopes being exited by continue
             let cleanups = self.collect_scope_cleanup_vars_above_depth(scope_depth);
             self.emit_cleanup_calls(&cleanups);
+            // Restore the stack pointer for VLA deallocation when continuing
+            // past scopes that contain VLAs. Without this, VLA stack space leaks
+            // on each loop iteration, causing stack overflow.
+            self.emit_vla_restore_for_scope_exit(scope_depth);
             self.terminate(Terminator::Branch(label));
             let dead = self.fresh_label();
             self.start_block(dead);
+        }
+    }
+
+    /// Emit StackRestore for VLA deallocation when exiting scopes via break/continue.
+    ///
+    /// Checks all scopes from `target_depth` to the current depth for VLA stack saves.
+    /// If any exited scope has a saved stack pointer (from VLA allocation), restores
+    /// the outermost one to reclaim all VLA stack space in the exited scopes.
+    fn emit_vla_restore_for_scope_exit(&mut self, target_depth: usize) {
+        let current_depth = self.func().scope_stack.len();
+        if target_depth < current_depth {
+            // Exiting one or more scopes. Find the outermost exited scope with VLAs
+            // and restore from its save point (this reclaims all VLA space in the
+            // exited scopes since their VLAs were allocated after that save point).
+            let vla_restore = self.func().scope_stack[target_depth..]
+                .iter()
+                .find_map(|frame| frame.scope_stack_save);
+            if let Some(save_val) = vla_restore {
+                self.emit(Instruction::StackRestore { ptr: save_val });
+            }
         }
     }
 
@@ -216,13 +243,8 @@ impl Lowerer {
         // We distinguish forward from backward gotos by checking whether the
         // target label has already been defined during lowering.
         if cleanup_depth < current_depth {
-            // Case 1: exiting scopes. Find the outermost exited scope with VLAs.
-            let vla_restore = self.func().scope_stack[cleanup_depth..]
-                .iter()
-                .find_map(|frame| frame.scope_stack_save);
-            if let Some(save_val) = vla_restore {
-                self.emit(Instruction::StackRestore { ptr: save_val });
-            }
+            // Case 1: exiting scopes — use the shared helper to restore VLA stack.
+            self.emit_vla_restore_for_scope_exit(cleanup_depth);
         } else if let Some(save_val) = self.func().vla_stack_save {
             // Case 2: same-scope goto. Only restore for backward jumps (label
             // already defined), which may re-enter VLA declarations.

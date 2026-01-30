@@ -77,14 +77,10 @@ impl Lowerer {
         // Perform the operation in the result type (operands are now properly widened)
         let result = self.emit_binop_val(op, lhs_val, rhs_val, result_ir_ty);
 
-        // Store the (possibly truncated/wrapped) result
-        self.emit(Instruction::Store { val: Operand::Value(result), ptr: result_ptr, ty: result_ir_ty,
-         seg_override: AddressSpace::Default });
-
-        // Compute the overflow flag.
-        // For generic variants with signed source(s) and unsigned result type, we use
-        // infinite-precision semantics: a negative mathematical result can't fit in an
-        // unsigned type. We detect this by checking the sign bit of the result.
+        // Compute the overflow flag BEFORE storing the result, because the
+        // output pointer may alias an input (e.g. __builtin_add_overflow(a, b, &a)).
+        // If we store first, the overflow check would compare against the
+        // clobbered value instead of the original input.
         let any_source_signed = is_generic
             && (lhs_src_ctype.is_signed() || rhs_src_ctype.is_signed());
         let overflow = if is_signed {
@@ -121,6 +117,11 @@ impl Lowerer {
         } else {
             self.compute_unsigned_overflow(op, lhs_val, rhs_val, result, result_ir_ty)
         };
+
+        // Store the (possibly truncated/wrapped) result AFTER computing the
+        // overflow flag to avoid clobbering aliased inputs.
+        self.emit(Instruction::Store { val: Operand::Value(result), ptr: result_ptr, ty: result_ir_ty,
+         seg_override: AddressSpace::Default });
 
         Some(Operand::Value(overflow))
     }

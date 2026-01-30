@@ -1,0 +1,11 @@
+Fix -Wreturn-type false positive for switch statements with default case
+
+The -Wreturn-type warning (added in 93e42c7d) treats all switch statements
+as able to fall through, causing false positives when every case (including
+default) contains a return. This breaks the kernel build with -Werror.
+
+Fix: Add switch exhaustiveness analysis to stmt_can_fall_through() that
+checks if the switch has a default case and all case branches diverge
+(return/goto/break).
+
+Status: in_progress

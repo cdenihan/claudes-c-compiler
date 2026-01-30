@@ -1,5 +1,0 @@
-Fix VLA stack deallocation on break/continue statements.
-
-break and continue in loops with VLAs did not emit StackRestore,
-causing unbounded stack growth (stack overflow) when VLAs were
-allocated inside loop bodies that used break or continue.
