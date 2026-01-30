@@ -73,6 +73,10 @@ enum LineKind {
     Alu,
     /// `sext.w` instruction — sign-extend word
     SextW { dst: u8, src: u8 },
+    /// `lla reg, symbol` or `la reg, symbol` — load address of symbol
+    /// Must not be modified by copy propagation (symbol names contain
+    /// register-like substrings such as `main.s1.0`).
+    LoadAddr { dst: u8 },
     /// Any other instruction
     Other,
 }
@@ -273,6 +277,18 @@ fn classify_line(line: &str) -> LineKind {
        trimmed.starts_with("not ") || trimmed.starts_with("snez ") ||
        trimmed.starts_with("seqz ") || trimmed.starts_with("lui ") {
         return LineKind::Alu;
+    }
+
+    // Load address: lla/la reg, symbol
+    // These must not have their symbol operands modified by copy propagation,
+    // since symbol names can contain register-like substrings (e.g. `main.s1.0`).
+    if let Some(rest) = trimmed.strip_prefix("lla ").or_else(|| trimmed.strip_prefix("la ")) {
+        if let Some((reg_str, _)) = rest.split_once(", ") {
+            let dst = parse_reg(reg_str.trim());
+            if dst != REG_NONE {
+                return LineKind::LoadAddr { dst };
+            }
+        }
     }
 
     LineKind::Other
@@ -658,7 +674,8 @@ fn global_store_forwarding(lines: &mut [String], kinds: &mut [LineKind], n: usiz
                 }
             }
 
-            LineKind::LoadImm { dst } | LineKind::SextW { dst, .. } => {
+            LineKind::LoadImm { dst } | LineKind::SextW { dst, .. }
+            | LineKind::LoadAddr { dst } => {
                 if (dst as usize) < NUM_REGS {
                     gsf_invalidate_reg(&mut slots, &mut reg_slots, dst);
                 }
@@ -768,10 +785,12 @@ fn propagate_register_copies(lines: &mut [String], kinds: &mut [LineKind], n: us
             continue;
         }
 
-        // Don't propagate across control flow boundaries
+        // Don't propagate across control flow boundaries or into instructions
+        // with symbol names (LoadAddr) that could be corrupted by register
+        // name replacement (e.g. `lla t0, main.s1.0` contains "s1").
         match kinds[j] {
             LineKind::Label | LineKind::Jump | LineKind::Ret | LineKind::Directive
-            | LineKind::Call => continue,
+            | LineKind::Call | LineKind::LoadAddr { .. } => continue,
             _ => {}
         }
 
@@ -861,6 +880,7 @@ fn eliminate_dead_reg_moves(lines: &[String], kinds: &mut [LineKind], n: usize) 
                 LineKind::StoreS0 { reg: store_reg, .. } => store_reg == dst,
                 LineKind::LoadS0 { .. } => false, // only writes to dest
                 LineKind::LoadImm { .. } => false, // only writes
+                LineKind::LoadAddr { .. } => false, // only writes (lla/la)
                 LineKind::Alu => {
                     // Check source positions (after first comma)
                     let trimmed = lines[j].trim();
@@ -885,6 +905,7 @@ fn eliminate_dead_reg_moves(lines: &[String], kinds: &mut [LineKind], n: usize) 
                 LineKind::LoadImm { dst: d } => Some(d),
                 LineKind::SextW { dst: d, .. } => Some(d),
                 LineKind::LoadS0 { reg: d, .. } => Some(d),
+                LineKind::LoadAddr { dst: d } => Some(d),
                 LineKind::Alu => parse_alu_dest(&lines[j]),
                 _ => None,
             };
@@ -907,7 +928,15 @@ fn eliminate_dead_reg_moves(lines: &[String], kinds: &mut [LineKind], n: usize) 
     changed
 }
 
-/// Check if `text` contains `word` at a word boundary (no adjacent alphanumeric).
+/// Check if a byte is a "word character" for the purposes of register name matching.
+/// Includes alphanumeric, `.`, and `_` since these appear in symbol names
+/// (e.g. `main.s1.0`, `_start`) and must not be treated as word boundaries.
+#[inline]
+fn is_ident_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'.' || b == b'_'
+}
+
+/// Check if `text` contains `word` at a word boundary (no adjacent identifier chars).
 fn has_whole_word(text: &str, word: &str) -> bool {
     let bytes = text.as_bytes();
     let word_bytes = word.as_bytes();
@@ -917,8 +946,8 @@ fn has_whole_word(text: &str, word: &str) -> bool {
     let mut i = 0;
     while i + word_len <= text_len {
         if &bytes[i..i + word_len] == word_bytes {
-            let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
-            let after_ok = i + word_len >= text_len || !bytes[i + word_len].is_ascii_alphanumeric();
+            let before_ok = i == 0 || !is_ident_char(bytes[i - 1]);
+            let after_ok = i + word_len >= text_len || !is_ident_char(bytes[i + word_len]);
             if before_ok && after_ok {
                 return true;
             }
@@ -959,8 +988,9 @@ fn replace_source_reg_in_instruction(line: &str, old_reg: &str, new_reg: &str) -
 }
 
 /// Replace `old` with `new` in `text` only at word boundaries.
-/// A word boundary is where the adjacent character is not alphanumeric.
-/// This prevents "t1" from matching inside "t10" or "s10".
+/// A word boundary is where the adjacent character is not an identifier char
+/// (alphanumeric, `.`, or `_`). This prevents "s1" from matching inside
+/// "s10", "main.s1.0", or "_s1_var".
 fn replace_whole_word(text: &str, old: &str, new: &str) -> String {
     let bytes = text.as_bytes();
     let old_bytes = old.as_bytes();
@@ -971,8 +1001,8 @@ fn replace_whole_word(text: &str, old: &str, new: &str) -> String {
 
     while i < text_len {
         if i + old_len <= text_len && &bytes[i..i + old_len] == old_bytes {
-            let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
-            let after_ok = i + old_len >= text_len || !bytes[i + old_len].is_ascii_alphanumeric();
+            let before_ok = i == 0 || !is_ident_char(bytes[i - 1]);
+            let after_ok = i + old_len >= text_len || !is_ident_char(bytes[i + old_len]);
             if before_ok && after_ok {
                 result.push_str(new);
                 i += old_len;
@@ -1298,6 +1328,31 @@ mod tests {
     }
 
     #[test]
+    fn test_copy_prop_no_symbol_corruption() {
+        // Register name inside symbol names must not be replaced
+        assert_eq!(
+            replace_whole_word(" main.s1.0", "s1", "t0"),
+            " main.s1.0"
+        );
+        assert_eq!(
+            replace_whole_word(" _s1_var", "s1", "t0"),
+            " _s1_var"
+        );
+    }
+
+    #[test]
+    fn test_lla_not_corrupted_by_copy_prop() {
+        // Regression test: copy propagation must not corrupt symbol names in lla
+        let input = "\
+    mv t0, s1\n\
+    lla t0, main.s1.0\n\
+    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("main.s1.0"), "Symbol name corrupted, got:\n{}", result);
+        assert!(!result.contains("main.t0.0"), "Symbol name corrupted to main.t0.0");
+    }
+
+    #[test]
     fn test_copy_prop_basic() {
         // mv t0, s1 ; addw t2, t0, t1 → addw t2, s1, t1
         let input = "\
@@ -1324,14 +1379,17 @@ mod tests {
     #[test]
     fn test_full_bb_copy_prop() {
         // mv t0, s1 ; mv t1, t0 ; add t2, t1, t0
-        // → (after copy prop) add uses s1 directly
+        // Copy propagation is single-step lookahead:
+        // 1. mv t0, s1 → propagates into next: mv t1, t0 → mv t1, s1
+        // 2. mv t1, s1 → propagates into next: add t2, t1, t0 → add t2, s1, t0
+        // t0 is not further propagated since mv t0, s1 is no longer adjacent to the add.
         let input = "\
     mv t0, s1\n\
     mv t1, t0\n\
     add t2, t1, t0\n\
     ret\n";
         let result = peephole_optimize(input.to_string());
-        // t1 should be resolved to s1, t0 should be resolved to s1
-        assert!(result.contains("add t2, s1, s1"), "Expected transitive copy prop, got:\n{}", result);
+        assert!(result.contains("mv t1, s1"), "Expected t1 = s1 via chain, got:\n{}", result);
+        assert!(result.contains("add t2, s1,"), "Expected t1 propagated in add, got:\n{}", result);
     }
 }

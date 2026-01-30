@@ -1244,9 +1244,18 @@ fn replace_source_reg_in_instruction(line: &str, old_reg: &str, new_reg: &str) -
     Some(format!("{}{}", leading_ws, new_trimmed))
 }
 
+/// Check if a byte is a "word character" for the purposes of register name matching.
+/// Includes alphanumeric, `.`, and `_` since these appear in symbol names
+/// (e.g. `main.s1.0`, `_start`) and must not be treated as word boundaries.
+#[inline]
+fn is_ident_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'.' || b == b'_'
+}
+
 /// Replace `old` with `new` in `text` only at word boundaries.
-/// A word boundary is a position where the adjacent character is not alphanumeric.
-/// This prevents "x1" from matching inside "x11" or "x10".
+/// A word boundary is a position where the adjacent character is not an identifier
+/// char (alphanumeric, `.`, or `_`). This prevents "x1" from matching inside
+/// "x11", "x10", or symbol names like "main.x1.0".
 fn replace_whole_word(text: &str, old: &str, new: &str) -> String {
     let bytes = text.as_bytes();
     let old_bytes = old.as_bytes();
@@ -1257,10 +1266,8 @@ fn replace_whole_word(text: &str, old: &str, new: &str) -> String {
 
     while i < text_len {
         if i + old_len <= text_len && &bytes[i..i + old_len] == old_bytes {
-            // Check word boundary: character before must not be alphanumeric
-            let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
-            // Check word boundary: character after must not be alphanumeric
-            let after_ok = i + old_len >= text_len || !bytes[i + old_len].is_ascii_alphanumeric();
+            let before_ok = i == 0 || !is_ident_char(bytes[i - 1]);
+            let after_ok = i + old_len >= text_len || !is_ident_char(bytes[i + old_len]);
             if before_ok && after_ok {
                 result.push_str(new);
                 i += old_len;
