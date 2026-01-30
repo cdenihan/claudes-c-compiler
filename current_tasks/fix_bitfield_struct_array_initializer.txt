@@ -1,0 +1,14 @@
+Task: Fix bitfield struct array initializer bug
+Started: 2026-01-30
+
+Bug: When initializing a struct member that is an array of structs with bitfields,
+using single-brace notation like `{8}` (instead of double-brace `{{8}}`), the scalar
+value is not being correctly applied to the first bitfield member.
+
+Example:
+  struct inner { unsigned int a : 4; unsigned int b : 4; };
+  struct outer { int x; struct inner arr[2]; };
+  static struct outer o = {5, {8}};  // o.arr[0].a should be 8 but is 0
+
+This affects the `lacc` project which uses this pattern extensively in its
+x86 encoding table, causing wrong assembly output.
