@@ -1870,6 +1870,18 @@ impl ArchCodegen for I686Codegen {
     }
 
     fn emit_copy_value(&mut self, dest: &Value, src: &Operand) {
+        // For LongDouble constants, load via x87 and store to dest slot.
+        // This handles the case where inlining propagates a LongDouble constant
+        // as the source of a Copy instruction (e.g., inlined `return 1.0L`).
+        if let Operand::Const(IrConst::LongDouble(..)) = src {
+            if let Some(dest_slot) = self.state.get_slot(dest.0) {
+                self.emit_f128_load_to_x87(src);
+                emit!(self.state, "    fstpt {}(%ebp)", dest_slot.0);
+                self.state.f128_direct_slots.insert(dest.0);
+                return;
+            }
+        }
+
         // For F128 values with full x87 data in their slots, copy via fldt/fstpt
         if let Operand::Value(v) = src {
             if self.state.f128_direct_slots.contains(&v.0) {

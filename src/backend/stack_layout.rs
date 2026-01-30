@@ -26,6 +26,7 @@
 
 use crate::ir::ir::{
     Instruction,
+    IrConst,
     IrFunction,
     Operand,
     Terminator,
@@ -1223,7 +1224,8 @@ fn classify_value(
     block_local_values: &mut Vec<BlockLocalValue>,
 ) {
     let is_i128 = matches!(inst.result_type(), Some(IrType::I128) | Some(IrType::U128));
-    let is_f128 = matches!(inst.result_type(), Some(IrType::F128));
+    let is_f128 = matches!(inst.result_type(), Some(IrType::F128))
+        || matches!(inst, Instruction::Copy { src: Operand::Const(IrConst::LongDouble(..)), .. });
 
     // Detect small values (types that fit in 4 bytes on 64-bit targets).
     // Currently used to populate small_slot_values for future store/load
