@@ -503,6 +503,10 @@ impl Parser {
     fn parse_typeof_specifier(&mut self) -> TypeSpecifier {
         let open = self.peek_span();
         self.expect_context(&TokenKind::LParen, "after 'typeof'");
+        // Save attrs.flags so that storage-class specifiers from declarations
+        // inside a statement expression (e.g., `typeof(({ extern void f(); x; }))`)
+        // don't leak into the outer declaration.
+        let saved_flags = self.attrs.flags;
         let save = self.pos;
         // Try parsing as a type first
         if self.is_type_specifier() {
@@ -510,16 +514,19 @@ impl Parser {
                 let result_type = self.parse_abstract_declarator_suffix(ts);
                 if matches!(self.peek(), TokenKind::RParen) {
                     self.advance();
+                    self.attrs.flags = saved_flags;
                     return TypeSpecifier::TypeofType(Box::new(result_type));
                 }
             }
             // Didn't work as type, backtrack
             self.pos = save;
+            self.attrs.flags = saved_flags;
             self.expect_context(&TokenKind::LParen, "after 'typeof'");
         }
         // Parse as expression
         let expr = self.parse_expr();
         self.expect_closing(&TokenKind::RParen, open);
+        self.attrs.flags = saved_flags;
         TypeSpecifier::Typeof(Box::new(expr))
     }
 

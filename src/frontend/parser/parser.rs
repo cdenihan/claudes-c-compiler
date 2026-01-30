@@ -112,7 +112,7 @@ pub(super) mod parsed_attr_flag {
 #[derive(Default)]
 pub(super) struct ParsedDeclAttrs {
     /// Packed boolean flags — see `parsed_attr_flag` constants.
-    flags: u32,
+    pub(super) flags: u32,
 
     /// `__seg_gs` or `__seg_fs` qualifier encountered.
     pub parsing_address_space: AddressSpace,

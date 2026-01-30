@@ -17,4 +17,4 @@ expands to typeof(({ compiletime_assert(...); expr; })), and the compiletime_ass
 macro (under __OPTIMIZE__) generates extern function declarations inside the
 statement expression.
 
-Status: in_progress
+Status: done
