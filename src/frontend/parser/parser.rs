@@ -490,6 +490,21 @@ impl Parser {
 
     // === Type and qualifier helpers ===
 
+    /// Check if the current position is a typedef name followed by ':',
+    /// which means it's a label (not a declaration). In C, label names
+    /// can shadow typedef names: `typedef struct Ins Ins; ... Ins: stmt;`
+    pub(super) fn is_typedef_label(&self) -> bool {
+        if let TokenKind::Identifier(name) = self.peek() {
+            if self.typedefs.contains(name) && !self.shadowed_typedefs.contains(name) {
+                // Check if next token is ':'
+                if self.pos + 1 < self.tokens.len() {
+                    return matches!(self.tokens[self.pos + 1].kind, TokenKind::Colon);
+                }
+            }
+        }
+        false
+    }
+
     pub(super) fn is_type_specifier(&self) -> bool {
         match self.peek() {
             TokenKind::Void | TokenKind::Char | TokenKind::Short | TokenKind::Int |

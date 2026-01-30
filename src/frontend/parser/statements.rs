@@ -67,7 +67,7 @@ impl Parser {
             }
             if matches!(self.peek(), TokenKind::StaticAssert) {
                 self.parse_static_assert();
-            } else if self.is_type_specifier() {
+            } else if self.is_type_specifier() && !self.is_typedef_label() {
                 if let Some(decl) = self.parse_local_declaration() {
                     items.push(BlockItem::Declaration(decl));
                 }
@@ -88,7 +88,7 @@ impl Parser {
         // after case/default, and other contexts where parse_stmt() is called.
         // We skip __extension__ first since it can precede declarations.
         self.skip_gcc_extensions();
-        if self.is_type_specifier() {
+        if self.is_type_specifier() && !self.is_typedef_label() {
             if let Some(decl) = self.parse_local_declaration() {
                 return Stmt::Declaration(decl);
             }

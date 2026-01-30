@@ -441,7 +441,7 @@ impl Parser {
         let mut fptr_params: Option<Vec<ParamDecl>> = None;
         let mut fptr_inner_ptr_depth: u32 = 0;
 
-        let name = if matches!(self.peek(), TokenKind::LParen) {
+        let name = if matches!(self.peek(), TokenKind::LParen) && self.is_paren_declarator() {
             self.parse_paren_param_declarator(&mut pointer_depth, &mut array_dims, &mut is_func_ptr, &mut ptr_to_array_dims, &mut fptr_params, &mut fptr_inner_ptr_depth)
         } else if let TokenKind::Identifier(ref n) = self.peek() {
             let n = n.clone();
@@ -476,18 +476,11 @@ impl Parser {
         // Trailing function parameter list means this parameter has function type,
         // which in C decays to a function pointer (C11 6.7.6.3p8).
         // E.g., `int f(union U callback(void))` → callback has type `union U (*)(void)`
+        // Also handles abstract declarators: `void (Dat *)` → function taking Dat*, returning void
         if matches!(self.peek(), TokenKind::LParen) {
-            if name.is_some() {
-                // Named parameter with trailing (params): function-type decay to pointer.
-                // Parse the param list to preserve function type information.
-                is_func_ptr = true;
-                let (fp_params, _variadic) = self.parse_param_list();
-                fptr_params = Some(fp_params);
-            } else {
-                // Abstract declarator with trailing parens (e.g., `([])`).
-                // Must still consume the balanced parens to avoid parse errors.
-                self.skip_balanced_parens();
-            }
+            is_func_ptr = true;
+            let (fp_params, _variadic) = self.parse_param_list();
+            fptr_params = Some(fp_params);
         }
 
         (name, pointer_depth, array_dims, is_func_ptr, ptr_to_array_dims, fptr_params, fptr_inner_ptr_depth)

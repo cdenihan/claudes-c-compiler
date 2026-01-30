@@ -82,6 +82,11 @@ pub fn peephole_optimize(asm: String) -> String {
     // (needed by another basic block) vs. dead stores left over from local
     // store/load elimination.
     let global_changed = global_store_forwarding(&mut store, &mut infos);
+    // Register copy propagation runs after store forwarding has converted
+    // stack store/load pairs into register moves (e.g., movq %rax, %rcx).
+    // It folds these moves into subsequent memory operands to eliminate
+    // intermediate register copies.
+    let global_changed = global_changed | propagate_register_copies(&mut store, &mut infos);
     let global_changed = global_changed | eliminate_dead_stores(&store, &mut infos);
     let global_changed = global_changed | fuse_compare_and_branch(&mut store, &mut infos);
 
@@ -854,6 +859,310 @@ fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
     changed
 }
 
+
+/// Replace all register-family occurrences of `old_family` with `new_family` in `line`.
+/// Handles all register sizes: 64-bit (%rax), 32-bit (%eax), 16-bit (%ax), 8-bit (%al).
+/// For example, replacing family 0 (rax) with family 1 (rcx) will convert:
+///   %rax -> %rcx, %eax -> %ecx, %ax -> %cx, %al -> %cl
+fn replace_reg_family(line: &str, old_id: RegId, new_id: RegId) -> String {
+    let mut result = line.to_string();
+    // Replace in order from longest to shortest to avoid partial matches.
+    // 64-bit names are longest (e.g., %r10, %rax), then 32-bit, 16-bit, 8-bit.
+    for size_idx in 0..4 {
+        let old_name = REG_NAMES[size_idx][old_id as usize];
+        let new_name = REG_NAMES[size_idx][new_id as usize];
+        if old_name == new_name {
+            continue;
+        }
+        result = replace_reg_name_exact(&result, old_name, new_name);
+    }
+    result
+}
+
+/// Replace all complete occurrences of `old_reg` with `new_reg` in `line`.
+/// A "complete" occurrence means `old_reg` is not a prefix of a longer register
+/// name (e.g., replacing `%r8` must not match `%r8d` or `%r8b`).
+/// After `old_reg`, the next character must be a delimiter: `,`, `)`, ` `, or end-of-string.
+fn replace_reg_name_exact(line: &str, old_reg: &str, new_reg: &str) -> String {
+    let mut result = String::with_capacity(line.len());
+    let bytes = line.as_bytes();
+    let old_bytes = old_reg.as_bytes();
+    let old_len = old_bytes.len();
+    let mut pos = 0;
+
+    while pos < bytes.len() {
+        if pos + old_len <= bytes.len() && &bytes[pos..pos + old_len] == old_bytes {
+            // Check that this is a complete register name
+            let after = pos + old_len;
+            let is_complete = after >= bytes.len()
+                || matches!(bytes[after], b',' | b')' | b' ' | b'\t' | b'\n');
+            if is_complete {
+                result.push_str(new_reg);
+                pos += old_len;
+                continue;
+            }
+        }
+        result.push(bytes[pos] as char);
+        pos += 1;
+    }
+    result
+}
+
+/// Replace register family occurrences only in the source operand part
+/// (before the last comma). The destination operand is left unchanged.
+fn replace_reg_family_in_source(line: &str, old_id: RegId, new_id: RegId) -> String {
+    if let Some(comma_pos) = line.rfind(',') {
+        let src_part = &line[..comma_pos];
+        let dst_part = &line[comma_pos..];
+        let new_src = replace_reg_family(src_part, old_id, new_id);
+        format!("{}{}", new_src, dst_part)
+    } else {
+        replace_reg_family(line, old_id, new_id)
+    }
+}
+
+// ── Register copy propagation ─────────────────────────────────────────────────
+//
+// Propagates register-to-register copies into subsequent instructions to
+// eliminate intermediate moves. The accumulator-based codegen often produces
+// patterns like:
+//
+//   movq %rax, %rcx             # copy rax -> rcx
+//   addq %rcx, %rdx             # uses rcx as source
+//
+// After propagation, this becomes:
+//
+//   movq %rax, %rcx             # now potentially dead
+//   addq %rax, %rdx             # uses rax directly
+//
+// The dead movq is then cleaned up by dead store elimination or subsequent
+// passes. Works for both memory base replacements (e.g., `(%rcx)` → `(%rax)`)
+// and direct register operand replacements (e.g., `%rcx` → `%rax`).
+//
+// Safety:
+//   - Only handles 64-bit GP reg-to-reg moves (movq %src, %dst)
+//   - Only propagates into the very next non-NOP instruction
+//   - Skips rsp/rbp registers
+//   - Skips if source register is the destination of the next instruction AND
+//     source appears as a read operand (would change value read)
+//   - Skips instructions with complex addressing modes using dst
+
+fn propagate_register_copies(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    let len = store.len();
+
+    let mut i = 0;
+    while i + 1 < len {
+        if infos[i].is_nop() || infos[i].is_barrier() {
+            i += 1;
+            continue;
+        }
+
+        // Parse register-to-register movq %src, %dst
+        let src_id;
+        let dst_id;
+
+        if let LineKind::Other { dest_reg } = infos[i].kind {
+            if dest_reg == REG_NONE || dest_reg > REG_GP_MAX {
+                i += 1;
+                continue;
+            }
+            let trimmed = infos[i].trimmed(store.get(i));
+            if let Some(rest) = trimmed.strip_prefix("movq ") {
+                if let Some((src_part, dst_part)) = rest.split_once(',') {
+                    let src = src_part.trim();
+                    let dst = dst_part.trim();
+                    let sfam = register_family_fast(src);
+                    let dfam = register_family_fast(dst);
+                    if sfam == REG_NONE || sfam > REG_GP_MAX || sfam == 4 || sfam == 5
+                        || dfam == REG_NONE || dfam > REG_GP_MAX || dfam == 4 || dfam == 5
+                        || sfam == dfam
+                    {
+                        i += 1;
+                        continue;
+                    }
+                    if !src.starts_with("%r") || !dst.starts_with("%r") {
+                        i += 1;
+                        continue;
+                    }
+                    src_id = sfam;
+                    dst_id = dfam;
+                } else {
+                    i += 1;
+                    continue;
+                }
+            } else {
+                i += 1;
+                continue;
+            }
+        } else {
+            i += 1;
+            continue;
+        }
+
+        let src_name = REG_NAMES[0][src_id as usize];
+        let dst_name = REG_NAMES[0][dst_id as usize];
+
+        // Find the next non-NOP instruction
+        let mut j = i + 1;
+        while j < len && infos[j].is_nop() {
+            j += 1;
+        }
+        if j >= len || infos[j].is_barrier() {
+            i += 1;
+            continue;
+        }
+
+        // The next instruction must reference the destination register
+        if infos[j].reg_refs & (1u16 << dst_id) == 0 {
+            i += 1;
+            continue;
+        }
+
+        // Get the next instruction's destination register
+        let next_dest = match infos[j].kind {
+            LineKind::Other { dest_reg } => dest_reg,
+            LineKind::StoreRbp { reg, .. } => {
+                // Store to stack: the register is a source, not a destination.
+                // We can propagate into the register being stored.
+                // StoreRbp doesn't have a register destination.
+                // But we need to check if dst is the register being stored
+                // (it's a read, so replacement is safe).
+                // Treat as no register destination.
+                let _ = reg;
+                REG_NONE
+            }
+            LineKind::LoadRbp { reg, .. } => reg,
+            LineKind::SetCC { reg } => reg,
+            LineKind::Pop { reg } => reg,
+            LineKind::Cmp => REG_NONE, // cmp/test don't write to a register
+            LineKind::Push { .. } => REG_NONE, // push reads its operand
+            _ => { i += 1; continue; }
+        };
+
+        let next_line = infos[j].trimmed(store.get(j));
+
+        // Safety: x86 shift/rotate instructions require %cl as the shift count.
+        // Don't propagate when dst is %rcx (family 1) and the next instruction
+        // is a shift or rotate (shl, shr, sar, sal, rol, ror, rcl, rcr).
+        // Also skip for div/idiv/mul which use specific registers (rax, rdx).
+        if dst_id == 1 {
+            let nb = next_line.as_bytes();
+            if nb.len() >= 3 && (
+                (nb[0] == b's' && (nb[1] == b'h' || nb[1] == b'a')) || // shl, shr, sal, sar
+                (nb[0] == b'r' && (nb[1] == b'o' || nb[1] == b'c'))    // rol, ror, rcl, rcr
+            ) {
+                i += 1;
+                continue;
+            }
+        }
+        // Similarly, don't propagate into div/idiv/mul/cqto which have implicit
+        // register usage (rax, rdx, rcx).
+        {
+            let nb = next_line.as_bytes();
+            if nb.len() >= 3 && (
+                (nb[0] == b'd' && nb[1] == b'i' && nb[2] == b'v') || // div, divl, divq
+                (nb[0] == b'i' && nb[1] == b'd' && nb[2] == b'i') || // idiv
+                (nb[0] == b'm' && nb[1] == b'u' && nb[2] == b'l') || // mul, mulq
+                next_line.starts_with("cqto") || next_line.starts_with("cdq") ||
+                next_line.starts_with("cqo") || next_line.starts_with("cwd") ||
+                next_line.starts_with("rep ") || next_line.starts_with("repne ") ||
+                next_line.starts_with("cpuid") || next_line.starts_with("syscall") ||
+                next_line.starts_with("rdtsc") || next_line.starts_with("rdmsr") ||
+                next_line.starts_with("wrmsr") ||
+                next_line.starts_with("xchg") || next_line.starts_with("cmpxchg") ||
+                next_line.starts_with("lock ")
+            ) {
+                i += 1;
+                continue;
+            }
+        }
+
+        // Safety check: if the next instruction writes to the source register,
+        // we can only propagate safely if dst is used ONLY as a read source
+        // (the read happens before the write in x86). But if src is also read
+        // directly, replacing dst with src changes the value read when they
+        // differ. Example problem: addq %rcx, %rax where src=rax, dst=rcx:
+        // replacing %rcx with %rax changes the addition operand.
+        // Skip if the source register is written AND also appears in source operands.
+        if next_dest == src_id {
+            // Source register is being written by next instruction.
+            // Only safe if dst appears ONLY in a memory base position like (%dst),
+            // which is read before the destination write.
+            let dst_paren = format!("({})", dst_name);
+            if !next_line.contains(dst_paren.as_str()) {
+                i += 1;
+                continue;
+            }
+            // Also check src doesn't appear directly as a source operand in addition
+            // to being the destination.
+            let src_paren = format!("({})", src_name);
+            let src_direct_count = next_line.matches(src_name).count();
+            let src_paren_count = next_line.matches(src_paren.as_str()).count();
+            // Count how many times src appears as the destination (last operand)
+            let is_dest_only = if let Some((_before, after_comma)) = next_line.rsplit_once(',') {
+                after_comma.trim() == src_name
+            } else {
+                false
+            };
+            let src_as_source = src_direct_count - src_paren_count - if is_dest_only { 1 } else { 0 };
+            if src_as_source > 0 {
+                // src is used as both source and destination - not safe to fold
+                i += 1;
+                continue;
+            }
+            // Safe: dst is only in memory base, and src is only the dest
+            let new_text = format!("    {}",
+                replace_reg_family(next_line, dst_id, src_id));
+            replace_line(store, &mut infos[j], j, new_text);
+            changed = true;
+            i += 1;
+            continue;
+        }
+
+        // Source register is NOT modified by next instruction.
+        // We can safely replace all read-uses of dst_name with src_name.
+        // But be careful: dst might appear as the DESTINATION of the next
+        // instruction (in which case we shouldn't replace that occurrence).
+        //
+        // Strategy: replace dst with src everywhere EXCEPT in the destination
+        // position (after the last comma for two-operand instructions).
+
+        // Check: if dst is not the destination of the next instruction,
+        // replace all occurrences.
+        if next_dest != dst_id {
+            // dst is purely a source operand in the next instruction.
+            // Replace all register-family occurrences of dst with src.
+            let new_content = replace_reg_family(next_line, dst_id, src_id);
+            if new_content != next_line {
+                let new_text = format!("    {}", new_content);
+                replace_line(store, &mut infos[j], j, new_text);
+                changed = true;
+            }
+        } else {
+            // dst is the destination of the next instruction AND a source.
+            // For single-operand read-modify-write instructions (negq, notq,
+            // incq, decq, etc.), the single operand is both source and
+            // destination. Replacing it would change which register is
+            // modified, which is incorrect. Detect these by checking for
+            // the absence of a comma in the instruction.
+            if !next_line.contains(',') {
+                i += 1;
+                continue;
+            }
+            // Only replace the source-position occurrences.
+            let new_content = replace_reg_family_in_source(next_line, dst_id, src_id);
+            if new_content != next_line {
+                let new_text = format!("    {}", new_content);
+                replace_line(store, &mut infos[j], j, new_text);
+                changed = true;
+            }
+        }
+
+        i += 1;
+    }
+    changed
+}
 
 // ── Dead store elimination ────────────────────────────────────────────────────
 
