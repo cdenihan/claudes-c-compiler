@@ -1,0 +1,21 @@
+Task: Fix TLS const pointer variable placed in read-only section
+Status: in_progress
+Started: 2026-01-30
+
+Problem:
+Thread-local variables declared as `static __thread const char *ptr;` are being
+placed in a read-only TLS section (.rodata or .tbss with wrong permissions).
+The `const` qualifier applies to the pointed-to type (char), not to the pointer
+itself, so the pointer should be writable.
+
+This causes a segfault when the pointer is assigned:
+  static __thread const char *my_global;
+  my_global = "hello";  // SIGSEGV - writing to read-only memory
+
+Affects: stb_image project (crashes in stbi__check_png_header), and likely
+any project using thread-local pointers to const data.
+
+Fix: The section/constness determination for global/static variables needs to
+check whether the top-level type is const-qualified, not whether any nested
+type qualifier is const. For `const char *`, the top-level type is `pointer`
+which is not const-qualified.
