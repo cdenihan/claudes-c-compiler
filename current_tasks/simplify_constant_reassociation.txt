@@ -1,0 +1,16 @@
+Task: Add constant reassociation and missing algebraic patterns to simplify pass
+Status: in_progress
+
+Description:
+Add constant reassociation to the simplify pass to fold chains of operations
+with multiple constants into single operations. Also add missing algebraic
+identity patterns.
+
+Changes:
+1. Add BinOpDef tracking infrastructure to simplify_function
+2. Constant reassociation: (x + C1) + C2 => x + (C1+C2) for Add, Sub, Shl, And, Or, Xor
+3. Missing patterns: x & all_ones => x, x | all_ones => all_ones
+4. Select with constant condition simplification
+5. Multiply strength reduction: x*3 => x+(x<<1), x*5 => x+(x<<2), etc.
+
+This is an IR-level optimization that benefits all backends.
