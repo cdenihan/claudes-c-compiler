@@ -14,3 +14,5 @@ of the struct regardless of which member is accessed.
 
 This bug causes segfaults in toaruos_misaka (kuroko) and likely other projects that use
 the GMP-style "typedef T name[1]" parameter passing pattern.
+
+Status: in_progress
