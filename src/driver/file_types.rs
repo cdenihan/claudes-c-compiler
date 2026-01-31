@@ -10,7 +10,9 @@ use super::Driver;
 impl Driver {
     /// Check if a file is an object file or archive (pass to linker directly).
     /// Recognizes standard extensions (.o, .a, .so) plus common variants used by
-    /// build systems (.os, .od, .lo, .obj) and versioned shared libs (.so.*).
+    /// build systems (.os, .od, .lo, .obj), versioned shared libs (.so.*), and
+    /// suffixed archives (.a.*) like the `.a.xyzzy` pattern used by skarnet.org
+    /// build systems (skalibs, s6, etc.).
     pub(super) fn is_object_or_archive(path: &str) -> bool {
         // Standard extensions
         if path.ends_with(".o") || path.ends_with(".a") || path.ends_with(".so") {
@@ -32,6 +34,17 @@ impl Driver {
             if after.chars().next().is_some_and(|c| c.is_ascii_digit()) {
                 return true;
             }
+        }
+        // Suffixed static archives: .a.xyzzy, .a.build, etc.
+        // The skarnet.org build system (used by skalibs, s6, execline) uses
+        // `lib%.a.xyzzy` as a build-time archive name to avoid collisions with
+        // installed library names. These are regular `ar` archives and must be
+        // passed through to the linker in their original command-line position.
+        // Only match `.a.` in the filename component (after the last `/`), not
+        // in directory names, to avoid false positives like `/path/to/data.a.dir/main.c`.
+        let filename = path.rsplit('/').next().unwrap_or(path);
+        if filename.contains(".a.") {
+            return true;
         }
         false
     }
