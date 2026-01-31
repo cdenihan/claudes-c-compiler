@@ -265,7 +265,9 @@ impl Lowerer {
                 // (due to align_down placement), skip the overlapping bytes.
                 let skip = current_offset.saturating_sub(storage_unit_offset);
                 // Emit only the non-overlapping portion of the storage unit
-                push_bytes_as_elements(&mut elements, &unit_bytes[skip..]);
+                if skip < unit_bytes.len() {
+                    push_bytes_as_elements(&mut elements, &unit_bytes[skip..]);
+                }
                 current_offset = storage_unit_offset + storage_unit_size;
                 continue;
             }

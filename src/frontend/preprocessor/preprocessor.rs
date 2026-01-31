@@ -856,10 +856,13 @@ impl Preprocessor {
     }
 
     fn handle_if(&mut self, expr: &str) {
-        // First expand macros, then resolve `defined(X)` and `defined X`
+        // First resolve `defined(X)` and `__has_*()` before macro expansion
         let resolved = self.resolve_defined_in_expr(expr);
         // Expand macros in the resolved expression (reuse directive_expanding set)
         let expanded = self.macros.expand_line_reuse(&resolved, &mut self.directive_expanding);
+        // Resolve again after macro expansion, in case macros expanded to
+        // __has_attribute(), __has_builtin(), __has_include(), etc.
+        let expanded = self.resolve_defined_in_expr(&expanded);
         // Replace any remaining identifiers with 0 (standard C behavior for #if)
         let final_expr = self.replace_remaining_idents_with_zero(&expanded);
         let condition = evaluate_condition(&final_expr, &self.macros);
@@ -869,6 +872,8 @@ impl Preprocessor {
     fn handle_elif(&mut self, expr: &str) {
         let resolved = self.resolve_defined_in_expr(expr);
         let expanded = self.macros.expand_line_reuse(&resolved, &mut self.directive_expanding);
+        // Resolve again after macro expansion (same reason as handle_if)
+        let expanded = self.resolve_defined_in_expr(&expanded);
         let final_expr = self.replace_remaining_idents_with_zero(&expanded);
         let condition = evaluate_condition(&final_expr, &self.macros);
         self.conditionals.handle_elif(condition);

@@ -145,6 +145,15 @@ impl MacroTable {
     /// Check if a macro is defined.
     pub fn is_defined(&self, name: &str) -> bool {
         name == "__COUNTER__" || name == "__LINE__" || self.macros.contains_key(name)
+            // These are special preprocessor operators, not real macros.
+            // They need to be recognized by #ifdef but are evaluated as
+            // special functions in #if expressions by resolve_defined_in_expr().
+            || name == "__has_builtin"
+            || name == "__has_attribute"
+            || name == "__has_feature"
+            || name == "__has_extension"
+            || name == "__has_include"
+            || name == "__has_include_next"
     }
 
     /// Iterate over all macro definitions.

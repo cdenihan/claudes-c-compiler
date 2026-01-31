@@ -361,7 +361,31 @@ impl Preprocessor {
             "may_alias" | "__may_alias__" |
             "transparent_union" | "__transparent_union__" |
             "error" | "__error__" |
-            "warning" | "__warning__"
+            "warning" | "__warning__" |
+            "cleanup" | "__cleanup__" |
+            "fallthrough" | "__fallthrough__" |
+            "flatten" | "__flatten__" |
+            "nonstring" | "__nonstring__" |
+            "uninitialized" | "__uninitialized__" |
+            "annotate" | "__annotate__" |
+            "no_instrument_function" | "__no_instrument_function__" |
+            "alloc_size" | "__alloc_size__" |
+            "format_arg" | "__format_arg__" |
+            "no_sanitize" | "__no_sanitize__" |
+            "no_sanitize_address" | "__no_sanitize_address__" |
+            "no_sanitize_thread" | "__no_sanitize_thread__" |
+            "no_sanitize_undefined" | "__no_sanitize_undefined__" |
+            "noclone" | "__noclone__" |
+            "optimize" | "__optimize__" |
+            "target" | "__target__" |
+            "assume_aligned" | "__assume_aligned__" |
+            "returns_nonnull" | "__returns_nonnull__" |
+            "externally_visible" | "__externally_visible__" |
+            "artificial" | "__artificial__" |
+            "leaf" | "__leaf__" |
+            "access" | "__access__" |
+            "fd_arg" | "__fd_arg__" |
+            "tls_model" | "__tls_model__"
         )
     }
 }

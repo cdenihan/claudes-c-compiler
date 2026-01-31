@@ -192,12 +192,11 @@ impl Preprocessor {
         // to properly evaluate side effects in the second argument.
         const PREDEFINED_FUNC_MACROS: &[(&str, &[&str], &str)] = &[
             ("__builtin_offsetof", &["type", "member"], "((unsigned long)&((type *)0)->member)"),
-            ("__has_builtin", &["x"], "0"),
-            ("__has_attribute", &["x"], "0"),
-            ("__has_feature", &["x"], "0"),
-            // __has_include and __has_include_next are handled in resolve_defined_in_expr()
-            // (expr_eval.rs) to actually check whether the header file exists on disk.
-            ("__has_extension", &["x"], "0"),
+            // __has_builtin, __has_attribute, __has_feature, __has_extension,
+            // __has_include, and __has_include_next are NOT defined as macros.
+            // They are handled as special preprocessor operators:
+            // - #ifdef checks use is_defined() which special-cases them
+            // - #if evaluation uses resolve_defined_in_expr() in expr_eval.rs
         ];
 
         for &(name, params, body) in PREDEFINED_FUNC_MACROS {
