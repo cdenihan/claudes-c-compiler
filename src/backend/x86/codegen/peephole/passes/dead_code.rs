@@ -221,10 +221,11 @@ pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -
                     break;
                 }
                 if store_bytes > 1 {
+                    let mut sub_pattern_bytes = [0u8; 24];
                     for byte_off in 1..store_bytes {
                         let check_off = store_offset + byte_off;
-                        let check_len = write_rbp_pattern(&mut pattern_bytes, check_off);
-                        let check_pattern = std::str::from_utf8(&pattern_bytes[..check_len])
+                        let check_len = write_rbp_pattern(&mut sub_pattern_bytes, check_off);
+                        let check_pattern = std::str::from_utf8(&sub_pattern_bytes[..check_len])
                             .expect("rbp pattern produced non-UTF8");
                         let line = infos[j].trimmed(store.get(j));
                         if line.contains(check_pattern) {

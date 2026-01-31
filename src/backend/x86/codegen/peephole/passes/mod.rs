@@ -851,6 +851,86 @@ mod tests {
 mod regression_tests {
     use super::*;
 
+    /// Regression test: dead store elimination must not use a stale pattern_bytes
+    /// buffer when checking multi-byte stores. The sub-byte-offset scan for a Q
+    /// (8-byte) store was overwriting pattern_bytes with the last sub-offset
+    /// (store_offset + 7), and subsequent scans within the same store's window
+    /// would reuse the stale pattern instead of the original store_offset.
+    ///
+    /// Pattern from oniguruma regparse.c: a store to -144(%rbp) was followed by
+    /// an Other instruction (movl %eax, %eax), then a Cmp with -144(%rbp) as a
+    /// memory operand (from memory_fold), then another store to -144(%rbp). The
+    /// sub-byte scan for the Other instruction overwrote pattern_bytes from
+    /// "-144(%rbp)" to "-137(%rbp)", causing the Cmp line's pattern check to fail,
+    /// and the later store marked the original as dead.
+    #[test]
+    fn test_dead_store_not_eliminated_when_cmp_reads_slot() {
+        // The critical pattern after memory_fold transforms the comparison:
+        //   movq %rax, -144(%rbp)     # store data[x*2]
+        //   movq -128(%rbp), %rax     # load to+1 (clobbers rax)
+        //   movl %eax, %eax           # truncate (Other, no rbp ref)
+        //   movq %rax, -136(%rbp)     # store to+1
+        //   cmpl -144(%rbp), %eax     # memory-folded cmp reads -144!
+        //   setae %al
+        //   movzbq %al, %rax
+        //   movq %rax, %rsi
+        //   movq %r11, %rax
+        //   addl $1, %eax
+        //   cltq
+        //   movq %rax, -144(%rbp)     # later store overwrites -144
+        //
+        // The bug: dead_stores saw the overwrite at the end, but missed the
+        // cmp read because pattern_bytes had been corrupted by the sub-byte
+        // offset scan for movl %eax, %eax.
+        let asm = [
+            "func:",
+            "    pushq %rbp",
+            "    movq %rsp, %rbp",
+            "    subq $160, %rsp",
+            // ... setup ...
+            "    movl (%rcx), %eax",
+            "    movq %rax, -144(%rbp)",       // store data[x*2]
+            "    movq -128(%rbp), %rax",       // load to+1 (clobbers rax)
+            "    movl %eax, %eax",             // truncate
+            "    movq %rax, -136(%rbp)",       // store to+1
+            "    cmpl -144(%rbp), %eax",       // memory-folded cmp (Cmp kind)
+            "    setae %al",
+            "    movzbq %al, %rax",
+            "    movq %rax, %rsi",
+            "    movq %r11, %rax",
+            "    addl $1, %eax",
+            "    cltq",
+            "    movq %rax, -144(%rbp)",       // later overwrite of -144
+            "    ret",
+            ".size func, .-func",
+        ].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        // After optimization, there must still be a store to -144(%rbp) before
+        // the cmpl that reads it. The cmpl must compare the correct value.
+        let lines: Vec<&str> = result.lines().collect();
+        for (idx, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if trimmed == "cmpl -144(%rbp), %eax" {
+                // Scan backward for a store to -144
+                let mut found_store = false;
+                for k in (0..idx).rev() {
+                    let prev = lines[k].trim();
+                    if prev.ends_with("-144(%rbp)") && prev.starts_with("mov") {
+                        found_store = true;
+                        break;
+                    }
+                    if prev.ends_with(':') { break; }
+                }
+                assert!(found_store,
+                    "cmpl -144(%rbp) has no preceding store in same block!\nResult:\n{}", result);
+                return;
+            }
+        }
+        // If the cmpl was not folded, check it exists in some form
+        assert!(result.contains("cmpl") || result.contains("setae"),
+            "No comparison found\nResult:\n{}", result);
+    }
+
     #[test]
     fn test_store_forward_param_ref_gep() {
         // This pattern comes from:
