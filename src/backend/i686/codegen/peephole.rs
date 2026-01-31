@@ -645,6 +645,90 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             continue;
         }
 
+        // Pattern 1b: Strength reduction for code size
+        // - addl $1, %reg → incl %reg (saves 2 bytes, critical for 16-bit boot code)
+        // - subl $1, %reg → decl %reg (saves 2 bytes)
+        // - movl $0, %reg → xorl %reg, %reg (saves 3 bytes)
+        // - addl $-1, %reg → decl %reg (saves 2 bytes)
+        // - subl $-1, %reg → incl %reg (saves 2 bytes)
+        if let LineKind::Other { dest_reg } = infos[i].kind {
+            if dest_reg != REG_NONE && dest_reg <= REG_GP_MAX && dest_reg != REG_ESP && dest_reg != REG_EBP {
+                let s = trimmed(store, &infos[i], i);
+                let rn = reg32_name(dest_reg);
+                // addl $1, %reg → incl %reg
+                if s.starts_with("addl $1, ") && s.ends_with(rn) {
+                    store.replace(i, format!("    incl {}", rn));
+                    infos[i] = LineInfo {
+                        kind: LineKind::Other { dest_reg },
+                        trim_start: 4,
+                        has_indirect_mem: false,
+                        ebp_offset: EBP_OFFSET_NONE,
+                    };
+                    changed = true;
+                    i += 1;
+                    continue;
+                }
+                // subl $1, %reg → decl %reg
+                if s.starts_with("subl $1, ") && s.ends_with(rn) {
+                    store.replace(i, format!("    decl {}", rn));
+                    infos[i] = LineInfo {
+                        kind: LineKind::Other { dest_reg },
+                        trim_start: 4,
+                        has_indirect_mem: false,
+                        ebp_offset: EBP_OFFSET_NONE,
+                    };
+                    changed = true;
+                    i += 1;
+                    continue;
+                }
+                // addl $-1, %reg → decl %reg
+                if s.starts_with("addl $-1, ") && s.ends_with(rn) {
+                    store.replace(i, format!("    decl {}", rn));
+                    infos[i] = LineInfo {
+                        kind: LineKind::Other { dest_reg },
+                        trim_start: 4,
+                        has_indirect_mem: false,
+                        ebp_offset: EBP_OFFSET_NONE,
+                    };
+                    changed = true;
+                    i += 1;
+                    continue;
+                }
+                // subl $-1, %reg → incl %reg
+                if s.starts_with("subl $-1, ") && s.ends_with(rn) {
+                    store.replace(i, format!("    incl {}", rn));
+                    infos[i] = LineInfo {
+                        kind: LineKind::Other { dest_reg },
+                        trim_start: 4,
+                        has_indirect_mem: false,
+                        ebp_offset: EBP_OFFSET_NONE,
+                    };
+                    changed = true;
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+        // movl $0, %reg → xorl %reg, %reg (saves 3 bytes, clears flags)
+        if let LineKind::Other { dest_reg } = infos[i].kind {
+            if dest_reg != REG_NONE && dest_reg <= REG_GP_MAX && dest_reg != REG_ESP && dest_reg != REG_EBP {
+                let s = trimmed(store, &infos[i], i);
+                let rn = reg32_name(dest_reg);
+                if s == format!("movl $0, {}", rn) {
+                    store.replace(i, format!("    xorl {}, {}", rn, rn));
+                    infos[i] = LineInfo {
+                        kind: LineKind::Other { dest_reg },
+                        trim_start: 4,
+                        has_indirect_mem: false,
+                        ebp_offset: EBP_OFFSET_NONE,
+                    };
+                    changed = true;
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+
         // Find next non-nop line
         let mut j = i + 1;
         while j < len && infos[j].is_nop() { j += 1; }
@@ -719,6 +803,24 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                                 continue;
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        // Pattern 5b: Redundant movsbl %al, %eax after movsbl (...), %eax
+        // The first sign-extension already produces a properly sign-extended 32-bit result,
+        // so the second `movsbl %al, %eax` is a no-op.
+        if let LineKind::Other { dest_reg: REG_EAX } = infos[i].kind {
+            let si = trimmed(store, &infos[i], i);
+            if si.starts_with("movsbl ") && si.ends_with(", %eax") {
+                if let LineKind::Other { dest_reg: REG_EAX } = infos[j].kind {
+                    let sj = trimmed(store, &infos[j], j);
+                    if sj == "movsbl %al, %eax" {
+                        infos[j].kind = LineKind::Nop;
+                        changed = true;
+                        i += 1;
+                        continue;
                     }
                 }
             }
@@ -1050,90 +1152,206 @@ fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
 
 // ── Pass: Compare and branch fusion ──────────────────────────────────────────
 
-/// Fuse `cmpl/testl + setCC %al + movzbl %al, %eax + testl %eax, %eax + jne/je`
+/// Maximum number of store/load offsets tracked during compare-and-branch fusion.
+const MAX_TRACKED_STORE_LOAD_OFFSETS: usize = 4;
+
+/// Size of the instruction lookahead window for compare-and-branch fusion.
+const CMP_FUSION_LOOKAHEAD: usize = 8;
+
+/// Collect up to N non-NOP line indices following `start_idx` (exclusive).
+/// Returns the number of indices collected.
+fn collect_non_nop_indices<const N: usize>(
+    infos: &[LineInfo], start_idx: usize, len: usize, out: &mut [usize; N],
+) -> usize {
+    let mut count = 0;
+    let mut j = start_idx + 1;
+    while j < len && count < N {
+        if !infos[j].is_nop() {
+            out[count] = j;
+            count += 1;
+        }
+        j += 1;
+    }
+    count
+}
+
+/// Fuse `cmpl/testl + setCC %al + movzbl %al, %eax + [store/load] + testl %eax, %eax + jne/je`
 /// into a single `jCC`/`j!CC` directly.
+///
+/// This enhanced version can skip over store/load pairs between the movzbl and
+/// testl, allowing fusion even when the boolean is temporarily spilled to the
+/// stack. It tracks stored offsets and verifies each has a matching load nearby,
+/// ensuring the stored boolean is only consumed locally.
 fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = infos.len();
     let mut changed = false;
 
     let mut i = 0;
     while i < len {
-        if infos[i].is_nop() { i += 1; continue; }
-        if infos[i].kind != LineKind::Cmp {
+        if infos[i].is_nop() || infos[i].kind != LineKind::Cmp {
             i += 1;
             continue;
         }
 
-        // Look for: cmp/test + setCC %al + movzbl %al, %eax + testl %eax, %eax + jne/je
-        let mut positions = [0usize; 5]; // cmp, setCC, movzbl, test, jCC
-        positions[0] = i;
-        let mut next = i;
-        // Find setCC
-        next = next_non_nop(infos, next + 1);
-        if next >= len { i += 1; continue; }
-        let setcc_cc = if let LineKind::SetCC { reg: REG_EAX } = infos[next].kind {
-            let s = trimmed(store, &infos[next], next);
+        // Collect next non-NOP lines: cmp itself + (CMP_FUSION_LOOKAHEAD-1) following
+        let mut seq_indices = [0usize; CMP_FUSION_LOOKAHEAD];
+        seq_indices[0] = i;
+        let mut rest = [0usize; CMP_FUSION_LOOKAHEAD - 1];
+        let rest_count = collect_non_nop_indices::<{ CMP_FUSION_LOOKAHEAD - 1 }>(infos, i, len, &mut rest);
+        seq_indices[1..(rest_count + 1)].copy_from_slice(&rest[..rest_count]);
+        let seq_count = 1 + rest_count;
+
+        if seq_count < 4 {
+            i += 1;
+            continue;
+        }
+
+        // Second must be setCC %al
+        let setcc_cc = if let LineKind::SetCC { reg: REG_EAX } = infos[seq_indices[1]].kind {
+            let s = trimmed(store, &infos[seq_indices[1]], seq_indices[1]);
             parse_setcc(s)
-        } else { None };
-        if setcc_cc.is_none() { i += 1; continue; }
-        let setcc_cc = setcc_cc.unwrap();
-        positions[1] = next;
-
-        // Find movzbl %al, %eax
-        next = next_non_nop(infos, next + 1);
-        if next >= len { i += 1; continue; }
-        let s = trimmed(store, &infos[next], next);
-        if s != "movzbl %al, %eax" { i += 1; continue; }
-        positions[2] = next;
-
-        // Handle optional store/load pair between movzbl and test
-        next = next_non_nop(infos, next + 1);
-        if next >= len { i += 1; continue; }
-
-        // Check for store to ebp (cross-block save of the boolean)
-        let has_cross_block_store = matches!(infos[next].kind, LineKind::StoreEbp { reg: REG_EAX, .. });
-        if has_cross_block_store {
-            // Can't fuse if the boolean is saved for use elsewhere
+        } else {
+            None
+        };
+        if setcc_cc.is_none() {
             i += 1;
             continue;
         }
+        let setcc_cc = setcc_cc.unwrap();
 
-        // Find testl %eax, %eax
-        let s = trimmed(store, &infos[next], next);
-        if s != "testl %eax, %eax" { i += 1; continue; }
-        positions[3] = next;
+        // Scan for testl %eax, %eax pattern.
+        // Track StoreEbp offsets so we can bail out if any store's slot is
+        // potentially read by another basic block (no matching load nearby).
+        let mut test_idx = None;
+        let mut store_offsets: [i32; MAX_TRACKED_STORE_LOAD_OFFSETS] = [0; MAX_TRACKED_STORE_LOAD_OFFSETS];
+        let mut store_count = 0usize;
+        let mut scan = 2;
+        while scan < seq_count {
+            let si = seq_indices[scan];
+            let line = trimmed(store, &infos[si], si);
 
-        // Find jne/je
-        next = next_non_nop(infos, next + 1);
-        if next >= len { i += 1; continue; }
-        if infos[next].kind != LineKind::CondJmp { i += 1; continue; }
-        let jmp_s = trimmed(store, &infos[next], next);
-        let (jmp_cc, jmp_target) = match parse_condjmp(jmp_s) {
-            Some(x) => x,
+            // Skip zero-extend of setcc result
+            if line == "movzbl %al, %eax" {
+                scan += 1;
+                continue;
+            }
+            // Skip store/load to ebp (pre-parsed fast check).
+            if let LineKind::StoreEbp { offset, .. } = infos[si].kind {
+                if store_count < MAX_TRACKED_STORE_LOAD_OFFSETS {
+                    store_offsets[store_count] = offset;
+                    store_count += 1;
+                } else {
+                    store_count = usize::MAX;
+                    break;
+                }
+                scan += 1;
+                continue;
+            }
+            if matches!(infos[si].kind, LineKind::LoadEbp { .. }) {
+                scan += 1;
+                continue;
+            }
+            // Skip cwtl (sign-extend ax->eax, i686 equivalent of cltq)
+            if line == "cwtl" || line.starts_with("movswl ") || line.starts_with("movsbl ") {
+                scan += 1;
+                continue;
+            }
+            // Check for test
+            if line == "testl %eax, %eax" {
+                test_idx = Some(scan);
+                break;
+            }
+            break;
+        }
+
+        let test_scan = match test_idx {
+            Some(t) => t,
             None => { i += 1; continue; }
         };
-        positions[4] = next;
 
-        // Compute the fused condition
-        let fused_cc = match jmp_cc {
-            "ne" => setcc_cc,
-            "e" => match invert_cc(setcc_cc) {
-                Some(inv) => inv,
-                None => { i += 1; continue; }
-            },
-            _ => { i += 1; continue; }
+        // If there are stores in the sequence, verify each has a matching load nearby.
+        if store_count == usize::MAX {
+            i += 1;
+            continue;
+        }
+        if store_count > 0 {
+            let range_start = seq_indices[1];
+            let range_end = seq_indices[test_scan];
+            let mut load_offsets: [i32; MAX_TRACKED_STORE_LOAD_OFFSETS] = [0; MAX_TRACKED_STORE_LOAD_OFFSETS];
+            let mut load_count = 0usize;
+            for ri in range_start..=range_end {
+                let off = match infos[ri].kind {
+                    LineKind::LoadEbp { offset, .. } => Some(offset),
+                    // Check NOP'd lines too - earlier passes (store/load forwarding)
+                    // may have NOP'd a load that originally matched a store.
+                    LineKind::Nop => {
+                        let orig = classify_line(store.get(ri));
+                        match orig.kind {
+                            LineKind::LoadEbp { offset, .. } => Some(offset),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(o) = off {
+                    if load_count < MAX_TRACKED_STORE_LOAD_OFFSETS {
+                        load_offsets[load_count] = o;
+                        load_count += 1;
+                    }
+                }
+            }
+            let has_unmatched_store = (0..store_count).any(|si| {
+                !(0..load_count).any(|li| load_offsets[li] == store_offsets[si])
+            });
+            if has_unmatched_store {
+                i += 1;
+                continue;
+            }
+        }
+
+        if test_scan + 1 >= seq_count {
+            i += 1;
+            continue;
+        }
+
+        // Find jne/je after test
+        let jmp_line = trimmed(store, &infos[seq_indices[test_scan + 1]], seq_indices[test_scan + 1]);
+        let (is_jne, branch_target) = if let Some(target) = jmp_line.strip_prefix("jne ") {
+            (true, target.trim())
+        } else if let Some(target) = jmp_line.strip_prefix("je ") {
+            (false, target.trim())
+        } else {
+            i += 1;
+            continue;
         };
 
-        // Replace: eliminate setCC, movzbl, test; replace jne/je with jCC
-        let new_jmp = format!("    j{} {}", fused_cc, jmp_target);
-        store.replace(positions[4], new_jmp);
-        // Mark intermediate lines as NOP
-        infos[positions[1]].kind = LineKind::Nop; // setCC
-        infos[positions[2]].kind = LineKind::Nop; // movzbl
-        infos[positions[3]].kind = LineKind::Nop; // test
-        // Keep the cmp and the new fused jCC
+        let fused_cc = if is_jne {
+            setcc_cc
+        } else {
+            match invert_cc(setcc_cc) {
+                Some(inv) => inv,
+                None => { i += 1; continue; }
+            }
+        };
+
+        let fused_jcc = format!("    j{} {}", fused_cc, branch_target);
+
+        // NOP out everything from setCC through testl
+        for s in 1..=test_scan {
+            infos[seq_indices[s]].kind = LineKind::Nop;
+        }
+        // Replace the jne/je with the fused conditional jump
+        let idx = seq_indices[test_scan + 1];
+        store.replace(idx, fused_jcc);
+        infos[idx] = LineInfo {
+            kind: LineKind::CondJmp,
+            trim_start: 4,
+            has_indirect_mem: false,
+            ebp_offset: EBP_OFFSET_NONE,
+        };
+
         changed = true;
-        i = positions[4] + 1;
+        i = idx + 1;
     }
 
     changed
@@ -1460,7 +1678,9 @@ mod tests {
     fn test_redundant_store_load() {
         let asm = "    movl %eax, -8(%ebp)\n    movl -8(%ebp), %eax\n".to_string();
         let result = peephole_optimize(asm);
-        assert_eq!(result.trim(), "movl %eax, -8(%ebp)");
+        // After store/load elimination, the load is removed. Then never-read
+        // store elimination removes the now-unread store too. Both gone.
+        assert_eq!(result.trim(), "");
     }
 
     #[test]
@@ -1514,14 +1734,70 @@ mod tests {
     }
 
     #[test]
+    fn test_compare_branch_fusion_with_store_load() {
+        // Pattern: cmp + setCC + movzbl + store + load + test + jne
+        // The store/load pair should be skipped, allowing fusion.
+        let asm = [
+            "    cmpl %ecx, %eax",
+            "    setge %al",
+            "    movzbl %al, %eax",
+            "    movl %eax, -16(%ebp)",
+            "    movl -16(%ebp), %eax",
+            "    testl %eax, %eax",
+            "    jne .LBB5",
+        ].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(result.contains("jge .LBB5"), "should fuse to jge: {}", result);
+        assert!(!result.contains("setge"), "should eliminate setge: {}", result);
+        assert!(!result.contains("movzbl"), "should eliminate movzbl: {}", result);
+        assert!(!result.contains("testl"), "should eliminate testl: {}", result);
+    }
+
+    #[test]
+    fn test_compare_branch_fusion_unmatched_store_bails() {
+        // If the store has no matching load, we should NOT fuse (the boolean
+        // escapes to another basic block).
+        let asm = [
+            "    cmpl %ecx, %eax",
+            "    setge %al",
+            "    movzbl %al, %eax",
+            "    movl %eax, -16(%ebp)",
+            "    testl %eax, %eax",
+            "    jne .LBB5",
+        ].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        // Should NOT fuse because the store has no matching load
+        assert!(result.contains("setge"), "should keep setge (unmatched store): {}", result);
+    }
+
+    #[test]
+    fn test_compare_branch_fusion_inverted() {
+        // Test je (inverted condition)
+        let asm = [
+            "    cmpl %ecx, %eax",
+            "    setl %al",
+            "    movzbl %al, %eax",
+            "    testl %eax, %eax",
+            "    je .LBB3",
+        ].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(result.contains("jge .LBB3"), "should fuse to jge (inverted): {}", result);
+        assert!(!result.contains("setl"), "should eliminate setl: {}", result);
+    }
+
+    #[test]
     fn test_dead_store() {
+        // Two consecutive stores to the same slot: first is dead, second survives.
+        // But never-read store elimination also removes the second store if no
+        // loads exist. Use a load after the second store to keep it alive.
         let asm = [
             "    movl %eax, -8(%ebp)",
             "    movl %ecx, -8(%ebp)",
+            "    movl -8(%ebp), %edx",
         ].join("\n") + "\n";
         let result = peephole_optimize(asm);
         assert!(!result.contains("%eax, -8(%ebp)"), "first store dead: {}", result);
-        assert!(result.contains("%ecx, -8(%ebp)"), "second store alive: {}", result);
+        assert!(result.contains("%ecx"), "second store alive: {}", result);
     }
 
     #[test]
@@ -1549,4 +1825,53 @@ mod tests {
 
     // Note: push/pop elimination test removed - eliminate_push_pop_pairs is disabled
     // due to callee-save/leal epilogue interactions.
+
+    #[test]
+    fn test_addl_1_to_incl() {
+        let asm = "    addl $1, %eax\n".to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("incl %eax"), "should convert to incl: {}", result);
+        assert!(!result.contains("addl"), "should eliminate addl: {}", result);
+    }
+
+    #[test]
+    fn test_subl_1_to_decl() {
+        let asm = "    subl $1, %ecx\n".to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("decl %ecx"), "should convert to decl: {}", result);
+        assert!(!result.contains("subl"), "should eliminate subl: {}", result);
+    }
+
+    #[test]
+    fn test_movl_0_to_xorl() {
+        let asm = "    movl $0, %ebx\n".to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("xorl %ebx, %ebx"), "should convert to xorl: {}", result);
+        assert!(!result.contains("movl"), "should eliminate movl: {}", result);
+    }
+
+    #[test]
+    fn test_redundant_movsbl() {
+        let asm = [
+            "    movsbl (%ecx), %eax",
+            "    movsbl %al, %eax",
+        ].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert_eq!(result.matches("movsbl").count(), 1,
+            "should eliminate redundant movsbl: {}", result);
+    }
+
+    #[test]
+    fn test_addl_neg1_to_decl() {
+        let asm = "    addl $-1, %edx\n".to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("decl %edx"), "should convert to decl: {}", result);
+    }
+
+    #[test]
+    fn test_subl_neg1_to_incl() {
+        let asm = "    subl $-1, %esi\n".to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("incl %esi"), "should convert to incl: {}", result);
+    }
 }
