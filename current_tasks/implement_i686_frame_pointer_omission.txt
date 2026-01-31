@@ -1,0 +1,12 @@
+Task: Implement -fomit-frame-pointer for i686
+Status: in_progress
+
+Implement ESP-relative addressing when omit_frame_pointer is true:
+1. Skip push/pop %ebp in prologue/epilogue
+2. Convert all slot references from EBP-relative to ESP-relative
+3. Track ESP adjustments during call sequences
+4. Add EBP as 4th allocatable register when FP omitted
+5. Update peephole optimizer for ESP-relative addressing
+6. Adjust param access offsets (no pushed EBP)
+
+Expected impact: ~10-15% code size reduction for Linux boot code
