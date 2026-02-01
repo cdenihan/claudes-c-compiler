@@ -171,6 +171,10 @@ pub struct Driver {
     /// Macro undefinitions from -U flags. These need to be forwarded when
     /// delegating preprocessing to gcc (e.g., -Uriscv for kernel linker scripts).
     pub(super) undef_macros: Vec<String>,
+    /// Whether -undef was passed. Prevents the preprocessor from predefining
+    /// any system-specific or GCC-specific macros. Must be forwarded when
+    /// delegating to gcc (e.g., for DTS preprocessing in kernel builds).
+    pub(super) undef_all: bool,
     /// Warning configuration parsed from -W flags. Controls which warnings are
     /// enabled, disabled, or promoted to errors. Processed left-to-right from
     /// the command line to match GCC semantics.
@@ -259,6 +263,7 @@ impl Driver {
             suppress_line_markers: false,
             nostdinc: false,
             undef_macros: Vec::new(),
+            undef_all: false,
             warning_config: WarningConfig::new(),
             gnu_extensions: true,
             function_sections: false,
@@ -435,6 +440,15 @@ impl Driver {
         // Pass through -U (undefine) flags (e.g., -Uriscv for kernel scripts)
         for undef in &self.undef_macros {
             cmd.arg(format!("-U{}", undef));
+        }
+        // Pass through -undef to suppress predefined macros (used for DTS preprocessing)
+        if self.undef_all {
+            cmd.arg("-undef");
+        }
+        // Pass through -x language override so gcc knows how to handle
+        // non-standard file extensions (e.g., .dts files in kernel builds)
+        if let Some(ref lang) = self.explicit_language {
+            cmd.arg("-x").arg(lang);
         }
         cmd.arg("-E");
         if self.suppress_line_markers {

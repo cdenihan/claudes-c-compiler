@@ -365,6 +365,11 @@ impl Driver {
                     self.linker_paths.push(arg[2..].to_string());
                 }
 
+                // Suppress all predefined macros (-undef)
+                // Must come before -U prefix match since -undef starts with -U
+                "-undef" => {
+                    self.undef_all = true;
+                }
                 // Undefine macro
                 "-U" => {
                     i += 1;
