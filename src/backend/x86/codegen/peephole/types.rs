@@ -552,12 +552,15 @@ pub(super) fn parse_dest_reg_fast(s: &str) -> RegId {
     // Single-operand instructions that modify their operand in-place:
     //   inc, dec, not, neg    (arithmetic/logic)
     //   bswapl, bswapq        (byte swap)
+    //   shr, shl, sar, ror, rol (shift/rotate by 1 with no immediate)
     //   popcntl, popcntq      (popcount, though these usually have 2 operands with comma)
     if b.len() >= 4 {
         let is_single_op_modifier =
             (b[0] == b'i' || b[0] == b'd' || b[0] == b'n') &&
             (s.starts_with("inc") || s.starts_with("dec") || s.starts_with("not") || s.starts_with("neg"))
-            || b[0] == b'b' && (s.starts_with("bswapl") || s.starts_with("bswapq"));
+            || b[0] == b'b' && (s.starts_with("bswapl") || s.starts_with("bswapq"))
+            || b[0] == b's' && (s.starts_with("shr") || s.starts_with("shl") || s.starts_with("sar"))
+            || b[0] == b'r' && (s.starts_with("ror") || s.starts_with("rol") || s.starts_with("rcr") || s.starts_with("rcl"));
         if is_single_op_modifier {
             if let Some(space_pos) = s.find(' ') {
                 let operand = s[space_pos + 1..].trim();
