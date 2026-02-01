@@ -1,0 +1,9 @@
+Fix: peephole copy propagation doesn't recognize single-operand shift/rotate
+instructions (shrq %reg, shlq %reg, etc.) as modifying their destination register.
+
+This causes the copy propagation pass to incorrectly replace the register
+in store instructions after inline asm shift operations, storing the original
+unshifted value instead of the shift result.
+
+Bug manifests when inline asm with "shrq %0" (no immediate) is used in a loop
+context where inlining creates multiple inline asm blocks in the same function.
