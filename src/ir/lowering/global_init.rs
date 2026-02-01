@@ -86,6 +86,18 @@ impl Lowerer {
         is_long_double_target: bool,
         is_bool_target: bool,
     ) -> GlobalInit {
+        // Resolve _Generic selections: unwrap to the selected expression before
+        // any other processing, so all downstream logic (const eval, string
+        // literals, address expressions, etc.) sees the resolved expression.
+        if let Expr::GenericSelection(ref controlling, ref associations, _) = expr {
+            if let Some(selected) = self.resolve_generic_selection_expr(controlling, associations) {
+                return self.lower_global_init_expr(
+                    selected, type_spec, base_ty, is_array, _struct_layout,
+                    is_long_double_target, is_bool_target,
+                );
+            }
+        }
+
         // Complex types: handle before scalar evaluation to prevent misinterpretation
         // of scalar values (e.g., `_Complex float g = 1.0f;`).
         {
@@ -603,6 +615,16 @@ impl Lowerer {
 
         let has_addr_exprs = items.iter().any(|item| {
             if let Initializer::Expr(expr) = &item.init {
+                // Resolve _Generic to its selected expression for detection
+                let expr = if let Expr::GenericSelection(ref controlling, ref associations, _) = expr {
+                    if let Some(selected) = self.resolve_generic_selection_expr(controlling, associations) {
+                        selected
+                    } else {
+                        expr
+                    }
+                } else {
+                    expr
+                };
                 if matches!(expr, Expr::StringLiteral(_, _)) {
                     return !is_multidim_char_array;
                 }
@@ -1706,6 +1728,17 @@ impl Lowerer {
     ) {
         match init {
             Initializer::Expr(expr) => {
+                // Resolve _Generic selections to their selected expression
+                // before any other processing.
+                let expr = if let Expr::GenericSelection(ref controlling, ref associations, _) = expr {
+                    if let Some(selected) = self.resolve_generic_selection_expr(controlling, associations) {
+                        selected
+                    } else {
+                        expr
+                    }
+                } else {
+                    expr
+                };
                 if let Expr::StringLiteral(s, _) = expr {
                     let label = self.intern_string_literal(s);
                     elements.push(GlobalInit::GlobalAddr(label));

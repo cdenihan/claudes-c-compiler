@@ -246,6 +246,10 @@ impl Lowerer {
             Expr::CompoundLiteral(ref type_spec, ref init, _) => {
                 self.eval_const_compound_literal(type_spec, init)
             }
+            Expr::GenericSelection(ref controlling, ref associations, _) => {
+                let selected = self.resolve_generic_selection_expr(controlling, associations)?;
+                self.eval_const_expr(selected)
+            }
             _ => None,
         }
     }

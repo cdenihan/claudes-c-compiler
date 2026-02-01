@@ -246,6 +246,14 @@ impl Lowerer {
                 // return None and let the caller's eval_const_expr handle it.
                 None
             }
+            // _Generic(controlling, type1: expr1, ...) -> resolve to the matching
+            // expression and evaluate it as a global address. This is critical for
+            // QEMU's OUTOP macro which uses _Generic in designated initializers:
+            //   [INDEX_op_st32] = _Generic(outop_st, TCGOutOpStore: &outop_st.base)
+            Expr::GenericSelection(ref controlling, ref associations, _) => {
+                let selected = self.resolve_generic_selection_expr(controlling, associations)?;
+                self.eval_global_addr_expr(selected)
+            }
             _ => None,
         }
     }

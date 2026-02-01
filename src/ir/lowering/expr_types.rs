@@ -589,7 +589,7 @@ impl Lowerer {
     /// Returns the matched expression (or the default), or None if no match.
     /// Both resolve_generic_selection_ctype and resolve_generic_selection_type
     /// delegate to this to avoid duplicating the matching logic.
-    fn resolve_generic_selection_expr<'a>(&self, controlling: &Expr, associations: &'a [GenericAssociation]) -> Option<&'a Expr> {
+    pub(super) fn resolve_generic_selection_expr<'a>(&self, controlling: &Expr, associations: &'a [GenericAssociation]) -> Option<&'a Expr> {
         // For _Generic, compute the controlling expression's type fresh to avoid
         // stale cached values that may have been computed before the controlling
         // expression's dependencies were fully available.
