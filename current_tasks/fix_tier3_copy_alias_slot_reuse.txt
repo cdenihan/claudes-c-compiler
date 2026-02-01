@@ -1,5 +1,5 @@
 Task: Fix Tier 3 copy-alias slot reuse causing SIGSEGV in libsodium x86
-Status: in_progress
+Status: completed
 Branch: fix_tier3_copy_alias_slot_reuse
 
 Problem:

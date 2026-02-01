@@ -1544,11 +1544,32 @@ fn assign_tier3_block_local_slots(
                     if block_local_set.contains(&v.0) {
                         last_use.insert(v.0, inst_idx);
                     }
+                    // Extend copy-alias root's last_use when the aliased
+                    // value is used as an operand.
+                    if let Some(&root) = ctx.copy_alias.get(&v.0) {
+                        if block_local_set.contains(&root) {
+                            let root_last = last_use.get(&root).copied().unwrap_or(0);
+                            if inst_idx > root_last {
+                                last_use.insert(root, inst_idx);
+                            }
+                        }
+                    }
                 }
             });
             for_each_value_use_in_instruction(inst, |v| {
                 if block_local_set.contains(&v.0) {
                     last_use.insert(v.0, inst_idx);
+                }
+                // Extend copy-alias root's last_use when the aliased
+                // value is used as a value reference (e.g., dest_ptr in
+                // Intrinsic, ptr in Store/Load).
+                if let Some(&root) = ctx.copy_alias.get(&v.0) {
+                    if block_local_set.contains(&root) {
+                        let root_last = last_use.get(&root).copied().unwrap_or(0);
+                        if inst_idx > root_last {
+                            last_use.insert(root, inst_idx);
+                        }
+                    }
                 }
             });
             // Extend last_use for InlineAsm output pointer values: Phase 4 reads
