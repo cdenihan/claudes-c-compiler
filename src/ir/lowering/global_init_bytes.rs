@@ -1206,8 +1206,15 @@ impl Lowerer {
     ) {
         let elem_ir_ty = IrType::from_ctype(elem_ty);
         let elem_size = elem_ir_ty.size().max(1);
-        for (idx, item) in items.iter().enumerate() {
-            let byte_offset = idx * elem_size;
+        let mut current_idx = 0usize;
+        for item in items {
+            // Respect designated array initializer indices (e.g., [3] = 40)
+            if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
+                if let Some(idx) = self.eval_const_expr(idx_expr).and_then(|c| c.to_usize()) {
+                    current_idx = idx;
+                }
+            }
+            let byte_offset = current_idx * elem_size;
             if byte_offset >= max_size { break; }
             if let Initializer::Expr(ref e) = item.init {
                 if let Some(val) = self.eval_const_expr(e) {
@@ -1216,6 +1223,7 @@ impl Lowerer {
                     self.write_const_to_bytes(bytes, byte_offset, &val, elem_ir_ty);
                 }
             }
+            current_idx += 1;
         }
     }
 
