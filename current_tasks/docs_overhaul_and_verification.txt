@@ -1,7 +1,0 @@
-Comprehensive documentation overhaul:
-- Verify all README claims against actual code
-- Fix the main README to be a proper project README
-- Update sub-directory READMEs with accurate information
-- Fix false/outdated claims (e.g., "delegates to GCC" when there's a native assembler/linker)
-- Add idea files for things that deserve cleanup
-- Check TODOs and resolve any that are done

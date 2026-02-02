@@ -1,0 +1,21 @@
+Enable LICM float/long-double/i128 load hoisting
+=================================================
+Priority: LOW
+
+The LICM pass (src/passes/licm.rs line 649) has a TODO saying:
+  "Extend to also hoist float, long double, and i128 loads once the
+   backend register paths support them."
+
+The backend register paths DO now support float and long double:
+- regalloc.rs handles is_float() and is_long_double() types
+- All four backends have register allocation
+
+The guard `!ty.is_float() && !ty.is_long_double()` is actively preventing
+float/long-double loads from being hoisted out of loops. Removing this
+restriction could improve performance for FP-heavy loops.
+
+Risk: Low. The loads being considered are already safe to hoist (non-address-
+taken alloca-based loads not modified within the loop). The type restriction
+was a conservative choice from when register allocation wasn't available.
+
+Test: Should be verified with FP-heavy benchmarks to ensure no regressions.

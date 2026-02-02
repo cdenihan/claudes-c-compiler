@@ -1,57 +1,62 @@
-Documentation Verification (2026-01-29, updated)
-=================================================
+Documentation Verification (2026-01-29, updated; 2026-02-02 full overhaul)
+==========================================================================
 
-All README.md files and ideas/*.txt files have been audited for correctness.
+All README.md files have been audited for correctness against the actual code.
 
-Fixes Applied (round 1, 2026-01-29):
-- README.md: -dumpversion output corrected from "6.5.0" to "6" (matches actual code)
-- README.md: test count updated from "~690" to "~718" directories
-- README.md: added note that i686/ lacks its own README.md
-- src/frontend/README.md: sema description updated to note it now emits some errors
-- src/common/README.md: added missing temp_files.rs to module listing
-- src/backend/README.md: trait method count corrected from "~58" to "~55" defaults
-- src/passes/README.md: pipeline description updated to include div_by_const pass
-  and note that GVN+LICM+IVSR share CFG analysis
-- ideas/register_allocator.txt: updated from "three backends" to "four backends"
-- ideas/reduce_stack_frame_size_for_postgres.txt: updated from "three" to "four"
-- ideas/high_use_def_chains.txt: updated pass pipeline description from 4 to 14 passes
+Full Overhaul (2026-02-02):
+- README.md: Complete rewrite as proper GitHub project README
+  - Fixed GCC version from "6.5"/"6" to "14.2.0"/"14" (matches actual -dumpversion output)
+  - Fixed "Optimize (O0-O3)" to include -Os/-Oz
+  - Fixed long double claim from "stored as f64 internally" to accurately describe
+    x87 inline asm support and ARM/RISC-V soft-float
+  - Added _Atomic limitation note
+  - Added optimization level uniformity note
+  - Updated architecture tree to list ALL backend shared files (liveness.rs, regalloc.rs,
+    state.rs, stack_layout.rs, call_abi.rs, cast.rs, f128_softfloat.rs, inline_asm.rs, common.rs)
+  - Added dead_statics and resolve_asm to passes listing
+  - Added peephole optimization as key design decision
+  - Added phi elimination step to pipeline diagram
+  - Added Linux kernel verification commands to Testing section
+  - Added scripts/ to project organization
+  - Reordered project table to show most impressive projects first
+  - Removed stale i686 "known limitations" wall-of-text, replaced with focused notes
+  - Added -fPIC example to usage
+  - Fixed test count to ~900
 
-Fixes Applied (round 2, 2026-01-29):
-- README.md: removed outdated i686 README exception (i686/ now has its own README.md)
-- README.md: test count updated from "~718" to "~724" directories
-- src/backend/f128_softfloat.rs: doc comment corrected from "~10" to "~34" primitives
-- src/driver/README.md: clarified that -Werror/-Wall are functional, only unrecognized
-  flags are silently ignored (was misleadingly saying "-W warnings" are ignored)
+- src/backend/x86/README.md: Complete rewrite
+  - Removed phantom register.rs (doesn't exist)
+  - Added ALL 17 actual codegen files as a complete file table
+  - Added register allocation section
 
-Verified Correct (no changes needed):
-- Cargo.toml binary targets match README description
-- Architecture tree listing in README matches actual directory structure
-- All 14 optimization pass files exist as documented
-- Pass pipeline runs 3 iterations as documented
-- All backend files match their README listings
-- F128SoftFloat trait has exactly 34 arch-specific primitives (now matches doc comment)
-- RISC-V callee-saved registers (s1, s7-s11 = 6) match documentation
-- Frontend module descriptions (preprocessor, lexer, parser, sema) are accurate
-- IR lowering file listing (~42 files) matches actual directory
-- mem2reg module files match documentation
-- Testing commands in README are accurate
-- All 17 README.md files use consistent markdown formatting
+- src/backend/arm/README.md: Complete rewrite
+  - Added ALL 18 codegen files as a complete file table
+  - Added peephole optimizer documentation
 
-Fixes Applied (round 3, 2026-01-29):
-- README.md: test count updated from "~724" to "~736" directories
-- src/backend/README.md: clarified generate_function/instruction/terminator as
-  internal (private) helpers, only generate_module() is public
-- src/backend/README.md: clarified common.rs emit_section_group/emit_init_data/
-  emit_symbol_directives/emit_zero_global as internal helpers
-- src/common/README.md: clarified eval_const_binop_i128 is internal, not public API
+- src/backend/riscv/README.md: Updated file table
+  - Added ALL 18 codegen files as a complete file table
 
-Fixes Applied (round 4, 2026-01-29):
-- README.md: test count updated from "~736" to "~762" directories
-- src/backend/README.md: added missing x86_common.rs module documentation
-  (shared x86/i686 register names, condition codes, inline asm template parsing)
+- src/backend/i686/README.md: Updated file table
+  - Added ALL 17 codegen files as a complete file table
+  - Noted casts.rs naming (vs cast_ops.rs in other backends)
+  - Removed outdated pass rate claim
 
-Known Stale (informational snapshots, not fixing):
-- ideas/fix_remaining_{arm,x86,riscv}_tests.txt: pass rate numbers from 2026-01-25
-  likely improved since then, but these are historical snapshots
-- ideas/fix_remaining_i686_projects.txt: some internal pass rates may be outdated
-- Runtime claims (kernel boots, PostgreSQL passes) cannot be verified from code alone
+- src/ir/lowering/README.md: Added missing expr_sizeof.rs
+
+- src/frontend/README.md: Improved module descriptions, fixed sema characterization
+
+- src/frontend/lexer/README.md: Expanded from bare minimum to include design notes
+
+Verified Correct (no changes needed, 2026-02-02):
+- src/backend/README.md: All 14 shared files match disk; module descriptions accurate
+- src/passes/README.md: All 16 submodule files match disk; pipeline order accurate
+- src/common/README.md: All 12 modules match disk
+- src/ir/README.md: All 7 files + 2 directories match disk
+- src/frontend/preprocessor/README.md: All 10 files match disk
+- src/frontend/parser/README.md: All 7 files match disk
+- src/frontend/sema/README.md: All 5 files match disk
+- src/ir/mem2reg/README.md: All 2 files match disk
+- src/backend/x86/codegen/peephole/README.md: Accurate pass pipeline
+- src/driver/README.md: Accurate pipeline and module descriptions
+
+Previous fixes (2026-01-29, rounds 1-4):
+- Retained for historical reference, see git history for details

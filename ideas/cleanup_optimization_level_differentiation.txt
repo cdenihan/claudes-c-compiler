@@ -1,0 +1,22 @@
+Add optimization level differentiation (-O0 vs -O2)
+====================================================
+Priority: MEDIUM
+
+Currently all optimization levels (-O0 through -O3, -Os, -Oz) run the exact
+same optimization pipeline (see passes/mod.rs line 248). This means:
+
+- -O0 is no faster to compile than -O2
+- Users expecting fast debug builds get full optimization overhead
+- -Os/-Oz don't actually optimize for size vs speed
+
+The TODO in the code says "Restore per-level optimization tiers once the compiler
+is stable enough." The compiler now builds Linux, PostgreSQL, Redis, SQLite, and
+many other projects -- it may be stable enough to start differentiating.
+
+Suggested tiers:
+- -O0: Only mem2reg (required for correctness) + constant_fold (for __builtin_constant_p).
+  Skip all other passes. Fast compile for debugging.
+- -O1: Core passes only (cfg_simplify, copy_prop, dce, constant_fold, simplify)
+- -O2: Full pipeline (current behavior)
+- -O3: Full pipeline + more aggressive inlining thresholds
+- -Os: Full pipeline with size-oriented inlining thresholds

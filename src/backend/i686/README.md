@@ -12,13 +12,26 @@ Code generation targeting 32-bit x86 (i686) with the cdecl calling convention.
 
 ## Structure
 
-- `codegen/` - Code generation implementation
-  - `codegen.rs` - Main `I686Codegen` struct implementing the `ArchCodegen` trait. The largest backend file due to 64-bit operation splitting (i128 ops require 4-register sequences)
-  - `asm_emitter.rs` - `InlineAsmEmitter` trait implementation for i686 inline assembly
-  - `inline_asm.rs` - i686 inline assembly template substitution and register formatting
+| File | Responsibility |
+|------|---------------|
+| `codegen.rs` | Main `I686Codegen` struct implementing `ArchCodegen`. The largest backend file due to 64-bit operation splitting |
+| `alu.rs` | Integer arithmetic and bitwise operations |
+| `atomics.rs` | Atomic operations |
+| `calls.rs` | Function call emission (cdecl, fastcall, regparm) |
+| `casts.rs` | Type casts |
+| `comparison.rs` | Compare operations |
+| `float_ops.rs` | Floating-point operations |
+| `globals.rs` | Global variable access |
+| `i128_ops.rs` | 128-bit integer operations (4-register sequences) |
+| `inline_asm.rs` | i686 inline asm template substitution and register formatting |
+| `intrinsics.rs` | SSE2 intrinsic emission |
+| `memory.rs` | Load/store operations |
+| `peephole.rs` | Post-codegen peephole optimizer |
+| `prologue.rs` | Function prologue/epilogue |
+| `returns.rs` | Return value handling |
+| `variadic.rs` | va_list / va_arg implementation |
+| `asm_emitter.rs` | `InlineAsmEmitter` trait implementation |
 
 ## Known Limitations
 
 - Division-by-constant pass disabled (generates 64-bit arithmetic the backend can't handle)
-- All 12 standard projects pass (zlib, lua, libsodium, mquickjs, libpng, jq, libjpeg, mbedtls, libuv, libffi, musl, tcc)
-- Unit tests: 100% pass rate (692/692 applicable tests)

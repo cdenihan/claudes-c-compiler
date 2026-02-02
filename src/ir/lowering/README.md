@@ -18,7 +18,8 @@ handles every C language construct. The `mem2reg` pass later promotes allocas to
 | `stmt_control_flow.rs` | Control flow lowering (if/while/for/goto/labels) |
 | `stmt_asm.rs` | Inline assembly lowering |
 | `struct_init.rs` | Struct/union initializer list lowering (`emit_struct_init`): field dispatch loop, per-field-type handlers |
-| `expr.rs` | Expression lowering: binary/unary ops, casts, ternary, sizeof, pointer arithmetic |
+| `expr.rs` | Expression lowering: binary/unary ops, casts, ternary, pointer arithmetic |
+| `expr_sizeof.rs` | sizeof/alignof expression lowering |
 | `expr_ops.rs` | Binary/unary operator lowering |
 | `expr_access.rs` | Member access (struct/union field) lowering |
 | `expr_builtins.rs` | `__builtin_*` intrinsics (fpclassify, clz, ctz, bswap, popcount, etc.) |
