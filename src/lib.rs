@@ -2,9 +2,6 @@
 // Compiler functions naturally accumulate parameters (context, types, spans, flags).
 // Refactoring every one into a struct would add boilerplate without improving clarity.
 #![allow(clippy::too_many_arguments)]
-// Intentional: separate branches for different semantic conditions that happen to
-// produce the same code today. Merging them would lose the conceptual distinction.
-#![allow(clippy::if_same_then_else)]
 // Complex return types arise naturally in compiler data structures; type aliases
 // would just move the complexity elsewhere.
 #![allow(clippy::type_complexity)]

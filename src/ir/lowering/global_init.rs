@@ -1110,9 +1110,9 @@ impl Lowerer {
             init, type_spec, base_ty, is_array, elem_size, alloc_size, &struct_layout, &[],
         );
 
-        let global_ty = if matches!(&global_init, GlobalInit::Array(vals) if !vals.is_empty() && matches!(vals[0], IrConst::I8(_))) {
-            IrType::I8
-        } else if struct_layout.is_some() && matches!(global_init, GlobalInit::Array(_)) {
+        let global_ty = if matches!(&global_init, GlobalInit::Array(vals) if !vals.is_empty() && matches!(vals[0], IrConst::I8(_)))
+            || (struct_layout.is_some() && matches!(global_init, GlobalInit::Array(_)))
+        {
             IrType::I8
         } else {
             base_ty

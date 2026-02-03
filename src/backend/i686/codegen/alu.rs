@@ -36,12 +36,10 @@ impl I686Codegen {
         }
     }
 
-    pub(super) fn emit_int_ctz_impl(&mut self, ty: IrType) {
-        if matches!(ty, IrType::I32 | IrType::U32 | IrType::Ptr) {
-            self.state.emit("    tzcntl %eax, %eax");
-        } else {
-            self.state.emit("    tzcntl %eax, %eax");
-        }
+    pub(super) fn emit_int_ctz_impl(&mut self, _ty: IrType) {
+        // tzcntl works for all integer widths on i686: the value is in %eax
+        // and trailing zero count is the same regardless of nominal width.
+        self.state.emit("    tzcntl %eax, %eax");
     }
 
     pub(super) fn emit_int_bswap_impl(&mut self, ty: IrType) {

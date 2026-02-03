@@ -250,9 +250,9 @@ impl MacroTable {
         if !result.is_empty() {
             let last = result.as_bytes()[result.len() - 1];
             let first = expanded.as_bytes()[0];
-            if would_paste_tokens(last, first) {
-                result.push(' ');
-            } else if is_ident_cont_byte(last) && is_ident_cont_byte(first) {
+            if would_paste_tokens(last, first)
+                || (is_ident_cont_byte(last) && is_ident_cont_byte(first))
+            {
                 result.push(' ');
             }
         }
@@ -600,11 +600,12 @@ impl MacroTable {
         let len = bytes.len();
         let mut j = i;
         while j < len {
-            if bytes[j].is_ascii_alphanumeric() || bytes[j] == b'.' || bytes[j] == b'_' {
-                j += 1;
-            } else if (bytes[j] == b'+' || bytes[j] == b'-')
-                && j > i
-                && matches!(bytes[j - 1], b'e' | b'E' | b'p' | b'P')
+            if bytes[j].is_ascii_alphanumeric()
+                || bytes[j] == b'.'
+                || bytes[j] == b'_'
+                || ((bytes[j] == b'+' || bytes[j] == b'-')
+                    && j > i
+                    && matches!(bytes[j - 1], b'e' | b'E' | b'p' | b'P'))
             {
                 j += 1;
             } else {

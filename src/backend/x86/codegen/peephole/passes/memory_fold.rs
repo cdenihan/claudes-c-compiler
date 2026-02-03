@@ -29,14 +29,23 @@ fn parse_alu_reg_reg(trimmed: &str) -> Option<(&str, &str, RegId, RegId)> {
     let b = trimmed.as_bytes();
     if b.len() < 6 { return None; }
 
-    let op_len = if b.starts_with(b"add") { 3 }
-        else if b.starts_with(b"sub") { 3 }
-        else if b.starts_with(b"and") { 3 }
-        else if b.starts_with(b"xor") { 3 }
-        else if b.starts_with(b"cmp") { 3 }
-        else if b.starts_with(b"test") { 4 }
-        else if b.starts_with(b"or") && b.len() > 2 && (b[2] == b'q' || b[2] == b'l' || b[2] == b'w' || b[2] == b'b') { 2 }
-        else { return None; };
+    let op_len = if b.starts_with(b"add")
+        || b.starts_with(b"sub")
+        || b.starts_with(b"and")
+        || b.starts_with(b"xor")
+        || b.starts_with(b"cmp")
+    {
+        3
+    } else if b.starts_with(b"test") {
+        4
+    } else if b.starts_with(b"or")
+        && b.len() > 2
+        && (b[2] == b'q' || b[2] == b'l' || b[2] == b'w' || b[2] == b'b')
+    {
+        2
+    } else {
+        return None;
+    };
 
     let suffix = b[op_len];
     if suffix != b'q' && suffix != b'l' && suffix != b'w' && suffix != b'b' {

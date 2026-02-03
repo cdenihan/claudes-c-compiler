@@ -980,9 +980,7 @@ impl ArmCodegen {
                     IrConst::I8(v) => self.state.emit_fmt(format_args!("    mov x0, #{}", v)),
                     IrConst::I16(v) => self.state.emit_fmt(format_args!("    mov x0, #{}", v)),
                     IrConst::I32(v) => {
-                        if *v >= 0 && *v <= 65535 {
-                            self.state.emit_fmt(format_args!("    mov x0, #{}", v));
-                        } else if *v < 0 && *v >= -65536 {
+                        if *v >= -65536 && *v <= 65535 {
                             self.state.emit_fmt(format_args!("    mov x0, #{}", v));
                         } else {
                             // Sign-extend to 64-bit before loading into x0.
@@ -992,9 +990,7 @@ impl ArmCodegen {
                         }
                     }
                     IrConst::I64(v) => {
-                        if *v >= 0 && *v <= 65535 {
-                            self.state.emit_fmt(format_args!("    mov x0, #{}", v));
-                        } else if *v < 0 && *v >= -65536 {
+                        if *v >= -65536 && *v <= 65535 {
                             self.state.emit_fmt(format_args!("    mov x0, #{}", v));
                         } else {
                             self.emit_load_imm64("x0", *v);

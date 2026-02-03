@@ -118,12 +118,8 @@ fn detect_include_guard(source: &str) -> Option<String> {
                 }
             } else {
                 // Inside the guard body - track nesting depth
-                if after_hash.starts_with("if")
-                    && !after_hash.starts_with("ifdef")
-                    && !after_hash.starts_with("ifndef")
-                {
-                    if_depth += 1;
-                } else if after_hash.starts_with("ifdef") || after_hash.starts_with("ifndef") {
+                if after_hash.starts_with("if") {
+                    // Covers #if, #ifdef, #ifndef
                     if_depth += 1;
                 } else if after_hash.starts_with("endif") {
                     if_depth -= 1;

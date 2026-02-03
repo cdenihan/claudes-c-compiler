@@ -171,21 +171,14 @@ impl I686Codegen {
         }
     }
 
-    pub(super) fn emit_float_to_i128_call_impl(&mut self, src: &Operand, to_signed: bool, from_ty: IrType) {
+    pub(super) fn emit_float_to_i128_call_impl(&mut self, src: &Operand, _to_signed: bool, _from_ty: IrType) {
+        // TODO: F64 should use fldl instead of flds, and unsigned conversion
+        // may need different handling for values exceeding i64 range.
         self.operand_to_eax(src);
         self.state.emit("    subl $8, %esp");
-        if from_ty == IrType::F32 {
-            self.state.emit("    movl %eax, (%esp)");
-            self.state.emit("    flds (%esp)");
-        } else {
-            self.state.emit("    movl %eax, (%esp)");
-            self.state.emit("    flds (%esp)");
-        }
-        if to_signed {
-            self.state.emit("    fisttpq (%esp)");
-        } else {
-            self.state.emit("    fisttpq (%esp)");
-        }
+        self.state.emit("    movl %eax, (%esp)");
+        self.state.emit("    flds (%esp)");
+        self.state.emit("    fisttpq (%esp)");
         self.state.emit("    movl (%esp), %eax");
         self.state.emit("    movl 4(%esp), %edx");
         self.state.emit("    addl $8, %esp");

@@ -253,21 +253,12 @@ impl InlineAsmEmitter for I686Codegen {
                 Operand::Value(v) => {
                     if let Some(slot) = self.state.get_slot(v.0) {
                         let sr = self.slot_ref(slot);
-                        if self.state.is_alloca(v.0) {
-                            let load_instr = match ty {
-                                IrType::F32 => "movss",
-                                IrType::F64 => "movsd",
-                                _ => "movdqu",
-                            };
-                            self.state.emit_fmt(format_args!("    {} {}, %{}", load_instr, sr, reg));
-                        } else {
-                            let load_instr = match ty {
-                                IrType::F32 => "movss",
-                                IrType::F64 => "movsd",
-                                _ => "movdqu",
-                            };
-                            self.state.emit_fmt(format_args!("    {} {}, %{}", load_instr, sr, reg));
-                        }
+                        let load_instr = match ty {
+                            IrType::F32 => "movss",
+                            IrType::F64 => "movsd",
+                            _ => "movdqu",
+                        };
+                        self.state.emit_fmt(format_args!("    {} {}, %{}", load_instr, sr, reg));
                     }
                 }
                 Operand::Const(_) => {

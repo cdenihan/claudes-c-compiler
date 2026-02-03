@@ -186,11 +186,12 @@ fn expand_condition_macros(expr: &str, macros: &MacroTable) -> String {
         if b.is_ascii_digit() || (b == b'.' && i + 1 < len && bytes[i + 1].is_ascii_digit()) {
             let start = i;
             while i < len {
-                if bytes[i].is_ascii_alphanumeric() || bytes[i] == b'.' || bytes[i] == b'_' {
-                    i += 1;
-                } else if (bytes[i] == b'+' || bytes[i] == b'-')
-                    && i > 0
-                    && matches!(bytes[i - 1], b'e' | b'E' | b'p' | b'P')
+                if bytes[i].is_ascii_alphanumeric()
+                    || bytes[i] == b'.'
+                    || bytes[i] == b'_'
+                    || ((bytes[i] == b'+' || bytes[i] == b'-')
+                        && i > 0
+                        && matches!(bytes[i - 1], b'e' | b'E' | b'p' | b'P'))
                 {
                     i += 1;
                 } else {

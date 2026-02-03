@@ -927,13 +927,8 @@ impl SemanticAnalyzer {
                 }
             }
             Stmt::DoWhile(body, cond, _) => {
-                if self.is_constant_true_expr(cond) {
-                    false // infinite loop
-                } else if !self.stmt_can_fall_through(body) {
-                    false // body diverges, condition never reached
-                } else {
-                    true
-                }
+                // Can fall through only if not an infinite loop AND body can fall through
+                !self.is_constant_true_expr(cond) && self.stmt_can_fall_through(body)
             }
             Stmt::For(_init, cond, _inc, _body, _) => {
                 // for(;;) with no condition is an infinite loop
@@ -1111,10 +1106,9 @@ impl SemanticAnalyzer {
                 }
             }
             Stmt::DoWhile(body, cond, _) => {
-                if self.is_constant_true_expr(cond) {
+                // Returns if: infinite loop OR body diverges
+                if self.is_constant_true_expr(cond) || !self.stmt_can_fall_through(body) {
                     SwitchSegmentOutcome::Returns
-                } else if !self.stmt_can_fall_through(body) {
-                    SwitchSegmentOutcome::Returns // body diverges
                 } else {
                     SwitchSegmentOutcome::FallsThrough
                 }

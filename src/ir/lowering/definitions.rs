@@ -291,9 +291,9 @@ impl DeclAnalysis {
     /// the global's element type must be I8 instead of the declared type.
     /// This logic is shared between `lower_global_decl` and `lower_local_static_decl`.
     pub fn resolve_global_ty(&self, init: &GlobalInit) -> IrType {
-        if matches!(init, GlobalInit::Array(vals) if !vals.is_empty() && matches!(vals[0], IrConst::I8(_))) {
-            IrType::I8
-        } else if self.is_struct && matches!(init, GlobalInit::Array(_)) {
+        if matches!(init, GlobalInit::Array(vals) if !vals.is_empty() && matches!(vals[0], IrConst::I8(_)))
+            || (self.is_struct && matches!(init, GlobalInit::Array(_)))
+        {
             IrType::I8
         } else if matches!(init, GlobalInit::Array(_)) {
             // Check if this is a vector type or array of vectors.
