@@ -126,9 +126,10 @@ CType::Void, Bool, Char, UChar, Short, UShort, Int, UInt,
        Vector(Box<CType>, usize)
 ```
 
-CType distinguishes `int` from `long` even on LP64 where both are 64 bits,
-because C requires them to be distinct types for type compatibility checks
-and correct format specifier warnings. CType also carries struct/union identity
+CType distinguishes `int` from `long` even when the underlying sizes match
+(e.g., both are 32 bits on ILP32), because C requires them to be distinct
+types for type compatibility checks and correct format specifier warnings.
+CType also carries struct/union identity
 through `RcStr` keys (e.g., `"struct.Foo"`) that index into a layout table.
 
 CType is the primary type during parsing, semantic analysis, and the early
@@ -394,12 +395,13 @@ Key internal helpers:
   domain with correct width handling.
 - `bool_to_i64(b)` -- Convert boolean to 0/1.
 
-Public evaluators:
-- `eval_const_binop_int(op, l, r, is_32bit, is_unsigned)` -- Integer binary
-  operations (add, sub, mul, div, mod, shifts, bitwise, comparisons) with
-  wrapping, division-by-zero checking, and proper width truncation.
-- `eval_const_binop_float(op, l, r)` -- Floating-point binary operations on
-  f64 values.
+Key evaluators:
+- `eval_const_binop_int(op, l, r, is_32bit, is_unsigned)` -- (module-private)
+  Integer binary operations (add, sub, mul, div, mod, shifts, bitwise,
+  comparisons) with wrapping, division-by-zero checking, and proper width
+  truncation.
+- `eval_const_binop_float(op, l, r)` -- (public) Floating-point binary
+  operations on f64 values.
 - Additional helpers for i128 operations and long double constant arithmetic,
   delegating to the `long_double` module for full-precision results.
 
@@ -529,9 +531,11 @@ Private Use Area (PUA) code points.
   sequences are preserved, and invalid bytes `0x80-0xFF` are encoded as PUA
   code points. A UTF-8 BOM at the start of the file is stripped, matching
   GCC/Clang behavior.
-- `decode_pua_byte(ch)` -- Recovers the original byte from a PUA code point.
-  Used by the lexer when processing string/character literals to emit the
-  correct raw bytes into the compiled output.
+- `decode_pua_byte(input: &[u8], pos: usize) -> (u8, usize)` -- Recovers the
+  original byte from a PUA-encoded UTF-8 sequence in a byte slice. Returns
+  the decoded byte and the number of input bytes consumed. Used by the lexer
+  when processing string/character literals to emit the correct raw bytes
+  into the compiled output.
 
 ### asm_constraints.rs -- Inline Assembly Constraint Classification
 

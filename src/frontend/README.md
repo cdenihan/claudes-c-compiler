@@ -97,13 +97,14 @@ ID) for source location tracking.
   returns all tokens, terminated by `TokenKind::Eof`. Uses a capacity heuristic
   of one token per five bytes to minimize reallocation.
 - **`Lexer::set_gnu_extensions(&mut self, enabled: bool)`** -- toggles GNU
-  extension support (enabled by default). When enabled, `$` is permitted in
-  identifiers and GNU-specific keywords are recognized.
+  extension support (enabled by default). When enabled, the bare keywords
+  `typeof` and `asm` (without double-underscore prefix) are recognized.
+  Note: `$` in identifiers is always permitted regardless of this flag.
 
 ### Output contract
 
-The token stream is a `Vec<Token>` where each `Token` is a `(TokenKind, Span)`
-pair. `TokenKind` covers:
+The token stream is a `Vec<Token>` where each `Token` is a struct with
+`kind: TokenKind` and `span: Span` fields. `TokenKind` covers:
 
 - **Literals**: integer (with suffix variants for `u`, `l`, `ll`), floating
   point (double, float, long double, imaginary), string (narrow, wide, u8,
@@ -132,17 +133,19 @@ stream and produces a typed AST rooted at `TranslationUnit`.
 
 ### Public interface
 
-- **`Parser::new(tokens: Vec<Token>, ...) -> Self`** -- takes ownership of the
-  token stream. Also accepts a `DiagnosticEngine` reference and a set of
-  known typedef names (fed from the preprocessor's macro table) to resolve the
-  typedef/identifier ambiguity during parsing.
+- **`Parser::new(tokens: Vec<Token>) -> Self`** -- takes ownership of the
+  token stream. The `DiagnosticEngine` is configured after construction via
+  a separate `set_diagnostics()` method. Typedef names are seeded from a
+  hardcoded `builtin_typedefs()` list of common C standard library types
+  (e.g., `size_t`, `int32_t`, `FILE`), not from the preprocessor's macro table.
 - **`Parser::parse(&mut self) -> TranslationUnit`** -- the main entry point.
   Parses the entire translation unit and returns the AST.
 
 ### Internal organization
 
-The parser is split across five `impl Parser` blocks in separate files, each
-extending the same `Parser` struct with `pub(super)` methods:
+The parser is split across six `impl Parser` blocks: the core in `parser.rs`
+and five extension files, each extending the same `Parser` struct with
+`pub(super)` methods:
 
 | Module | Scope |
 |--------|-------|
@@ -242,11 +245,11 @@ The following diagram shows the concrete Rust types that flow between phases:
        |
        | Lexer::tokenize()
        v
-  [Tokens: Vec<Token>]        Token = (TokenKind, Span)
+  [Tokens: Vec<Token>]        Token = struct { kind: TokenKind, span: Span }
        |
        | Parser::parse()
        v
-  [AST: TranslationUnit]      TranslationUnit = Vec<ExternalDecl>
+  [AST: TranslationUnit]      TranslationUnit = struct { decls: Vec<ExternalDecl> }
        |
        | SemanticAnalyzer::analyze()
        v

@@ -213,21 +213,58 @@ src/
 
 Each subdirectory has its own `README.md` with detailed design documentation.
 
-### Compilation Pipeline
+### Compilation Pipeline (Data Flow)
+
+Each phase transforms the program into a progressively lower-level
+representation. The concrete Rust types flowing between phases are:
 
 ```
-C source
-  → Preprocessor (macro expansion, includes, conditionals)
-  → Lexer (tokens with source locations)
-  → Parser (recursive descent → AST)
-  → Sema (type checking, symbol resolution, const evaluation)
-  → IR lowering (AST → alloca-based IR)
-  → mem2reg (SSA promotion via iterated dominance frontier)
-  → Optimization passes (up to 3 iterations with dirty tracking)
-  → Phi elimination (SSA → register copies)
-  → Code generation (IR → textual assembly)
-  → [external gcc -c] → object file
-  → [external gcc] → linked executable
+  &str  (C source text)
+    │
+    │  Preprocessor::preprocess()
+    ▼
+  String  (expanded text with line markers)
+    │
+    │  Lexer::tokenize()
+    ▼
+  Vec<Token>  (each Token = { kind: TokenKind, span: Span })
+    │
+    │  Parser::parse()
+    ▼
+  TranslationUnit  (AST: Vec<ExternalDecl> with source spans)
+    │
+    │  SemanticAnalyzer::analyze()
+    ▼
+  TranslationUnit + SemaResult
+    │   SemaResult bundles:
+    │     • functions: FxHashMap<String, FunctionInfo>
+    │     • type_context: TypeContext (struct layouts, typedefs, enums)
+    │     • expr_types: FxHashMap<ExprId, CType>
+    │     • const_values: FxHashMap<ExprId, IrConst>
+    │
+    │  Lowerer::lower()
+    ▼
+  IrModule  (alloca-based IR: every local is a stack slot)
+    │
+    │  promote_allocas()  (mem2reg)
+    ▼
+  IrModule  (SSA form: phi nodes, virtual registers)
+    │
+    │  run_passes()  (up to 3 iterations with dirty tracking)
+    ▼
+  IrModule  (optimized SSA)
+    │
+    │  eliminate_phis()
+    ▼
+  IrModule  (non-SSA: phi nodes lowered to register copies)
+    │
+    │  generate_assembly()  (ArchCodegen trait dispatch)
+    ▼
+  String  (target-specific assembly text)
+    │
+    │  [external gcc -c + gcc link]
+    ▼
+  ELF executable
 ```
 
 ### Key Design Decisions
@@ -249,7 +286,32 @@ C source
   pass types.
 - **Dual type system**: CType represents C-level types (preserving `int` vs `long`
   distinctions for type checking), while IrType is a flat machine-level enumeration
-  (`I8`..`I128`, `F32`, `F64`, `F128`, `Ptr`). The lowering phase bridges between them.
+  (`I8`..`I128`, `U8`..`U128`, `F32`, `F64`, `F128`, `Ptr`, `Void`). The lowering
+  phase bridges between them.
+
+### Design Philosophy
+
+- **Separation of concerns through representations.** Each major phase works on
+  its own representation: the frontend on text/tokens/AST, the IR subsystem on
+  alloca-based IR, the optimizer on SSA IR, and the backend on non-SSA IR. Phase
+  boundaries are explicit ownership transfers, not shared mutable state.
+
+- **Alloca-then-promote for SSA construction.** Rather than constructing SSA
+  directly during AST lowering (which interleaves C semantics with SSA
+  bookkeeping), the lowerer emits simple alloca/load/store sequences. The
+  mem2reg pass then promotes these to SSA independently. This is the same
+  strategy LLVM uses and cleanly separates the two concerns.
+
+- **Trait-based backend abstraction.** The `ArchCodegen` trait (~140 methods)
+  captures the interface between the shared code generation framework and
+  architecture-specific instruction emission. Default implementations express
+  algorithms once (e.g., the 8-phase call sequence), while backends supply
+  only the architecture-specific primitives.
+
+- **No compiler-specific dependencies.** The entire compiler is built from
+  general-purpose Rust crates. No lexer generators, parser generators,
+  register allocator libraries, or external assemblers/linkers are used.
+  Assembly and linking delegate to GCC as a temporary measure.
 
 ---
 

@@ -56,16 +56,16 @@ The driver is the entry point that wires together every other compiler subsystem
 optimization level, output path, include paths, defines, warning settings, linker flags,
 and feature flags (PIC, debug info, retpoline thunks, patchable function entries, etc.).
 
-Target architecture is determined from the binary name at startup (`ccc-arm` selects
-AArch64, `ccc-riscv` selects RISC-V 64, `ccc-i686` selects i686, everything else
-defaults to x86-64).
+Target architecture is determined from the binary name at startup: any name
+containing `arm` or `aarch64` selects AArch64, `riscv` selects RISC-V 64,
+`i686` or `i386` selects i686, and everything else defaults to x86-64.
 
 ### CLI Parsing
 
 The CLI parser (`cli.rs`) is a simple `while` loop with a flat `match` on each argument.
 No external parser library is used. Key behaviors:
 
-- **Query flags** (`-dumpmachine`, `-dumpversion`, `--version`, `--print-search-dirs`)
+- **Query flags** (`-dumpmachine`, `-dumpversion`, `--version`, `-print-search-dirs`)
   are handled as early exits before input files are required. Build systems use these
   to detect the compiler and target.
 - **Response files** (`@file`) are expanded inline, supporting the GCC/MSVC convention

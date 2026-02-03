@@ -47,7 +47,7 @@ The optimizer executes in four sequential phases:
    +-------------------------------------------------------+
    |  1.  cfg_simplify                                     |
    |  2.  copy_prop                                        |
-   |  2a. div_by_const         (iteration 0 only, 64-bit)  |
+   |  2a. div_by_const         (iteration 0 only, disabled on i686) |
    |  2b. narrow                                           |
    |  3.  simplify                                         |
    |  4.  constant_fold                                    |
@@ -517,17 +517,22 @@ which other passes. An arrow from A to B means "changes made by A may enable
 further changes in B."
 
 ```
-cfg_simplify ---------> copy_prop, gvn, dce
-copy_prop ------------> simplify, constant_fold, gvn, narrow
+cfg_simplify ---------> copy_prop, gvn, licm, dce, if_convert
+copy_prop ------------> simplify, constant_fold, gvn, licm, narrow
 narrow ---------------> simplify, constant_fold
 simplify -------------> constant_fold, copy_prop, gvn
-constant_fold --------> cfg_simplify, copy_prop, dce
-gvn ------------------> copy_prop, dce
+constant_fold --------> cfg_simplify, copy_prop, dce, if_convert
+gvn ------------------> copy_prop, licm, dce
 licm -----------------> copy_prop, dce
-if_convert -----------> copy_prop, dce
+if_convert -----------> copy_prop, constant_fold, cfg_simplify, dce
 dce ------------------> cfg_simplify
 ipcp -----------------> constant_fold, dce, cfg_simplify
 ```
+
+Note: The edges above reflect the actual `should_run!` macro dependencies in
+`mod.rs`. An arrow from A to B means "B's `should_run!` check includes A as
+an upstream dependency." For example, `licm` depends on `cfg_simplify`,
+`copy_prop`, and `gvn` -- if none of those made changes, LICM is skipped.
 
 This dependency graph is encoded in the `should_run!` macro invocations in
 `mod.rs` and drives the per-pass skip logic described above.

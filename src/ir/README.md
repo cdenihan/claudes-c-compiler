@@ -85,15 +85,21 @@ The IR uses a small, target-independent type vocabulary defined by `IrType`
 
 | IR Type    | Width   | Meaning                                  |
 |------------|---------|------------------------------------------|
-| `I8`       | 8-bit   | `char`, `_Bool`, byte-sized integers     |
-| `I16`      | 16-bit  | `short`                                  |
-| `I32`      | 32-bit  | `int`                                    |
-| `I64`      | 64-bit  | `long`, `long long`                      |
-| `I128`     | 128-bit | `__int128`                               |
+| `I8`       | 8-bit   | `char`, `_Bool`, byte-sized signed       |
+| `I16`      | 16-bit  | `short` (signed)                         |
+| `I32`      | 32-bit  | `int` (signed)                           |
+| `I64`      | 64-bit  | `long`, `long long` (signed)             |
+| `I128`     | 128-bit | `__int128` (signed)                      |
+| `U8`       | 8-bit   | `unsigned char`                          |
+| `U16`      | 16-bit  | `unsigned short`                         |
+| `U32`      | 32-bit  | `unsigned int`                           |
+| `U64`      | 64-bit  | `unsigned long`, `unsigned long long`    |
+| `U128`     | 128-bit | `unsigned __int128`                      |
 | `F32`      | 32-bit  | `float`                                  |
 | `F64`      | 64-bit  | `double`                                 |
 | `F128`     | 128-bit | `long double` (quad precision)           |
 | `Ptr`      | target  | All pointer types (opaque)               |
+| `Void`     | 0       | Void type (used for void returns, etc.)  |
 
 Pointers are opaque at the IR level. The `IrType` attached to load/store
 instructions determines the access width; the pointer itself carries no
@@ -122,8 +128,8 @@ for AArch64/RISC-V, and `f64_to_x87_bytes` converts to x86 80-bit extended.
 
 ## Instruction Set
 
-The `Instruction` enum defines approximately 30 variants organized into the
-following categories.
+The `Instruction` enum defines 38 variants organized into the following
+categories.
 
 ### Memory
 
@@ -162,8 +168,7 @@ locals that must survive `setjmp`/`longjmp`.
 carries methods `is_commutative()` and `can_trap()` (the latter is true for
 division and remainder, which may cause SIGFPE and therefore must not be
 speculatively executed by if-conversion). Constant folding is provided by
-`eval_i64`, `eval_i128`, and `eval_f64` methods that return `None` for
-division by zero.
+`eval_i64` and `eval_i128` methods that return `None` for division by zero.
 
 **Unary operations** (`IrUnaryOp`): `Neg`, `Not`, `Clz`, `Ctz`, `Bswap`,
 `Popcount`, `IsConstant` (for `__builtin_constant_p`, resolved after inlining
@@ -287,7 +292,7 @@ operations that each backend maps to native instructions:
 - **128-bit load/store**: `Loaddqu`, `Storedqu`
 - **AES-NI**: `Aesenc128`, `Aesenclast128`, `Aesdec128`, `Aesdeclast128`,
   `Aesimc128`, `Aeskeygenassist128`
-- **CLMUL**: `Pclmulqdq`
+- **CLMUL**: `Pclmulqdq128`
 - **CRC32**: `Crc32_8`, `Crc32_16`, `Crc32_32`, `Crc32_64`
 - **Scalar math**: `SqrtF32`, `SqrtF64`, `FabsF32`, `FabsF64`
 - **Frame/return address**: `FrameAddress`, `ReturnAddress`, `ThreadPointer`
@@ -433,11 +438,12 @@ range of indices into `data` for the neighbors of node `i`. Access is via
 `row(i)`, which returns a `&[u32]` slice of neighbors.
 
 **`CfgAnalysis`.** A cached bundle of pre-computed analysis results
-(predecessors, successors, immediate dominators, dominator tree children, loop
-information) shared across multiple optimization passes within a single
+(predecessors, successors, immediate dominators, dominator tree children, and
+block count) shared across multiple optimization passes within a single
 pipeline iteration. Since passes like GVN only replace instruction operands
 without modifying the CFG, these results remain valid across GVN, LICM, and
-IVSR, avoiding redundant recomputation.
+IVSR, avoiding redundant recomputation. Loop analysis is performed separately
+by the `loop_analysis` module when needed by LICM and IVSR.
 
 ### Algorithms
 

@@ -1,7 +1,53 @@
-Documentation Verification (2026-01-29, updated; 2026-02-02 full overhaul)
+Documentation Verification (2026-01-29, updated; 2026-02-03 accuracy audit)
 ==========================================================================
 
 All README.md files have been audited for correctness against the actual code.
+
+Accuracy Audit (2026-02-03):
+- Every README was systematically verified against the source code.
+  Inaccuracies fixed:
+
+  src/frontend/README.md:
+  - Fixed `$` in identifiers claim (always permitted, not gated by gnu_extensions)
+  - Fixed Token described as tuple `(TokenKind, Span)` -> struct with named fields
+  - Fixed Parser::new() signature (takes only Vec<Token>, not DiagnosticEngine/typedefs)
+  - Fixed "five impl Parser blocks" -> six (includes parser.rs core block)
+  - Fixed TranslationUnit described as Vec<ExternalDecl> -> struct { decls: Vec<ExternalDecl> }
+
+  src/ir/README.md:
+  - Added missing IrType variants: U8, U16, U32, U64, U128, Void
+  - Fixed instruction count from "approximately 30" to 38
+  - Removed false claim that IrBinOp has eval_f64 method (it does not)
+  - Fixed CfgAnalysis "loop information" claim (it contains block count, not loops)
+  - Fixed Pclmulqdq -> Pclmulqdq128 intrinsic name
+
+  src/passes/README.md:
+  - Fixed div_by_const annotation from "(64-bit)" to "(disabled on i686)"
+  - Rewrote dependency graph to include all actual should_run! edges
+    (added missing edges for licm inputs, if_convert <-> constant_fold, etc.)
+
+  src/backend/README.md:
+  - Fixed method count from "~100 methods, ~20 defaults" to "~140 methods, ~53 defaults"
+  - Removed nonexistent emit_call_indirect method
+  - Fixed "6-phase call sequence" to 8-phase (added emit_call_f128_pre_convert,
+    emit_call_sret_setup)
+  - Fixed "approximately 17 codegen files" to 18-19
+  - Fixed "Backends provide free functions" to "traits.rs provides free functions"
+
+  src/common/README.md:
+  - Fixed LP64 int/long claim ("both 64 bits" is wrong; int is 32, long is 64)
+  - Fixed decode_pua_byte signature (takes &[u8]+pos, not a char)
+  - Fixed eval_const_binop_int described as "public" (it is module-private)
+
+  src/driver/README.md:
+  - Fixed --print-search-dirs to -print-search-dirs (single dash, matches GCC)
+  - Expanded target detection to document aarch64 and i386 triggers
+
+  README.md (top-level):
+  - Added IrType U8-U128 and Void to dual type system description
+  - Replaced linear compilation pipeline with detailed data-flow diagram
+    showing concrete Rust types at each phase boundary
+  - Added Design Philosophy section
 
 Full Overhaul (2026-02-02):
 - README.md: Complete rewrite as proper GitHub project README

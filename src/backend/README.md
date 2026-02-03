@@ -90,7 +90,7 @@ architecture-specific subdirectories:
 ```
 src/backend/
   mod.rs              Target enum, CodegenOptions, top-level dispatch
-  traits.rs           ArchCodegen trait (~100 methods, ~20 default impls)
+  traits.rs           ArchCodegen trait (~140 methods, ~53 default impls)
   generation.rs       Module/function/instruction dispatch (arch-independent)
   state.rs            CodegenState, StackSlot, SlotAddr, RegCache
   stack_layout.rs     Three-tier stack slot allocation
@@ -109,8 +109,8 @@ src/backend/
   riscv/              RISC-V 64 backend (LP64D)
 ```
 
-Each architecture subdirectory contains approximately 17 codegen files that
-implement the `ArchCodegen` trait methods:
+Each architecture subdirectory contains approximately 18-19 codegen files
+(including `mod.rs`) that implement the `ArchCodegen` trait methods:
 
 | File | Responsibility |
 |------|---------------|
@@ -146,7 +146,7 @@ For architecture-specific details, see:
 
 The `ArchCodegen` trait (defined in `traits.rs`) is the central abstraction
 that decouples the shared code generation framework from architecture-specific
-instruction emission. It defines approximately 100 methods organized into
+instruction emission. It defines approximately 140 methods organized into
 several categories:
 
 - **State access**: `state()` and `state_ref()` provide mutable and immutable
@@ -165,10 +165,12 @@ several categories:
 - **Casts**: `emit_cast`, `emit_float_to_int`, `emit_int_to_float`.
 - **Control flow**: `emit_jump`, `emit_cond_branch`, `emit_switch`,
   `build_jump_table`.
-- **Function calls**: `emit_call`, `emit_call_indirect`, plus the 6-phase
-  hook methods (`emit_call_compute_stack_space`, `emit_call_spill_fptr`,
-  `emit_call_stack_args`, `emit_call_reg_args`, `emit_call_instruction`,
-  `emit_call_cleanup`, `emit_call_store_result`).
+- **Function calls**: `emit_call` (handles both direct and indirect calls
+  via `direct_name: Option<&str>` and `func_ptr: Option<&Operand>`), plus
+  the 8-phase hook methods (`emit_call_compute_stack_space`,
+  `emit_call_f128_pre_convert`, `emit_call_spill_fptr`,
+  `emit_call_stack_args`, `emit_call_sret_setup`, `emit_call_reg_args`,
+  `emit_call_instruction`, `emit_call_cleanup`, `emit_call_store_result`).
 - **Atomics**: `emit_atomic_load`, `emit_atomic_store`, `emit_atomic_rmw`,
   `emit_atomic_cmpxchg`.
 - **128-bit**: `emit_i128_binop`, `emit_i128_store`, `emit_i128_load`.
@@ -177,7 +179,7 @@ several categories:
 
 ### Default Implementations and Primitive Composition
 
-Approximately 20 methods have default implementations that capture shared
+Approximately 53 methods have default implementations that capture shared
 codegen patterns. These defaults are built from small "primitive" methods that
 each backend overrides with 1--4 line architecture-specific implementations.
 The design lets the shared framework express an algorithm once while backends
@@ -198,10 +200,12 @@ Key default implementations include:
   default.
 - **`emit_binop`**: Classifies the operation as i128, float, or integer and
   delegates to the corresponding specialized method.
-- **`emit_call`**: Orchestrates a 6-phase call sequence (classify arguments,
-  spill function pointer, push stack arguments, load register arguments, emit
-  the call instruction, clean up the stack, store the result). Each phase is a
-  backend-supplied hook method.
+- **`emit_call`**: Orchestrates an 8-phase call sequence (Phase 0: classify
+  arguments and compute stack space, Phase 1: F128 pre-conversion, Phase 2:
+  spill function pointer, Phase 3: push stack arguments, Phase 3.5: sret
+  pointer setup, Phase 4: load register arguments, Phase 5: emit the call
+  instruction, Phase 6: clean up the stack and store the result). Each phase
+  is a backend-supplied hook method.
 - **`emit_load_with_const_offset` / `emit_store_with_const_offset`**: Handle
   GEP-folded memory accesses by dispatching on `SlotAddr` and folding the
   constant offset into the appropriate addressing mode.
@@ -209,10 +213,11 @@ Key default implementations include:
   use relative 32-bit offsets (`.long target - table_base`) to avoid
   unresolved `R_*_ABS64` relocations; i686 uses absolute 4-byte entries.
 
-Backends also provide free functions (`emit_store_default`, `emit_load_default`,
-`emit_cast_default`, `emit_unaryop_default`, `emit_return_default`) that
-backends overriding a method for special types (e.g., x86 F128) can call for
-the non-special cases, avoiding code duplication.
+The `traits.rs` module also provides free functions (`emit_store_default`,
+`emit_load_default`, `emit_cast_default`, `emit_unaryop_default`,
+`emit_return_default`) that backends overriding a trait method for special
+types (e.g., x86 F128) can call for the non-special cases, avoiding code
+duplication.
 
 ### The `delegate_to_impl!` Macro
 
