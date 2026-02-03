@@ -43,7 +43,7 @@ use crate::frontend::sema::builtins;
 use super::type_context::{TypeContext, FunctionTypedefInfo};
 use super::const_eval::{SemaConstEval, ConstMap};
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 /// Outcome of a case segment in a switch statement for -Wreturn-type analysis.
@@ -121,9 +121,9 @@ pub struct SemanticAnalyzer {
     result: SemaResult,
     /// Current enum counter for auto-incrementing enum values.
     enum_counter: i64,
-    /// Counter for generating unique anonymous struct/union keys.
-    /// Uses Cell for interior mutability so type_spec_to_ctype can take &self.
-    anon_struct_counter: Cell<usize>,
+    // Anonymous struct/union keys are generated via TypeContext::next_anon_struct_id()
+    // to ensure a single shared counter across both declaration processing and
+    // expression type inference, avoiding key collisions between the two paths.
     /// Structured diagnostic engine for error/warning reporting.
     /// All sema errors and warnings are emitted with source spans through this
     /// engine, which handles rendering, filtering (-Wall/-Werror), and counting.
@@ -144,7 +144,6 @@ impl SemanticAnalyzer {
             symbol_table: SymbolTable::new(),
             result: SemaResult::default(),
             enum_counter: 0,
-            anon_struct_counter: Cell::new(0),
             diagnostics: RefCell::new(DiagnosticEngine::new()),
             defined_structs: RefCell::new(FxHashSet::default()),
         };
@@ -180,12 +179,8 @@ impl SemanticAnalyzer {
 
     /// Get the analysis results (consumed after analysis).
     pub fn into_result(self) -> SemaResult {
-        // Synchronize the TypeContext's anonymous struct counter with sema's counter.
-        // Both generate keys in the format "__anon_struct_{id}", and the lowerer uses
-        // TypeContext's counter. Without this, the lowerer would start at 0 and
-        // overwrite struct layouts that sema stored at those keys.
-        let sema_count = self.anon_struct_counter.get() as u32;
-        self.result.type_context.set_anon_ctype_counter(sema_count);
+        // Both sema's declaration processing and expression type inference now use
+        // TypeContext::next_anon_struct_id(), so no counter synchronization is needed.
         self.result
     }
 
@@ -1722,8 +1717,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
         let key = if let Some(tag) = name {
             format!("{}.{}", prefix, tag)
         } else {
-            let id = self.anon_struct_counter.get();
-            self.anon_struct_counter.set(id + 1);
+            let id = self.result.type_context.next_anon_struct_id();
             format!("__anon_struct_{}", id)
         };
         // Track whether this struct/union has been defined (has a body in the

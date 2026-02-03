@@ -340,12 +340,6 @@ impl TypeContext {
         id
     }
 
-    /// Set the anonymous struct counter to avoid key collisions between phases.
-    /// Called after sema to ensure the lowerer's counter starts past sema's IDs.
-    pub fn set_anon_ctype_counter(&self, value: u32) {
-        self.anon_ctype_counter.set(value);
-    }
-
     /// Insert a struct layout from a &self context (interior mutability via RefCell).
     pub fn insert_struct_layout_from_ref(&self, key: &str, layout: StructLayout) {
         self.struct_layouts.borrow_mut().insert(key.to_string(), Rc::new(layout));
