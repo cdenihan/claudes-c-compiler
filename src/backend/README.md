@@ -961,24 +961,30 @@ assembler and linker commands respectively.
 **`MY_ASM`**: When set, its value is used as the assembler command instead
 of the target's default GCC toolchain command.
 
-**`MY_LD`** (x86-64 and RISC-V 64): When set, the linker is invoked
+**`MY_LD`** (x86-64, i686, and RISC-V 64): When set, the linker is invoked
 directly (ld-style) instead of going through GCC. The compiler automatically:
 - Discovers and adds CRT startup/finalization objects (crt1.o, crti.o,
   crtbegin.o, crtend.o, crtn.o) from standard system paths
 - Adds library search paths for GCC and system libraries
 - Converts `-Wl,` prefixed flags to direct ld flags
-- Adds the dynamic linker, emulation mode (`-m elf_x86_64` or
-  `-m elf64lriscv`), and security hardening flags (`-z relro`, `-z noexecstack`)
+- Adds the dynamic linker, emulation mode (`-m elf_x86_64`, `-m elf_i386`,
+  or `-m elf64lriscv`), and security hardening flags (`-z relro`,
+  `-z noexecstack`)
 - Handles `-nostdlib`, `-shared`, `-static`, and `-r` (relocatable) modes
 - Uses appropriate CRT variants (crtbeginT.o for -static, crtbeginS.o
   for -shared)
+
+The i686 path probes both cross-compiler paths
+(`/usr/lib/gcc-cross/i686-linux-gnu`) and native paths
+(`/usr/lib/gcc/i686-linux-gnu`), and uses the i386 dynamic linker
+(`/lib/ld-linux.so.2`).
 
 For RISC-V cross-compilation, CRT discovery probes both `gcc-cross` paths
 (Debian/Ubuntu) and native GCC paths, with the dynamic linker set to
 `/lib/ld-linux-riscv64-lp64d.so.1`.
 
-For other targets (i686, ARM), `MY_LD` falls back to using the
-specified command as a GCC-style driver (same flags as the default path).
+For other targets (ARM), `MY_LD` falls back to using the specified command
+as a GCC-style driver (same flags as the default path).
 
 Usage examples:
 
@@ -994,6 +1000,9 @@ MY_LD=ld ccc-x86 -fPIC -shared file.c -o file.so
 
 # Use ld with kernel-style -nostdlib
 MY_LD=ld ccc-x86 -nostdlib file.o -o file -lgcc
+
+# Use system ld directly for i686
+MY_LD=ld ccc-i686 file.c -o file
 
 # Use RISC-V cross-linker directly
 MY_LD=riscv64-linux-gnu-ld ccc-riscv file.c -o file
