@@ -295,7 +295,7 @@ impl MacroTable {
                                 let trimmed_len = expanded.trim_end().len();
                                 let prefix_len = trimmed_len - trail_ident.len();
                                 expanded.truncate(prefix_len);
-                                let trail_expanded = self.expand_function_macro(&trail_mac_clone, &trail_args, expanding);
+                                let (trail_expanded, _) = self.expand_function_macro(&trail_mac_clone, &trail_args, expanding);
                                 expanded.push_str(&trail_expanded);
                                 continue;
                             }
@@ -344,7 +344,7 @@ impl MacroTable {
         }
         let (args, end_pos) = self.parse_macro_args(bytes, j);
         let target_mac_clone = target_mac.clone();
-        let func_expanded = self.expand_function_macro(&target_mac_clone, &args, expanding);
+        let (func_expanded, _) = self.expand_function_macro(&target_mac_clone, &args, expanding);
         Some((func_expanded, end_pos))
     }
 
@@ -528,8 +528,19 @@ impl MacroTable {
             if j < len && bytes[j] == b'(' {
                 let (args, end_pos) = self.parse_macro_args(bytes, j);
                 let mut i = end_pos;
-                let expanded = self.expand_function_macro(mac, &args, expanding);
-                let (expanded, new_i) = self.expand_trailing_func_macros(expanded, bytes, i, expanding);
+                let (expanded, body_ended_with_func_ident) = self.expand_function_macro(mac, &args, expanding);
+                // Per C11 §6.10.3.4, only connect trailing function-like macro
+                // identifiers with subsequent source `(` if the substituted body
+                // (before rescan) truly ended with that identifier. If the body
+                // had tokens after the identifier (e.g., `FOO EMPTY()` from deferred
+                // expansion patterns like `#define DEFER(x) x EMPTY()`), those tokens
+                // act as a barrier during left-to-right scanning, preventing FOO from
+                // connecting with `(` in the source.
+                let (expanded, new_i) = if body_ended_with_func_ident {
+                    self.expand_trailing_func_macros(expanded, bytes, i, expanding)
+                } else {
+                    (expanded, i)
+                };
                 i = new_i;
                 let next = if i < len { Some(bytes[i]) } else { None };
                 Self::append_with_paste_guard(result, &expanded, next);
@@ -687,12 +698,20 @@ impl MacroTable {
     /// into the body. Occurrences adjacent to # or ## use the raw (unexpanded)
     /// argument, handled by handle_stringify_and_paste. After substitution, the
     /// result is rescanned with the current macro name suppressed (§6.10.3.4).
+    /// Expand a function-like macro, returning (expanded_text, body_ended_with_func_ident).
+    /// The second return value indicates whether the substituted body (before rescan)
+    /// ended with a function-like macro identifier. This is needed to correctly implement
+    /// C11 §6.10.3.4: the rescan of the replacement list "along with all subsequent
+    /// preprocessing tokens of the source file" must be left-to-right. If the body
+    /// ended with tokens AFTER a function-like macro name (e.g., `FOO EMPTY()` from
+    /// `#define DEFER(x) x EMPTY()`), those tokens act as a barrier preventing the
+    /// function-like macro from connecting with `(` in the subsequent source tokens.
     fn expand_function_macro(
         &self,
         mac: &MacroDef,
         args: &[String],
         expanding: &mut FxHashSet<String>,
-    ) -> String {
+    ) -> (String, bool) {
         // Step 1-2: Prescan - expand ALL arguments (C11 §6.10.3.1).
         // Per the standard, arguments adjacent to # or ## use the RAW (unexpanded)
         // form, but that is handled separately by handle_stringify_and_paste (Step 3)
@@ -715,11 +734,31 @@ impl MacroTable {
         // Step 4: Substitute parameters with expanded arguments
         let body = self.substitute_params(&body, &mac.params, &expanded_args, mac.is_variadic, mac.has_named_variadic);
 
+        // Check if the substituted body (before rescan) ends with a function-like
+        // macro identifier. Per C11 §6.10.3.4, the rescan processes the replacement
+        // list "along with all subsequent preprocessing tokens" left-to-right. If the
+        // body ends with `FOO EMPTY()` (from deferred expansion patterns), FOO should
+        // NOT connect with `(` from subsequent source tokens because the EMPTY() tokens
+        // act as a barrier during left-to-right scanning. Only if the body truly ends
+        // with a function-like macro identifier (no tokens after it) should we allow
+        // trailing resolution with subsequent source `(`.
+        let body_ends_with_func_ident = {
+            if let Some(trailing) = extract_trailing_ident(&body) {
+                if let Some(tmac) = self.macros.get(trailing.as_str()) {
+                    tmac.is_function_like
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+
         // Step 5: Rescan with the current macro name suppressed
         expanding.insert(mac.name.clone());
         let result = self.expand_text(&body, expanding);
         expanding.remove(&mac.name);
-        result
+        (result, body_ends_with_func_ident)
     }
 
     /// Handle # (stringify) and ## (token paste) operators.

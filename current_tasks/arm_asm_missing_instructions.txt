@@ -1,0 +1,12 @@
+ARM assembler: add missing instruction encodings
+
+Adding the following missing instruction categories to the ARM (AArch64) assembler encoder:
+
+1. Sub-word exclusive load/store: ldxrb, stxrb, ldaxrb, stlxrb, ldxrh, stxrh, ldaxrh, stlxrh
+2. Sub-word load-acquire/store-release: ldarb, ldarh, stlrb, stlrh
+3. System instructions: yield, clrex, dc civac
+4. NEON vector instructions: cmeq, uqsub, sqsub, ushr, mul (vector), ext, addv, umov, dup,
+   mov v.d[N]/xN (insert/extract), mov v.16b (register move), orr/and/eor with .16b arrangement
+5. Parser support for NEON register arrangement operands (v0.16b etc.) and lane indexing (v0.d[1])
+
+Also creating/updating scripts/compare_asm.py for testing.

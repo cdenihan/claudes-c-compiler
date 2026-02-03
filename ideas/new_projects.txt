@@ -15,3 +15,4 @@ QuickJS: PASS (x86; fixed is_all_ones i128 truncation bug in simplify pass)
 CPython: PASS (x86) - fixed AVX2 intrinsics, nested struct global init with PointerMemberAccess
 clay: PASS (all 4 backends: x86, i686, arm, riscv) - fixed by adding missing ARM NEON intrinsics (vorrq_u64, vshlq_n_u64, vld1_u64, vdup_n_u64, vminvq_u32)
 alpine: PASS (all 4 backends: x86, i686, arm, riscv) - fixed by adding sizeof incomplete struct/union type check in sema
+criterion: PASS (all 4 backends: x86, i686, arm, riscv) - fixed preprocessor deferred expansion (DEFER pattern)
