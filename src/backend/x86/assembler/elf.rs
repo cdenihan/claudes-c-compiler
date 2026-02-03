@@ -61,6 +61,21 @@ const SHN_UNDEF: u16 = 0;
 const SHN_ABS: u16 = 0xFFF1;
 const SHN_COMMON: u16 = 0xFFF2;
 
+/// Tracks a jump instruction for relaxation (long -> short).
+#[derive(Clone, Debug)]
+struct JumpInfo {
+    /// Offset of the start of the jump instruction in section data.
+    offset: usize,
+    /// Total length of the instruction (5 for JMP rel32, 6 for Jcc rel32).
+    len: usize,
+    /// Target label name.
+    target: String,
+    /// Whether this is a conditional jump (Jcc) vs unconditional (JMP).
+    is_conditional: bool,
+    /// Whether this jump has already been relaxed to short form.
+    relaxed: bool,
+}
+
 /// Tracks a section being built.
 struct Section {
     name: String,
@@ -70,6 +85,8 @@ struct Section {
     alignment: u64,
     /// Relocations for this section.
     relocations: Vec<ElfRelocation>,
+    /// Jump instructions eligible for short-form relaxation.
+    jumps: Vec<JumpInfo>,
     /// Index in the final section header table.
     #[allow(dead_code)]
     index: usize,
@@ -164,6 +181,7 @@ impl ObjectBuilder {
             data: Vec::new(),
             alignment: if flags & SHF_EXECINSTR != 0 { 16 } else { 1 },
             relocations: Vec::new(),
+            jumps: Vec::new(),
             index: 0, // will be set later
         });
         self.section_map.insert(name.to_string(), idx);
@@ -405,7 +423,26 @@ impl ObjectBuilder {
 
         // Copy encoded bytes to section
         let base_offset = self.sections[sec_idx].data.len() as u64;
+        let instr_len = encoder.bytes.len();
         self.sections[sec_idx].data.extend_from_slice(&encoder.bytes);
+
+        // Detect jump instructions eligible for short-form relaxation.
+        // Long JMP rel32 = E9 xx xx xx xx (5 bytes)
+        // Long Jcc rel32 = 0F 8x xx xx xx xx (6 bytes)
+        // Only consider jumps to labels (they'll have a PC32 relocation).
+        if let Some(ref label) = self.get_jump_target_label(instr) {
+            let is_conditional = instr.mnemonic != "jmp";
+            let expected_len = if is_conditional { 6 } else { 5 };
+            if instr_len == expected_len {
+                self.sections[sec_idx].jumps.push(JumpInfo {
+                    offset: base_offset as usize,
+                    len: expected_len,
+                    target: label.clone(),
+                    is_conditional,
+                    relaxed: false,
+                });
+            }
+        }
 
         // Copy relocations, adjusting offsets
         for reloc in encoder.relocations {
@@ -418,6 +455,23 @@ impl ObjectBuilder {
         }
 
         Ok(())
+    }
+
+    /// Extract the target label from a jump instruction, if any.
+    fn get_jump_target_label(&self, instr: &Instruction) -> Option<String> {
+        let mnem = &instr.mnemonic;
+        let is_jump = mnem == "jmp" || (mnem.starts_with('j') && mnem.len() >= 2 && mnem != "jmp");
+        if !is_jump {
+            return None;
+        }
+        if instr.operands.len() != 1 {
+            return None;
+        }
+        if let Operand::Label(label) = &instr.operands[0] {
+            Some(label.clone())
+        } else {
+            None
+        }
     }
 
     /// Emit the final ELF object file.
@@ -441,12 +495,159 @@ impl ObjectBuilder {
             }
         }
 
+        // Relax long jumps to short jumps where possible
+        self.relax_jumps();
+
         // Resolve internal relocations (labels within the same section)
         self.resolve_internal_relocations();
 
         // Build the ELF file
         let mut elf = ElfWriter::new();
         elf.write_object(&self.sections, &self.symbols, &self.aliases, &self.label_positions)
+    }
+
+    /// Relax long jumps to short jumps when the displacement fits in a signed byte.
+    ///
+    /// Long JMP (E9 rel32, 5 bytes) -> Short JMP (EB rel8, 2 bytes): saves 3 bytes
+    /// Long Jcc (0F 8x rel32, 6 bytes) -> Short Jcc (7x rel8, 2 bytes): saves 4 bytes
+    ///
+    /// Uses an iterative approach: shrinking one jump may bring other jumps within
+    /// short range, so we repeat until no more relaxation is possible.
+    fn relax_jumps(&mut self) {
+        for sec_idx in 0..self.sections.len() {
+            if self.sections[sec_idx].jumps.is_empty() {
+                continue;
+            }
+
+            // Iterate until convergence
+            loop {
+                let mut any_relaxed = false;
+
+                // Collect label positions within this section
+                let mut local_labels: HashMap<String, usize> = HashMap::new();
+                for (name, &(s_idx, offset)) in &self.label_positions {
+                    if s_idx == sec_idx {
+                        local_labels.insert(name.clone(), offset as usize);
+                    }
+                }
+
+                // Find jumps to relax
+                let mut to_relax: Vec<usize> = Vec::new();
+                for (j_idx, jump) in self.sections[sec_idx].jumps.iter().enumerate() {
+                    if jump.relaxed {
+                        continue;
+                    }
+                    if let Some(&target_off) = local_labels.get(&jump.target) {
+                        // Compute displacement from end of the SHORT instruction
+                        // Short form is always 2 bytes, so end = jump.offset + 2
+                        let short_end = jump.offset as i64 + 2;
+                        let disp = target_off as i64 - short_end;
+                        if disp >= -128 && disp <= 127 {
+                            to_relax.push(j_idx);
+                        }
+                    }
+                }
+
+                if to_relax.is_empty() {
+                    break;
+                }
+
+                // Process relaxations from back to front so offsets stay valid
+                to_relax.sort_unstable();
+                to_relax.reverse();
+
+                for &j_idx in &to_relax {
+                    let jump = &self.sections[sec_idx].jumps[j_idx];
+                    let offset = jump.offset;
+                    let old_len = jump.len;
+                    let is_conditional = jump.is_conditional;
+                    let new_len = 2usize; // short form is always 2 bytes
+                    let shrink = old_len - new_len;
+
+                    // Rewrite the instruction bytes in place:
+                    // For Jcc: replace [0F, 8x, d32...] with [7x, d8]
+                    // For JMP: replace [E9, d32...] with [EB, d8]
+                    let data = &mut self.sections[sec_idx].data;
+                    if is_conditional {
+                        // Extract condition code from 0F 8x encoding
+                        let cc = data[offset + 1] - 0x80;
+                        data[offset] = 0x70 + cc;
+                        data[offset + 1] = 0; // placeholder displacement, will be resolved later
+                    } else {
+                        data[offset] = 0xEB;
+                        data[offset + 1] = 0; // placeholder displacement
+                    }
+
+                    // Remove the extra bytes
+                    let remove_start = offset + new_len;
+                    let remove_end = offset + old_len;
+                    data.drain(remove_start..remove_end);
+
+                    // Update all label positions after this point
+                    for (_, pos) in self.label_positions.iter_mut() {
+                        if pos.0 == sec_idx && (pos.1 as usize) > offset {
+                            pos.1 -= shrink as u64;
+                        }
+                    }
+
+                    // Update all relocation offsets after this point
+                    // Also remove the relocation for this jump (it becomes inline displacement)
+                    self.sections[sec_idx].relocations.retain_mut(|reloc| {
+                        let reloc_off = reloc.offset as usize;
+                        // The old relocation for this jump was at offset+1 (JMP) or offset+2 (Jcc)
+                        let old_reloc_pos = if is_conditional { offset + 2 } else { offset + 1 };
+                        if reloc_off == old_reloc_pos {
+                            // Remove this relocation - displacement is resolved inline
+                            return false;
+                        }
+                        if reloc_off > offset {
+                            reloc.offset -= shrink as u64;
+                        }
+                        true
+                    });
+
+                    // Update all other jump offsets after this point
+                    for other_jump in self.sections[sec_idx].jumps.iter_mut() {
+                        if other_jump.offset > offset {
+                            other_jump.offset -= shrink;
+                        }
+                    }
+
+                    // Mark this jump as relaxed
+                    self.sections[sec_idx].jumps[j_idx].relaxed = true;
+                    self.sections[sec_idx].jumps[j_idx].len = new_len;
+                    any_relaxed = true;
+                }
+
+                if !any_relaxed {
+                    break;
+                }
+            }
+
+            // Now resolve the short jump displacements inline
+            let mut local_labels: HashMap<String, usize> = HashMap::new();
+            for (name, &(s_idx, offset)) in &self.label_positions {
+                if s_idx == sec_idx {
+                    local_labels.insert(name.clone(), offset as usize);
+                }
+            }
+
+            // Collect patches to apply
+            let patches: Vec<(usize, u8)> = self.sections[sec_idx].jumps.iter()
+                .filter(|j| j.relaxed)
+                .filter_map(|jump| {
+                    local_labels.get(&jump.target).map(|&target_off| {
+                        let end_of_instr = jump.offset + 2;
+                        let disp = (target_off as i64 - end_of_instr as i64) as i8;
+                        (jump.offset + 1, disp as u8)
+                    })
+                })
+                .collect();
+
+            for (off, byte) in patches {
+                self.sections[sec_idx].data[off] = byte;
+            }
+        }
     }
 
     /// Resolve relocations that reference internal labels (same-section).
