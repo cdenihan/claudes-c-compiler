@@ -1,7 +1,12 @@
-Docs overhaul: improve README quality across all major subsystems.
+Docs Overhaul: Design-Doc Quality READMEs
+==========================================
 
-Goals:
-- Rewrite main README.md: remove project list, remove /verify references, improve architecture diagrams
-- Enhance thin subsystem READMEs (lexer, parser, sema, mem2reg, preprocessor) to be complete design docs
-- Ensure no references to /verify, verify_compiler, or external test harnesses remain
-- Add better ASCII architecture diagrams where helpful
+Status: in_progress
+
+Goal: Comprehensive documentation overhaul
+- Audit all READMEs against actual code for accuracy
+- Remove references to external test pipelines/verify scripts
+- Remove project compilation lists from README
+- Ensure architecture diagrams explain how things fit together
+- Write design-doc quality explanations for major subsystems
+- Make docs complete enough that code can be skipped for understanding

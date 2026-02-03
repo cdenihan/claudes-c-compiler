@@ -4,9 +4,9 @@ Date: 2026-01-30 (updated after generic constraint register clobbering fix)
 
 Current status:
 - Unit tests: 100% pass (692/692 applicable tests)
-- Standard projects (run_all_verify): 12/12 pass
+- Standard projects: 12/12 pass
   (zlib, lua, mquickjs, libpng, jq, libjpeg, libuv, libsodium, mbedtls, libffi, musl + redis*, tcc*)
-  * redis: passes (tested separately, not in standard run)
+  * redis: passes (tested separately)
   * tcc: build succeeds; test suite fails due to missing i686 CRT/headers (same as GCC)
 - sqlite: 622/622 pass
 - postgres: build fails (linker error, R_386_GOTOFF relocation / shared lib)

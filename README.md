@@ -53,8 +53,7 @@ replacement in build systems.
 
 ## Status
 
-The compiler can build and run real-world C projects across all four target architectures,
-including the Linux kernel (boots on x86-64, AArch64, and RISC-V) and PostgreSQL.
+The compiler can build and run real-world C codebases across all four architectures.
 
 ### Known Limitations
 
@@ -75,71 +74,87 @@ including the Linux kernel (boots on x86-64, AArch64, and RISC-V) and PostgreSQL
 
 ---
 
-## Architecture Overview
+## Architecture
+
+### High-Level Pipeline
+
+The compiler follows a classical multi-phase architecture. Each phase is a separate
+Rust module with a well-defined input/output interface:
 
 ```
-                        ┌─────────────────────────────────────┐
-                        │           C Source Files             │
-                        └──────────────┬──────────────────────┘
-                                       │
-                        ┌──────────────▼──────────────────────┐
-                        │          Preprocessor                │
-                        │  (macro expansion, #include, #ifdef) │
-                        └──────────────┬──────────────────────┘
-                                       │  expanded text
-                        ┌──────────────▼──────────────────────┐
-                        │            Lexer                     │
-                        │  (tokens with source locations)      │
-                        └──────────────┬──────────────────────┘
-                                       │  token stream
-                        ┌──────────────▼──────────────────────┐
-                        │            Parser                    │
-                        │  (recursive descent → spanned AST)   │
-                        └──────────────┬──────────────────────┘
-                                       │  AST
-                        ┌──────────────▼──────────────────────┐
-                        │       Semantic Analysis              │
-                        │  (type check, const eval, symbols)   │
-                        └──────────────┬──────────────────────┘
-                                       │  typed AST + TypeContext
-                        ┌──────────────▼──────────────────────┐
-                        │        IR Lowering                   │
-                        │  (AST → alloca-based IR)             │
-                        └──────────────┬──────────────────────┘
-                                       │  alloca IR
-                        ┌──────────────▼──────────────────────┐
-                        │          mem2reg                     │
-                        │  (SSA promotion via dom frontiers)   │
-                        └──────────────┬──────────────────────┘
-                                       │  SSA IR
-                        ┌──────────────▼──────────────────────┐
-                        │     Optimization Passes              │
-                        │  (constant fold, DCE, GVN, LICM,    │
-                        │   inline, IPCP, narrowing, ...)      │
-                        └──────────────┬──────────────────────┘
-                                       │  optimized SSA IR
-                        ┌──────────────▼──────────────────────┐
-                        │       Phi Elimination                │
-                        │  (SSA → register copies)             │
-                        └──────────────┬──────────────────────┘
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │                        C Source Files (.c, .h)                      │
+    └────────────────────────────────┬────────────────────────────────────┘
+                                     │
+    ┌────────────────────────────────▼────────────────────────────────────┐
+    │                    FRONTEND (src/frontend/)                         │
+    │                                                                    │
+    │  ┌──────────────┐    ┌───────┐    ┌────────┐    ┌──────────────┐  │
+    │  │ Preprocessor  │───>│ Lexer │───>│ Parser │───>│     Sema     │  │
+    │  │              │    │       │    │        │    │              │  │
+    │  │ macro expand, │    │tokens │    │spanned │    │ type check,  │  │
+    │  │ #include,     │    │ with  │    │  AST   │    │ const eval,  │  │
+    │  │ #ifdef        │    │ spans │    │        │    │ symbol table │  │
+    │  └──────────────┘    └───────┘    └────────┘    └──────┬───────┘  │
+    └─────────────────────────────────────────────────────────┼──────────┘
+                                                              │
+                                          AST + SemaResult (TypeContext,
+                                          expr types, const values)
+                                                              │
+    ┌─────────────────────────────────────────────────────────▼──────────┐
+    │                    IR SUBSYSTEM (src/ir/)                           │
+    │                                                                    │
+    │  ┌──────────────────┐         ┌────────────────────────────────┐  │
+    │  │   IR Lowering     │────────>│          mem2reg               │  │
+    │  │                  │         │                                │  │
+    │  │ AST → alloca-    │         │ SSA promotion via dominator    │  │
+    │  │ based IR (every   │         │ frontiers; insert phi nodes,   │  │
+    │  │ local is a stack  │         │ rename values                  │  │
+    │  │ slot)             │         │                                │  │
+    │  └──────────────────┘         └──────────────┬─────────────────┘  │
+    └──────────────────────────────────────────────┼────────────────────┘
+                                                   │  SSA IR
+    ┌──────────────────────────────────────────────▼────────────────────┐
+    │               OPTIMIZATION PASSES (src/passes/)                   │
+    │                                                                    │
+    │  Phase 0: Inlining + cleanup                                      │
+    │           ↓                                                        │
+    │  Main Loop (up to 3 iterations, dirty-tracked):                   │
+    │    cfg_simplify → copy_prop → narrow → simplify → constant_fold   │
+    │    → gvn → licm → iv_strength_reduce → if_convert → dce → ipcp   │
+    │           ↓                                                        │
+    │  Phase 11: Dead static elimination                                │
+    │           ↓                                                        │
+    │  Phi Elimination (SSA → register copies)                          │
+    └──────────────────────────────────┬───────────────────────────────-─┘
                                        │  non-SSA IR
-                ┌──────────────────────▼──────────────────────────────┐
-                │              Code Generation + Peephole             │
-                │                                                     │
-                │  ┌────────┐  ┌────────┐  ┌────────┐  ┌──────────┐  │
-                │  │ x86-64 │  │  i686  │  │ AArch64│  │ RISC-V 64│  │
-                │  └────┬───┘  └───┬────┘  └───┬────┘  └────┬─────┘  │
-                └───────┼──────────┼───────────┼────────────┼─────────┘
-                        │          │           │            │
-                        ▼          ▼           ▼            ▼
-                    AT&T asm    AT&T asm    ARM asm      RV asm
-                        │          │           │            │
-                    [gcc -c]   [gcc -c]    [gcc -c]     [gcc -c]
-                        │          │           │            │
-                    [gcc link] [gcc link]  [gcc link]   [gcc link]
-                        │          │           │            │
-                        ▼          ▼           ▼            ▼
-                      ELF        ELF         ELF          ELF
+    ┌──────────────────────────────────▼────────────────────────────────┐
+    │                    BACKEND (src/backend/)                          │
+    │                                                                    │
+    │  ┌─────────────────────────────────────────────────────────────┐  │
+    │  │              Code Generation (ArchCodegen trait)              │  │
+    │  │                                                              │  │
+    │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────┐  │  │
+    │  │  │  x86-64  │  │   i686   │  │  AArch64 │  │  RISC-V 64 │  │  │
+    │  │  │ SysV ABI │  │  cdecl   │  │ AAPCS64  │  │   LP64D    │  │  │
+    │  │  └─────┬────┘  └─────┬────┘  └────┬─────┘  └─────┬──────┘  │  │
+    │  └────────┼─────────────┼────────────┼───────────────┼─────────┘  │
+    │           │             │            │               │            │
+    │  ┌────────▼─────────────▼────────────▼───────────────▼─────────┐  │
+    │  │              Peephole Optimizer (per-arch)                    │  │
+    │  │  store/load forwarding, dead code, copy prop, branch fusion  │  │
+    │  └────────┬─────────────┬────────────┬───────────────┬─────────┘  │
+    └───────────┼─────────────┼────────────┼───────────────┼────────────┘
+                │             │            │               │
+                ▼             ▼            ▼               ▼
+            AT&T asm      AT&T asm     ARM asm         RV asm
+                │             │            │               │
+            [gcc -c]      [gcc -c]     [gcc -c]        [gcc -c]
+                │             │            │               │
+            [gcc link]    [gcc link]   [gcc link]      [gcc link]
+                │             │            │               │
+                ▼             ▼            ▼               ▼
+              ELF           ELF          ELF             ELF
 ```
 
 ### Source Tree
@@ -232,6 +247,9 @@ C source
   eliminates redundant patterns (store/load forwarding, dead stores, copy propagation)
   from the stack-based code generator. The x86 peephole is the most mature with 8+
   pass types.
+- **Dual type system**: CType represents C-level types (preserving `int` vs `long`
+  distinctions for type checking), while IrType is a flat machine-level enumeration
+  (`I8`..`I128`, `F32`, `F64`, `F128`, `Ptr`). The lowering phase bridges between them.
 
 ---
 
@@ -239,8 +257,6 @@ C source
 
 - `src/` — Compiler source code (Rust)
 - `include/` — Bundled C headers (SSE/AVX/NEON intrinsic stubs)
-- `tests/` — Unit test suite
+- `tests/` — Unit test suite (each test is a directory with `main.c` and expected output)
 - `ideas/` — Design docs and future work proposals
-- `current_tasks/` — Active work items (lock files for multi-agent coordination)
-- `completed_tasks/` — Finished work items (for reference)
 - `scripts/` — Helper scripts (i686 cross-compilation setup)

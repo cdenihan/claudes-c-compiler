@@ -20,4 +20,4 @@ Key changes:
   when the base is in a register
 
 Performance: ~4% runtime improvement on zlib minigzip, ~9% code size reduction in deflate.o
-Correctness: verify_compiler.py --ratio 10: 2966/2990 pass (99.2%), all 24 failures pre-existing
+Correctness: 2966/2990 pass (99.2%), all 24 failures pre-existing
