@@ -1,0 +1,11 @@
+Fix all 7 clippy::ptr_arg warnings and remove the crate-level #![allow(clippy::ptr_arg)] suppression.
+
+Change &mut Vec<T> parameters to &mut [T] in functions that only use slice operations
+(indexing, iteration, sort) and don't need Vec-specific methods (push, extend, retain, etc.).
+
+Files affected:
+- src/passes/simplify.rs (set_def)
+- src/backend/stack_layout.rs (pack_values_into_slots)
+- src/backend/inline_asm.rs (finalize_operands_and_build_gcc_map)
+- src/backend/x86/codegen/peephole/passes/store_forwarding.rs (invalidate_slots_at, gsf_handle_load)
+- src/backend/riscv/codegen/peephole.rs (gsf_invalidate_overlapping, gsf_invalidate_reg)
