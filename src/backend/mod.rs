@@ -251,7 +251,28 @@ impl Target {
 
     /// Assemble text to object file with dynamic extra arguments.
     /// Used to pass through -mabi= and -march= flags from the CLI.
+    ///
+    /// When `MY_ASM=builtin` is set and the target has a native assembler
+    /// implementation, uses the built-in assembler instead of shelling out
+    /// to an external tool.
     pub(crate) fn assemble_with_extra(&self, asm_text: &str, output_path: &str, extra_args: &[String]) -> Result<(), String> {
+        // Check if we should use the built-in assembler
+        if let Ok(ref val) = std::env::var("MY_ASM") {
+            if val == "builtin" {
+                match self {
+                    Target::Aarch64 => {
+                        return arm::assembler::assemble(asm_text, output_path);
+                    }
+                    // TODO: add builtin assembler for other targets
+                    _ => {
+                        return Err(format!(
+                            "MY_ASM=builtin: no built-in assembler for {} yet",
+                            self.triple()
+                        ));
+                    }
+                }
+            }
+        }
         common::assemble_with_extra(&self.assembler_config(), asm_text, output_path, extra_args)
     }
 
