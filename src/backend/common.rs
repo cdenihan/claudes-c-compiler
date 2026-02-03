@@ -649,24 +649,13 @@ fn link_direct_ld(
         }
     }
 
-    // Library search paths
-    if let Some(ref gcc) = gcc_lib_dir {
-        cmd.arg(format!("-L{}", gcc));
-    }
-    if let Some(ref crt) = crt_dir {
-        cmd.arg(format!("-L{}", crt));
-    }
-    for dir in arch.system_lib_dirs {
-        if std::path::Path::new(dir).exists() {
-            cmd.arg(format!("-L{}", dir));
-        }
-    }
-
     for obj in object_files {
         cmd.arg(obj);
     }
 
-    // User-provided linker args, with -Wl, prefix stripping and GCC flag conversion
+    // User-provided linker args, with -Wl, prefix stripping and GCC flag conversion.
+    // User args (including -L paths) come BEFORE system library search paths,
+    // matching GCC's behavior so user-supplied libraries take precedence.
     for arg in user_args {
         if let Some(wl_arg) = arg.strip_prefix("-Wl,") {
             for part in wl_arg.split(',') {
@@ -686,8 +675,22 @@ fn link_direct_ld(
         }
     }
 
-    // Default libraries (skip for -nostdlib, -shared, and -r)
-    if !is_nostdlib && !is_shared && !is_relocatable {
+    // System library search paths come after user args so user -L paths
+    // take precedence (matches GCC linker driver ordering)
+    if let Some(ref gcc) = gcc_lib_dir {
+        cmd.arg(format!("-L{}", gcc));
+    }
+    if let Some(ref crt) = crt_dir {
+        cmd.arg(format!("-L{}", crt));
+    }
+    for dir in arch.system_lib_dirs {
+        if std::path::Path::new(dir).exists() {
+            cmd.arg(format!("-L{}", dir));
+        }
+    }
+
+    // Default libraries (skip for -nostdlib and -r; shared libraries need -lc too)
+    if !is_nostdlib && !is_relocatable {
         if is_static {
             cmd.arg("--start-group");
             cmd.arg("-lgcc");
