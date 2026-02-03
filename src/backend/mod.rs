@@ -269,6 +269,9 @@ impl Target {
                             .map_err(|e| format!("Failed to write object file: {}", e))?;
                         return Ok(());
                     }
+                    Target::Riscv64 => {
+                        return riscv::assembler::assemble(asm_text, output_path);
+                    }
                     // TODO: add builtin assembler for other targets
                     _ => {
                         return Err(format!(
