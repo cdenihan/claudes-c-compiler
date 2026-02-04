@@ -1,0 +1,13 @@
+Deduplicate ARM and RISC-V ELF writer shared infrastructure.
+
+The ARM and RISC-V assembler ELF writers (arm/assembler/elf_writer.rs and
+riscv/assembler/elf_writer.rs) have structurally identical types (Section,
+ElfReloc, ElfSymbol) and many duplicated methods (ensure_section, current_offset,
+emit_bytes, emit_u32_le, add_reloc, align_to, write_elf, process_directive for
+.global/.weak/.hidden/.type/.size/.align/.byte/.short/.long/.quad/.comm/.local/.set).
+
+This task extracts the shared types and methods into the shared elf.rs module,
+reducing ~500+ lines of duplication while keeping architecture-specific logic
+(instruction encoding, branch resolution, compression) in the per-arch files.
+
+Status: in_progress
