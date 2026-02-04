@@ -262,6 +262,15 @@ pub fn link_with_args(config: &LinkerConfig, object_files: &[&str], output_path:
         let is_disabled = matches!(lower.as_str(), "0" | "false" | "no" | "off" | "");
 
         if !is_disabled {
+            // For x86-64, use the built-in native linker.
+            // This avoids requiring an external ld binary entirely.
+            if config.expected_elf_machine == 62 && !is_shared && !is_relocatable {
+                return link_builtin_x86(
+                    object_files, output_path, user_args,
+                    is_nostdlib, is_static,
+                );
+            }
+
             // Resolve the actual ld binary path. If the value is a boolean-like flag
             // ("1", "true", "yes"), auto-detect the correct ld for the target arch.
             // Otherwise use the provided value as the ld binary path.
@@ -541,6 +550,109 @@ fn find_crt_dir(arch: &DirectLdArchConfig) -> Option<String> {
         }
     }
     None
+}
+
+/// Link using the built-in native x86-64 ELF linker.
+///
+/// This is the fully native path: no external ld binary is needed. The linker
+/// reads ELF .o files and .a archives, resolves symbols against system shared
+/// libraries (libc.so.6), handles relocations, and produces a dynamically-linked
+/// ELF executable. Activated by MY_LD=1/true/yes/on/builtin for x86-64 targets.
+fn link_builtin_x86(
+    object_files: &[&str],
+    output_path: &str,
+    user_args: &[String],
+    is_nostdlib: bool,
+    _is_static: bool,
+) -> Result<(), String> {
+    use crate::backend::x86::linker;
+
+    let arch = &DIRECT_LD_X86_64;
+    let gcc_lib_dir = find_gcc_lib_dir(arch);
+    let crt_dir = find_crt_dir(arch);
+
+    let mut all_lib_paths: Vec<&str> = Vec::new();
+
+    // Add GCC and CRT library paths
+    if let Some(ref gcc) = gcc_lib_dir {
+        all_lib_paths.push(gcc);
+    }
+    if let Some(ref crt) = crt_dir {
+        all_lib_paths.push(crt);
+    }
+    for dir in arch.system_lib_dirs {
+        if std::path::Path::new(dir).exists() {
+            all_lib_paths.push(dir);
+        }
+    }
+
+    // Add user-provided -L paths from args
+    let mut user_lib_paths: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < user_args.len() {
+        let arg = &user_args[i];
+        if let Some(path) = arg.strip_prefix("-L") {
+            if path.is_empty() {
+                if i + 1 < user_args.len() {
+                    i += 1;
+                    user_lib_paths.push(user_args[i].clone());
+                }
+            } else {
+                user_lib_paths.push(path.to_string());
+            }
+        } else if arg.starts_with("-Wl,") {
+            for part in arg[4..].split(',') {
+                if let Some(lpath) = part.strip_prefix("-L") {
+                    user_lib_paths.push(lpath.to_string());
+                }
+            }
+        }
+        i += 1;
+    }
+
+    // Collect CRT objects
+    let mut crt_before: Vec<String> = Vec::new();
+    let mut crt_after: Vec<String> = Vec::new();
+
+    if !is_nostdlib {
+        if let Some(ref crt) = crt_dir {
+            crt_before.push(format!("{}/crt1.o", crt));
+            crt_before.push(format!("{}/crti.o", crt));
+        }
+        if let Some(ref gcc) = gcc_lib_dir {
+            crt_before.push(format!("{}/crtbegin.o", gcc));
+        }
+        if let Some(ref gcc) = gcc_lib_dir {
+            crt_after.push(format!("{}/crtend.o", gcc));
+        }
+        if let Some(ref crt) = crt_dir {
+            crt_after.push(format!("{}/crtn.o", crt));
+        }
+    }
+
+    // Default libraries
+    let needed_libs: Vec<&str> = if !is_nostdlib {
+        vec!["gcc", "c", "m"]
+    } else {
+        vec![]
+    };
+
+    // Combine library paths: user paths first, then system paths
+    let mut combined_lib_paths: Vec<&str> = user_lib_paths.iter().map(|s| s.as_str()).collect();
+    combined_lib_paths.extend_from_slice(&all_lib_paths);
+
+    let crt_before_refs: Vec<&str> = crt_before.iter().map(|s| s.as_str()).collect();
+    let crt_after_refs: Vec<&str> = crt_after.iter().map(|s| s.as_str()).collect();
+
+    linker::link_builtin(
+        object_files,
+        output_path,
+        user_args,
+        &combined_lib_paths,
+        &needed_libs,
+        &crt_before_refs,
+        &crt_after_refs,
+    )
 }
 
 /// Link using ld directly (not through GCC) for any supported architecture.
