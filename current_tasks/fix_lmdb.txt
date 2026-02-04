@@ -1,0 +1,2 @@
+Testing lmdb project with builtin assembler and linker (MY_ASM=builtin MY_LD=builtin).
+Will fix any compiler/assembler/linker issues found.
