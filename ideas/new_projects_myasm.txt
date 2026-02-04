@@ -116,3 +116,8 @@ Tracking project build/test results with MY_ASM=builtin MY_LD=builtin
 | quicklz | PASS | TODO | TODO | TODO | Passes x86 |
 | lemon   | PASS | TODO | TODO | TODO | Passes x86 |
 | incbin  | PASS | PASS | PASS | PASS | Added .incbin directive to x86/i686/ARM assemblers; fixed .int directive recognition; fixed i686 SymbolDiff resolution |
+| uzlib   | PASS | PASS | PASS | PASS | All architectures pass out of the box |
+| spng    | PASS | PASS | PASS | PASS | All architectures pass out of the box |
+| zlib    | PASS | TODO | TODO | TODO | Passes x86 |
+| protobuf-c | PASS | TODO | TODO | TODO | Passes x86 |
+| cdb     | PASS | TODO | TODO | TODO | Passes x86 |
