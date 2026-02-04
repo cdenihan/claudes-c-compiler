@@ -1344,7 +1344,12 @@ fn sign_extend_li(val: i64, bits: u32) -> i64 {
     (val << shift) >> shift
 }
 
-/// Emit lui + addi (or just lui/addi) for a 32-bit signed value into register `rd`.
+/// Emit lui + addiw (or just addi) for a 32-bit signed value into register `rd`.
+///
+/// On RV64, the `li` pseudo-instruction uses `lui + addiw` (not `lui + addi`)
+/// to ensure proper 32-bit sign extension. GAS always uses `addiw` after `lui`
+/// for `li` on RV64. For small values (fits in 12 bits), `addi rd, x0, imm`
+/// is sufficient since the result is the same.
 fn encode_li_32bit(rd: u32, imm: i32) -> Vec<u32> {
     if imm >= -2048 && imm <= 2047 {
         return vec![encode_i(OP_OP_IMM, rd, 0, 0, imm)]; // addi rd, x0, imm
@@ -1353,7 +1358,10 @@ fn encode_li_32bit(rd: u32, imm: i32) -> Vec<u32> {
     let hi = ((imm as u32).wrapping_add(if lo < 0 { 0x1000 } else { 0 })) & 0xFFFFF000;
     let mut words = vec![encode_u(OP_LUI, rd, hi)];
     if lo != 0 {
-        words.push(encode_i(OP_OP_IMM, rd, 0, rd, lo)); // addi rd, rd, lo
+        // Use addiw (OP_OP_IMM_32) to match GAS behavior on RV64.
+        // lui sign-extends the 20-bit immediate to 64 bits, and addiw
+        // ensures the final 32-bit result is properly sign-extended.
+        words.push(encode_i(OP_OP_IMM_32, rd, 0, rd, lo)); // addiw rd, rd, lo
     }
     words
 }

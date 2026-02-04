@@ -1,6 +1,0 @@
-Fix RISC-V assembler: li pseudo-instruction uses addi instead of addiw after lui
-
-The encode_li_32bit function in the RISC-V assembler uses OP_OP_IMM (addi)
-instead of OP_OP_IMM_32 (addiw) for the low 12-bit addition after lui.
-On RV64, GAS always uses addiw after lui for the li pseudo-instruction.
-This causes incorrect code generation for sqlite and redis when using MY_ASM=builtin.
