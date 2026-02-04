@@ -201,21 +201,23 @@ impl ElfWriter {
                 self.pending_types.insert(name.clone(), *kind);
             }
             AsmItem::Size(name, expr) => {
-                // Resolve .-symbol immediately to capture the current position
-                match expr {
+                // For CurrentMinusSymbol (.-sym), record the current position
+                // as an internal label so that after jump relaxation we can
+                // compute the correct size from updated label positions.
+                let resolved = match expr {
                     SizeExpr::CurrentMinusSymbol(start_sym) => {
-                        if let Some(&(sec_idx, start_off)) = self.label_positions.get(start_sym) {
+                        if let Some(sec_idx) = self.current_section {
                             let current_off = self.sections[sec_idx].data.len() as u32;
-                            let size = (current_off - start_off) as u64;
-                            self.pending_sizes.insert(name.clone(), SizeExpr::Constant(size));
+                            let end_label = format!(".Lsize_end_{}", name);
+                            self.label_positions.insert(end_label.clone(), (sec_idx, current_off));
+                            SizeExpr::SymbolDiff(end_label, start_sym.clone())
                         } else {
-                            self.pending_sizes.insert(name.clone(), expr.clone());
+                            expr.clone()
                         }
                     }
-                    _ => {
-                        self.pending_sizes.insert(name.clone(), expr.clone());
-                    }
-                }
+                    other => other.clone(),
+                };
+                self.pending_sizes.insert(name.clone(), resolved);
             }
             AsmItem::Label(name) => {
                 self.ensure_section()?;
@@ -498,17 +500,17 @@ impl ElfWriter {
     }
 
     fn emit_elf(mut self) -> Result<Vec<u8>, String> {
-        // Relax jumps first - this changes label positions and section data
+        // Relax jumps first, before resolving sizes and updating symbol values
         self.relax_jumps();
 
-        // Update symbol values from label_positions after relaxation
-        for (name, &(_, offset)) in &self.label_positions {
+        // After relaxation, update all symbol values from the (now-correct) label_positions.
+        for (name, &(_sec_idx, offset)) in &self.label_positions {
             if let Some(&sym_idx) = self.symbol_map.get(name) {
                 self.symbols[sym_idx].value = offset;
             }
         }
 
-        // Resolve sizes (after relaxation so positions are final)
+        // Resolve sizes (after relaxation so sizes are correct)
         for (name, expr) in &self.pending_sizes {
             if let Some(&sym_idx) = self.symbol_map.get(name) {
                 let size = match expr {
@@ -520,6 +522,11 @@ impl ElfWriter {
                         } else {
                             0
                         }
+                    }
+                    SizeExpr::SymbolDiff(end_label, start_label) => {
+                        let end_off = self.label_positions.get(end_label).map(|p| p.1).unwrap_or(0);
+                        let start_off = self.label_positions.get(start_label).map(|p| p.1).unwrap_or(0);
+                        end_off.wrapping_sub(start_off)
                     }
                 };
                 self.symbols[sym_idx].size = size;

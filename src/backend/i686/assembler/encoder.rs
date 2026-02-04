@@ -556,6 +556,10 @@ impl InstructionEncoder {
                 self.add_relocation(sym, R_386_32, *addend);
                 (0i64, true)
             }
+            Displacement::SymbolPlusOffset(sym, offset) => {
+                self.add_relocation(sym, R_386_32, *offset);
+                (0i64, true)
+            }
             Displacement::SymbolMod(sym, modifier) => {
                 let reloc_type = self.tls_reloc_type(modifier);
                 self.add_relocation(sym, reloc_type, 0);

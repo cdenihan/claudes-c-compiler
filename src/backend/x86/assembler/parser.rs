@@ -90,6 +90,8 @@ pub enum SymbolKind {
 pub enum SizeExpr {
     Constant(u64),
     CurrentMinusSymbol(String),
+    /// end_label - start_label (resolved by ELF writer after relaxation)
+    SymbolDiff(String, String),
 }
 
 /// A data value that can be a constant, a symbol, or a symbol expression.
@@ -189,6 +191,8 @@ pub enum Displacement {
     SymbolAddend(String, i64),
     /// Symbol with relocation modifier: symbol@GOT, symbol@GOTPCREL, symbol@TPOFF, etc.
     SymbolMod(String, String),
+    /// Symbol plus integer offset: symbol+N or symbol-N
+    SymbolPlusOffset(String, i64),
 }
 
 /// Parse assembly text into a list of AsmItems.
@@ -803,7 +807,7 @@ fn parse_memory_inner(s: &str) -> Result<MemoryOperand, String> {
     }
 }
 
-/// Parse a displacement: integer, symbol, or symbol@modifier.
+/// Parse a displacement: integer, symbol, symbol+offset, or symbol@modifier.
 fn parse_displacement(s: &str) -> Result<Displacement, String> {
     let s = s.trim();
     if s.is_empty() {
@@ -822,22 +826,39 @@ fn parse_displacement(s: &str) -> Result<Displacement, String> {
         return Ok(Displacement::SymbolMod(sym, modifier));
     }
 
-    // Check for symbol+offset or symbol-offset (e.g., GD_struct+128)
-    // Look for + or - that separates symbol from offset (skip first char for .-prefixed labels)
-    for (i, c) in s.char_indices().skip(1) {
-        if c == '+' || c == '-' {
-            let sym = s[..i].trim();
-            let offset_str = &s[i..]; // includes the sign
-            if let Ok(offset) = parse_integer_expr(offset_str) {
-                if !sym.is_empty() && !sym.contains(' ') {
-                    return Ok(Displacement::SymbolAddend(sym.to_string(), offset));
-                }
-            }
-        }
+    // Check for symbol+offset or symbol-offset (e.g., `.Lstr0+1`, `foo-4`)
+    // Find the last '+' or '-' that's not at position 0 (to avoid splitting
+    // negative numbers or labels starting with '.')
+    if let Some(offset_disp) = try_parse_symbol_plus_offset(s) {
+        return Ok(offset_disp);
     }
 
     // Plain symbol
     Ok(Displacement::Symbol(s.to_string()))
+}
+
+/// Try to parse a `symbol+offset` or `symbol-offset` expression.
+/// Returns None if the string doesn't match this pattern.
+fn try_parse_symbol_plus_offset(s: &str) -> Option<Displacement> {
+    // Scan for '+' or '-' that separates the symbol from the offset.
+    // Skip the first character to avoid splitting on leading sign/dot.
+    for (i, c) in s.char_indices().skip(1) {
+        if c == '+' || c == '-' {
+            let sym = s[..i].trim();
+            let offset_str = s[i..].trim(); // includes the + or -
+            if sym.is_empty() {
+                continue;
+            }
+            // The offset part must be parseable as an integer
+            if let Ok(offset) = parse_integer_expr(offset_str) {
+                // Make sure the symbol part looks like a valid symbol name
+                if sym.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '$') {
+                    return Some(Displacement::SymbolPlusOffset(sym.to_string(), offset));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Parse a comma-separated list of integer values.

@@ -98,6 +98,9 @@ struct ElfRelocation {
     symbol: String,
     reloc_type: u32,
     addend: i64,
+    /// For symbol-difference relocations (.long a - b), stores the `b` symbol.
+    /// The ELF writer resolves this: addend += offset_in_section - offset_of(b)
+    diff_symbol: Option<String>,
 }
 
 /// Symbol info collected during assembly.
@@ -223,21 +226,23 @@ impl ElfWriter {
                 self.pending_types.insert(name.clone(), *kind);
             }
             AsmItem::Size(name, expr) => {
-                // Resolve .-symbol immediately to capture the current position
-                match expr {
+                // For CurrentMinusSymbol (.-sym), record the current position
+                // as an internal label so that after jump relaxation we can
+                // compute the correct size from updated label positions.
+                let resolved = match expr {
                     SizeExpr::CurrentMinusSymbol(start_sym) => {
-                        if let Some(&(sec_idx, start_off)) = self.label_positions.get(start_sym) {
+                        if let Some(sec_idx) = self.current_section {
                             let current_off = self.sections[sec_idx].data.len() as u64;
-                            let size = current_off - start_off;
-                            self.pending_sizes.insert(name.clone(), SizeExpr::Constant(size));
+                            let end_label = format!(".Lsize_end_{}", name);
+                            self.label_positions.insert(end_label.clone(), (sec_idx, current_off));
+                            SizeExpr::SymbolDiff(end_label, start_sym.clone())
                         } else {
-                            self.pending_sizes.insert(name.clone(), expr.clone());
+                            expr.clone()
                         }
                     }
-                    _ => {
-                        self.pending_sizes.insert(name.clone(), expr.clone());
-                    }
-                }
+                    other => other.clone(),
+                };
+                self.pending_sizes.insert(name.clone(), resolved);
             }
             AsmItem::Label(name) => {
                 self.ensure_section()?;
@@ -401,6 +406,7 @@ impl ElfWriter {
                         symbol: sym.clone(),
                         reloc_type,
                         addend: 0,
+                        diff_symbol: None,
                     });
                     let section = &mut self.sections[sec_idx];
                     section.data.extend(std::iter::repeat(0).take(size));
@@ -413,23 +419,23 @@ impl ElfWriter {
                         symbol: sym.clone(),
                         reloc_type,
                         addend: *addend,
+                        diff_symbol: None,
                     });
                     let section = &mut self.sections[sec_idx];
                     section.data.extend(std::iter::repeat(0).take(size));
                 }
-                DataValue::SymbolDiff(a, _b) => {
-                    // For .long .LBB3 - .Ljt_0, we need to resolve this.
-                    // If both are in the same section, this becomes a constant.
-                    // Otherwise, we need a pair of relocations.
-                    // For now, emit placeholder and add relocation.
+                DataValue::SymbolDiff(a, b) => {
+                    // For `.long a - b` (e.g., .long .LBB3 - .Ljt_0):
+                    // Store as a R_X86_64_PC32 relocation with diff_symbol set.
+                    // The ELF writer will resolve the addend correctly after all
+                    // labels are known (handles forward references).
                     let offset = self.sections[sec_idx].data.len() as u64;
-                    // Emit symbol_a - symbol_b as a relocation against symbol_a
-                    // with addend that subtracts symbol_b's position
                     self.sections[sec_idx].relocations.push(ElfRelocation {
                         offset,
                         symbol: a.clone(),
                         reloc_type: if size == 4 { R_X86_64_PC32 } else { R_X86_64_64 },
                         addend: 0,
+                        diff_symbol: Some(b.clone()),
                     });
                     let section = &mut self.sections[sec_idx];
                     section.data.extend(std::iter::repeat(0).take(size));
@@ -477,6 +483,7 @@ impl ElfWriter {
                 symbol: reloc.symbol,
                 reloc_type: reloc.reloc_type,
                 addend: reloc.addend,
+                diff_symbol: None,
             });
         }
 
@@ -503,18 +510,18 @@ impl ElfWriter {
     /// Emit the final ELF object file.
     fn emit_elf(mut self) -> Result<Vec<u8>, String> {
         // Relax long jumps to short jumps where possible.
-        // This must happen BEFORE resolving sizes and symbol values,
+        // This must happen BEFORE resolving sizes and updating symbol values,
         // because relaxation changes label positions and section data lengths.
         self.relax_jumps();
 
-        // Update symbol values from label_positions after relaxation
-        for (name, &(sec_idx, offset)) in &self.label_positions {
+        // After relaxation, update all symbol values from the (now-correct) label_positions.
+        for (name, &(_sec_idx, offset)) in &self.label_positions {
             if let Some(&sym_idx) = self.symbol_map.get(name) {
                 self.symbols[sym_idx].value = offset;
             }
         }
 
-        // Resolve sizes from .size directives (after relaxation so positions are final)
+        // Resolve sizes from .size directives (after relaxation so sizes are correct)
         for (name, expr) in &self.pending_sizes {
             if let Some(&sym_idx) = self.symbol_map.get(name) {
                 let size = match expr {
@@ -527,6 +534,12 @@ impl ElfWriter {
                         } else {
                             0
                         }
+                    }
+                    SizeExpr::SymbolDiff(end_label, start_label) => {
+                        // Compute end_label - start_label using post-relaxation positions
+                        let end_off = self.label_positions.get(end_label).map(|p| p.1).unwrap_or(0);
+                        let start_off = self.label_positions.get(start_label).map(|p| p.1).unwrap_or(0);
+                        end_off.wrapping_sub(start_off)
                     }
                 };
                 self.symbols[sym_idx].size = size;
@@ -712,6 +725,27 @@ impl ElfWriter {
             let mut unresolved = Vec::new();
 
             for reloc in &self.sections[sec_idx].relocations {
+                // SymbolDiff relocations are cross-section; don't resolve inline
+                if reloc.diff_symbol.is_some() {
+                    // For SymbolDiff where both symbols end up in the same section,
+                    // we CAN resolve to a constant.
+                    if let Some(ref diff_sym) = reloc.diff_symbol {
+                        if let (Some(&(a_sec, a_off)), Some(&(b_sec, b_off))) = (
+                            self.label_positions.get(&reloc.symbol),
+                            self.label_positions.get(diff_sym),
+                        ) {
+                            if a_sec == b_sec {
+                                // Both in same section: constant = a - b
+                                let val = a_off as i64 - b_off as i64;
+                                resolved.push((reloc.offset as usize, val as i32));
+                                continue;
+                            }
+                        }
+                    }
+                    unresolved.push(reloc.clone());
+                    continue;
+                }
+
                 if let Some(&(target_sec, target_off)) = self.label_positions.get(&reloc.symbol) {
                     let is_local = self.is_local_symbol(&reloc.symbol);
                     if target_sec == sec_idx && is_local
@@ -1060,7 +1094,7 @@ impl ElfByteWriter {
 
                 // Compute addend: for local symbols referenced by section symbol,
                 // the addend includes the symbol's offset within the section
-                let addend = if let Some(&(target_sec, target_off)) = label_positions.get(&reloc.symbol) {
+                let mut addend = if let Some(&(target_sec, target_off)) = label_positions.get(&reloc.symbol) {
                     if let Some(&sec_sym) = section_sym_indices.get(&target_sec) {
                         if sym_idx == sec_sym {
                             // Using section symbol: addend must include offset
@@ -1074,6 +1108,20 @@ impl ElfByteWriter {
                 } else {
                     reloc.addend
                 };
+
+                // For symbol-difference relocations (.long a - b):
+                // R_X86_64_PC32 computes S + A - P, but we want a - b.
+                // Since S + A already has the offset of `a`, we need to
+                // adjust so that P effectively becomes b's address.
+                // addend += reloc.offset - offset_of(b) when b is in same section.
+                if let Some(ref diff_sym) = reloc.diff_symbol {
+                    if let Some(&(b_sec, b_off)) = label_positions.get(diff_sym) {
+                        // b is in the same section as the relocation (typical case)
+                        let _ = b_sec; // b_sec should equal the current section
+                        addend += reloc.offset as i64 - b_off as i64;
+                    }
+                }
+
                 self.write_i64(addend);
             }
         }
