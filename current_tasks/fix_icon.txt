@@ -1,1 +1,0 @@
-Fixing Icon project for x86 target with builtin assembler/linker.

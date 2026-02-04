@@ -817,13 +817,15 @@ libraries (`/lib/x86_64-linux-gnu/libc.so.6`, etc.).  This is pragmatic but
 not portable.  A production linker would use `ldconfig` cache or search paths
 from `/etc/ld.so.conf`.
 
-### 10. No Section Headers in Output
+### 10. Section Headers in Output
 
-The output executable does not contain a section header table (the ELF header's
-`e_shoff`, `e_shnum`, and `e_shentsize` are all zero).  This is valid for
-execution -- the kernel and dynamic linker only use program headers.  However,
-it means tools like `readelf -S` and `objdump -d` will not show section
-information.  This was a deliberate simplification.
+The output executable includes a section header table appended after the main
+file data.  This enables tools like `strip`, `readelf -S`, and `objdump -d`
+to work correctly.  The section header table describes all loadable sections
+(.interp, .gnu.hash, .dynsym, .dynstr, .rela.dyn, .rela.plt, .plt, merged
+text/rodata/data sections, TLS sections, .init_array, .fini_array, .dynamic,
+.got, .got.plt, .bss) plus a `.shstrtab` string table.  The `e_shoff`,
+`e_shnum`, and `e_shstrndx` fields are patched back into the ELF header.
 
 ### 11. Flat Output Buffer
 
