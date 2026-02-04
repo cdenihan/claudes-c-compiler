@@ -782,11 +782,14 @@ pub(crate) fn link_builtin_i686(
 
     let mut setup = resolve_builtin_link_setup(&DIRECT_LD_I686, user_args, is_nostdlib, is_static);
 
-    // The i686 builtin linker scans shared libraries for dynamic symbol resolution.
-    // Unlike the x86-64 linker which resolves libgcc via libgcc_s.so.1, the i686
-    // environment uses libgcc.a (static archive) linked through CRT objects. Only
-    // libc and libm need dynamic symbol scanning.
-    setup.needed_libs.retain(|lib| lib != "gcc");
+    // i686 static linking needs libgcc.a for compiler helper functions
+    // (__divmoddi4, __udivmoddi4, etc.) referenced by libc, plus libgcc_eh.a
+    // for exception handling / stack unwinding.
+    if !is_nostdlib {
+        if let Some(pos) = setup.needed_libs.iter().position(|l| l == "gcc") {
+            setup.needed_libs.insert(pos + 1, "gcc_eh".to_string());
+        }
+    }
 
     let lib_path_refs: Vec<&str> = setup.lib_paths.iter().map(|s| s.as_str()).collect();
     let needed_lib_refs: Vec<&str> = setup.needed_libs.iter().map(|s| s.as_str()).collect();

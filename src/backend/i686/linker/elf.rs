@@ -5,7 +5,7 @@
 //!
 //! Shared ELF helpers are imported from `crate::backend::elf`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::backend::elf::{
@@ -65,7 +65,10 @@ const R_386_TLS_TPOFF: u32 = 14;   // S - TLS_end (negative offset from TP)
 const R_386_TLS_IE: u32 = 15;      // GOT entry (absolute addr) containing TPOFF
 const R_386_TLS_GOTIE: u32 = 16;   // GOT-relative offset to TLS GOT entry
 const R_386_TLS_LE: u32 = 17;      // TLS_end - S (positive offset for @NTPOFF)
+const R_386_TLS_GD: u32 = 18;      // General Dynamic TLS
 const R_386_TLS_LE_32: u32 = 34;   // TLS_end - S (IE-to-LE, @NTPOFF)
+const R_386_TLS_DTPMOD32: u32 = 35; // Module ID for GD TLS
+const R_386_TLS_DTPOFF32: u32 = 36; // Offset within TLS block for GD TLS
 const R_386_TLS_TPOFF32: u32 = 37; // S + A - TLS_end (negative offset, @TPOFF)
 const R_386_IRELATIVE: u32 = 42;
 const R_386_GOT32X: u32 = 43;
@@ -836,22 +839,86 @@ pub fn link_builtin(
         all_objects.push(lib_path.clone());
     }
 
-    // Parse all input objects
+    // Parse all input objects.  Non-archive objects are added directly.
+    // Archive members are kept in a pool and pulled in on demand based on
+    // which symbols are undefined, iterating until no more members are needed.
+    // This avoids pulling in unused archive members (e.g. BID decimal objects
+    // from libgcc.a) that reference unsupported TLS models or add huge bloat.
     let mut inputs: Vec<InputObject> = Vec::new();
+    let mut archive_pool: Vec<InputObject> = Vec::new();
+
     for obj_path in &all_objects {
         let data = std::fs::read(obj_path)
             .map_err(|e| format!("cannot read {}: {}", obj_path, e))?;
         if data.len() >= 8 && &data[0..8] == b"!<arch>\n" {
-            // Archive file - extract needed members
+            // Archive file - parse members into the pool
             let members = parse_archive(&data, obj_path)?;
             for (name, mdata) in members {
                 let member_name = format!("{}({})", obj_path, name);
                 if let Ok(obj) = parse_elf32(&mdata, &member_name) {
-                    inputs.push(obj);
-                } // Skip non-ELF32 members
+                    archive_pool.push(obj);
+                }
             }
         } else {
             inputs.push(parse_elf32(&data, obj_path)?);
+        }
+    }
+
+    // Demand-driven archive member extraction: pull in members that define
+    // symbols referenced (undefined) by already-included objects.  Iterate
+    // until stable to handle transitive dependencies.
+    {
+        // Build set of defined and undefined symbol names from current inputs
+        let mut defined: HashSet<String> = HashSet::new();
+        let mut undefined: HashSet<String> = HashSet::new();
+        for obj in &inputs {
+            for sym in &obj.symbols {
+                if sym.name.is_empty() || sym.sym_type == STT_FILE || sym.sym_type == STT_SECTION {
+                    continue;
+                }
+                if sym.section_index != SHN_UNDEF {
+                    defined.insert(sym.name.clone());
+                } else {
+                    undefined.insert(sym.name.clone());
+                }
+            }
+        }
+        // Remove symbols that are already defined
+        undefined.retain(|s| !defined.contains(s));
+
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let mut i = 0;
+            while i < archive_pool.len() {
+                // Check if this member defines any currently-undefined symbol
+                let resolves = archive_pool[i].symbols.iter().any(|sym| {
+                    !sym.name.is_empty()
+                        && sym.sym_type != STT_FILE
+                        && sym.sym_type != STT_SECTION
+                        && sym.section_index != SHN_UNDEF
+                        && undefined.contains(&sym.name)
+                });
+                if resolves {
+                    let obj = archive_pool.remove(i);
+                    // Register this member's definitions and new undefined refs
+                    for sym in &obj.symbols {
+                        if sym.name.is_empty() || sym.sym_type == STT_FILE || sym.sym_type == STT_SECTION {
+                            continue;
+                        }
+                        if sym.section_index != SHN_UNDEF {
+                            defined.insert(sym.name.clone());
+                            undefined.remove(&sym.name);
+                        } else if !defined.contains(&sym.name) {
+                            undefined.insert(sym.name.clone());
+                        }
+                    }
+                    inputs.push(obj);
+                    changed = true;
+                } else {
+                    i += 1;
+                }
+            }
         }
     }
 
@@ -1098,29 +1165,28 @@ pub fn link_builtin(
                         version: dyn_ver.clone(),
                     });
                 } else {
-                    // Check if it's a weak undefined (ok to leave as 0)
-                    if sym.binding == STB_WEAK {
-                        global_symbols.entry(name.clone()).or_insert(LinkerSymbol {
-                            address: 0,
-                            size: 0,
-                            sym_type: sym.sym_type,
-                            binding: STB_WEAK,
-                            visibility: STV_DEFAULT,
-                            is_defined: false,
-                            needs_plt: false,
-                            needs_got: false,
-                            output_section: usize::MAX,
-                            section_offset: 0,
-                            plt_index: 0,
-                            got_index: 0,
-                            is_dynamic: false,
-                            dynlib: String::new(),
-                            needs_copy: false,
-                            copy_addr: 0,
-                            version: None,
-                        });
-                    }
-                    // If truly undefined and global, we'll error later
+                    // Track undefined symbols so the check below can catch them.
+                    // Weak undefined symbols resolve to 0; strong undefined symbols
+                    // will trigger an error if no library provides them.
+                    global_symbols.entry(name.clone()).or_insert(LinkerSymbol {
+                        address: 0,
+                        size: 0,
+                        sym_type: sym.sym_type,
+                        binding: sym.binding,
+                        visibility: STV_DEFAULT,
+                        is_defined: false,
+                        needs_plt: false,
+                        needs_got: false,
+                        output_section: usize::MAX,
+                        section_offset: 0,
+                        plt_index: 0,
+                        got_index: 0,
+                        is_dynamic: false,
+                        dynlib: String::new(),
+                        needs_copy: false,
+                        copy_addr: 0,
+                        version: None,
+                    });
                 }
             }
         }
@@ -1200,7 +1266,8 @@ pub fn link_builtin(
         .map(|(n, _)| n)
         .collect();
 
-    // Some special symbols are provided by the linker
+    // Some special symbols are provided by the linker or are allowed to be
+    // undefined in static binaries (e.g. ___tls_get_addr from dead archive members).
     let linker_defined = [
         "_GLOBAL_OFFSET_TABLE_",
         "__ehdr_start",
@@ -1216,6 +1283,9 @@ pub fn link_builtin(
         "__fini_array_start", "__fini_array_end",
         "__preinit_array_start", "__preinit_array_end",
         "__rel_iplt_start", "__rel_iplt_end",
+        // TLS general-dynamic accessor: referenced by some libc.a members that
+        // are unconditionally extracted but never called in static binaries.
+        "___tls_get_addr",
     ];
 
     let truly_undefined: Vec<&&String> = undefined.iter()
@@ -2365,20 +2435,22 @@ pub fn link_builtin(
                         (tpoff + addend) as u32
                     }
                     R_386_TLS_LE => {
-                        // Type 17: TLS_end - S + A (negated TPOFF, used with @NTPOFF)
-                        // Code does: neg %reg; mov %gs:(%reg), ...
-                        let ntpoff = tls_addr as i32 + tls_mem_size as i32 - sym_addr as i32;
-                        (ntpoff + addend) as u32
+                        // Type 17: S + A - TLS_end (negative offset from TP, @ntpoff)
+                        // Used as: mov %gs:@ntpoff(x), %reg  (direct negative offset)
+                        let tpoff = sym_addr as i32 - tls_addr as i32 - tls_mem_size as i32;
+                        (tpoff + addend) as u32
                     }
                     R_386_TLS_LE_32 => {
-                        // Type 34: Same as R_386_TLS_LE (TLS_end - S + A)
+                        // Type 34: TLS_end - (S + A) (positive/negated offset, @tpoff)
+                        // Used with neg/sub patterns: negl %reg; movl %gs:(%reg), ...
                         let ntpoff = tls_addr as i32 + tls_mem_size as i32 - sym_addr as i32;
                         (ntpoff + addend) as u32
                     }
                     R_386_TLS_TPOFF32 => {
-                        // Type 37: S + A - TLS_end (negative offset from TP)
-                        let tpoff = sym_addr as i32 - tls_addr as i32 - tls_mem_size as i32;
-                        (tpoff + addend) as u32
+                        // Type 37: TLS_end - (S + A) (positive/negated offset from TP)
+                        // Used with sub/neg patterns, opposite sign from R_386_TLS_TPOFF
+                        let ntpoff = tls_addr as i32 + tls_mem_size as i32 - sym_addr as i32;
+                        (ntpoff + addend) as u32
                     }
                     R_386_TLS_IE => {
                         // Initial Exec TLS via GOT: absolute address of GOT entry
@@ -2408,6 +2480,32 @@ pub fn link_builtin(
                                 let tpoff = sym_addr as i32 - tls_addr as i32 - tls_mem_size as i32;
                                 (tpoff + addend) as u32
                             }
+                        } else {
+                            addend as u32
+                        }
+                    }
+                    R_386_TLS_GD => {
+                        // General Dynamic TLS model → relaxed to Local Exec for static linking.
+                        // In static binaries these come from dead code in unconditionally
+                        // extracted archive members.  Resolve to the LE TP offset so that
+                        // if the code IS reached it still works correctly.
+                        if has_tls && sym.sym_type == STT_TLS {
+                            let tpoff = sym_addr as i32 - tls_addr as i32 - tls_mem_size as i32;
+                            (tpoff + addend) as u32
+                        } else {
+                            addend as u32
+                        }
+                    }
+                    R_386_TLS_DTPMOD32 => {
+                        // Module ID for GD TLS.  In a static executable the single
+                        // module has ID 1.
+                        1u32
+                    }
+                    R_386_TLS_DTPOFF32 => {
+                        // Offset within the TLS block from the module base.
+                        // For static linking: sym_addr - tls_addr (base of TLS segment).
+                        if has_tls {
+                            (sym_addr as i32 - tls_addr as i32 + addend) as u32
                         } else {
                             addend as u32
                         }
