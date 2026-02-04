@@ -929,6 +929,12 @@ pub fn link_builtin(
     let mut section_name_to_idx: HashMap<String, usize> = HashMap::new();
     let mut section_map: SectionMap = HashMap::new();
 
+    // Track COMDAT groups that have already been included.
+    // Sections with SHF_GROUP flag are COMDAT sections; only the first
+    // occurrence of each (by input section name) should be included.
+    // Subsequent duplicates are skipped to avoid multiple-definition errors.
+    let mut included_comdat_sections: HashSet<String> = HashSet::new();
+
     // Determine the output section name for an input section
     fn output_section_name(name: &str, flags: u32, sh_type: u32) -> Option<String> {
         // Skip non-allocatable sections, symbol tables, relocation sections, etc.
@@ -1047,6 +1053,17 @@ pub fn link_builtin(
                 Some(n) => n,
                 None => continue,
             };
+
+            // COMDAT deduplication: if this section has the SHF_GROUP flag,
+            // only include the first occurrence (by input section name).
+            // This handles __x86.get_pc_thunk.bx and similar COMDAT sections
+            // that appear in multiple translation units.
+            if sec.flags & SHF_GROUP != 0 {
+                if !included_comdat_sections.insert(sec.name.clone()) {
+                    // Already included a section with this name; skip duplicate
+                    continue;
+                }
+            }
 
             let out_idx = if let Some(&idx) = section_name_to_idx.get(&out_name) {
                 idx

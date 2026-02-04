@@ -75,6 +75,8 @@ struct ElfRelocation {
     symbol: String,
     reloc_type: u32,
     addend: i32,
+    /// For SymbolDiff (.long A - B): the subtracted symbol B, used to adjust the addend.
+    diff_symbol: Option<String>,
 }
 
 /// Symbol info collected during assembly.
@@ -448,6 +450,7 @@ impl ElfWriter {
                         symbol: sym.clone(),
                         reloc_type: R_386_32,
                         addend: 0,
+                        diff_symbol: None,
                     });
                     let section = &mut self.sections[sec_idx];
                     section.data.extend(std::iter::repeat_n(0, size));
@@ -459,17 +462,19 @@ impl ElfWriter {
                         symbol: sym.clone(),
                         reloc_type: R_386_32,
                         addend: *addend as i32,
+                        diff_symbol: None,
                     });
                     let section = &mut self.sections[sec_idx];
                     section.data.extend(std::iter::repeat_n(0, size));
                 }
-                DataValue::SymbolDiff(a, _b) => {
+                DataValue::SymbolDiff(a, b) => {
                     let offset = self.sections[sec_idx].data.len() as u32;
                     self.sections[sec_idx].relocations.push(ElfRelocation {
                         offset,
                         symbol: a.clone(),
                         reloc_type: R_386_PC32,
                         addend: 0,
+                        diff_symbol: Some(b.clone()),
                     });
                     let section = &mut self.sections[sec_idx];
                     section.data.extend(std::iter::repeat_n(0, size));
@@ -496,6 +501,7 @@ impl ElfWriter {
                         symbol: sym.clone(),
                         reloc_type: R_386_32,
                         addend: 0,
+                        diff_symbol: None,
                     });
                     let section = &mut self.sections[sec_idx];
                     section.data.extend(std::iter::repeat_n(0, 8));
@@ -507,17 +513,19 @@ impl ElfWriter {
                         symbol: sym.clone(),
                         reloc_type: R_386_32,
                         addend: *addend as i32,
+                        diff_symbol: None,
                     });
                     let section = &mut self.sections[sec_idx];
                     section.data.extend(std::iter::repeat_n(0, 8));
                 }
-                DataValue::SymbolDiff(a, _b) => {
+                DataValue::SymbolDiff(a, b) => {
                     let offset = self.sections[sec_idx].data.len() as u32;
                     self.sections[sec_idx].relocations.push(ElfRelocation {
                         offset,
                         symbol: a.clone(),
                         reloc_type: R_386_PC32,
                         addend: 0,
+                        diff_symbol: Some(b.clone()),
                     });
                     let section = &mut self.sections[sec_idx];
                     section.data.extend(std::iter::repeat_n(0, 8));
@@ -561,6 +569,7 @@ impl ElfWriter {
                 symbol: reloc.symbol,
                 reloc_type: reloc.reloc_type,
                 addend: reloc.addend as i32,
+                diff_symbol: None,
             });
         }
 
@@ -598,7 +607,7 @@ impl ElfWriter {
 
             let mut relocs = Vec::new();
             for reloc in &sec.relocations {
-                let (sym_name, addend) = if reloc.symbol.starts_with('.') {
+                let (sym_name, mut addend) = if reloc.symbol.starts_with('.') {
                     // Internal label: convert to section symbol + offset
                     if let Some(&(target_sec, target_off)) = self.label_positions.get(&reloc.symbol) {
                         (section_names[target_sec].clone(), reloc.addend + target_off as i32)
@@ -608,6 +617,16 @@ impl ElfWriter {
                 } else {
                     (reloc.symbol.clone(), reloc.addend)
                 };
+
+                // For SymbolDiff (.long A - B): adjust addend by (P - B_offset)
+                // where P is the relocation site offset and B_offset is the subtracted
+                // symbol's offset within its section.  R_386_PC32 computes S + A - P;
+                // we need the result to be A_addr - B_addr, so A must include (P - B).
+                if let Some(ref diff_sym) = reloc.diff_symbol {
+                    if let Some(&(_b_sec, b_off)) = self.label_positions.get(diff_sym.as_str()) {
+                        addend += reloc.offset as i32 - b_off as i32;
+                    }
+                }
 
                 // For REL format: patch the addend into the section data
                 let off = reloc.offset as usize;

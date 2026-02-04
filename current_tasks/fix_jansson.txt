@@ -1,4 +1,0 @@
-Testing and fixing the jansson JSON library project across all architectures.
-Started 2026-02-04.
-GCC passes all 215 tests - confirmed working.
-Now testing with ccc compilers (x86 first, then other arches).
