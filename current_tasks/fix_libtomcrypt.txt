@@ -1,0 +1,3 @@
+Fix libtomcrypt RISC-V test failure: narrow pass incorrectly removes
+zero-extension AND mask (uint32 & 0xFFFFFFFF) when narrowing from I64 to U32.
+Also adding libtomcrypt to the project tracking file.
