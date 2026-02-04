@@ -1,0 +1,3 @@
+Fix hdiffpatch project: add xgetbv and rsqrtss instructions to x86 assembler.
+The lzma dependency in hdiffpatch uses inline asm with xgetbv.
+Also add rsqrtss (needed by miniaudio).
