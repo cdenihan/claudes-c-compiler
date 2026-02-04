@@ -1,0 +1,9 @@
+LOCKED: Fix libuv with MY_ASM=builtin MY_LD=builtin on x86
+
+Two bugs:
+1. x86/i686 builtin assembler: "rep; nop" (pause) fails because "rep" appears as
+   standalone mnemonic after semicolon splitting. Fix: handle rep/repz/repnz/lock
+   as standalone instructions that emit just the prefix byte.
+2. x86/RISC-V builtin linker: -l:filename syntax not handled. The colon prefix means
+   "search for exact filename" rather than lib<name>.so/lib<name>.a pattern.
+   Fix: detect ':' prefix and use exact filename search.
