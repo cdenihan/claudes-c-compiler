@@ -1,0 +1,7 @@
+Improve RISC-V native assembler:
+1. Add R_RISCV_RELAX relocations alongside PCREL/CALL_PLT/TPREL/GOT relocations
+   to enable linker relaxation (code size reduction).
+2. Fix .note.GNU-stack section flags - should honor explicit empty flags from
+   .section directive instead of falling back to defaults.
+3. Fix section flag fallback logic to distinguish between "no flags specified"
+   and "empty flags explicitly specified".
