@@ -141,64 +141,78 @@ Tracking project build/test results with MY_ASM=builtin MY_LD=builtin
 | uthash  | PASS | TODO | TODO | TODO | Passes x86 |
 | rax     | PASS | TODO | TODO | TODO | Passes x86 |
 | par     | PASS | TODO | TODO | TODO | Passes x86 |
-| dr_libs | PASS | TODO | TODO | TODO | Passes x86 |
-| fenster | PASS | TODO | TODO | TODO | Passes x86 |
+| dr_libs | PASS | PASS | FAIL (arm) | PASS | ARM fails (separate issue) |
+| fenster | PASS | PASS | PASS | PASS | All architectures pass |
 | microui | PASS | TODO | TODO | TODO | Passes x86 |
 | nanovg  | PASS | TODO | TODO | TODO | Passes x86 |
-| tinybasic | PASS | TODO | TODO | TODO | Passes x86 |
+| tinybasic | PASS | PASS | PASS | PASS | All architectures pass |
 | tinyobjloader-c | PASS | TODO | TODO | TODO | Passes x86 |
-| minmea  | PASS | TODO | TODO | TODO | Passes x86 |
-| lwrb    | PASS | TODO | TODO | TODO | Passes x86 |
-| olive.c | PASS | TODO | TODO | TODO | Passes x86 |
-| 2048.c  | PASS | TODO | TODO | TODO | Passes x86 |
-| tinflate | PASS | TODO | TODO | TODO | Passes x86 |
+| minmea  | PASS | PASS | PASS | PASS | All architectures pass |
+| lwrb    | PASS | PASS | PASS | PASS | All architectures pass |
+| olive.c | PASS | PASS | PASS | PASS | All architectures pass |
+| 2048.c  | PASS | PASS | PASS | PASS | All architectures pass |
+| tinflate | PASS | PASS | PASS | PASS | All architectures pass |
 | minizip | PASS | TODO | TODO | TODO | Passes x86 |
-| himeno  | PASS | TODO | TODO | TODO | Passes x86 |
-| nbench  | PASS | TODO | TODO | TODO | Passes x86 |
+| himeno  | PASS | PASS | PASS | PASS | All architectures pass |
+| nbench  | PASS | PASS | PASS | PASS | All architectures pass |
 | sokol   | PASS | TODO | TODO | TODO | Passes x86 |
-| libjpeg_IJG_original | PASS | TODO | TODO | TODO | Passes x86 |
+| libjpeg_IJG_original | PASS | PASS | PASS | PASS | All architectures pass |
 | libiconv | PASS | TODO | TODO | TODO | Passes x86 |
-| kilo    | PASS | TODO | TODO | TODO | Passes x86 |
+| kilo    | PASS | PASS | PASS | PASS | All architectures pass |
 | nanopb  | PASS | TODO | TODO | TODO | Passes x86 |
 | asn1c   | PASS | TODO | TODO | TODO | Passes x86 |
-| pkgconf | PASS | TODO | TODO | TODO | Passes x86 |
+| pkgconf | PASS | PASS | PASS | PASS | All architectures pass |
 | bison   | PASS | TODO | TODO | TODO | Passes x86 |
-| less    | PASS | TODO | TODO | TODO | Passes x86 |
-| joe     | PASS | TODO | TODO | TODO | Passes x86 |
-| picocom | PASS | TODO | TODO | TODO | Passes x86 |
-| mini_httpd | PASS | TODO | TODO | TODO | Passes x86 |
-| thttpd  | PASS | TODO | TODO | TODO | Passes x86 |
-| peg_leg | PASS | TODO | TODO | TODO | Passes x86 |
-| cfitsio | PASS | TODO | TODO | TODO | Passes x86 |
-| cgltf   | PASS | TODO | TODO | TODO | Passes x86 |
-| cello   | PASS | TODO | TODO | TODO | Passes x86 |
+| less    | PASS | PASS | PASS | PASS | All architectures pass |
+| joe     | PASS | PASS | PASS | PASS | All architectures pass |
+| picocom | PASS | PASS | PASS | PASS | All architectures pass |
+| mini_httpd | PASS | PASS | PASS | PASS | All architectures pass |
+| thttpd  | PASS | PASS | PASS | PASS | All architectures pass |
+| peg_leg | PASS | PASS | PASS | PASS | All architectures pass |
+| cfitsio | PASS | PASS | PASS | PASS | All architectures pass |
+| cgltf   | PASS | PASS | PASS | PASS | All architectures pass |
+| cello   | PASS | PASS | PASS | PASS | All architectures pass |
 | greatest | PASS | TODO | TODO | TODO | Passes x86 |
-| cNBT    | PASS | TODO | TODO | TODO | Passes x86 |
+| cNBT    | PASS | PASS | PASS | PASS | All architectures pass |
 | chipmunk2d | PASS | TODO | TODO | TODO | Passes x86 |
-| minunit | PASS | TODO | TODO | TODO | Passes x86 |
-| json-parser | PASS | TODO | TODO | TODO | Passes x86 |
-| gb_string | PASS | TODO | TODO | TODO | Passes x86 |
-| embedded-cli | PASS | TODO | TODO | TODO | Passes x86 |
+| minunit | PASS | PASS | PASS | PASS | All architectures pass |
+| json-parser | PASS | PASS | PASS | PASS | All architectures pass |
+| gb_string | PASS | PASS | PASS | PASS | All architectures pass |
+| embedded-cli | PASS | PASS | PASS | PASS | All architectures pass |
 | FSE     | PASS | TODO | TODO | TODO | Passes x86 |
-| c-algorithms | PASS | TODO | TODO | TODO | Passes x86 |
-| c-ares  | PASS | TODO | TODO | TODO | Passes x86 |
+| c-algorithms | PASS | PASS | PASS | PASS | All architectures pass |
+| c-ares  | PASS | PASS | PASS | PASS | All architectures pass |
 | box2d-lite | PASS | TODO | TODO | TODO | Passes x86 |
 | cproc   | PASS | TODO | TODO | TODO | Passes x86 |
-| lacc    | PASS | TODO | TODO | TODO | Passes x86 |
+| lacc    | PASS | PASS | PASS | PASS | All architectures pass |
 | lcc     | PASS | TODO | TODO | TODO | Passes x86 |
 | pcc     | PASS | TODO | TODO | TODO | Passes x86 |
 | vbcc    | PASS | TODO | TODO | TODO | Passes x86 |
-| speex_speexdsp | PASS | TODO | TODO | TODO | Passes x86 |
-| lzfse   | PASS | TODO | TODO | TODO | Passes x86 |
-| getopt_standalone | PASS | TODO | TODO | TODO | Passes x86 |
-| finite-state-entropy | PASS | TODO | TODO | TODO | Passes x86 |
+| speex_speexdsp | PASS | PASS | PASS | PASS | All architectures pass |
+| lzfse   | PASS | PASS | PASS | PASS | All architectures pass |
+| getopt_standalone | PASS | PASS | PASS | PASS | All architectures pass |
+| finite-state-entropy | PASS | PASS | PASS | PASS | All architectures pass |
 | pngcrush | PASS | TODO | TODO | TODO | Passes x86 |
 | bc_GNU  | PASS | TODO | TODO | TODO | Passes x86 |
 | toybox  | PASS | TODO | TODO | TODO | Passes x86 |
 | zopfli  | PASS | TODO | TODO | TODO | Passes x86 |
-| optparse | PASS | TODO | TODO | TODO | Passes x86 |
+| optparse | PASS | PASS | PASS | PASS | All architectures pass |
 | dnsmasq | PASS | TODO | TODO | TODO | Passes x86 |
-| mandoc  | PASS | TODO | TODO | TODO | Passes x86 |
+| mandoc  | PASS | PASS | PASS | PASS | All architectures pass |
 | dropbear | PASS | TODO | TODO | TODO | Passes x86 |
 | pigz    | PASS | TODO | TODO | TODO | Passes x86 |
 | Chibi-Scheme | PASS | TODO | TODO | TODO | Fixed x86: shared lib linker now includes libgcc.a for __udivti3 etc.; check script needs ANSI strip fix |
+| miniaudio | PASS | PASS | FAIL (arm NEON int32x4x2_t) | PASS | Fixed: added rsqrtss/rsqrtps/rcpss/rcpps/sqrtps/sqrtpd to x86+i686 assemblers |
+| ini     | PASS | PASS | PASS | PASS | All architectures pass out of the box |
+| shapelib | PASS | PASS | PASS | PASS | All architectures pass |
+| stc     | PASS | PASS | PASS | PASS | All architectures pass |
+| libflac | PASS | PASS | FAIL (arm) | PASS | ARM fails (separate issue) |
+| jbigkit | PASS | PASS | PASS | PASS | All architectures pass |
+| minimp3 | PASS | PASS | FAIL (arm) | PASS | ARM fails (separate issue) |
+| libfastcdc | PASS | PASS | PASS | PASS | All architectures pass |
+| sod     | PASS | PASS | PASS | PASS | All architectures pass |
+| stretchy_buffer | PASS | PASS | PASS | PASS | All architectures pass |
+| rans    | PASS | PASS | PASS | PASS | All architectures pass |
+| wflz    | PASS | PASS | PASS | PASS | All architectures pass |
+| lzw     | PASS | PASS | PASS | PASS | All architectures pass |
+| vec     | PASS | PASS | PASS | PASS | All architectures pass |
