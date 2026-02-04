@@ -119,7 +119,7 @@ impl Driver {
                 "-print-search-dirs" => {
                     println!("install: /usr/lib/gcc/{}/13/", target.triple());
                     println!("programs: /usr/bin/");
-                    println!("libraries: /usr/lib/");
+                    println!("libraries: {}", target.implicit_library_paths());
                     return Ok(true);
                 }
                 _ if arg.starts_with("-print-file-name=") => {

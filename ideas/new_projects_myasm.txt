@@ -99,3 +99,19 @@ Tracking project build/test results with MY_ASM=builtin MY_LD=builtin
 | discount | PASS | PASS | PASS | PASS | Fixed x86 linker: local symbol collision (local STB_LOCAL symbols were resolved to global symbols with same name from other object files) |
 | gdbm    | PASS | PASS | PASS | PASS | Fixed RISC-V linker: added _Unwind/gcc_personality to linker_defined list + fixed .so search in linker scripts |
 | xz_liblzma | PASS (with -DXZ_CLMUL_CRC=OFF) | TODO | TODO | TODO | Fixed inline asm early-clobber + callee-saved overflow. CLMUL CRC codegen is a separate bug. |
+| libharu | PASS | PASS | FAIL (arm segfault) | PASS | Fixed: verbose -v link output now emits ld line with -L paths + LIBRARY_PATH for CMake implicit lib dir detection |
+| map     | PASS | PASS | PASS | PASS | All architectures pass out of the box |
+| sort.h  | PASS | TODO | TODO | TODO | Passes x86 |
+| fastlz  | PASS | PASS | PASS | PASS | All architectures pass out of the box |
+| crush   | PASS | TODO | TODO | TODO | Passes x86 |
+| huf     | PASS | TODO | TODO | TODO | Passes x86 |
+| stb_ds  | PASS | TODO | TODO | TODO | Passes x86 |
+| microtar | PASS | TODO | TODO | TODO | Passes x86 |
+| minilzo | PASS | TODO | TODO | TODO | Passes x86 |
+| qoi     | PASS | TODO | TODO | TODO | Passes x86 |
+| stb_truetype | PASS | TODO | TODO | TODO | Passes x86 |
+| pl_mpeg | PASS | TODO | TODO | TODO | Passes x86 |
+| tree    | PASS | TODO | TODO | TODO | Passes x86 |
+| jo_gif  | PASS | TODO | TODO | TODO | Passes x86 |
+| quicklz | PASS | TODO | TODO | TODO | Passes x86 |
+| lemon   | PASS | TODO | TODO | TODO | Passes x86 |

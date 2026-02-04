@@ -134,6 +134,86 @@ impl Target {
         }
     }
 
+    /// Return the dynamic linker path for this target.
+    pub(crate) fn dynamic_linker(&self) -> &'static str {
+        match self {
+            Target::X86_64 => "/lib64/ld-linux-x86-64.so.2",
+            Target::I686 => "/lib/ld-linux.so.2",
+            Target::Aarch64 => "/lib/ld-linux-aarch64.so.1",
+            Target::Riscv64 => "/lib/ld-linux-riscv64-lp64d.so.1",
+        }
+    }
+
+    /// Return the implicit library search directories for this target.
+    /// This is used by the driver to emit `LIBRARY_PATH=...` during verbose
+    /// linking, which CMake parses to discover implicit link directories
+    /// (needed for `find_library()` to locate libraries like libm in
+    /// multiarch paths like /usr/lib/x86_64-linux-gnu/).
+    pub(crate) fn implicit_library_paths(&self) -> String {
+        let triple = self.triple();
+
+        // GCC lib base paths and versions to probe
+        let gcc_bases: &[&str] = match self {
+            Target::X86_64 => &[
+                "/usr/lib/gcc/x86_64-linux-gnu",
+                "/usr/lib/gcc/x86_64-redhat-linux",
+                "/usr/lib64/gcc/x86_64-linux-gnu",
+            ],
+            Target::I686 => &[
+                "/usr/lib/gcc-cross/i686-linux-gnu",
+                "/usr/lib/gcc/i686-linux-gnu",
+                "/usr/lib/gcc/i386-linux-gnu",
+            ],
+            Target::Aarch64 => &[
+                "/usr/lib/gcc-cross/aarch64-linux-gnu",
+                "/usr/lib/gcc/aarch64-linux-gnu",
+            ],
+            Target::Riscv64 => &[
+                "/usr/lib/gcc-cross/riscv64-linux-gnu",
+                "/usr/lib/gcc/riscv64-linux-gnu",
+            ],
+        };
+        let gcc_versions: &[&str] = &["14", "13", "12", "11", "10", "9", "8", "7"];
+
+        let mut paths: Vec<String> = Vec::new();
+
+        // Find GCC lib dir (contains crtbegin.o)
+        'outer: for base in gcc_bases {
+            for ver in gcc_versions {
+                let dir = format!("{}/{}", base, ver);
+                if std::path::Path::new(&format!("{}/crtbegin.o", dir)).exists() {
+                    paths.push(dir);
+                    break 'outer;
+                }
+            }
+        }
+
+        // Multiarch lib dirs
+        let lib_dir = format!("/usr/lib/{}", triple);
+        if std::path::Path::new(&lib_dir).exists() {
+            paths.push(lib_dir);
+        }
+        let lib_alt = format!("/lib/{}", triple);
+        if std::path::Path::new(&lib_alt).exists() {
+            paths.push(lib_alt);
+        }
+
+        // Cross-compiler lib dirs
+        let cross_lib = format!("/usr/{}/lib", triple);
+        if std::path::Path::new(&cross_lib).exists() {
+            paths.push(cross_lib);
+        }
+
+        // Generic fallback dirs
+        for dir in &["/usr/lib", "/lib"] {
+            if std::path::Path::new(dir).exists() {
+                paths.push(dir.to_string());
+            }
+        }
+
+        paths.join(":")
+    }
+
     /// Whether this target uses 32-bit pointers (ILP32 data model).
     pub(crate) fn is_32bit(&self) -> bool {
         matches!(self, Target::I686)

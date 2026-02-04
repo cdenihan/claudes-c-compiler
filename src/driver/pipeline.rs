@@ -665,6 +665,29 @@ impl Driver {
         // Build linker args from -l, -L, -static flags, preserving positional ordering
         let linker_args = self.build_linker_args();
 
+        // Emit a synthetic verbose link line for build system compatibility.
+        // CMake's CMakeParseImplicitLinkInfo.cmake looks for a line matching
+        // `collect2` or `ld` and extracts -L paths from it, which populate
+        // CMAKE_C_IMPLICIT_LINK_DIRECTORIES (used by find_library()).
+        // Without this, CMake can't find libraries in multiarch paths like
+        // /usr/lib/x86_64-linux-gnu/.
+        // NOTE: This line is intentionally incomplete -- it only contains -L
+        // flags for CMake detection, not actual linker arguments. Our built-in
+        // linker is invoked internally, not via a subprocess.
+        if self.verbose {
+            let lib_paths = self.target.implicit_library_paths();
+            let l_flags: String = lib_paths
+                .split(':')
+                .filter(|p| !p.is_empty())
+                .map(|p| format!(" -L{}", p))
+                .collect();
+            eprintln!(
+                " /usr/bin/ld -dynamic-linker {} -o {}{}",
+                self.target.dynamic_linker(), self.output_path, l_flags,
+            );
+            eprintln!("LIBRARY_PATH={}", lib_paths);
+        }
+
         if linker_args.is_empty() {
             self.target.link(&all_objects, &self.output_path)?;
         } else {

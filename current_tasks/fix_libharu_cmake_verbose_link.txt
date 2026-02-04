@@ -1,9 +1,0 @@
-Fix CMake implicit link directory detection by emitting GCC-compatible
-verbose link output (ld line with -L paths and LIBRARY_PATH=...) when
-the compiler is invoked with -v during linking. This allows CMake's
-find_library() to locate libraries in multiarch paths like
-/usr/lib/x86_64-linux-gnu/.
-
-Target project: libharu (and any other CMake-based project that uses
-find_library for system libs like libm, libz).
-Started 2026-02-04.
