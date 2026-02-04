@@ -1,0 +1,1 @@
+Working on getting the coremark project to build and pass tests with builtin asm/ld on all architectures.

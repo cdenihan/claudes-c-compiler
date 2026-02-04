@@ -599,12 +599,18 @@ fn emit_executable(
             offset += sec.mem_size;
         }
     }
+    // If only .tbss (NOBITS TLS) exists with no .tdata, we still need a TLS segment.
+    // Set tls_addr/tls_file_offset to the current position so TPOFF calculations work.
+    if tls_addr == 0 && has_tls {
+        tls_addr = BASE_ADDR + offset;
+        tls_file_offset = offset;
+    }
     // TLS BSS (.tbss) - doesn't consume file space
     for sec in output_sections.iter_mut() {
         if sec.flags & SHF_TLS != 0 && sec.sh_type == SHT_NOBITS {
             let a = sec.alignment.max(1);
             let aligned = (tls_mem_size + a - 1) & !(a - 1);
-            sec.addr = if tls_addr != 0 { tls_addr + aligned } else { BASE_ADDR + offset + aligned };
+            sec.addr = tls_addr + aligned;
             sec.file_offset = offset;
             if debug_layout {
                 eprintln!("  LAYOUT TBSS: {} addr=0x{:x} aligned_off=0x{:x} sz=0x{:x} align={} tls_mem_size=0x{:x}",

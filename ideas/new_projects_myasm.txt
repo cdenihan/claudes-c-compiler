@@ -66,3 +66,12 @@ Tracking project build/test results with MY_ASM=builtin MY_LD=builtin
 | http-parser | PASS | PASS | PASS | PASS | All architectures pass out of the box |
 | tiny-regex-c | PASS | PASS | PASS | PASS | All architectures pass out of the box |
 | binn    | PASS | PASS | PASS | PASS | Fixed ARM: mixed float/int param clobbering (pre-store promoted GP params) |
+| coremark | PASS | PASS | PASS | PASS | All architectures pass out of the box |
+| tinycthread | PASS | FAIL (i686 thread-exit) | FAIL (arm thread-exit) | FAIL (riscv thread-exit) | Fixed x86: .tbss-only TLS missing PT_TLS. i686/arm/riscv fail on thread-exit (pthread_exit static linking issue, separate bug) |
+| dlmalloc | PASS | TODO | TODO | TODO | Passes x86 |
+| c4 | PASS | TODO | TODO | TODO | Passes x86 |
+| shoco | PASS | TODO | TODO | TODO | Passes x86 |
+| ncompress | PASS | TODO | TODO | TODO | Passes x86 |
+| lzf | PASS | TODO | TODO | TODO | Passes x86 |
+| whetstone | PASS | TODO | TODO | TODO | Passes x86 |
+| dhrystone | PASS | TODO | TODO | TODO | Passes x86 |

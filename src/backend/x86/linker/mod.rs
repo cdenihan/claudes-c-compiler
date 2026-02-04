@@ -1039,6 +1039,12 @@ fn emit_executable(
             offset += sec.mem_size;
         }
     }
+    // If only .tbss (NOBITS TLS) exists with no .tdata, we still need a TLS segment.
+    // Set tls_addr/tls_file_offset to the current position so TPOFF calculations work.
+    if tls_addr == 0 && has_tls_sections {
+        tls_addr = BASE_ADDR + offset;
+        tls_file_offset = offset;
+    }
     for sec in output_sections.iter_mut() {
         if sec.flags & SHF_TLS != 0 && sec.sh_type == SHT_NOBITS {
             let a = sec.alignment.max(1);
