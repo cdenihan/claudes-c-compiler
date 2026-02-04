@@ -925,7 +925,7 @@ impl ElfWriter {
         }
 
         // Convert symbols, filtering out .L* labels
-        let shared_symbols: Vec<ObjSymbol> = self.symbols.iter()
+        let mut shared_symbols: Vec<ObjSymbol> = self.symbols.iter()
             .filter(|sym| !sym.name.is_empty() && !sym.name.starts_with('.'))
             .map(|sym| ObjSymbol {
                 name: sym.name.clone(),
@@ -940,6 +940,64 @@ impl ElfWriter {
                     sym.section.clone().unwrap_or_default()
                 },
             }).collect();
+
+        // Add undefined symbols for external references (e.g., printf, strlen, etc.)
+        // that appear in relocations but have no definition in this object file.
+        // Without these, the linker can't resolve PC32 calls to external functions.
+        let defined_names: std::collections::HashSet<&str> = shared_symbols.iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        let section_name_set: std::collections::HashSet<&str> = section_names.iter()
+            .map(|s| s.as_str())
+            .collect();
+
+        let mut undefined_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for sec in shared_sections.values() {
+            for reloc in &sec.relocs {
+                let name = &reloc.symbol_name;
+                if name.is_empty() || name.starts_with('.') {
+                    continue; // Skip empty and internal (.L*) labels / section symbols
+                }
+                if section_name_set.contains(name.as_str()) {
+                    continue; // Skip section names (already have section symbols)
+                }
+                if !defined_names.contains(name.as_str()) {
+                    undefined_names.insert(name.clone());
+                }
+            }
+        }
+
+        for name in &undefined_names {
+            let binding = if self.pending_weaks.contains(name) {
+                STB_WEAK
+            } else {
+                STB_GLOBAL
+            };
+            let sym_type = match self.pending_types.get(name.as_str()) {
+                Some(SymbolKind::Function) => STT_FUNC,
+                Some(SymbolKind::Object) => STT_OBJECT,
+                Some(SymbolKind::TlsObject) => STT_TLS,
+                Some(SymbolKind::NoType) | None => STT_NOTYPE,
+            };
+            let visibility = if self.pending_hidden.contains(name) {
+                STV_HIDDEN
+            } else if self.pending_protected.contains(name) {
+                STV_PROTECTED
+            } else if self.pending_internal.contains(name) {
+                STV_INTERNAL
+            } else {
+                STV_DEFAULT
+            };
+            shared_symbols.push(ObjSymbol {
+                name: name.clone(),
+                value: 0,
+                size: 0,
+                binding,
+                sym_type,
+                visibility,
+                section_name: String::new(), // empty = SHN_UNDEF
+            });
+        }
 
         let config = ElfConfig {
             e_machine: EM_386,

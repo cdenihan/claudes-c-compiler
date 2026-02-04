@@ -33,6 +33,7 @@ const PT_INTERP: u32 = 3;
 const PT_NOTE: u32 = 4;
 const PT_PHDR: u32 = 6;
 const PT_GNU_EH_FRAME: u32 = 0x6474e550;
+const PT_TLS: u32 = 7;
 const PT_GNU_STACK: u32 = 0x6474e551;
 const PT_GNU_RELRO: u32 = 0x6474e552;
 
@@ -74,6 +75,7 @@ const STT_OBJECT: u8 = 1;
 const STT_FUNC: u8 = 2;
 const STT_SECTION: u8 = 3;
 const STT_FILE: u8 = 4;
+const STT_TLS: u8 = 6;
 const STT_GNU_IFUNC: u8 = 10;
 const STV_DEFAULT: u8 = 0;
 const STV_HIDDEN: u8 = 2;
@@ -89,6 +91,13 @@ const R_386_GOT32: u32 = 3;
 const R_386_PLT32: u32 = 4;
 const R_386_GOTOFF: u32 = 9;
 const R_386_GOTPC: u32 = 10;
+const R_386_TLS_TPOFF: u32 = 14;   // S - TLS_end (negative offset from TP)
+const R_386_TLS_IE: u32 = 15;      // GOT entry (absolute addr) containing TPOFF
+const R_386_TLS_GOTIE: u32 = 16;   // GOT-relative offset to TLS GOT entry
+const R_386_TLS_LE: u32 = 17;      // TLS_end - S (positive offset for @NTPOFF)
+const R_386_TLS_LE_32: u32 = 34;   // TLS_end - S (IE-to-LE, @NTPOFF)
+const R_386_TLS_TPOFF32: u32 = 37; // S + A - TLS_end (negative offset, @TPOFF)
+const R_386_IRELATIVE: u32 = 42;
 const R_386_GOT32X: u32 = 43;
 
 // Dynamic tags
@@ -794,9 +803,12 @@ pub fn link_builtin(
     }
 
     // Handle -l flags in static linking mode
-    if is_static && !extra_libs.is_empty() {
+    // Include both needed_libs (from compiler driver, e.g. "c") and extra_libs (from user -l flags)
+    if is_static {
         let all_lib_refs: Vec<&str> = all_lib_dirs.iter().map(|s| s.as_str()).collect();
-        for lib in &extra_libs {
+        let mut libs_to_scan: Vec<String> = needed_libs.iter().map(|s| s.to_string()).collect();
+        libs_to_scan.extend(extra_libs.iter().cloned());
+        for lib in &libs_to_scan {
             let ar_filename = format!("lib{}.a", lib);
             for dir in &all_lib_refs {
                 let path = format!("{}/{}", dir, ar_filename);
@@ -910,6 +922,18 @@ pub fn link_builtin(
         if name == ".eh_frame" {
             return Some(".eh_frame".to_string());
         }
+        if name == ".tbss" || name.starts_with(".tbss.") {
+            return Some(".tbss".to_string());
+        }
+        if name == ".tdata" || name.starts_with(".tdata.") {
+            return Some(".tdata".to_string());
+        }
+        if flags & SHF_TLS != 0 {
+            if sh_type == SHT_NOBITS {
+                return Some(".tbss".to_string());
+            }
+            return Some(".tdata".to_string());
+        }
         if name.starts_with(".data") || name.starts_with(".data.") {
             return Some(".data".to_string());
         }
@@ -963,6 +987,8 @@ pub fn link_builtin(
                     ".rodata" => (SHT_PROGBITS, SHF_ALLOC),
                     ".data" => (SHT_PROGBITS, SHF_ALLOC | SHF_WRITE),
                     ".bss" => (SHT_NOBITS, SHF_ALLOC | SHF_WRITE),
+                    ".tdata" => (SHT_PROGBITS, SHF_ALLOC | SHF_WRITE | SHF_TLS),
+                    ".tbss" => (SHT_NOBITS, SHF_ALLOC | SHF_WRITE | SHF_TLS),
                     ".init" => (SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR),
                     ".fini" => (SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR),
                     ".init_array" => (SHT_INIT_ARRAY, SHF_ALLOC | SHF_WRITE),
@@ -1147,7 +1173,8 @@ pub fn link_builtin(
         for sec in &obj.sections {
             for &(_, rel_type, _, _) in &sec.relocations {
                 match rel_type {
-                    R_386_PLT32 | R_386_GOT32 | R_386_GOT32X | R_386_GOTPC | R_386_GOTOFF => {
+                    R_386_PLT32 | R_386_GOT32 | R_386_GOT32X | R_386_GOTPC | R_386_GOTOFF
+                    | R_386_TLS_GOTIE | R_386_TLS_IE => {
                         // These need GOT/PLT infrastructure
                     }
                     _ => {}
@@ -1187,6 +1214,11 @@ pub fn link_builtin(
                             gs.needs_got = true;
                         }
                     }
+                    R_386_TLS_GOTIE | R_386_TLS_IE => {
+                        if let Some(gs) = global_symbols.get_mut(name) {
+                            gs.needs_got = true;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1214,7 +1246,7 @@ pub fn link_builtin(
         "__init_array_start", "__init_array_end",
         "__fini_array_start", "__fini_array_end",
         "__preinit_array_start", "__preinit_array_end",
-        "__rela_iplt_start", "__rela_iplt_end",
+        "__rel_iplt_start", "__rel_iplt_end",
     ];
 
     let truly_undefined: Vec<&&String> = undefined.iter()
@@ -1257,7 +1289,20 @@ pub fn link_builtin(
     }
 
     let num_plt = plt_symbols.len();
-    let _num_got_total = plt_symbols.len() + got_symbols.len();
+    let num_got_total = plt_symbols.len() + got_symbols.len();
+
+    // ── IFUNC support for static linking ─────────────────────────────────────
+    // Collect IFUNC symbols that need IPLT entries and IRELATIVE relocations
+    let mut ifunc_symbols: Vec<String> = Vec::new();
+    if is_static {
+        for (name, sym) in &global_symbols {
+            if sym.is_defined && sym.sym_type == STT_GNU_IFUNC {
+                ifunc_symbols.push(name.clone());
+            }
+        }
+        ifunc_symbols.sort();
+    }
+    let num_ifunc = ifunc_symbols.len();
 
     // ── Layout ───────────────────────────────────────────────────────────────
     // ELF32 header: 52 bytes
@@ -1266,6 +1311,10 @@ pub fn link_builtin(
 
     let ehdr_size: u32 = 52;
     let phdr_size: u32 = 32;
+
+    // Check for TLS sections early (needed for program header count)
+    let has_tls_sections = output_sections.iter()
+        .any(|s| s.flags & SHF_TLS != 0 && s.flags & SHF_ALLOC != 0);
 
     // Count program headers we need
     let mut num_phdrs: u32 = 0;
@@ -1277,6 +1326,7 @@ pub fn link_builtin(
     num_phdrs += 1; // LOAD (data + bss)
     if !is_static { num_phdrs += 1; } // DYNAMIC
     num_phdrs += 1; // GNU_STACK
+    if has_tls_sections { num_phdrs += 1; } // PT_TLS
     // Skip GNU_RELRO for now: it conflicts with lazy PLT binding when
     // .got and .got.plt share the same page.
 
@@ -1546,6 +1596,10 @@ pub fn link_builtin(
     let _note_vaddr = vaddr;
     let note_size = note_sec_idx.map(|i| output_sections[i].data.len() as u32).unwrap_or(0);
     if note_size > 0 {
+        if let Some(idx) = note_sec_idx {
+            output_sections[idx].file_offset = file_offset;
+            output_sections[idx].addr = vaddr;
+        }
         file_offset += note_size;
         vaddr += note_size;
     }
@@ -1714,6 +1768,19 @@ pub fn link_builtin(
         fini_size = 0;
     }
 
+    // .iplt section (IFUNC PLT entries for static linking)
+    // Each entry is 8 bytes: jmp *[abs32]; nop nop
+    let iplt_entry_size: u32 = 8;
+    let iplt_total_size = (num_ifunc as u32) * iplt_entry_size;
+    file_offset = align_up(file_offset, 8);
+    vaddr = align_up(vaddr, 8);
+    let iplt_offset = file_offset;
+    let iplt_vaddr = vaddr;
+    if iplt_total_size > 0 {
+        file_offset += iplt_total_size;
+        vaddr += iplt_total_size;
+    }
+
     let text_seg_file_end = file_offset;
     let text_seg_vaddr_end = vaddr;
     let text_seg_filesz = text_seg_file_end - text_seg_file_start;
@@ -1858,13 +1925,15 @@ pub fn link_builtin(
     vaddr = align_up(vaddr, 4);
     let got_offset = file_offset;
     let got_vaddr = vaddr;
-    // GOT[0] = address of .dynamic
+    // GOT[0] = address of .dynamic (or 0 in static mode)
     // Additional entries for GOT-only symbols
-    let got_reserved = 1; // Just _DYNAMIC
+    let got_reserved: usize = 1; // Just _DYNAMIC (or reserved slot)
     let got_non_plt_entries = got_symbols.len();
     let got_entry_size: u32 = 4;
     let got_size = (got_reserved + got_non_plt_entries) as u32 * got_entry_size;
-    if !is_static {
+    // Allocate GOT in both static and dynamic modes (static needs it for TLS and GOT-relative accesses)
+    let needs_got = !is_static || got_non_plt_entries > 0 || num_got_total > 0;
+    if needs_got {
         file_offset += got_size;
         vaddr += got_size;
     }
@@ -1887,6 +1956,24 @@ pub fn link_builtin(
         vaddr += gotplt_size;
     }
 
+    // IFUNC GOT entries (for static linking IRELATIVE resolution)
+    let ifunc_got_offset = file_offset;
+    let ifunc_got_vaddr = vaddr;
+    let ifunc_got_size = (num_ifunc as u32) * 4;
+    if ifunc_got_size > 0 {
+        file_offset += ifunc_got_size;
+        vaddr += ifunc_got_size;
+    }
+
+    // .rel.iplt (IRELATIVE relocations for static IFUNC)
+    let rel_iplt_offset = file_offset;
+    let rel_iplt_vaddr = vaddr;
+    let rel_iplt_size = (num_ifunc as u32) * 8; // Each REL entry is 8 bytes
+    if rel_iplt_size > 0 {
+        file_offset += rel_iplt_size;
+        vaddr += rel_iplt_size;
+    }
+
     // .data
     let data_sec_idx = section_name_to_idx.get(".data").copied();
     if let Some(idx) = data_sec_idx {
@@ -1899,6 +1986,51 @@ pub fn link_builtin(
         file_offset += sec.data.len() as u32;
         vaddr += sec.data.len() as u32;
     }
+
+    // TLS sections (.tdata, .tbss) - place after .data, track for PT_TLS
+    let mut tls_addr = 0u32;
+    let mut tls_file_offset = 0u32;
+    let mut tls_file_size = 0u32;
+    let mut tls_mem_size = 0u32;
+    let mut tls_align = 1u32;
+
+    // .tdata (TLS initialized data)
+    if let Some(&idx) = section_name_to_idx.get(".tdata") {
+        let sec = &mut output_sections[idx];
+        let a = sec.align.max(4);
+        file_offset = align_up(file_offset, a);
+        vaddr = align_up(vaddr, a);
+        sec.addr = vaddr;
+        sec.file_offset = file_offset;
+        tls_addr = vaddr;
+        tls_file_offset = file_offset;
+        tls_align = a;
+        let sz = sec.data.len() as u32;
+        tls_file_size = sz;
+        tls_mem_size = sz;
+        file_offset += sz;
+        vaddr += sz;
+    }
+
+    // .tbss (TLS zero-initialized data, NOBITS - no file space)
+    if let Some(&idx) = section_name_to_idx.get(".tbss") {
+        let sec = &mut output_sections[idx];
+        let a = sec.align.max(4);
+        let aligned = align_up(tls_mem_size, a);
+        if tls_addr == 0 {
+            tls_addr = align_up(vaddr, a);
+            tls_file_offset = file_offset;
+            tls_align = a;
+        }
+        sec.addr = tls_addr + aligned;
+        sec.file_offset = file_offset; // No file space for NOBITS
+        tls_mem_size = aligned + sec.data.len() as u32;
+        if a > tls_align { tls_align = a; }
+    }
+
+    // Align TLS size to TLS alignment
+    tls_mem_size = align_up(tls_mem_size, tls_align);
+    let has_tls = tls_addr != 0;
 
     let data_seg_file_end = file_offset;
 
@@ -2000,9 +2132,50 @@ pub fn link_builtin(
             "__fini_array_start" => sym.address = fini_array_vaddr,
             "__fini_array_end" => sym.address = fini_array_vaddr + fini_array_size,
             "__preinit_array_start" | "__preinit_array_end" => sym.address = 0,
-            "__rela_iplt_start" | "__rela_iplt_end" => sym.address = 0,
+            "__rel_iplt_start" => sym.address = rel_iplt_vaddr,
+            "__rel_iplt_end" => sym.address = rel_iplt_vaddr + rel_iplt_size,
             _ => {}
         }
+    }
+
+    // Override IFUNC symbol addresses to point to their IPLT entries.
+    // Save resolver addresses first (the original symbol address is the IFUNC resolver).
+    let mut ifunc_resolver_addrs: Vec<u32> = Vec::new();
+    for (i, name) in ifunc_symbols.iter().enumerate() {
+        if let Some(sym) = global_symbols.get_mut(name) {
+            ifunc_resolver_addrs.push(sym.address);
+            sym.address = iplt_vaddr + (i as u32) * iplt_entry_size;
+        }
+    }
+
+    // ── Build IPLT entries (IFUNC PLT stubs for static linking) ──────────────
+    let mut iplt_data: Vec<u8> = Vec::new();
+    if num_ifunc > 0 {
+        for i in 0..num_ifunc {
+            let got_entry_addr = ifunc_got_vaddr + (i as u32) * 4;
+            // jmp *[abs32]  (ff 25 <abs32>)
+            iplt_data.push(0xff);
+            iplt_data.push(0x25);
+            iplt_data.extend_from_slice(&got_entry_addr.to_le_bytes());
+            // 2-byte nop padding (66 90)
+            iplt_data.push(0x66);
+            iplt_data.push(0x90);
+        }
+    }
+
+    // ── Build IFUNC GOT entries (resolver addresses initially) ───────────────
+    let mut ifunc_got_data: Vec<u8> = Vec::new();
+    for &resolver_addr in &ifunc_resolver_addrs {
+        ifunc_got_data.extend_from_slice(&resolver_addr.to_le_bytes());
+    }
+
+    // ── Build .rel.iplt (R_386_IRELATIVE relocations) ────────────────────────
+    let mut rel_iplt_data: Vec<u8> = Vec::new();
+    for i in 0..num_ifunc {
+        let r_offset = ifunc_got_vaddr + (i as u32) * 4;
+        let r_info = R_386_IRELATIVE; // type=42, sym=0
+        rel_iplt_data.extend_from_slice(&r_offset.to_le_bytes());
+        rel_iplt_data.extend_from_slice(&r_info.to_le_bytes());
     }
 
     // ── Build PLT entries ────────────────────────────────────────────────────
@@ -2086,13 +2259,30 @@ pub fn link_builtin(
                 } else {
                     match global_symbols.get(&sym.name) {
                         Some(gs) => gs.address,
-                        None => 0,
+                        None => {
+                            // Local symbol not in global_symbols: resolve via section_map + sym.value
+                            if sym.section_index != SHN_UNDEF && sym.section_index != SHN_ABS {
+                                match section_map.get(&(obj_idx, sym.section_index as usize)) {
+                                    Some(&(sec_out_idx, sec_out_offset)) => {
+                                        output_sections[sec_out_idx].addr + sec_out_offset + sym.value
+                                    }
+                                    None => sym.value,
+                                }
+                            } else if sym.section_index == SHN_ABS {
+                                sym.value
+                            } else {
+                                0
+                            }
+                        }
                     }
                 };
 
                 // Determine if this symbol is dynamic (needs PLT)
                 let is_dyn = !sym.name.is_empty() && global_symbols.get(&sym.name)
                     .map(|gs| gs.is_dynamic && gs.needs_plt).unwrap_or(false);
+
+                // Track whether we need to rewrite mov→lea for GOT32X relaxation
+                let mut relax_got32x = false;
 
                 let value: u32 = match rel_type {
                     R_386_NONE => continue,
@@ -2142,15 +2332,75 @@ pub fn link_builtin(
                                 // Local symbol with GOT entry
                                 let got_entry_addr = got_vaddr + (got_reserved as u32 + (gs.got_index - num_plt) as u32) * 4;
                                 (got_entry_addr as i32 + addend - got_base as i32) as u32
+                            } else if rel_type == R_386_GOT32X {
+                                // GOT32X relaxation: rewrite mov→lea, use GOTOFF
+                                relax_got32x = true;
+                                (sym_addr as i32 + addend - got_base as i32) as u32
                             } else {
-                                // For R_386_GOT32X with a defined symbol, we can relax to
-                                // a direct reference if the symbol is local
-                                // TODO: implement GOT32X relaxation
-                                // For now, create an implicit GOT entry
+                                // R_386_GOT32 without GOT entry - treat as GOTOFF
                                 (sym_addr as i32 + addend - got_base as i32) as u32
                             }
+                        } else if rel_type == R_386_GOT32X {
+                            // Section symbol or unknown: relax GOT32X to GOTOFF
+                            relax_got32x = true;
+                            (sym_addr as i32 + addend - got_base as i32) as u32
                         } else {
-                            (addend - got_base as i32) as u32
+                            // R_386_GOT32 for section/unknown symbol - GOTOFF
+                            (sym_addr as i32 + addend - got_base as i32) as u32
+                        }
+                    }
+                    R_386_TLS_TPOFF => {
+                        // Type 14: S + A - TLS_end (negative offset from TP)
+                        // Used with @TPOFF: %gs:tpoff accesses the variable
+                        let tpoff = sym_addr as i32 - tls_addr as i32 - tls_mem_size as i32;
+                        (tpoff + addend) as u32
+                    }
+                    R_386_TLS_LE => {
+                        // Type 17: TLS_end - S + A (negated TPOFF, used with @NTPOFF)
+                        // Code does: neg %reg; mov %gs:(%reg), ...
+                        let ntpoff = tls_addr as i32 + tls_mem_size as i32 - sym_addr as i32;
+                        (ntpoff + addend) as u32
+                    }
+                    R_386_TLS_LE_32 => {
+                        // Type 34: Same as R_386_TLS_LE (TLS_end - S + A)
+                        let ntpoff = tls_addr as i32 + tls_mem_size as i32 - sym_addr as i32;
+                        (ntpoff + addend) as u32
+                    }
+                    R_386_TLS_TPOFF32 => {
+                        // Type 37: S + A - TLS_end (negative offset from TP)
+                        let tpoff = sym_addr as i32 - tls_addr as i32 - tls_mem_size as i32;
+                        (tpoff + addend) as u32
+                    }
+                    R_386_TLS_IE => {
+                        // Initial Exec TLS via GOT: absolute address of GOT entry
+                        // The GOT entry contains the negative TP offset
+                        if let Some(gs) = global_symbols.get(&sym.name) {
+                            if gs.needs_got {
+                                let got_entry_addr = got_vaddr + (got_reserved as u32 + (gs.got_index - num_plt) as u32) * 4;
+                                (got_entry_addr as i32 + addend) as u32
+                            } else {
+                                // Relax to LE: direct TPOFF
+                                let tpoff = sym_addr as i32 - tls_addr as i32 - tls_mem_size as i32;
+                                (tpoff + addend) as u32
+                            }
+                        } else {
+                            addend as u32
+                        }
+                    }
+                    R_386_TLS_GOTIE => {
+                        // GOT-relative offset to TLS GOT entry
+                        // Value = GOT_entry_addr - GOT_base
+                        if let Some(gs) = global_symbols.get(&sym.name) {
+                            if gs.needs_got {
+                                let got_entry_addr = got_vaddr + (got_reserved as u32 + (gs.got_index - num_plt) as u32) * 4;
+                                (got_entry_addr as i32 + addend - got_base as i32) as u32
+                            } else {
+                                // No GOT entry; use direct offset
+                                let tpoff = sym_addr as i32 - tls_addr as i32 - tls_mem_size as i32;
+                                (tpoff + addend) as u32
+                            }
+                        } else {
+                            addend as u32
                         }
                     }
                     other => {
@@ -2165,6 +2415,12 @@ pub fn link_builtin(
                 let out_sec = &mut output_sections[out_sec_idx];
                 let off = patch_offset as usize;
                 if off + 4 <= out_sec.data.len() {
+                    // For GOT32X relaxation, rewrite mov (0x8b) → lea (0x8d)
+                    if relax_got32x && off >= 2 {
+                        if out_sec.data[off - 2] == 0x8b {
+                            out_sec.data[off - 2] = 0x8d;
+                        }
+                    }
                     out_sec.data[off..off + 4].copy_from_slice(&value.to_le_bytes());
                 }
             }
@@ -2173,13 +2429,23 @@ pub fn link_builtin(
 
     // ── Build GOT entries ────────────────────────────────────────────────────
     let mut got_data: Vec<u8> = Vec::new();
-    if !is_static {
-        // GOT[0] = .dynamic address
-        got_data.extend_from_slice(&dynamic_vaddr.to_le_bytes());
+    if needs_got {
+        if is_static {
+            // GOT[0] = 0 in static mode (no .dynamic)
+            got_data.extend_from_slice(&0u32.to_le_bytes());
+        } else {
+            // GOT[0] = .dynamic address
+            got_data.extend_from_slice(&dynamic_vaddr.to_le_bytes());
+        }
         // Non-PLT GOT entries
         for name in &got_symbols {
             if let Some(gs) = global_symbols.get(name) {
-                if gs.is_dynamic {
+                if has_tls && gs.sym_type == STT_TLS {
+                    // TLS GOT entry: store the TPOFF value (negative offset from TP)
+                    // On i386 variant II: TPOFF = sym_addr - tls_addr - tls_mem_size
+                    let tpoff = gs.address as i32 - tls_addr as i32 - tls_mem_size as i32;
+                    got_data.extend_from_slice(&(tpoff as u32).to_le_bytes());
+                } else if gs.is_dynamic {
                     got_data.extend_from_slice(&0u32.to_le_bytes()); // Filled by ld.so
                 } else {
                     got_data.extend_from_slice(&gs.address.to_le_bytes());
@@ -2426,6 +2692,14 @@ pub fn link_builtin(
         0, 0, 0, 0,
         PF_R | PF_W, 0x10);
 
+    // PT_TLS
+    if has_tls {
+        write_phdr(&mut output, &mut phdr_pos, PT_TLS,
+            tls_file_offset, tls_addr,
+            tls_file_size, tls_mem_size,
+            PF_R, tls_align);
+    }
+
     // GNU_RELRO omitted: see note above about .got/.got.plt page sharing
 
     // ── Write section data to file ───────────────────────────────────────────
@@ -2434,15 +2708,6 @@ pub fn link_builtin(
     if !is_static {
         output[interp_offset as usize..interp_offset as usize + interp_data.len()]
             .copy_from_slice(&interp_data);
-    }
-
-    // Write .note
-    if let Some(idx) = note_sec_idx {
-        let sec = &output_sections[idx];
-        if !sec.data.is_empty() {
-            output[note_offset as usize..note_offset as usize + sec.data.len()]
-                .copy_from_slice(&sec.data);
-        }
     }
 
     // Write .hash
@@ -2487,73 +2752,10 @@ pub fn link_builtin(
             .copy_from_slice(&rel_plt_data);
     }
 
-    // Write .init
-    if let Some(idx) = init_sec_idx {
-        let sec = &output_sections[idx];
-        if !sec.data.is_empty() {
-            output[sec.file_offset as usize..sec.file_offset as usize + sec.data.len()]
-                .copy_from_slice(&sec.data);
-        }
-    }
-
     // Write .plt
     if !plt_data.is_empty() {
         output[plt_offset as usize..plt_offset as usize + plt_data.len()]
             .copy_from_slice(&plt_data);
-    }
-
-    // Write .text
-    if let Some(idx) = text_sec_idx {
-        let sec = &output_sections[idx];
-        if !sec.data.is_empty() {
-            output[sec.file_offset as usize..sec.file_offset as usize + sec.data.len()]
-                .copy_from_slice(&sec.data);
-        }
-    }
-
-    // Write .fini
-    if let Some(idx) = fini_sec_idx {
-        let sec = &output_sections[idx];
-        if !sec.data.is_empty() {
-            output[sec.file_offset as usize..sec.file_offset as usize + sec.data.len()]
-                .copy_from_slice(&sec.data);
-        }
-    }
-
-    // Write .rodata
-    if let Some(idx) = rodata_sec_idx {
-        let sec = &output_sections[idx];
-        if !sec.data.is_empty() {
-            output[sec.file_offset as usize..sec.file_offset as usize + sec.data.len()]
-                .copy_from_slice(&sec.data);
-        }
-    }
-
-    // Write .eh_frame
-    if let Some(idx) = eh_frame_sec_idx {
-        let sec = &output_sections[idx];
-        if !sec.data.is_empty() {
-            output[sec.file_offset as usize..sec.file_offset as usize + sec.data.len()]
-                .copy_from_slice(&sec.data);
-        }
-    }
-
-    // Write .init_array
-    if let Some(idx) = init_array_sec_idx {
-        let sec = &output_sections[idx];
-        if !sec.data.is_empty() {
-            output[sec.file_offset as usize..sec.file_offset as usize + sec.data.len()]
-                .copy_from_slice(&sec.data);
-        }
-    }
-
-    // Write .fini_array
-    if let Some(idx) = fini_array_sec_idx {
-        let sec = &output_sections[idx];
-        if !sec.data.is_empty() {
-            output[sec.file_offset as usize..sec.file_offset as usize + sec.data.len()]
-                .copy_from_slice(&sec.data);
-        }
     }
 
     // Write .dynamic
@@ -2563,7 +2765,7 @@ pub fn link_builtin(
     }
 
     // Write .got
-    if !is_static && !got_data.is_empty() {
+    if !got_data.is_empty() {
         output[got_offset as usize..got_offset as usize + got_data.len()]
             .copy_from_slice(&got_data);
     }
@@ -2574,14 +2776,34 @@ pub fn link_builtin(
             .copy_from_slice(&gotplt_data);
     }
 
-    // Write .data
-    if let Some(idx) = data_sec_idx {
-        let sec = &output_sections[idx];
-        if !sec.data.is_empty() {
-            output[sec.file_offset as usize..sec.file_offset as usize + sec.data.len()]
-                .copy_from_slice(&sec.data);
+    // Write .iplt (IFUNC PLT stubs)
+    if !iplt_data.is_empty() {
+        output[iplt_offset as usize..iplt_offset as usize + iplt_data.len()]
+            .copy_from_slice(&iplt_data);
+    }
+
+    // Write IFUNC GOT entries
+    if !ifunc_got_data.is_empty() {
+        output[ifunc_got_offset as usize..ifunc_got_offset as usize + ifunc_got_data.len()]
+            .copy_from_slice(&ifunc_got_data);
+    }
+
+    // Write .rel.iplt (IRELATIVE relocations)
+    if !rel_iplt_data.is_empty() {
+        output[rel_iplt_offset as usize..rel_iplt_offset as usize + rel_iplt_data.len()]
+            .copy_from_slice(&rel_iplt_data);
+    }
+
+    // Write all output sections (generic loop, matching x86-64 approach)
+    for sec in output_sections.iter() {
+        if sec.sh_type == SHT_NOBITS || sec.data.is_empty() { continue; }
+        let off = sec.file_offset as usize;
+        let end = off + sec.data.len();
+        if end <= output.len() {
+            output[off..end].copy_from_slice(&sec.data);
         }
     }
+
 
     // Write to file
     std::fs::write(output_path, &output)
