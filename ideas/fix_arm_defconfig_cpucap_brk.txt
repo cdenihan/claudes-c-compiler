@@ -1,0 +1,29 @@
+Fix ARM64 defconfig kernel BRK crash in cpucap_is_possible
+
+After fixing the GOT relocation issue, the ARM64 defconfig kernel boots much
+further but crashes with a BRK #0 in cpucap_is_possible().
+
+Root cause: cpucap_is_possible() uses compiletime_assert(__builtin_constant_p(cap))
+which expects the cap argument to always be a compile-time constant. When
+__builtin_constant_p() doesn't properly evaluate to 1 after inlining, the
+compiletime_assert generates a brk #0 at runtime.
+
+Call trace:
+  cpucap_is_possible <- ___slab_alloc <- __slab_alloc <- kmem_cache_alloc_node
+  <- init_kmem_cache_nodes <- kmem_cache_open <- __kmem_cache_create
+  <- create_boot_cache <- kmem_cache_init <- mm_core_init <- start_kernel
+
+The issue is that the compiler doesn't properly propagate constant values
+through the __always_inline call chain, so __builtin_constant_p(cap)
+evaluates to 0 instead of 1, leaving the brk #0 in the generated code.
+
+Possible fixes:
+1. Improve __builtin_constant_p handling after inlining: after an
+   __always_inline function is inlined and its argument becomes a constant,
+   re-evaluate __builtin_constant_p to 1.
+2. Improve the IsConstant IR instruction resolution in constant_fold pass.
+3. Handle __attribute__((error("msg"))) properly: if the function is never
+   called after optimization, eliminate it entirely. If it IS called,
+   emit a compile-time error instead of a brk #0.
+
+This only affects the defconfig kernel, not tinyconfig (which boots fine).

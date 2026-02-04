@@ -1,0 +1,10 @@
+Fix libuv segfault with builtin linker on ARM and RISC-V
+
+When MY_LD=builtin is set, libuv tests segfault (exit=-11) on ARM and RISC-V.
+The builtin assembler works fine. The issue is specifically in the static linker
+for these two architectures.
+
+libuv version test passes (just prints the version), but all functional tests
+that call libuv APIs (loop, timer, idle, async, tcp_bind, fs) segfault.
+
+This suggests a relocation or symbol resolution issue in the linker.

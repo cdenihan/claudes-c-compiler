@@ -858,11 +858,17 @@ pub(crate) fn link_builtin_riscv(
 
     let mut setup = resolve_builtin_link_setup(&DIRECT_LD_RISCV64, user_args, is_nostdlib, is_static);
 
-    // RISC-V needs gcc_s in addition to the default libs for dynamic linking
-    if !is_nostdlib && !is_static {
-        // Insert gcc_s after gcc
-        if let Some(pos) = setup.needed_libs.iter().position(|l| l == "gcc") {
-            setup.needed_libs.insert(pos + 1, "gcc_s".to_string());
+    if !is_nostdlib {
+        if is_static {
+            // RISC-V static linking needs gcc_eh for exception handling/unwinding
+            if let Some(pos) = setup.needed_libs.iter().position(|l| l == "gcc") {
+                setup.needed_libs.insert(pos + 1, "gcc_eh".to_string());
+            }
+        } else {
+            // RISC-V dynamic linking needs gcc_s
+            if let Some(pos) = setup.needed_libs.iter().position(|l| l == "gcc") {
+                setup.needed_libs.insert(pos + 1, "gcc_s".to_string());
+            }
         }
     }
 

@@ -193,11 +193,13 @@ pub fn link_builtin(
                 // Skip well-known linker-defined symbols
                 if !matches!(name.as_str(), "__bss_start" | "_edata" | "_end" | "__end"
                     | "_GLOBAL_OFFSET_TABLE_" | "__dso_handle" | "_DYNAMIC"
-                    | "__GNU_EH_FRAME_HDR" | "__ehdr_start" | "_init" | "_fini"
+                    | "__GNU_EH_FRAME_HDR" | "__ehdr_start" | "__executable_start"
+                    | "_init" | "_fini"
                     | "__init_array_start" | "__init_array_end"
                     | "__fini_array_start" | "__fini_array_end"
                     | "__preinit_array_start" | "__preinit_array_end"
                     | "__rela_iplt_start" | "__rela_iplt_end"
+                    | "_etext" | "etext" | "__data_start" | "data_start"
                     // TODO: __getauxval is weakly referenced by glibc init; resolves to 0 in static binaries
                     | "__getauxval") {
                     unresolved.push(name.clone());
@@ -830,7 +832,8 @@ fn emit_executable(
     let init_addr = output_sections.iter().find(|s| s.name == ".init").map(|s| s.addr).unwrap_or(0);
     let fini_addr = output_sections.iter().find(|s| s.name == ".fini").map(|s| s.addr).unwrap_or(0);
 
-    // Define linker-provided symbols
+    // Define linker-provided symbols (consistent with x86-64/i686/RISC-V)
+    let text_seg_end = BASE_ADDR + rx_filesz;
     let linker_syms = [
         ("__dso_handle", BASE_ADDR),
         ("_DYNAMIC", 0),
@@ -842,11 +845,16 @@ fn emit_executable(
         ("__preinit_array_start", init_array_start),
         ("__preinit_array_end", init_array_start),
         ("__ehdr_start", BASE_ADDR),
+        ("__executable_start", BASE_ADDR),
         ("__GNU_EH_FRAME_HDR", 0),
         ("_init", init_addr),
         ("_fini", fini_addr),
         ("__rela_iplt_start", rela_iplt_addr),
         ("__rela_iplt_end", rela_iplt_end_addr),
+        ("_etext", text_seg_end),
+        ("etext", text_seg_end),
+        ("__data_start", rw_page_addr),
+        ("data_start", rw_page_addr),
     ];
     for (name, val) in &linker_syms {
         if globals.get(*name).map(|g| g.defined_in.is_none()).unwrap_or(true) {

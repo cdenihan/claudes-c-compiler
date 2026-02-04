@@ -277,8 +277,11 @@ This handles transitive dependencies between archive members.
 
 After all user-specified inputs are loaded, any remaining undefined symbols
 are searched in system libraries (`libc.so.6`, `libm.so.6`, `libgcc_s.so.1`)
-at well-known paths.  Built-in symbols (`_GLOBAL_OFFSET_TABLE_`, `__bss_start`,
-`_edata`, `_end`) are excluded from this check.
+at well-known paths.  Linker-defined symbols (`_GLOBAL_OFFSET_TABLE_`, `__bss_start`,
+`_edata`, `_end`, `__end`, `__ehdr_start`, `__executable_start`, `_etext`, `etext`,
+`__dso_handle`, `_DYNAMIC`, `__data_start`, `data_start`, init/fini/preinit array
+boundary symbols, and `__rela_iplt_start`/`__rela_iplt_end`) are excluded from this
+check since they are defined during the layout phase.
 
 ### Phase 2: Symbol Resolution
 
@@ -472,9 +475,11 @@ Where:
 
 1. **Section symbols** -- Resolved via the section map to the output section
    address plus input section offset.
-2. **Named symbols** -- Looked up in the `globals` table.
-   - Special built-in symbols: `_GLOBAL_OFFSET_TABLE_` -> `got_plt_addr`,
-     `__bss_start`/`_edata` -> `bss_addr`, `_end`/`__end` -> `bss_addr + bss_size`.
+2. **Named symbols** -- Looked up in the `globals` table.  Linker-defined symbols
+   (e.g., `_GLOBAL_OFFSET_TABLE_`, `__bss_start`, `_edata`, `_end`, `__ehdr_start`,
+   `_etext`, `__dso_handle`, `_DYNAMIC`, `__data_start`, init/fini array boundaries)
+   are inserted into `globals` during the layout phase in `emit_executable` and
+   resolved through the normal lookup path.
    - Defined globals: use `value` directly.
    - Dynamic symbols: use PLT address if available.
    - Weak undefined: resolve to 0.

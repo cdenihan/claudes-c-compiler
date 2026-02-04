@@ -10,14 +10,13 @@ use std::collections::HashMap;
 use super::parser::*;
 use super::encoder::*;
 use crate::backend::elf::{
-    SHT_NULL, SHT_PROGBITS, SHT_SYMTAB, SHT_STRTAB, SHT_RELA, SHT_NOBITS,
+    SHT_PROGBITS, SHT_NOBITS,
     SHT_INIT_ARRAY, SHT_FINI_ARRAY, SHT_NOTE,
     SHF_WRITE, SHF_ALLOC, SHF_EXECINSTR, SHF_MERGE, SHF_STRINGS, SHF_TLS, SHF_GROUP,
     STB_LOCAL, STB_GLOBAL, STB_WEAK,
-    STT_NOTYPE, STT_OBJECT, STT_FUNC, STT_SECTION, STT_TLS,
+    STT_NOTYPE, STT_OBJECT, STT_FUNC, STT_TLS,
     STV_DEFAULT, STV_INTERNAL, STV_HIDDEN, STV_PROTECTED,
-    SHN_UNDEF, SHN_COMMON,
-    ELFCLASS64, ELFDATA2LSB, EV_CURRENT, ELFOSABI_NONE, ET_REL, EM_X86_64,
+    ELFCLASS64, EM_X86_64,
 };
 
 /// Tracks a jump instruction for relaxation (long -> short).
@@ -101,6 +100,8 @@ pub struct ElfWriter {
     pending_internal: Vec<String>,
     /// Set aliases.
     aliases: HashMap<String, String>,
+    /// Section stack for .pushsection/.popsection.
+    section_stack: Vec<Option<usize>>,
 }
 
 /// Check if a string is a numeric local label (just digits, e.g., "1", "42").
@@ -187,6 +188,14 @@ fn resolve_numeric_labels(items: &[AsmItem]) -> Vec<AsmItem> {
                     operands: new_ops,
                 }));
             }
+            AsmItem::Long(vals) => {
+                let new_vals = resolve_numeric_data_values(vals, i, &defs);
+                result.push(AsmItem::Long(new_vals));
+            }
+            AsmItem::Quad(vals) => {
+                let new_vals = resolve_numeric_data_values(vals, i, &defs);
+                result.push(AsmItem::Quad(new_vals));
+            }
             _ => result.push(item.clone()),
         }
     }
@@ -224,6 +233,38 @@ fn resolve_numeric_operand(
         }
         _ => op.clone(),
     }
+}
+
+/// Resolve numeric label references in data values (.long, .quad directives).
+fn resolve_numeric_data_values(
+    vals: &[DataValue],
+    current_idx: usize,
+    defs: &HashMap<String, Vec<(usize, String)>>,
+) -> Vec<DataValue> {
+    vals.iter().map(|val| {
+        match val {
+            DataValue::Symbol(name) => {
+                if let Some(resolved) = resolve_numeric_name(name, current_idx, defs) {
+                    DataValue::Symbol(resolved)
+                } else {
+                    val.clone()
+                }
+            }
+            DataValue::SymbolDiff(lhs, rhs) => {
+                let new_lhs = resolve_numeric_name(lhs, current_idx, defs).unwrap_or_else(|| lhs.clone());
+                let new_rhs = resolve_numeric_name(rhs, current_idx, defs).unwrap_or_else(|| rhs.clone());
+                DataValue::SymbolDiff(new_lhs, new_rhs)
+            }
+            DataValue::SymbolOffset(name, offset) => {
+                if let Some(resolved) = resolve_numeric_name(name, current_idx, defs) {
+                    DataValue::SymbolOffset(resolved, *offset)
+                } else {
+                    val.clone()
+                }
+            }
+            _ => val.clone(),
+        }
+    }).collect()
 }
 
 /// Resolve a numeric label reference name (e.g., "1f" -> ".Lnum_1_0").
@@ -294,6 +335,7 @@ impl ElfWriter {
             pending_protected: Vec::new(),
             pending_internal: Vec::new(),
             aliases: HashMap::new(),
+            section_stack: Vec::new(),
         }
     }
 
@@ -345,6 +387,18 @@ impl ElfWriter {
         match item {
             AsmItem::Section(dir) => {
                 self.switch_section(dir);
+            }
+            AsmItem::PushSection(dir) => {
+                // Save the current section and switch to the new one
+                self.section_stack.push(self.current_section);
+                self.switch_section(dir);
+            }
+            AsmItem::PopSection => {
+                // Restore the previous section from the stack
+                if let Some(prev) = self.section_stack.pop() {
+                    self.current_section = prev;
+                }
+                // If stack is empty, silently keep current section (matches GNU as behavior)
             }
             AsmItem::Global(name) => {
                 self.pending_globals.push(name.clone());
@@ -699,7 +753,7 @@ impl ElfWriter {
         // Resolve .set aliases into proper symbols with correct binding/visibility.
         // This must happen here (in emit_elf) because pending_weaks/hidden/globals
         // are available, and write_object doesn't have access to them.
-        let empty_aliases: HashMap<String, String> = HashMap::new();
+        let _empty_aliases: HashMap<String, String> = HashMap::new();
         for (alias, target) in &self.aliases {
             // Find the target symbol to copy section/value/size from
             let (section, value, size, target_sym_type) = if let Some(&sym_idx) = self.symbol_map.get(target.as_str()) {
@@ -812,9 +866,141 @@ impl ElfWriter {
             self.symbol_map.insert(name.clone(), sym_idx);
         }
 
-        // Build the ELF file
-        let mut elf = ElfByteWriter::new();
-        elf.write_object(&self.sections, &self.symbols, &empty_aliases, &self.label_positions)
+        // Convert to shared ObjSection/ObjSymbol format and delegate to shared writer.
+        // The x86 assembler uses section symbols for .L* label relocations:
+        // when a relocation references a .L* label, we convert it to reference the
+        // section name (so the shared writer maps it to the section symbol) with the
+        // label's offset baked into the addend.
+        use crate::backend::elf::{self as elf_mod, ElfConfig, ObjSection, ObjSymbol, ObjReloc};
+
+        let section_names: Vec<String> = self.sections.iter().map(|s| s.name.clone()).collect();
+
+        let mut shared_sections: HashMap<String, ObjSection> = HashMap::new();
+        for sec in &self.sections {
+            let mut relocs = Vec::new();
+            for reloc in &sec.relocations {
+                let (sym_name, mut addend) = if reloc.symbol.starts_with('.') {
+                    // Internal label (.L*, .Lstr*, etc.): convert to section symbol + offset
+                    if let Some(&(target_sec, target_off)) = self.label_positions.get(&reloc.symbol) {
+                        (section_names[target_sec].clone(), reloc.addend + target_off as i64)
+                    } else {
+                        (reloc.symbol.clone(), reloc.addend)
+                    }
+                } else {
+                    (reloc.symbol.clone(), reloc.addend)
+                };
+
+                // Handle symbol-difference relocations (.long a - b)
+                if let Some(ref diff_sym) = reloc.diff_symbol {
+                    if let Some(&(_b_sec, b_off)) = self.label_positions.get(diff_sym) {
+                        addend += reloc.offset as i64 - b_off as i64;
+                    }
+                }
+
+                relocs.push(ObjReloc {
+                    offset: reloc.offset,
+                    reloc_type: reloc.reloc_type,
+                    symbol_name: sym_name,
+                    addend,
+                });
+            }
+            shared_sections.insert(sec.name.clone(), ObjSection {
+                name: sec.name.clone(),
+                sh_type: sec.section_type,
+                sh_flags: sec.flags,
+                data: sec.data.clone(),
+                sh_addralign: sec.alignment,
+                relocs,
+            });
+        }
+
+        // Convert internal symbols, filtering out .L* labels (they're handled via section symbols)
+        let mut shared_symbols: Vec<ObjSymbol> = self.symbols.iter()
+            .filter(|sym| !sym.name.is_empty() && !sym.name.starts_with('.'))
+            .map(|sym| ObjSymbol {
+                name: sym.name.clone(),
+                value: if sym.is_common { sym.common_align as u64 } else { sym.value },
+                size: sym.size,
+                binding: sym.binding,
+                sym_type: sym.sym_type,
+                visibility: sym.visibility,
+                section_name: if sym.is_common {
+                    "*COM*".to_string()
+                } else {
+                    sym.section.clone().unwrap_or_default()
+                },
+            }).collect();
+
+        // Add undefined symbols for external references (e.g., strlen, printf, etc.)
+        // that appear in relocations but have no definition in this object file.
+        // Without these, the linker can't resolve PLT32/PC32 calls to external functions.
+        let defined_names: std::collections::HashSet<&str> = shared_symbols.iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        let section_name_set: std::collections::HashSet<&str> = section_names.iter()
+            .map(|s| s.as_str())
+            .collect();
+
+        let mut undefined_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for sec in shared_sections.values() {
+            for reloc in &sec.relocs {
+                let name = &reloc.symbol_name;
+                if name.is_empty() || name.starts_with('.') {
+                    continue; // Skip empty and internal (.L*) labels / section symbols
+                }
+                if section_name_set.contains(name.as_str()) {
+                    continue; // Skip section names (already have section symbols)
+                }
+                if !defined_names.contains(name.as_str()) {
+                    undefined_names.insert(name.clone());
+                }
+            }
+        }
+
+        for name in &undefined_names {
+            let binding = if self.pending_weaks.contains(name) {
+                STB_WEAK
+            } else {
+                STB_GLOBAL
+            };
+            let sym_type = match self.pending_types.get(name.as_str()) {
+                Some(SymbolKind::Function) => STT_FUNC,
+                Some(SymbolKind::Object) => STT_OBJECT,
+                Some(SymbolKind::TlsObject) => STT_TLS,
+                Some(SymbolKind::NoType) | None => STT_NOTYPE,
+            };
+            let visibility = if self.pending_hidden.contains(name) {
+                STV_HIDDEN
+            } else if self.pending_protected.contains(name) {
+                STV_PROTECTED
+            } else if self.pending_internal.contains(name) {
+                STV_INTERNAL
+            } else {
+                STV_DEFAULT
+            };
+            shared_symbols.push(ObjSymbol {
+                name: name.clone(),
+                value: 0,
+                size: 0,
+                binding,
+                sym_type,
+                visibility,
+                section_name: String::new(), // empty = SHN_UNDEF
+            });
+        }
+
+        let config = ElfConfig {
+            e_machine: EM_X86_64,
+            e_flags: 0,
+            elf_class: ELFCLASS64,
+        };
+
+        elf_mod::write_relocatable_object(
+            &config,
+            &section_names,
+            &shared_sections,
+            &shared_symbols,
+        )
     }
 
     /// Relax long jumps to short jumps when the displacement fits in a signed byte.
@@ -1125,505 +1311,6 @@ impl ElfWriter {
     }
 }
 
-/// Low-level ELF byte serializer.
-struct ElfByteWriter {
-    output: Vec<u8>,
-}
-
-impl ElfByteWriter {
-    fn new() -> Self {
-        ElfByteWriter { output: Vec::new() }
-    }
-
-    fn write_object(
-        &mut self,
-        sections: &[Section],
-        symbols: &[SymbolInfo],
-        aliases: &HashMap<String, String>,
-        label_positions: &HashMap<String, (usize, u64)>,
-    ) -> Result<Vec<u8>, String> {
-        // Plan the layout:
-        // 1. ELF header (64 bytes)
-        // 2. Section data (each section's contents)
-        // 3. .symtab (symbol table)
-        // 4. .strtab (string table for symbols)
-        // 5. .shstrtab (string table for section names)
-        // 6. .rela.* sections (one per section with relocations)
-        // 7. Section header table
-
-        // Build string tables
-        let mut shstrtab = StringTable::new();
-        let mut strtab = StringTable::new();
-
-        // Add section names
-        shstrtab.add(""); // Null entry
-        for sec in sections {
-            shstrtab.add(&sec.name);
-        }
-        shstrtab.add(".symtab");
-        shstrtab.add(".strtab");
-        shstrtab.add(".shstrtab");
-        for sec in sections {
-            if !sec.relocations.is_empty() {
-                shstrtab.add(&format!(".rela{}", sec.name));
-            }
-        }
-
-        // Add symbol names
-        strtab.add(""); // Null entry
-        for sym in symbols {
-            if !sym.name.is_empty() {
-                strtab.add(&sym.name);
-            }
-        }
-        // Add names for alias symbols
-        for alias in aliases.keys() {
-            strtab.add(alias);
-        }
-
-        // Build symbol table
-        // Order: null symbol, local symbols (section + defined), then global/weak
-        let mut sym_entries: Vec<SymEntry> = Vec::new();
-        // Null symbol (index 0)
-        sym_entries.push(SymEntry::null());
-
-        // Section symbols (one per section, local)
-        // Section symbols use st_name=0 (empty) since the section header identifies them.
-        let mut section_sym_indices: HashMap<usize, usize> = HashMap::new();
-        for (i, _sec) in sections.iter().enumerate() {
-            section_sym_indices.insert(i, sym_entries.len());
-            sym_entries.push(SymEntry {
-                name_offset: 0, // Section symbols use empty name
-                info: (STB_LOCAL << 4) | STT_SECTION,
-                other: STV_DEFAULT,
-                shndx: (i + 1) as u16, // section indices start at 1 (0 is null)
-                value: 0,
-                size: 0,
-            });
-        }
-
-        // Local defined symbols
-        let mut symbol_to_elf_idx: HashMap<String, usize> = HashMap::new();
-        for sym in symbols {
-            if sym.binding != STB_LOCAL {
-                continue;
-            }
-            if sym.name.is_empty() || sym.name.starts_with('.') {
-                // Skip internal labels (we handle them via section symbols)
-                continue;
-            }
-            let shndx = if sym.is_common {
-                SHN_COMMON
-            } else if let Some(ref sec_name) = sym.section {
-                if let Some(sec_idx) = sections.iter().position(|s| s.name == *sec_name) {
-                    (sec_idx + 1) as u16
-                } else {
-                    SHN_UNDEF
-                }
-            } else {
-                SHN_UNDEF
-            };
-
-            symbol_to_elf_idx.insert(sym.name.clone(), sym_entries.len());
-            sym_entries.push(SymEntry {
-                name_offset: strtab.offset_of(&sym.name),
-                info: (sym.binding << 4) | sym.sym_type,
-                other: sym.visibility,
-                shndx,
-                value: sym.value,
-                size: sym.size,
-            });
-        }
-
-        let first_global = sym_entries.len() as u32;
-
-        // Global and weak symbols
-        for sym in symbols {
-            if sym.binding == STB_LOCAL {
-                continue;
-            }
-            let shndx = if sym.is_common {
-                SHN_COMMON
-            } else if let Some(ref sec_name) = sym.section {
-                if let Some(sec_idx) = sections.iter().position(|s| s.name == *sec_name) {
-                    (sec_idx + 1) as u16
-                } else {
-                    SHN_UNDEF
-                }
-            } else {
-                SHN_UNDEF
-            };
-
-            symbol_to_elf_idx.insert(sym.name.clone(), sym_entries.len());
-            sym_entries.push(SymEntry {
-                name_offset: strtab.offset_of(&sym.name),
-                info: (sym.binding << 4) | sym.sym_type,
-                other: sym.visibility,
-                shndx,
-                value: if sym.is_common { sym.common_align as u64 } else { sym.value },
-                size: sym.size,
-            });
-        }
-
-        // Alias symbols (.set)
-        for (alias, target) in aliases {
-            // Find target symbol
-            if let Some(&target_idx) = symbol_to_elf_idx.get(target) {
-                let target_entry = &sym_entries[target_idx];
-                symbol_to_elf_idx.insert(alias.clone(), sym_entries.len());
-                sym_entries.push(SymEntry {
-                    name_offset: strtab.offset_of(alias),
-                    info: target_entry.info,
-                    other: target_entry.other,
-                    shndx: target_entry.shndx,
-                    value: target_entry.value,
-                    size: target_entry.size,
-                });
-            }
-        }
-
-        // Create undefined symbols for any relocations that reference
-        // symbols not yet in the symbol table (external references like printf).
-        for sec in sections {
-            for reloc in &sec.relocations {
-                let sym_name = &reloc.symbol;
-                if sym_name.is_empty() || sym_name.starts_with('.') {
-                    continue; // Skip internal labels
-                }
-                if symbol_to_elf_idx.contains_key(sym_name) {
-                    continue; // Already defined
-                }
-                // Create undefined global symbol
-                strtab.add(sym_name);
-                symbol_to_elf_idx.insert(sym_name.clone(), sym_entries.len());
-                sym_entries.push(SymEntry {
-                    name_offset: strtab.offset_of(sym_name),
-                    info: (STB_GLOBAL << 4) | STT_NOTYPE,
-                    other: STV_DEFAULT,
-                    shndx: SHN_UNDEF,
-                    value: 0,
-                    size: 0,
-                });
-            }
-        }
-
-        // Now compute the layout
-        let ehdr_size = 64u64;
-        let mut offset = ehdr_size;
-
-        // Section data offsets
-        let mut section_offsets: Vec<u64> = Vec::new();
-        for sec in sections {
-            // Align section data
-            let align = std::cmp::max(sec.alignment, 1);
-            offset = (offset + align - 1) & !(align - 1);
-            section_offsets.push(offset);
-            if sec.section_type != SHT_NOBITS {
-                offset += sec.data.len() as u64;
-            }
-        }
-
-        // Symtab
-        let symtab_offset = (offset + 7) & !7; // 8-byte aligned
-        let sym_entry_size = 24u64; // Elf64_Sym size
-        let symtab_size = sym_entries.len() as u64 * sym_entry_size;
-        offset = symtab_offset + symtab_size;
-
-        // Strtab
-        let strtab_offset = offset;
-        let strtab_data = strtab.as_bytes().to_vec();
-        offset += strtab_data.len() as u64;
-
-        // Shstrtab
-        let shstrtab_offset = offset;
-        let shstrtab_data = shstrtab.as_bytes().to_vec();
-        offset += shstrtab_data.len() as u64;
-
-        // Rela sections
-        let rela_entry_size = 24u64; // Elf64_Rela size
-        let mut rela_offsets: Vec<(usize, u64, u64)> = Vec::new(); // (sec_idx, offset, size)
-        for (i, sec) in sections.iter().enumerate() {
-            if !sec.relocations.is_empty() {
-                offset = (offset + 7) & !7;
-                let rela_size = sec.relocations.len() as u64 * rela_entry_size;
-                rela_offsets.push((i, offset, rela_size));
-                offset += rela_size;
-            }
-        }
-
-        // Section header table
-        let shdr_offset = (offset + 7) & !7;
-
-        // Count total sections:
-        // 0: NULL
-        // 1..N: data sections
-        // N+1: .symtab
-        // N+2: .strtab
-        // N+3: .shstrtab
-        // N+4..: .rela.* sections
-        let num_data_sections = sections.len();
-        let symtab_shndx = num_data_sections + 1;
-        let strtab_shndx = num_data_sections + 2;
-        let shstrtab_shndx = num_data_sections + 3;
-        let total_sections = shstrtab_shndx + 1 + rela_offsets.len();
-
-        // Write ELF header
-        self.output.clear();
-        self.output.reserve(shdr_offset as usize + total_sections * 64);
-
-        // e_ident
-        self.output.extend_from_slice(&[0x7f, b'E', b'L', b'F']); // magic
-        self.output.push(ELFCLASS64);
-        self.output.push(ELFDATA2LSB);
-        self.output.push(EV_CURRENT);
-        self.output.push(ELFOSABI_NONE);
-        self.output.extend_from_slice(&[0u8; 8]); // padding
-
-        self.write_u16(ET_REL);           // e_type
-        self.write_u16(EM_X86_64);        // e_machine
-        self.write_u32(1);                // e_version
-        self.write_u64(0);                // e_entry
-        self.write_u64(0);                // e_phoff
-        self.write_u64(shdr_offset);      // e_shoff
-        self.write_u32(0);                // e_flags
-        self.write_u16(64);               // e_ehsize
-        self.write_u16(0);                // e_phentsize
-        self.write_u16(0);                // e_phnum
-        self.write_u16(64);               // e_shentsize
-        self.write_u16(total_sections as u16); // e_shnum
-        self.write_u16(shstrtab_shndx as u16); // e_shstrndx
-
-        // Write section data
-        for (i, sec) in sections.iter().enumerate() {
-            // Pad to alignment
-            while self.output.len() < section_offsets[i] as usize {
-                self.output.push(0);
-            }
-            if sec.section_type != SHT_NOBITS {
-                self.output.extend_from_slice(&sec.data);
-            }
-        }
-
-        // Write symtab
-        while self.output.len() < symtab_offset as usize {
-            self.output.push(0);
-        }
-        for entry in &sym_entries {
-            self.write_u32(entry.name_offset); // st_name
-            self.output.push(entry.info);              // st_info
-            self.output.push(entry.other);             // st_other
-            self.write_u16(entry.shndx);              // st_shndx
-            self.write_u64(entry.value);              // st_value
-            self.write_u64(entry.size);               // st_size
-        }
-
-        // Write strtab
-        self.output.extend_from_slice(&strtab_data);
-
-        // Write shstrtab
-        self.output.extend_from_slice(&shstrtab_data);
-
-        // Write rela sections
-        for &(sec_idx, rela_offset, _) in &rela_offsets {
-            while self.output.len() < rela_offset as usize {
-                self.output.push(0);
-            }
-            for reloc in &sections[sec_idx].relocations {
-                // Find symbol index in ELF symtab
-                let sym_idx = self.resolve_reloc_symbol(
-                    &reloc.symbol, &symbol_to_elf_idx, &section_sym_indices,
-                    label_positions, sections,
-                );
-
-                self.write_u64(reloc.offset);
-                // r_info = (sym << 32) | type
-                let r_info = ((sym_idx as u64) << 32) | (reloc.reloc_type as u64);
-                self.write_u64(r_info);
-
-                // Compute addend: for local symbols referenced by section symbol,
-                // the addend includes the symbol's offset within the section
-                let mut addend = if let Some(&(target_sec, target_off)) = label_positions.get(&reloc.symbol) {
-                    if let Some(&sec_sym) = section_sym_indices.get(&target_sec) {
-                        if sym_idx == sec_sym {
-                            // Using section symbol: addend must include offset
-                            reloc.addend + target_off as i64
-                        } else {
-                            reloc.addend
-                        }
-                    } else {
-                        reloc.addend
-                    }
-                } else {
-                    reloc.addend
-                };
-
-                // For symbol-difference relocations (.long a - b):
-                // R_X86_64_PC32 computes S + A - P, but we want a - b.
-                // Since S + A already has the offset of `a`, we need to
-                // adjust so that P effectively becomes b's address.
-                // addend += reloc.offset - offset_of(b) when b is in same section.
-                if let Some(ref diff_sym) = reloc.diff_symbol {
-                    if let Some(&(b_sec, b_off)) = label_positions.get(diff_sym) {
-                        // b is in the same section as the relocation (typical case)
-                        let _ = b_sec; // b_sec should equal the current section
-                        addend += reloc.offset as i64 - b_off as i64;
-                    }
-                }
-
-                self.write_i64(addend);
-            }
-        }
-
-        // Write section header table
-        while self.output.len() < shdr_offset as usize {
-            self.output.push(0);
-        }
-
-        // Section 0: NULL
-        self.write_shdr(0, SHT_NULL, 0, 0, 0, 0, 0, 0, 0, 0);
-
-        // Data sections
-        for (i, sec) in sections.iter().enumerate() {
-            self.write_shdr(
-                shstrtab.offset_of(&sec.name),
-                sec.section_type,
-                sec.flags,
-                0, // addr
-                section_offsets[i],
-                sec.data.len() as u64,
-                0, // link
-                0, // info
-                sec.alignment,
-                0, // entsize
-            );
-        }
-
-        // .symtab
-        self.write_shdr(
-            shstrtab.offset_of(".symtab"),
-            SHT_SYMTAB,
-            0,
-            0,
-            symtab_offset,
-            symtab_size,
-            strtab_shndx as u32, // link to strtab
-            first_global,        // info: first global symbol index
-            8,
-            sym_entry_size,
-        );
-
-        // .strtab
-        self.write_shdr(
-            shstrtab.offset_of(".strtab"),
-            SHT_STRTAB,
-            0,
-            0,
-            strtab_offset,
-            strtab_data.len() as u64,
-            0, 0, 1, 0,
-        );
-
-        // .shstrtab
-        self.write_shdr(
-            shstrtab.offset_of(".shstrtab"),
-            SHT_STRTAB,
-            0,
-            0,
-            shstrtab_offset,
-            shstrtab_data.len() as u64,
-            0, 0, 1, 0,
-        );
-
-        // .rela.* sections
-        for &(sec_idx, rela_offset, rela_size) in &rela_offsets {
-            let rela_name = format!(".rela{}", sections[sec_idx].name);
-            self.write_shdr(
-                shstrtab.offset_of(&rela_name),
-                SHT_RELA,
-                0,
-                0,
-                rela_offset,
-                rela_size,
-                symtab_shndx as u32,     // link to symtab
-                (sec_idx + 1) as u32,     // info: section this rela applies to
-                8,
-                rela_entry_size,
-            );
-        }
-
-        Ok(self.output.clone())
-    }
-
-    fn resolve_reloc_symbol(
-        &self,
-        symbol: &str,
-        symbol_to_elf_idx: &HashMap<String, usize>,
-        section_sym_indices: &HashMap<usize, usize>,
-        label_positions: &HashMap<String, (usize, u64)>,
-        _sections: &[Section],
-    ) -> usize {
-        // First try direct symbol lookup
-        if let Some(&idx) = symbol_to_elf_idx.get(symbol) {
-            return idx;
-        }
-
-        // For internal labels (.LBB*, .Lstr*, etc.), use the section symbol
-        if let Some(&(sec_idx, _)) = label_positions.get(symbol) {
-            if let Some(&sec_sym_idx) = section_sym_indices.get(&sec_idx) {
-                return sec_sym_idx;
-            }
-        }
-
-        // External/undefined symbol - it should be in the symbol table
-        // If not found, return 0 (undefined)
-        // TODO: Create undefined symbol entries for forward references
-        0
-    }
-
-    fn write_shdr(&mut self, name: u32, shtype: u32, flags: u64, addr: u64,
-                  offset: u64, size: u64, link: u32, info: u32, addralign: u64, entsize: u64) {
-        self.write_u32(name);
-        self.write_u32(shtype);
-        self.write_u64(flags);
-        self.write_u64(addr);
-        self.write_u64(offset);
-        self.write_u64(size);
-        self.write_u32(link);
-        self.write_u32(info);
-        self.write_u64(addralign);
-        self.write_u64(entsize);
-    }
-
-    fn write_u16(&mut self, v: u16) { self.output.extend_from_slice(&v.to_le_bytes()); }
-    fn write_u32(&mut self, v: u32) { self.output.extend_from_slice(&v.to_le_bytes()); }
-    fn write_u64(&mut self, v: u64) { self.output.extend_from_slice(&v.to_le_bytes()); }
-    fn write_i64(&mut self, v: i64) { self.output.extend_from_slice(&v.to_le_bytes()); }
-}
-
-/// Elf64_Sym entry.
-struct SymEntry {
-    name_offset: u32,
-    info: u8,
-    other: u8,
-    shndx: u16,
-    value: u64,
-    size: u64,
-}
-
-impl SymEntry {
-    fn null() -> Self {
-        SymEntry {
-            name_offset: 0,
-            info: 0,
-            other: 0,
-            shndx: 0,
-            value: 0,
-            size: 0,
-        }
-    }
-}
-
-use crate::backend::elf::StringTable;
 
 /// Parse section name, flags string, and type into ELF section type and flags.
 fn parse_section_flags(name: &str, flags_str: Option<&str>, type_str: Option<&str>) -> (u32, u64) {

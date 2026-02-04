@@ -206,6 +206,10 @@ impl Driver {
                 .map_err(|e| format!("Cannot read {}: {}", input_file, e))?;
             let mut preprocessor = crate::frontend::preprocessor::Preprocessor::new();
             self.configure_preprocessor(&mut preprocessor);
+            // GCC defines __ASSEMBLER__ when preprocessing assembly source files (.S).
+            // This is needed for headers like <cet.h> which gate assembly-specific
+            // macro definitions (e.g. _CET_ENDBR) behind #ifdef __ASSEMBLER__.
+            preprocessor.define_macro("__ASSEMBLER__", "1");
             preprocessor.set_filename(input_file);
             self.process_force_includes(&mut preprocessor)
                 .map_err(|e| format!("Preprocessing {} failed: {}", input_file, e))?;

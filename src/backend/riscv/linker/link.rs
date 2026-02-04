@@ -347,36 +347,53 @@ pub fn link_builtin(
     }
 
     // ── Phase 1c: Resolve remaining undefined symbols from .a archives ──
+    // Group-loading: iterate all archives until no new symbols are resolved,
+    // handling circular dependencies (e.g., libm -> libgcc -> libc -> libgcc).
 
-    let mut resolved_archives: HashSet<String> = HashSet::new();
-    for libname in &needed_libs {
-        // -l:filename means search for exact filename
-        let archive_name = if let Some(exact) = libname.strip_prefix(':') {
-            exact.to_string()
-        } else {
-            format!("lib{}.a", libname)
-        };
-        for dir in &lib_search_paths {
-            let path = format!("{}/{}", dir, archive_name);
-            if resolved_archives.contains(&path) {
-                continue;
-            }
-            if std::path::Path::new(&path).exists() {
-                let data = match std::fs::read(&path) {
-                    Ok(d) => d,
-                    Err(_) => continue,
-                };
-                if data.len() >= 8 && &data[0..8] == b"!<arch>\n" {
-                    if let Ok(members) = parse_archive(&data) {
-                        resolve_archive_members(
-                            members, &mut input_objs,
-                            &mut defined_syms, &mut undefined_syms,
-                        );
+    // First, resolve all archive paths
+    let mut archive_paths: Vec<String> = Vec::new();
+    {
+        let mut seen: HashSet<String> = HashSet::new();
+        for libname in &needed_libs {
+            let archive_name = if let Some(exact) = libname.strip_prefix(':') {
+                exact.to_string()
+            } else {
+                format!("lib{}.a", libname)
+            };
+            for dir in &lib_search_paths {
+                let path = format!("{}/{}", dir, archive_name);
+                if std::path::Path::new(&path).exists() {
+                    if !seen.contains(&path) {
+                        seen.insert(path.clone());
+                        archive_paths.push(path);
                     }
-                    resolved_archives.insert(path);
+                    break;
                 }
-                break;
             }
+        }
+    }
+
+    // Iterate all archives in a group until stable (no new objects added)
+    let mut group_changed = true;
+    while group_changed {
+        group_changed = false;
+        let prev_count = input_objs.len();
+        for path in &archive_paths {
+            let data = match std::fs::read(path) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            if data.len() >= 8 && &data[0..8] == b"!<arch>\n" {
+                if let Ok(members) = parse_archive(&data) {
+                    resolve_archive_members(
+                        members, &mut input_objs,
+                        &mut defined_syms, &mut undefined_syms,
+                    );
+                }
+            }
+        }
+        if input_objs.len() != prev_count {
+            group_changed = true;
         }
     }
 
@@ -712,9 +729,12 @@ pub fn link_builtin(
     // Also identify symbols that need GOT entries (referenced via GOT_HI20)
     let mut got_symbols: Vec<String> = Vec::new();
     let mut tls_got_symbols: HashSet<String> = HashSet::new();
+    // Track local symbol info for GOT entries: got_key -> (obj_idx, sym_idx, addend)
+    // This is needed because local symbols aren't in global_syms
+    let mut local_got_sym_info: HashMap<String, (usize, usize, i64)> = HashMap::new();
     {
         let mut got_set: HashSet<String> = HashSet::new();
-        for (_, obj) in input_objs.iter() {
+        for (obj_idx, (_, obj)) in input_objs.iter().enumerate() {
             for relocs in obj.relocs.values() {
                 for reloc in relocs {
                     if reloc.reloc_type == R_RISCV_GOT_HI20
@@ -722,15 +742,13 @@ pub fn link_builtin(
                         || reloc.reloc_type == R_RISCV_TLS_GD_HI20
                     {
                         let sym = &obj.symbols[reloc.symbol_idx as usize];
-                        let name = if sym.sym_type == STT_SECTION {
-                            let sec = &obj.sections[sym.section_idx as usize];
-                            sec.name.clone()
-                        } else {
-                            sym.name.clone()
-                        };
+                        let (name, is_local) = got_sym_key(obj_idx, sym, reloc.addend);
                         if !name.is_empty() && !got_set.contains(&name) {
                             got_set.insert(name.clone());
                             got_symbols.push(name.clone());
+                            if is_local {
+                                local_got_sym_info.insert(name.clone(), (obj_idx, reloc.symbol_idx as usize, reloc.addend));
+                            }
                         }
                         // Track TLS GOT symbols so we can fill them with TP offsets
                         if reloc.reloc_type == R_RISCV_TLS_GOT_HI20
@@ -1288,8 +1306,11 @@ pub fn link_builtin(
     define_linker_sym("__preinit_array_start", preinit_start, STB_GLOBAL);
     define_linker_sym("__preinit_array_end", preinit_end, STB_GLOBAL);
 
-    // ELF header address
+    // ELF header / executable start addresses
     define_linker_sym("__ehdr_start", BASE_ADDR, STB_GLOBAL);
+    define_linker_sym("__executable_start", BASE_ADDR, STB_GLOBAL);
+    define_linker_sym("_etext", rx_segment_end_vaddr, STB_GLOBAL);
+    define_linker_sym("etext", rx_segment_end_vaddr, STB_GLOBAL);
 
     // Relocation boundaries (for IPLT, usually empty for non-PIE)
     define_linker_sym("__rela_iplt_start", 0, STB_GLOBAL);
@@ -1449,12 +1470,7 @@ pub fn link_builtin(
                         patch_s_type(data, off, hi_val as u32);
                     }
                     R_RISCV_GOT_HI20 => {
-                        // Symbol needs GOT entry
-                        let sym_name = if sym.sym_type == STT_SECTION {
-                            obj.sections[sym.section_idx as usize].name.clone()
-                        } else {
-                            sym.name.clone()
-                        };
+                        let (sym_name, _) = got_sym_key(obj_idx, sym, reloc.addend);
 
                         let got_entry_vaddr = if let Some(gs) = global_syms.get(&sym_name) {
                             if let Some(got_off) = gs.got_offset {
@@ -1703,11 +1719,7 @@ pub fn link_builtin(
                     R_RISCV_TLS_GOT_HI20 | R_RISCV_TLS_GD_HI20 => {
                         // TLS GOT reference: auipc should point to the GOT entry
                         // that holds the TP offset for this TLS symbol
-                        let sym_name = if sym.sym_type == STT_SECTION {
-                            obj.sections[sym.section_idx as usize].name.clone()
-                        } else {
-                            sym.name.clone()
-                        };
+                        let (sym_name, _) = got_sym_key(obj_idx, sym, reloc.addend);
 
                         let got_entry_vaddr = if let Some(gs) = global_syms.get(&sym_name) {
                             if let Some(got_off) = gs.got_offset {
@@ -1748,6 +1760,32 @@ pub fn link_builtin(
                 gs.value.wrapping_sub(tls_vaddr)
             } else {
                 gs.value
+            }
+        } else if let Some(&(obj_idx, sym_idx, addend)) = local_got_sym_info.get(name) {
+            // Local symbol: compute value from object's symbol table and section mapping
+            let obj = &input_objs[obj_idx].1;
+            let sym = &obj.symbols[sym_idx];
+            let final_val = if sym.sym_type == STT_SECTION {
+                // Section symbol: vaddr = merged_base + sec_offset + addend
+                // sec_offset is where this object's contribution starts in merged section
+                // addend is the offset within the original section
+                if let Some(&(merged_idx, sec_offset)) = sec_mapping.get(&(obj_idx, sym.section_idx as usize)) {
+                    (section_vaddrs[merged_idx] + sec_offset) as i64 + addend
+                } else {
+                    0
+                }
+            } else {
+                // Regular local symbol: vaddr = merged_base + sec_offset + sym.value + addend
+                if let Some(&(merged_idx, sec_offset)) = sec_mapping.get(&(obj_idx, sym.section_idx as usize)) {
+                    (section_vaddrs[merged_idx] + sec_offset + sym.value) as i64 + addend
+                } else {
+                    0
+                }
+            } as u64;
+            if tls_got_symbols.contains(name) {
+                final_val.wrapping_sub(tls_vaddr)
+            } else {
+                final_val
             }
         } else {
             0
@@ -2563,6 +2601,24 @@ fn encode_uleb128_in_place(data: &mut [u8], off: usize, value: u64) {
     }
 }
 
+/// Build a unique GOT key for a symbol referenced via GOT_HI20 or TLS_GOT_HI20.
+///
+/// Local and section symbols aren't in `global_syms`, so they need synthetic keys
+/// that incorporate the object index to avoid collisions between objects. The addend
+/// is included because different offsets within the same section need distinct GOT
+/// entries pointing to different addresses.
+///
+/// Returns (key, is_local) where is_local indicates the symbol won't be in global_syms.
+fn got_sym_key(obj_idx: usize, sym: &ObjSymbol, addend: i64) -> (String, bool) {
+    if sym.sym_type == STT_SECTION {
+        (format!("__local_sec_{}_{}_{}", obj_idx, sym.section_idx, addend), true)
+    } else if sym.binding == STB_LOCAL {
+        (format!("__local_{}_{}_{}", obj_idx, sym.name, addend), true)
+    } else {
+        (sym.name.clone(), false)
+    }
+}
+
 /// Find the hi20 value for a pcrel_lo12 relocation.
 /// The pcrel_lo12 references an auipc instruction; we need to find the hi20
 /// relocation at that auipc and compute the full offset, then return the low 12 bits.
@@ -2604,14 +2660,10 @@ fn find_hi20_value(
                     return offset & 0xFFF;
                 }
                 R_RISCV_GOT_HI20 | R_RISCV_TLS_GOT_HI20 | R_RISCV_TLS_GD_HI20 => {
-                    // For GOT references, the target is the GOT entry address, not the symbol address
+                    // For GOT references, the target is the GOT entry address
                     let hi_sym_idx = reloc.symbol_idx as usize;
                     let sym = &obj.symbols[hi_sym_idx];
-                    let sym_name = if sym.sym_type == STT_SECTION {
-                        obj.sections[sym.section_idx as usize].name.clone()
-                    } else {
-                        sym.name.clone()
-                    };
+                    let (sym_name, _) = got_sym_key(obj_idx, sym, reloc.addend);
 
                     let got_entry_vaddr = if let Some(gs) = global_syms.get(&sym_name) {
                         if let Some(got_off) = gs.got_offset {

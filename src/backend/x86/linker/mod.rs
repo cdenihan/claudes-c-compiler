@@ -403,9 +403,19 @@ fn load_archive_for_dynamic(
 fn resolve_dynamic_symbols(
     globals: &mut HashMap<String, GlobalSymbol>, needed_sonames: &mut Vec<String>,
 ) -> Result<(), String> {
+    // Linker-defined symbols that will be resolved during layout
+    let linker_defined = [
+        "_GLOBAL_OFFSET_TABLE_", "__bss_start", "_edata", "_end", "__end",
+        "__ehdr_start", "__executable_start", "_etext", "etext",
+        "__dso_handle", "_DYNAMIC", "__data_start", "data_start",
+        "__init_array_start", "__init_array_end",
+        "__fini_array_start", "__fini_array_end",
+        "__preinit_array_start", "__preinit_array_end",
+        "__rela_iplt_start", "__rela_iplt_end",
+    ];
     let undefined: Vec<String> = globals.iter()
         .filter(|(name, sym)| sym.defined_in.is_none() && !sym.is_dynamic &&
-            !matches!(name.as_str(), "_GLOBAL_OFFSET_TABLE_" | "__bss_start" | "_edata" | "_end" | "__end"))
+            !linker_defined.contains(&name.as_str()))
         .map(|(name, _)| name.clone()).collect();
     if undefined.is_empty() { return Ok(()); }
 
@@ -886,6 +896,44 @@ fn emit_executable(
         }
     }
 
+    // Define linker-provided symbols (consistent with i686/ARM/RISC-V backends)
+    let text_seg_end = text_page_addr + text_total_size;
+    let data_seg_start = rw_page_addr;
+    let data_seg_end = bss_addr + bss_size;
+    let define_linker_sym = |globals: &mut HashMap<String, GlobalSymbol>, name: &str, value: u64| {
+        let entry = globals.entry(name.to_string()).or_insert(GlobalSymbol {
+            value: 0, size: 0, info: (STB_GLOBAL << 4),
+            defined_in: None, from_lib: None, plt_idx: None, got_idx: None,
+            section_idx: SHN_ABS, is_dynamic: false, copy_reloc: false,
+        });
+        if entry.defined_in.is_none() && !entry.is_dynamic {
+            entry.value = value;
+            entry.defined_in = Some(usize::MAX); // sentinel: linker-defined
+            entry.section_idx = SHN_ABS;
+        }
+    };
+    define_linker_sym(globals, "_GLOBAL_OFFSET_TABLE_", got_plt_addr);
+    define_linker_sym(globals, "__bss_start", bss_addr);
+    define_linker_sym(globals, "_edata", bss_addr);
+    define_linker_sym(globals, "_end", data_seg_end);
+    define_linker_sym(globals, "__end", data_seg_end);
+    define_linker_sym(globals, "__ehdr_start", BASE_ADDR);
+    define_linker_sym(globals, "__executable_start", BASE_ADDR);
+    define_linker_sym(globals, "_etext", text_seg_end);
+    define_linker_sym(globals, "etext", text_seg_end);
+    define_linker_sym(globals, "__dso_handle", data_seg_start);
+    define_linker_sym(globals, "_DYNAMIC", dynamic_addr);
+    define_linker_sym(globals, "__data_start", data_seg_start);
+    define_linker_sym(globals, "data_start", data_seg_start);
+    define_linker_sym(globals, "__init_array_start", init_array_addr);
+    define_linker_sym(globals, "__init_array_end", init_array_addr + init_array_size);
+    define_linker_sym(globals, "__fini_array_start", fini_array_addr);
+    define_linker_sym(globals, "__fini_array_end", fini_array_addr + fini_array_size);
+    define_linker_sym(globals, "__preinit_array_start", 0);
+    define_linker_sym(globals, "__preinit_array_end", 0);
+    define_linker_sym(globals, "__rela_iplt_start", 0);
+    define_linker_sym(globals, "__rela_iplt_end", 0);
+
     let entry_addr = globals.get("_start").map(|s| s.value).unwrap_or(text_page_addr);
 
     // === Build output buffer ===
@@ -1085,7 +1133,7 @@ fn emit_executable(
                 let fp = (sfo + sec_off + rela.offset) as usize;
                 let a = rela.addend;
                 let s = resolve_sym(obj_idx, sym, &globals_snap, section_map, output_sections,
-                                    got_plt_addr, plt_addr, bss_addr, bss_size);
+                                    plt_addr);
 
                 match rela.rela_type {
                     R_X86_64_64 => {
@@ -1205,19 +1253,13 @@ fn emit_executable(
 fn resolve_sym(
     obj_idx: usize, sym: &Symbol, globals: &HashMap<String, GlobalSymbol>,
     section_map: &HashMap<(usize, usize), (usize, u64)>, output_sections: &[OutputSection],
-    got_plt_addr: u64, plt_addr: u64, bss_addr: u64, bss_size: u64,
+    plt_addr: u64,
 ) -> u64 {
     if sym.sym_type() == STT_SECTION {
         let si = sym.shndx as usize;
         return section_map.get(&(obj_idx, si)).map(|&(oi, so)| output_sections[oi].addr + so).unwrap_or(0);
     }
     if !sym.name.is_empty() {
-        match sym.name.as_str() {
-            "_GLOBAL_OFFSET_TABLE_" => return got_plt_addr,
-            "__bss_start" | "_edata" => return bss_addr,
-            "_end" | "__end" => return bss_addr + bss_size,
-            _ => {}
-        }
         if let Some(g) = globals.get(&sym.name) {
             if g.defined_in.is_some() { return g.value; }
             if g.is_dynamic {

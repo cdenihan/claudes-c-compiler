@@ -269,7 +269,8 @@ InputSecRef {
    skipped.
 5. Parse `-L` paths and `-l` library names from user arguments, including
    `-Wl,` pass-through syntax.
-6. Add default library search paths and default libraries (`-lgcc -lgcc_s -lc -lm`).
+6. Add default library search paths and default libraries (`-lgcc -lgcc_eh -lc -lm`
+   for static linking, `-lgcc -lgcc_s -lc -lm` for dynamic linking).
 
 ### Phase 1b: Library Resolution
 
@@ -283,22 +284,29 @@ input objects. Then:
    Read the `.dynsym` section of each real shared library to collect all
    exported symbol names, types, and sizes.
 
-2. **Archive member resolution**: A multi-pass iterative algorithm pulls in
-   archive members on demand:
+2. **Archive group-loading**: All archives are iterated in an outer group
+   loop until no new objects are added, handling circular cross-archive
+   dependencies (e.g., `libm -> libgcc -> libc -> libgcc`). Within each
+   archive, a multi-pass iterative algorithm pulls in members on demand:
    ```
+   # Outer group loop (cross-archive)
    loop {
-       added_any = false
-       for each unprocessed archive member:
-           if member defines any currently-undefined symbol:
-               add member to input_objs
-               update defined_syms and undefined_syms
-               added_any = true
-       if !added_any: break
+       prev_count = input_objs.len()
+       for each archive:
+           # Inner per-archive loop
+           loop {
+               added_any = false
+               for each unprocessed archive member:
+                   if member defines any currently-undefined symbol:
+                       add member to input_objs
+                       update defined_syms and undefined_syms
+                       added_any = true
+               if !added_any: break
+       if input_objs.len() == prev_count: break
    }
    ```
-   This handles transitive dependencies: pulling in member A may create new
-   undefined symbols that are satisfied by member B, which is pulled in on
-   the next iteration.
+   This handles both intra-archive transitive dependencies and cross-archive
+   circular dependencies.
 
 3. **SONAME discovery**: For each `-l` library, the linker searches the
    library directory for versioned shared object names (e.g., `libc.so.6`)

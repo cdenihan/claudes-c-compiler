@@ -1209,6 +1209,12 @@ pub fn link_builtin(
         "end", "edata", "etext",
         "__end__",
         "__dso_handle",
+        "_DYNAMIC",
+        "__data_start", "data_start",
+        "__init_array_start", "__init_array_end",
+        "__fini_array_start", "__fini_array_end",
+        "__preinit_array_start", "__preinit_array_end",
+        "__rela_iplt_start", "__rela_iplt_end",
     ];
 
     let truly_undefined: Vec<&&String> = undefined.iter()
@@ -1975,7 +1981,7 @@ pub fn link_builtin(
         if sym.output_section < output_sections.len() {
             sym.address = output_sections[sym.output_section].addr + sym.section_offset;
         }
-        // Special symbols
+        // Special symbols (linker-defined, consistent with x86-64/ARM/RISC-V)
         match name.as_str() {
             "_GLOBAL_OFFSET_TABLE_" => sym.address = got_base,
             "__bss_start" | "__bss_start__" => sym.address = bss_vaddr,
@@ -1987,6 +1993,14 @@ pub fn link_builtin(
                 sym.is_defined = true;
                 if sym.address == 0 { sym.address = data_seg_vaddr_start; }
             }
+            "_DYNAMIC" => sym.address = dynamic_vaddr,
+            "__data_start" | "data_start" => sym.address = data_seg_vaddr_start,
+            "__init_array_start" => sym.address = init_array_vaddr,
+            "__init_array_end" => sym.address = init_array_vaddr + init_array_size,
+            "__fini_array_start" => sym.address = fini_array_vaddr,
+            "__fini_array_end" => sym.address = fini_array_vaddr + fini_array_size,
+            "__preinit_array_start" | "__preinit_array_end" => sym.address = 0,
+            "__rela_iplt_start" | "__rela_iplt_end" => sym.address = 0,
             _ => {}
         }
     }

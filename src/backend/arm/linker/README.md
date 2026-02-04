@@ -340,6 +340,9 @@ The following symbols are automatically provided:
 | `__fini_array_start` / `__fini_array_end` | `.fini_array` bounds |
 | `__preinit_array_start` / `__preinit_array_end` | Same as init_array start |
 | `__ehdr_start` | `BASE_ADDR` |
+| `__executable_start` | `BASE_ADDR` |
+| `_etext` / `etext` | End of text (RX) segment |
+| `__data_start` / `data_start` | Start of RW data segment |
 | `_init` / `_fini` | Address of `.init` / `.fini` sections |
 | `__rela_iplt_start` / `__rela_iplt_end` | IRELATIVE relocation table bounds |
 | `__bss_start` / `_edata` | BSS start address |

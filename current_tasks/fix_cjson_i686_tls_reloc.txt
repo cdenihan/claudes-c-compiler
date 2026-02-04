@@ -1,0 +1,10 @@
+Fix cJSON build with i686 builtin linker.
+
+The i686 builtin linker is missing TLS relocation support (R_386_TLS_GOTIE type 16,
+and potentially other TLS relocations). This causes the link to fail when linking
+with libm.a which uses TLS for errno.
+
+Plan:
+- Add TLS section layout to i686 linker (PT_TLS segment)
+- Add R_386_TLS_GOTIE relocation handling (GOT entry with negative TLS offset)
+- Add any other TLS relocations needed (R_386_TLS_LE, R_386_TLS_IE, etc.)
