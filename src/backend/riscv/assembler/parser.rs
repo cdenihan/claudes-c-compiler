@@ -682,11 +682,7 @@ fn parse_instruction(line: &str) -> Result<AsmStatement, String> {
     };
 
     let mnemonic = mnemonic.to_lowercase();
-    // Only classify FenceArg operands when the instruction is actually "fence".
-    // Otherwise, single-letter variable names like "i", "o", "r", "w" would be
-    // misclassified as fence arguments (e.g., "lla t0, i" for a global named "i").
-    let is_fence = mnemonic == "fence";
-    let operands = parse_operands(operands_str, is_fence)?;
+    let operands = parse_operands(operands_str, &mnemonic)?;
 
     Ok(AsmStatement::Instruction {
         mnemonic,
@@ -695,16 +691,40 @@ fn parse_instruction(line: &str) -> Result<AsmStatement, String> {
     })
 }
 
+/// Determine which operand positions for a given instruction mnemonic must be
+/// parsed as symbols rather than registers. This prevents function/variable
+/// names that happen to match register names (e.g., `f1`, `a0`, `ra`, `s1`)
+/// from being misclassified.
+fn symbol_operand_mask(mnemonic: &str) -> u8 {
+    match mnemonic {
+        // call <symbol> — operand 0 is always a symbol
+        "call" | "tail" => 0b0000_0001,
+        // la/lla rd, <symbol> — operand 1 is always a symbol
+        "la" | "lla" => 0b0000_0010,
+        // jump <label>, <temp_reg> — operand 0 is always a symbol
+        "jump" => 0b0000_0001,
+        _ => 0,
+    }
+}
+
 /// Parse an operand list separated by commas.
-/// `is_fence`: when true, single-char subsets of "iorw" are parsed as FenceArg.
-fn parse_operands(s: &str, is_fence: bool) -> Result<Vec<Operand>, String> {
+/// `mnemonic`: the instruction mnemonic, used for context-sensitive parsing
+/// (e.g., fence operands, symbol-position disambiguation).
+fn parse_operands(s: &str, mnemonic: &str) -> Result<Vec<Operand>, String> {
     if s.is_empty() {
         return Ok(Vec::new());
     }
 
+    // Only classify FenceArg operands when the instruction is actually "fence".
+    // Otherwise, single-letter variable names like "i", "o", "r", "w" would be
+    // misclassified as fence arguments (e.g., "lla t0, i" for a global named "i").
+    let is_fence = mnemonic == "fence";
+    let sym_mask = symbol_operand_mask(mnemonic);
+
     let mut operands = Vec::new();
     let mut current = String::new();
     let mut paren_depth = 0;
+    let mut operand_idx: u8 = 0;
 
     for ch in s.chars() {
         match ch {
@@ -717,9 +737,11 @@ fn parse_operands(s: &str, is_fence: bool) -> Result<Vec<Operand>, String> {
                 current.push(')');
             }
             ',' if paren_depth == 0 => {
-                let op = parse_single_operand(current.trim(), is_fence)?;
+                let force_symbol = (sym_mask & (1 << operand_idx)) != 0;
+                let op = parse_single_operand(current.trim(), is_fence, force_symbol)?;
                 operands.push(op);
                 current.clear();
+                operand_idx = operand_idx.saturating_add(1);
             }
             _ => {
                 current.push(ch);
@@ -730,7 +752,8 @@ fn parse_operands(s: &str, is_fence: bool) -> Result<Vec<Operand>, String> {
     // Last operand
     let trimmed = current.trim().to_string();
     if !trimmed.is_empty() {
-        let op = parse_single_operand(&trimmed, is_fence)?;
+        let force_symbol = (sym_mask & (1 << operand_idx)) != 0;
+        let op = parse_single_operand(&trimmed, is_fence, force_symbol)?;
         operands.push(op);
     }
 
@@ -739,7 +762,11 @@ fn parse_operands(s: &str, is_fence: bool) -> Result<Vec<Operand>, String> {
 
 /// Parse a single operand.
 /// `is_fence`: when true, classify subsets of "iorw" as FenceArg.
-fn parse_single_operand(s: &str, is_fence: bool) -> Result<Operand, String> {
+/// `force_symbol`: when true, this operand position is known to be a symbol
+/// (e.g., the target of `call` or `tail`), so skip the register check. This
+/// prevents function names like `f1`, `a0`, `ra` from being misclassified
+/// as register operands.
+fn parse_single_operand(s: &str, is_fence: bool, force_symbol: bool) -> Result<Operand, String> {
     let s = s.trim();
     if s.is_empty() {
         return Err("empty operand".to_string());
@@ -747,8 +774,10 @@ fn parse_single_operand(s: &str, is_fence: bool) -> Result<Operand, String> {
 
     // Memory operand: offset(base) e.g., 8(sp), -16(s0), 0(a0)
     // Also handles: %lo(sym)(reg), %hi(sym)
-    if let Some(result) = try_parse_memory_operand(s) {
-        return Ok(result);
+    if !force_symbol {
+        if let Some(result) = try_parse_memory_operand(s) {
+            return Ok(result);
+        }
     }
 
     // %hi(symbol) or %lo(symbol) - used as immediates in lui/addi
@@ -769,18 +798,20 @@ fn parse_single_operand(s: &str, is_fence: bool) -> Result<Operand, String> {
     }
 
     // Rounding modes
-    if is_rounding_mode(s) {
+    if !force_symbol && is_rounding_mode(s) {
         return Ok(Operand::RoundingMode(s.to_string()));
     }
 
-    // Register
-    if is_register(s) {
+    // Register — skip when this operand position is known to be a symbol
+    if !force_symbol && is_register(s) {
         return Ok(Operand::Reg(s.to_string()));
     }
 
-    // Try to parse as immediate
-    if let Ok(val) = parse_int_literal(s) {
-        return Ok(Operand::Imm(val));
+    // Try to parse as immediate (only when not forcing symbol)
+    if !force_symbol {
+        if let Ok(val) = parse_int_literal(s) {
+            return Ok(Operand::Imm(val));
+        }
     }
 
     // Symbol with offset: sym+offset or sym-offset
