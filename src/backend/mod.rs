@@ -3,6 +3,7 @@ pub(crate) mod asm_preprocess;  // Shared GAS preprocessing: comments, macros, r
 pub(crate) mod common;
 #[allow(dead_code)]
 pub(crate) mod elf;
+pub(crate) mod elf_writer_common; // Shared x86/i686 assembler ELF writer
 pub(crate) mod linker_common;
 
 // Shared codegen framework, split into focused modules:
