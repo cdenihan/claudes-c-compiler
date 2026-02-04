@@ -1,2 +1,0 @@
-Testing tinyexpr project with builtin assembler and linker.
-Will test on all architectures and fix any issues found.
