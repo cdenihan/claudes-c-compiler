@@ -669,8 +669,36 @@ impl ElfWriter {
         Ok(())
     }
 
+    /// Resolve local label references in data relocations.
+    ///
+    /// When a data directive like `.xword .Lstr0` references a local label
+    /// in a different section, the local label won't be in the symbol table.
+    /// We need to convert these to section_symbol + offset_of_label_in_section,
+    /// just like GCC's assembler does.
+    fn resolve_local_data_relocs(&mut self) {
+        let labels = &self.labels;
+        for sec_name in &self.section_order.clone() {
+            if let Some(section) = self.sections.get_mut(sec_name) {
+                for reloc in &mut section.relocs {
+                    // Check if this references a local label (starts with .L or .l)
+                    if (reloc.symbol_name.starts_with(".L") || reloc.symbol_name.starts_with(".l"))
+                        && !reloc.symbol_name.is_empty()
+                    {
+                        if let Some((label_section, label_offset)) = labels.get(&reloc.symbol_name) {
+                            // Convert to section symbol + addend
+                            reloc.addend += *label_offset as i64;
+                            reloc.symbol_name = label_section.clone();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Write the final ELF object file.
     pub fn write_elf(&mut self, output_path: &str) -> Result<(), String> {
+        // Resolve local label references in data relocations before building symbol table
+        self.resolve_local_data_relocs();
         // Build the symbol table from labels and directives
         self.build_symbol_table();
 

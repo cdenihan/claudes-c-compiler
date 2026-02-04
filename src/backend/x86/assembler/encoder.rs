@@ -276,16 +276,16 @@ impl InstructionEncoder {
             | "cmovel" | "cmovnel" | "cmovll" | "cmovlel" | "cmovgl" | "cmovgel"
             | "cmovbl" | "cmovbel" | "cmoval" | "cmovael" => self.encode_cmovcc(ops, mnemonic),
 
-            // Jumps
-            "jmp" => self.encode_jmp(ops),
+            // Jumps (jmpq is a common AT&T alias for jmp on x86-64)
+            "jmp" | "jmpq" => self.encode_jmp(ops),
             "je" | "jz" | "jne" | "jnz" | "jl" | "jle" | "jg" | "jge"
             | "jb" | "jbe" | "ja" | "jae" | "js" | "jns" | "jo" | "jno" | "jp" | "jnp" => {
                 self.encode_jcc(ops, mnemonic)
             }
 
-            // Call/return
-            "call" => self.encode_call(ops),
-            "ret" => {
+            // Call/return (callq/retq are common AT&T aliases on x86-64)
+            "call" | "callq" => self.encode_call(ops),
+            "ret" | "retq" => {
                 if ops.is_empty() {
                     self.bytes.push(0xC3);
                 } else if let Some(Operand::Immediate(ImmediateValue::Integer(val))) = ops.first() {

@@ -1,0 +1,11 @@
+Unify ARM/RISC-V linker CRT discovery to use shared common.rs infrastructure.
+
+Currently x86-64 and i686 builtin linkers use the shared resolve_builtin_link_setup()
+in common.rs for CRT/library discovery, while ARM and RISC-V have their own internal
+duplicated CRT discovery logic with hardcoded paths. This makes the linkers inconsistent
+and means improvements to CRT discovery only benefit x86/i686.
+
+Fix: Refactor ARM and RISC-V linkers to accept pre-resolved CRT objects, library paths,
+and needed libraries from common.rs (same pattern as x86/i686), removing their internal
+CRT discovery code. Add link_builtin_aarch64() and link_builtin_riscv() wrappers in
+common.rs.

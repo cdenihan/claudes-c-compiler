@@ -667,13 +667,28 @@ fn encode_add_sub(operands: &[Operand], is_sub: bool, set_flags: bool) -> Result
 
     // ADD Rd, Rn, #imm
     if let Some(Operand::Imm(imm)) = operands.get(2) {
-        let imm12 = (*imm as u32) & 0xFFF;
-        // Check for lsl #12 shift
-        let sh = if operands.len() > 3 {
+        let imm_val = *imm as u64;
+        // Check for explicit lsl #12 shift
+        let explicit_shift = if operands.len() > 3 {
             if let Some(Operand::Shift { kind, amount }) = operands.get(3) {
-                if kind == "lsl" && *amount == 12 { 1u32 } else { 0u32 }
-            } else { 0u32 }
-        } else { 0u32 };
+                kind == "lsl" && *amount == 12
+            } else { false }
+        } else { false };
+
+        let (imm12, sh) = if explicit_shift {
+            // Explicit lsl #12: use the immediate as-is (must fit in 12 bits)
+            ((imm_val as u32) & 0xFFF, 1u32)
+        } else if imm_val <= 0xFFF {
+            // Fits in 12 bits unshifted
+            (imm_val as u32, 0u32)
+        } else if (imm_val & 0xFFF) == 0 && (imm_val >> 12) <= 0xFFF {
+            // Low 12 bits are zero and shifted value fits: auto-shift
+            // e.g., #4096 -> #1, lsl #12
+            ((imm_val >> 12) as u32, 1u32)
+        } else {
+            return Err(format!("immediate {} does not fit in add/sub imm12 encoding", imm_val));
+        };
+
         let word = (sf << 31) | (op << 30) | (s_bit << 29) | (0b10001 << 24) | (sh << 22) | (imm12 << 10) | (rn << 5) | rd;
         return Ok(EncodeResult::Word(word));
     }
