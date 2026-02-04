@@ -4,4 +4,5 @@ Tracking project build/test results with MY_ASM=builtin MY_LD=builtin
 |---------|-----|------|-----|-------|-------|
 | lz4     | PASS | FAIL (segfault in datagen) | FAIL | FAIL | x86 works after fixing -shared fallback |
 | libyaml | PASS | FAIL (segfault in builtin linker) | PASS | PASS | Fixed R_RISCV_ALIGN/RVC_BRANCH/RVC_JUMP relocations |
-| tomlc99 | PASS | FAIL (segfault in unittest) | PASS | FAIL (bad key parse) | Fixed ARM IPLT stubs gap error; x86+ARM pass |
+| tomlc99 | PASS | FAIL (segfault in unittest) | PASS | PASS | Fixed ARM IPLT stubs gap error; riscv fixed by TLS GOT local sym fix |
+| parson  | PASS | FAIL (segfault/crash) | PASS | PASS | Fixed RISC-V local TLS GOT symbol resolution (.LANCHOR0 etc) |

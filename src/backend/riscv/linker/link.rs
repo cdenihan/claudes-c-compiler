@@ -708,9 +708,11 @@ pub fn link_builtin(
     // Also identify symbols that need GOT entries (referenced via GOT_HI20)
     let mut got_symbols: Vec<String> = Vec::new();
     let mut tls_got_symbols: HashSet<String> = HashSet::new();
+    // Track local GOT symbols: name -> (obj_idx, sym_idx) for symbols not in global_syms
+    let mut local_got_sym_refs: HashMap<String, (usize, usize)> = HashMap::new();
     {
         let mut got_set: HashSet<String> = HashSet::new();
-        for (_obj_idx, (_, obj)) in input_objs.iter().enumerate() {
+        for (obj_idx, (_, obj)) in input_objs.iter().enumerate() {
             for (_sec_idx, relocs) in &obj.relocs {
                 for reloc in relocs {
                     if reloc.reloc_type == R_RISCV_GOT_HI20
@@ -727,6 +729,10 @@ pub fn link_builtin(
                         if !name.is_empty() && !got_set.contains(&name) {
                             got_set.insert(name.clone());
                             got_symbols.push(name.clone());
+                            // Track local symbol references for GOT data building
+                            if sym.binding == STB_LOCAL && sym.sym_type != STT_SECTION {
+                                local_got_sym_refs.insert(name.clone(), (obj_idx, reloc.symbol_idx as usize));
+                            }
                         }
                         // Track TLS GOT symbols so we can fill them with TP offsets
                         if reloc.reloc_type == R_RISCV_TLS_GOT_HI20
@@ -1766,6 +1772,14 @@ pub fn link_builtin(
                 gs.value.wrapping_sub(tls_vaddr)
             } else {
                 gs.value
+            }
+        } else if let Some(&(oi, si)) = local_got_sym_refs.get(name) {
+            // Local symbol (not in global_syms) - resolve via local_sym_vaddrs
+            let sym_vaddr = local_sym_vaddrs[oi][si];
+            if tls_got_symbols.contains(name) {
+                sym_vaddr.wrapping_sub(tls_vaddr)
+            } else {
+                sym_vaddr
             }
         } else {
             0

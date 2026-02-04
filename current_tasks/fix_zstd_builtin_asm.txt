@@ -1,0 +1,6 @@
+Fix zstd compilation with MY_ASM=builtin MY_LD=builtin on x86:
+- Define __ASSEMBLER__ when preprocessing .S files with builtin assembler
+- Add .pushsection/.popsection support to x86/i686 assembler
+- Add BMI2 instruction support (shrxq/shlxq/sarxq + suffix-less forms)
+- Add bitwise OR/AND and parenthesized expression support in .long/.quad
+- Add numeric label resolution in data directives (.long/.quad)
