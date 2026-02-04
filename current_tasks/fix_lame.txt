@@ -1,2 +1,0 @@
-Fixing lame project for x86 target.
-Investigating build/test failures with ccc-x86 standalone compiler.
