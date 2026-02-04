@@ -1,4 +1,4 @@
-# CCC -- The Claude C Compiler
+# CCC
 
 A C compiler written entirely from scratch in Rust, targeting x86-64, i686,
 AArch64, and RISC-V 64. Zero compiler-specific dependencies -- the frontend,
