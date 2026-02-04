@@ -1,0 +1,15 @@
+Task: Fix x86 builtin assembler missing external/undefined symbols in ELF output
+Status: in_progress
+Started: 2026-02-04
+
+Problem: When MY_ASM=builtin is set, the x86 builtin assembler produces object files
+that are missing all external (undefined) symbols in the symbol table. For example,
+compiling zlib's example.c produces an object file with only 23 symbols instead of 57 -
+all the undefined external function references like strlen, compress, fprintf, exit, etc.
+are missing. This causes R_X86_64_PLT32 relocations to reference symbol index 0 (null),
+leading to segfaults at runtime when function calls jump to address 0.
+
+The GCC assembler correctly includes these as NOTYPE GLOBAL DEFAULT UND symbols.
+
+Fix: Update the x86 builtin assembler's ELF writer to emit proper symbol table entries
+for all referenced but undefined symbols used in relocations (call instructions, etc.).
