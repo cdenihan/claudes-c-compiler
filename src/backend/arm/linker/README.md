@@ -218,7 +218,7 @@ link(object_files, output_path, user_args):
   5. SECTION MERGING (merge_sections)
      a. Map input section names to output names:
         .text.*, .text       -> .text
-        .data.rel*           -> .data.rel.ro
+        .data.rel.ro*        -> .data.rel.ro
         .data.*, .data       -> .data
         .rodata.*, .rodata   -> .rodata
         .bss.*, .bss         -> .bss

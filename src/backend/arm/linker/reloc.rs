@@ -89,9 +89,13 @@ pub fn resolve_sym(
 }
 
 /// Build a GOT key for a symbol reference in a relocation.
+/// Local symbols must be scoped to their object to avoid collisions
+/// (e.g., `.LANCHOR3` in different objects referring to different TLS vars).
 pub fn got_key(obj_idx: usize, sym: &Symbol) -> String {
-    if !sym.name.is_empty() {
+    if !sym.name.is_empty() && !sym.is_local() {
         sym.name.clone()
+    } else if !sym.name.is_empty() {
+        format!("{}@{}", sym.name, obj_idx)
     } else if sym.sym_type() == STT_SECTION {
         format!("__sec_{}_{}", obj_idx, sym.shndx)
     } else {
@@ -364,11 +368,19 @@ fn apply_one_reloc(
         // On AArch64 variant 1, tp offset = sym_offset_in_tls + 16 (TCB size)
         R_AARCH64_TLSLE_ADD_TPREL_HI12 => {
             let tp = tprel(s, a, tls_info);
+            if std::env::var("LINKER_DEBUG_TLS").is_ok() {
+                eprintln!("  TLSLE_HI12: sym='{}' s=0x{:x} a={} tls_addr=0x{:x} tls_size=0x{:x} -> tp=0x{:x}",
+                    sym_name, s, a, tls_info.tls_addr, tls_info.tls_size, tp as u64);
+            }
             let imm12 = ((tp as u64 >> 12) & 0xFFF) as u32;
             encode_add_imm12(out, fp, imm12);
         }
         R_AARCH64_TLSLE_ADD_TPREL_LO12 | R_AARCH64_TLSLE_ADD_TPREL_LO12_NC => {
             let tp = tprel(s, a, tls_info);
+            if std::env::var("LINKER_DEBUG_TLS").is_ok() {
+                eprintln!("  TLSLE_LO12: sym='{}' s=0x{:x} a={} tls_addr=0x{:x} -> tp=0x{:x}",
+                    sym_name, s, a, tls_info.tls_addr, tp as u64);
+            }
             let imm12 = (tp as u64 & 0xFFF) as u32;
             encode_add_imm12(out, fp, imm12);
         }

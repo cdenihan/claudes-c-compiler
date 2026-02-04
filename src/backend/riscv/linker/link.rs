@@ -1472,7 +1472,7 @@ pub fn link_builtin(
                     R_RISCV_GOT_HI20 => {
                         let (sym_name, _) = got_sym_key(obj_idx, sym, reloc.addend);
 
-                        let got_entry_vaddr = if let Some(gs) = global_syms.get(&sym_name) {
+                        let got_entry_vaddr = if let Some(gs) = global_syms.get(&sym.name) {
                             if let Some(got_off) = gs.got_offset {
                                 got_vaddr + got_off
                             } else {
@@ -1721,7 +1721,7 @@ pub fn link_builtin(
                         // that holds the TP offset for this TLS symbol
                         let (sym_name, _) = got_sym_key(obj_idx, sym, reloc.addend);
 
-                        let got_entry_vaddr = if let Some(gs) = global_syms.get(&sym_name) {
+                        let got_entry_vaddr = if let Some(gs) = global_syms.get(&sym.name) {
                             if let Some(got_off) = gs.got_offset {
                                 got_vaddr + got_off
                             } else if let Some(idx) = got_symbols.iter().position(|n| n == &sym_name) {
@@ -2665,7 +2665,7 @@ fn find_hi20_value(
                     let sym = &obj.symbols[hi_sym_idx];
                     let (sym_name, _) = got_sym_key(obj_idx, sym, reloc.addend);
 
-                    let got_entry_vaddr = if let Some(gs) = global_syms.get(&sym_name) {
+                    let got_entry_vaddr = if let Some(gs) = global_syms.get(&sym.name) {
                         if let Some(got_off) = gs.got_offset {
                             got_vaddr + got_off
                         } else {

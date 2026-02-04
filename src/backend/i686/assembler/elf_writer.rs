@@ -65,6 +65,261 @@ struct SymbolInfo {
     common_align: u32,
 }
 
+/// Check if a label name is a numeric label (e.g. "1", "2", "42").
+fn is_numeric_label(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Check if a string is a numeric forward/backward reference like "1f" or "2b".
+/// Returns Some((number_str, is_forward)) if it is, None otherwise.
+fn parse_numeric_ref(name: &str) -> Option<(&str, bool)> {
+    if name.len() < 2 {
+        return None;
+    }
+    let last = name.as_bytes()[name.len() - 1];
+    let num_part = &name[..name.len() - 1];
+    if !num_part.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    match last {
+        b'f' => Some((num_part, true)),
+        b'b' => Some((num_part, false)),
+        _ => None,
+    }
+}
+
+/// Resolve numeric local labels (1:, 2:, etc.) and their references (1f, 1b)
+/// into unique internal label names.
+///
+/// GNU assembler numeric labels can be defined multiple times. Each forward
+/// reference `Nf` refers to the next definition of `N`, and each backward
+/// reference `Nb` refers to the most recent definition of `N`.
+///
+/// This function renames each definition to a unique `.Lnum_N_K` name and
+/// updates all references accordingly.
+fn resolve_numeric_labels(items: &[AsmItem]) -> Vec<AsmItem> {
+    // First pass: find all numeric label definitions and assign unique names.
+    let mut defs: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+    let mut unique_counter: HashMap<String, usize> = HashMap::new();
+
+    for (i, item) in items.iter().enumerate() {
+        if let AsmItem::Label(name) = item {
+            if is_numeric_label(name) {
+                let count = unique_counter.entry(name.clone()).or_insert(0);
+                let unique_name = format!(".Lnum_{}_{}", name, *count);
+                *count += 1;
+                defs.entry(name.clone()).or_default().push((i, unique_name));
+            }
+        }
+    }
+
+    // If no numeric labels found, return original items unchanged
+    if defs.is_empty() {
+        return items.to_vec();
+    }
+
+    // Clone items and resolve references
+    let mut result = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        match item {
+            AsmItem::Label(name) if is_numeric_label(name) => {
+                // Replace with unique name
+                if let Some(def_list) = defs.get(name) {
+                    if let Some((_, unique_name)) = def_list.iter().find(|(idx, _)| *idx == i) {
+                        result.push(AsmItem::Label(unique_name.clone()));
+                        continue;
+                    }
+                }
+                result.push(item.clone());
+            }
+            AsmItem::Instruction(instr) => {
+                // Resolve operand references
+                let new_ops: Vec<Operand> = instr.operands.iter().map(|op| {
+                    resolve_numeric_operand(op, i, &defs)
+                }).collect();
+                result.push(AsmItem::Instruction(Instruction {
+                    prefix: instr.prefix.clone(),
+                    mnemonic: instr.mnemonic.clone(),
+                    operands: new_ops,
+                }));
+            }
+            AsmItem::Byte(vals) => {
+                let new_vals = resolve_numeric_data_values(vals, i, &defs);
+                result.push(AsmItem::Byte(new_vals));
+            }
+            AsmItem::Long(vals) => {
+                let new_vals = resolve_numeric_data_values(vals, i, &defs);
+                result.push(AsmItem::Long(new_vals));
+            }
+            AsmItem::Quad(vals) => {
+                let new_vals = resolve_numeric_data_values(vals, i, &defs);
+                result.push(AsmItem::Quad(new_vals));
+            }
+            AsmItem::SkipExpr(expr, fill) => {
+                let new_expr = resolve_numeric_refs_in_expr(expr, i, &defs);
+                result.push(AsmItem::SkipExpr(new_expr, *fill));
+            }
+            _ => result.push(item.clone()),
+        }
+    }
+
+    result
+}
+
+/// Resolve numeric label references in a single operand.
+fn resolve_numeric_operand(
+    op: &Operand,
+    current_idx: usize,
+    defs: &HashMap<String, Vec<(usize, String)>>,
+) -> Operand {
+    match op {
+        Operand::Label(name) => {
+            if let Some(resolved) = resolve_numeric_name(name, current_idx, defs) {
+                Operand::Label(resolved)
+            } else {
+                op.clone()
+            }
+        }
+        Operand::Memory(mem) => {
+            let new_disp = resolve_numeric_displacement(&mem.displacement, current_idx, defs);
+            if let Some(new_disp) = new_disp {
+                Operand::Memory(MemoryOperand {
+                    segment: mem.segment.clone(),
+                    displacement: new_disp,
+                    base: mem.base.clone(),
+                    index: mem.index.clone(),
+                    scale: mem.scale,
+                })
+            } else {
+                op.clone()
+            }
+        }
+        _ => op.clone(),
+    }
+}
+
+/// Resolve numeric label references in data values (.byte, .long, .quad directives).
+fn resolve_numeric_data_values(
+    vals: &[DataValue],
+    current_idx: usize,
+    defs: &HashMap<String, Vec<(usize, String)>>,
+) -> Vec<DataValue> {
+    vals.iter().map(|val| {
+        match val {
+            DataValue::Symbol(name) => {
+                if let Some(resolved) = resolve_numeric_name(name, current_idx, defs) {
+                    DataValue::Symbol(resolved)
+                } else {
+                    val.clone()
+                }
+            }
+            DataValue::SymbolDiff(lhs, rhs) => {
+                let new_lhs = resolve_numeric_name(lhs, current_idx, defs).unwrap_or_else(|| lhs.clone());
+                let new_rhs = resolve_numeric_name(rhs, current_idx, defs).unwrap_or_else(|| rhs.clone());
+                DataValue::SymbolDiff(new_lhs, new_rhs)
+            }
+            DataValue::SymbolOffset(name, offset) => {
+                if let Some(resolved) = resolve_numeric_name(name, current_idx, defs) {
+                    DataValue::SymbolOffset(resolved, *offset)
+                } else {
+                    val.clone()
+                }
+            }
+            _ => val.clone(),
+        }
+    }).collect()
+}
+
+/// Resolve a numeric label reference name (e.g., "1f" -> ".Lnum_1_0").
+fn resolve_numeric_name(
+    name: &str,
+    current_idx: usize,
+    defs: &HashMap<String, Vec<(usize, String)>>,
+) -> Option<String> {
+    let (num, is_forward) = parse_numeric_ref(name)?;
+    let def_list = defs.get(num)?;
+
+    if is_forward {
+        // Find the first definition after current_idx
+        def_list.iter()
+            .find(|(idx, _)| *idx > current_idx)
+            .map(|(_, name)| name.clone())
+    } else {
+        // Find the last definition at or before current_idx
+        def_list.iter()
+            .rev()
+            .find(|(idx, _)| *idx < current_idx)
+            .map(|(_, name)| name.clone())
+    }
+}
+
+/// Resolve numeric label references in a displacement.
+fn resolve_numeric_displacement(
+    disp: &Displacement,
+    current_idx: usize,
+    defs: &HashMap<String, Vec<(usize, String)>>,
+) -> Option<Displacement> {
+    match disp {
+        Displacement::Symbol(name) => {
+            resolve_numeric_name(name, current_idx, defs)
+                .map(Displacement::Symbol)
+        }
+        Displacement::SymbolAddend(name, addend) => {
+            resolve_numeric_name(name, current_idx, defs)
+                .map(|n| Displacement::SymbolAddend(n, *addend))
+        }
+        Displacement::SymbolMod(name, modifier) => {
+            resolve_numeric_name(name, current_idx, defs)
+                .map(|n| Displacement::SymbolMod(n, modifier.clone()))
+        }
+        Displacement::SymbolPlusOffset(name, offset) => {
+            resolve_numeric_name(name, current_idx, defs)
+                .map(|n| Displacement::SymbolPlusOffset(n, *offset))
+        }
+        _ => None,
+    }
+}
+
+/// Resolve numeric label references in a SkipExpr expression string.
+/// Scans for digit sequences followed by 'f' or 'b' and replaces them
+/// with the resolved unique label name.
+fn resolve_numeric_refs_in_expr(
+    expr: &str,
+    current_idx: usize,
+    defs: &HashMap<String, Vec<(usize, String)>>,
+) -> String {
+    let mut result = String::with_capacity(expr.len());
+    let bytes = expr.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Look for sequences of digits possibly followed by 'f' or 'b'
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            // Check if followed by 'f' or 'b' (and not more alphanumeric chars)
+            if i < bytes.len() && (bytes[i] == b'f' || bytes[i] == b'b') {
+                let next = i + 1;
+                if next >= bytes.len() || !bytes[next].is_ascii_alphanumeric() {
+                    let ref_name = &expr[start..=i];
+                    if let Some(resolved) = resolve_numeric_name(ref_name, current_idx, defs) {
+                        result.push_str(&resolved);
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+            // Not a numeric ref, just copy the digits
+            result.push_str(&expr[start..i]);
+        } else {
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    result
+}
+
 /// Builds a 32-bit ELF relocatable object file from parsed assembly items.
 pub struct ElfWriter {
     sections: Vec<Section>,
@@ -73,6 +328,9 @@ pub struct ElfWriter {
     symbol_map: HashMap<String, usize>,
     current_section: Option<usize>,
     label_positions: HashMap<String, (usize, u32)>,
+    /// Tracks positions of numeric labels (1:, 2:, etc.) for runtime resolution
+    /// during jump relaxation and relocation processing.
+    numeric_label_positions: HashMap<String, Vec<(usize, u32)>>,
     pending_globals: Vec<String>,
     pending_weaks: Vec<String>,
     pending_types: HashMap<String, SymbolKind>,
@@ -97,6 +355,7 @@ impl ElfWriter {
             symbol_map: HashMap::new(),
             current_section: None,
             label_positions: HashMap::new(),
+            numeric_label_positions: HashMap::new(),
             pending_globals: Vec::new(),
             pending_weaks: Vec::new(),
             pending_types: HashMap::new(),
@@ -112,7 +371,10 @@ impl ElfWriter {
 
     /// Build the ELF object file from parsed assembly items.
     pub fn build(mut self, items: &[AsmItem]) -> Result<Vec<u8>, String> {
-        for item in items {
+        // Resolve numeric local labels (1:, 2:, etc.) to unique names
+        let items = resolve_numeric_labels(items);
+
+        for item in &items {
             self.process_item(item)?;
         }
         self.emit_elf()
@@ -203,6 +465,18 @@ impl ElfWriter {
                 let sec_idx = self.current_section.unwrap();
                 let offset = self.sections[sec_idx].data.len() as u32;
                 self.label_positions.insert(name.clone(), (sec_idx, offset));
+
+                // Track numeric label positions for 1b/1f resolution.
+                // The pre-pass (resolve_numeric_labels) rewrites most references, but
+                // this runtime tracking provides defense-in-depth for jump relaxation
+                // and relocation resolution where offsets may shift.
+                if name.chars().all(|c| c.is_ascii_digit()) {
+                    self.numeric_label_positions
+                        .entry(name.clone())
+                        .or_default()
+                        .push((sec_idx, offset));
+                }
+
                 self.ensure_symbol(name, sec_idx, offset);
             }
             AsmItem::Align(n) => {
@@ -663,6 +937,48 @@ impl ElfWriter {
         )
     }
 
+    /// Resolve a numeric label reference like "1b" or "1f".
+    /// Returns the (section_index, offset) of the target label.
+    fn resolve_numeric_label(&self, symbol: &str, reloc_offset: u32, sec_idx: usize) -> Option<(usize, u32)> {
+        let len = symbol.len();
+        if len < 2 {
+            return None;
+        }
+        let suffix = symbol.as_bytes()[len - 1];
+        if suffix != b'b' && suffix != b'f' {
+            return None;
+        }
+        let label_num = &symbol[..len - 1];
+        if !label_num.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+
+        let positions = self.numeric_label_positions.get(label_num)?;
+        if suffix == b'b' {
+            // Backward: find the nearest label BEFORE (or at) reloc_offset in the same section
+            let mut best: Option<(usize, u32)> = None;
+            for &(s_idx, off) in positions {
+                if s_idx == sec_idx && off <= reloc_offset {
+                    if best.is_none() || off > best.unwrap().1 {
+                        best = Some((s_idx, off));
+                    }
+                }
+            }
+            best
+        } else {
+            // Forward: find the nearest label AFTER reloc_offset in the same section
+            let mut best: Option<(usize, u32)> = None;
+            for &(s_idx, off) in positions {
+                if s_idx == sec_idx && off > reloc_offset {
+                    if best.is_none() || off < best.unwrap().1 {
+                        best = Some((s_idx, off));
+                    }
+                }
+            }
+            best
+        }
+    }
+
     fn relax_jumps(&mut self) {
         for sec_idx in 0..self.sections.len() {
             if self.sections[sec_idx].jumps.is_empty() {
@@ -681,7 +997,13 @@ impl ElfWriter {
                 let mut to_relax: Vec<usize> = Vec::new();
                 for (j_idx, jump) in self.sections[sec_idx].jumps.iter().enumerate() {
                     if jump.relaxed { continue; }
-                    if let Some(&target_off) = local_labels.get(&jump.target) {
+                    let target_off_opt = local_labels.get(&jump.target).copied()
+                        .or_else(|| {
+                            // Try numeric label resolution
+                            self.resolve_numeric_label(&jump.target, jump.offset as u32, sec_idx)
+                                .map(|(_, off)| off as usize)
+                        });
+                    if let Some(target_off) = target_off_opt {
                         let short_end = jump.offset as i64 + 2;
                         let disp = target_off as i64 - short_end;
                         if (-128..=127).contains(&disp) {
@@ -723,6 +1045,15 @@ impl ElfWriter {
                         }
                     }
 
+                    // Also update numeric label positions
+                    for (_, positions) in self.numeric_label_positions.iter_mut() {
+                        for pos in positions.iter_mut() {
+                            if pos.0 == sec_idx && (pos.1 as usize) > offset {
+                                pos.1 -= shrink as u32;
+                            }
+                        }
+                    }
+
                     self.sections[sec_idx].relocations.retain_mut(|reloc| {
                         let reloc_off = reloc.offset as usize;
                         let old_reloc_pos = if is_conditional { offset + 2 } else { offset + 1 };
@@ -760,7 +1091,12 @@ impl ElfWriter {
             let patches: Vec<(usize, u8)> = self.sections[sec_idx].jumps.iter()
                 .filter(|j| j.relaxed)
                 .filter_map(|jump| {
-                    local_labels.get(&jump.target).map(|&target_off| {
+                    let target = local_labels.get(&jump.target).copied()
+                        .or_else(|| {
+                            self.resolve_numeric_label(&jump.target, jump.offset as u32, sec_idx)
+                                .map(|(_, off)| off as usize)
+                        });
+                    target.map(|target_off| {
                         let end_of_instr = jump.offset + 2;
                         let disp = (target_off as i64 - end_of_instr as i64) as i8;
                         (jump.offset + 1, disp as u8)
@@ -783,6 +1119,13 @@ impl ElfWriter {
         if name.starts_with('.') {
             return true;
         }
+        // Numeric labels (e.g., "1f", "1b", "2f", "2b") are always local
+        if name.len() >= 2 {
+            let last = name.as_bytes()[name.len() - 1];
+            if (last == b'f' || last == b'b') && name[..name.len()-1].chars().all(|c| c.is_ascii_digit()) {
+                return true;
+            }
+        }
         // Check the symbol table for binding
         if let Some(&sym_idx) = self.symbol_map.get(name) {
             self.symbols[sym_idx].binding == STB_LOCAL
@@ -801,7 +1144,10 @@ impl ElfWriter {
             let mut unresolved = Vec::new();
 
             for reloc in &self.sections[sec_idx].relocations {
-                if let Some(&(target_sec, target_off)) = self.label_positions.get(&reloc.symbol) {
+                // Try regular label lookup first, then numeric label resolution (1b, 1f, etc.)
+                let label_pos = self.label_positions.get(&reloc.symbol).copied()
+                    .or_else(|| self.resolve_numeric_label(&reloc.symbol, reloc.offset, sec_idx));
+                if let Some((target_sec, target_off)) = label_pos {
                     let is_local = self.is_local_symbol(&reloc.symbol);
                     if target_sec == sec_idx && is_local
                         && (reloc.reloc_type == R_386_PC32 || reloc.reloc_type == R_386_PLT32)

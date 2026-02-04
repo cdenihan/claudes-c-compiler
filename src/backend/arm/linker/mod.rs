@@ -385,7 +385,7 @@ fn resolve_lib(name: &str, paths: &[String]) -> Option<String> {
 
 fn map_section_name(name: &str) -> String {
     if name.starts_with(".text.") || name == ".text" { return ".text".to_string(); }
-    if name.starts_with(".data.rel") { return ".data.rel.ro".to_string(); }
+    if name.starts_with(".data.rel.ro") { return ".data.rel.ro".to_string(); }
     if name.starts_with(".data.") || name == ".data" { return ".data".to_string(); }
     if name.starts_with(".rodata.") || name == ".rodata" { return ".rodata".to_string(); }
     if name.starts_with(".bss.") || name == ".bss" { return ".bss".to_string(); }
@@ -546,6 +546,7 @@ fn emit_executable(
     let has_tls = output_sections.iter().any(|s| s.flags & SHF_TLS != 0 && s.mem_size > 0);
     let phdr_count: u64 = 2 + if has_tls { 1 } else { 0 } + 1; // 2 LOAD + optional TLS + GNU_STACK
     let phdr_total_size = phdr_count * 56;
+    let debug_layout = std::env::var("LINKER_DEBUG_LAYOUT").is_ok();
 
     // === Layout: RX segment (starts at file offset 0, vaddr BASE_ADDR) ===
     let mut offset = 64 + phdr_total_size; // After ELF header + phdrs
@@ -570,6 +571,10 @@ fn emit_executable(
             offset = (offset + a - 1) & !(a - 1);
             sec.addr = BASE_ADDR + offset;
             sec.file_offset = offset;
+            if debug_layout {
+                eprintln!("  LAYOUT RO: {} addr=0x{:x} foff=0x{:x} sz=0x{:x} flags=0x{:x}",
+                    sec.name, sec.addr, sec.file_offset, sec.mem_size, sec.flags);
+            }
             offset += sec.mem_size;
         }
     }
@@ -614,6 +619,10 @@ fn emit_executable(
             if tls_addr == 0 { tls_addr = sec.addr; tls_file_offset = offset; tls_align = a; }
             tls_file_size += sec.mem_size;
             tls_mem_size += sec.mem_size;
+            if debug_layout {
+                eprintln!("  LAYOUT TLS: {} addr=0x{:x} foff=0x{:x} sz=0x{:x} align={} flags=0x{:x}",
+                    sec.name, sec.addr, sec.file_offset, sec.mem_size, a, sec.flags);
+            }
             offset += sec.mem_size;
         }
     }
@@ -624,6 +633,10 @@ fn emit_executable(
             let aligned = (tls_mem_size + a - 1) & !(a - 1);
             sec.addr = if tls_addr != 0 { tls_addr + aligned } else { BASE_ADDR + offset + aligned };
             sec.file_offset = offset;
+            if debug_layout {
+                eprintln!("  LAYOUT TBSS: {} addr=0x{:x} aligned_off=0x{:x} sz=0x{:x} align={} tls_mem_size=0x{:x}",
+                    sec.name, sec.addr, aligned, sec.mem_size, a, tls_mem_size);
+            }
             tls_mem_size = aligned + sec.mem_size;
             if a > tls_align { tls_align = a; }
         }
@@ -662,6 +675,10 @@ fn emit_executable(
             offset = (offset + a - 1) & !(a - 1);
             sec.addr = BASE_ADDR + offset;
             sec.file_offset = offset;
+            if debug_layout {
+                eprintln!("  LAYOUT RW: {} addr=0x{:x} foff=0x{:x} sz=0x{:x} flags=0x{:x}",
+                    sec.name, sec.addr, sec.file_offset, sec.mem_size, sec.flags);
+            }
             offset += sec.mem_size;
         }
     }
@@ -675,6 +692,10 @@ fn emit_executable(
             offset = (offset + a - 1) & !(a - 1);
             sec.addr = BASE_ADDR + offset;
             sec.file_offset = offset;
+            if debug_layout {
+                eprintln!("  LAYOUT RW: {} addr=0x{:x} foff=0x{:x} sz=0x{:x} flags=0x{:x}",
+                    sec.name, sec.addr, sec.file_offset, sec.mem_size, sec.flags);
+            }
             offset += sec.mem_size;
         }
     }
@@ -924,6 +945,10 @@ fn emit_executable(
                 // AArch64 variant 1: tp_offset = (sym_addr - tls_base) + 16
                 if tls_addr != 0 {
                     let offset = (sym_addr as i64) - (tls_addr as i64) + 16;
+                    if std::env::var("LINKER_DEBUG_TLS").is_ok() {
+                        eprintln!("  GOT TLS IE: key='{}' sym_addr=0x{:x} tls_addr=0x{:x} -> got_val=0x{:x}",
+                            key, sym_addr, tls_addr, offset as u64);
+                    }
                     offset as u64
                 } else {
                     sym_addr

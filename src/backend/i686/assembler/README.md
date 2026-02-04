@@ -122,6 +122,23 @@ Lines containing `;` are split into multiple items (GAS multi-statement syntax).
 Comments starting with `#` are stripped.  String literals are respected during
 both comment stripping and semicolon splitting.
 
+### Numeric Label Resolution (pre-pass)
+
+Before encoding begins, the ELF writer runs a numeric label resolution pre-pass
+(`resolve_numeric_labels`).  GNU assembler numeric labels (`1:`, `2:`, etc.) can
+be defined multiple times; forward references (`1f`) refer to the next
+definition, and backward references (`1b`) refer to the most recent.
+
+The pre-pass renames each numeric label definition to a unique internal name
+(`.Lnum_N_K`) and updates all instruction operands and data directives (`Byte`,
+`Long`, `Quad`, `SkipExpr`) that reference them.  This converts inherently
+ambiguous references into unique `.L`-prefixed labels that the rest of the
+pipeline handles normally.
+
+As a defense-in-depth measure, the ELF writer also tracks numeric label
+positions at runtime for fallback resolution during jump relaxation and
+relocation processing.
+
 ### Stage 2: Instruction Encoding
 
 The `InstructionEncoder` converts each `Instruction` into machine-code bytes.
@@ -372,7 +389,7 @@ format).
 | `mod.rs`         | ~33   | Module root; `assemble()` entry point; re-exports parser|
 | `encoder.rs`     | ~2370 | Instruction-to-bytes encoder; ModR/M/SIB encoding;     |
 |                  |       | relocation generation; full i686 ISA coverage           |
-| `elf_writer.rs`  | ~1247 | Section/symbol/relocation management; jump relaxation;  |
+| `elf_writer.rs`  | ~1233 | Section/symbol/relocation management; jump relaxation;  |
 |                  |       | internal reloc resolution; ELF32 binary serialization   |
 | *(shared)*       |       |                                                        |
 | `x86/assembler/` | ~1100 | AT&T syntax parser; `AsmItem`/`Instruction`/`Operand`  |
