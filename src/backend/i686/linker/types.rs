@@ -86,6 +86,7 @@ pub(super) const DT_RELSZ: i32 = 18;
 pub(super) const DT_RELENT: i32 = 19;
 pub(super) const DT_PLTREL: i32 = 20;
 pub(super) const DT_DEBUG: i32 = 21;
+pub(super) const DT_TEXTREL: i32 = 22;
 pub(super) const DT_JMPREL: i32 = 23;
 pub(super) const DT_INIT_ARRAY: i32 = 25;
 pub(super) const DT_FINI_ARRAY: i32 = 26;
@@ -197,6 +198,8 @@ pub(super) struct LinkerSymbol {
     pub needs_copy: bool,
     pub copy_addr: u32,
     pub version: Option<String>,
+    /// Whether this dynamic data symbol uses text relocations instead of COPY.
+    pub uses_textrel: bool,
 }
 
 /// A merged output section.

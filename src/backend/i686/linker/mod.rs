@@ -115,6 +115,21 @@ pub fn link_builtin(
     // Phase 8: Build PLT/GOT structures
     let (plt_symbols, got_symbols, num_plt, num_got_total) = build_plt_got_lists(&mut global_symbols);
 
+    // Phase 8b: Mark WEAK dynamic data symbols for text relocations instead of COPY
+    if !is_static {
+        let weak_data_syms: Vec<String> = global_symbols.iter()
+            .filter(|(_, s)| s.is_dynamic && s.needs_copy && s.binding == STB_WEAK
+                && s.sym_type != STT_FUNC && s.sym_type != STT_GNU_IFUNC)
+            .map(|(n, _)| n.clone())
+            .collect();
+        for name in &weak_data_syms {
+            if let Some(sym) = global_symbols.get_mut(name) {
+                sym.needs_copy = false;
+                sym.uses_textrel = true;
+            }
+        }
+    }
+
     // Phase 9: Collect IFUNC symbols for static linking
     let ifunc_symbols = collect_ifunc_symbols(&global_symbols, is_static);
 
@@ -247,8 +262,8 @@ fn load_libraries(
     extra_libs: &[String],
     extra_lib_files: &[String],
     all_lib_dirs: &[String],
-) -> (HashMap<String, (String, u8, u32, Option<String>, bool)>, Vec<String>) {
-    let mut dynlib_syms: HashMap<String, (String, u8, u32, Option<String>, bool)> = HashMap::new();
+) -> (HashMap<String, (String, u8, u32, Option<String>, bool, u8)>, Vec<String>) {
+    let mut dynlib_syms: HashMap<String, (String, u8, u32, Option<String>, bool, u8)> = HashMap::new();
     let mut static_lib_objects: Vec<String> = Vec::new();
     let all_lib_refs: Vec<&str> = all_lib_dirs.iter().map(|s| s.as_str()).collect();
 
@@ -321,7 +336,7 @@ fn load_libraries(
 fn scan_shared_lib(
     lib: &str,
     lib_refs: &[&str],
-    dynlib_syms: &mut HashMap<String, (String, u8, u32, Option<String>, bool)>,
+    dynlib_syms: &mut HashMap<String, (String, u8, u32, Option<String>, bool, u8)>,
 ) -> bool {
     let so_base = format!("lib{}.so", lib);
     for dir in lib_refs {
@@ -356,18 +371,18 @@ fn scan_shared_lib(
 }
 
 fn insert_dynsym(
-    dynlib_syms: &mut HashMap<String, (String, u8, u32, Option<String>, bool)>,
+    dynlib_syms: &mut HashMap<String, (String, u8, u32, Option<String>, bool, u8)>,
     sym: DynSymInfo,
     lib_soname: &str,
 ) {
     let entry = dynlib_syms.entry(sym.name.clone());
     match entry {
         std::collections::hash_map::Entry::Vacant(e) => {
-            e.insert((lib_soname.to_string(), sym.sym_type, sym.size, sym.version, sym.is_default_ver));
+            e.insert((lib_soname.to_string(), sym.sym_type, sym.size, sym.version, sym.is_default_ver, sym.binding));
         }
         std::collections::hash_map::Entry::Occupied(mut e) => {
             if sym.is_default_ver && !e.get().4 {
-                e.insert((lib_soname.to_string(), sym.sym_type, sym.size, sym.version, sym.is_default_ver));
+                e.insert((lib_soname.to_string(), sym.sym_type, sym.size, sym.version, sym.is_default_ver, sym.binding));
             }
         }
     }
@@ -601,7 +616,7 @@ fn resolve_symbols(
     inputs: &[InputObject],
     _output_sections: &[OutputSection],
     section_map: &SectionMap,
-    dynlib_syms: &HashMap<String, (String, u8, u32, Option<String>, bool)>,
+    dynlib_syms: &HashMap<String, (String, u8, u32, Option<String>, bool, u8)>,
 ) -> (HashMap<String, LinkerSymbol>, HashMap<(usize, usize), String>) {
     let mut global_symbols: HashMap<String, LinkerSymbol> = HashMap::new();
     let mut sym_resolution: HashMap<(usize, usize), String> = HashMap::new();
@@ -639,6 +654,7 @@ fn resolve_symbols(
                 needs_copy: false,
                 copy_addr: 0,
                 version: None,
+                uses_textrel: false,
             };
 
             match global_symbols.get(&sym.name) {
@@ -667,13 +683,13 @@ fn resolve_symbols(
             if sym.section_index == SHN_UNDEF {
                 if global_symbols.contains_key(&sym.name) { continue; }
 
-                if let Some((lib, dyn_sym_type, dyn_size, dyn_ver, _is_default)) = dynlib_syms.get(&sym.name) {
+                if let Some((lib, dyn_sym_type, dyn_size, dyn_ver, _is_default, dyn_binding)) = dynlib_syms.get(&sym.name) {
                     let is_func = *dyn_sym_type == STT_FUNC || *dyn_sym_type == STT_GNU_IFUNC;
                     global_symbols.insert(sym.name.clone(), LinkerSymbol {
                         address: 0,
                         size: *dyn_size,
                         sym_type: *dyn_sym_type,
-                        binding: STB_GLOBAL,
+                        binding: *dyn_binding,
                         visibility: STV_DEFAULT,
                         is_defined: false,
                         needs_plt: is_func,
@@ -687,6 +703,7 @@ fn resolve_symbols(
                         needs_copy: !is_func,
                         copy_addr: 0,
                         version: dyn_ver.clone(),
+                        uses_textrel: false,
                     });
                 } else {
                     global_symbols.entry(sym.name.clone()).or_insert(LinkerSymbol {
@@ -707,6 +724,7 @@ fn resolve_symbols(
                         needs_copy: false,
                         copy_addr: 0,
                         version: None,
+                        uses_textrel: false,
                     });
                 }
             }
@@ -858,7 +876,7 @@ fn emit_executable(
     section_map: &SectionMap,
     global_symbols: &mut HashMap<String, LinkerSymbol>,
     _sym_resolution: &HashMap<(usize, usize), String>,
-    _dynlib_syms: &HashMap<String, (String, u8, u32, Option<String>, bool)>,
+    _dynlib_syms: &HashMap<String, (String, u8, u32, Option<String>, bool, u8)>,
     plt_symbols: &[String],
     got_symbols: &[String],
     num_plt: usize,
@@ -943,8 +961,32 @@ fn emit_executable(
         dynsym_names.push(name.clone());
     }
 
+    // Textrel symbols (hashed: need dynamic R_386_32 relocs)
+    let mut textrel_syms_for_dynsym: Vec<String> = global_symbols.iter()
+        .filter(|(_, s)| s.uses_textrel && s.is_dynamic)
+        .map(|(n, _)| n.clone())
+        .collect();
+    textrel_syms_for_dynsym.sort();
+
+    for name in &textrel_syms_for_dynsym {
+        let idx = dynsym_entries.len();
+        let name_off = dynstr.add(name);
+        let sym = &global_symbols[name];
+        dynsym_entries.push(Elf32Sym {
+            name: name_off, value: 0, size: sym.size,
+            info: (sym.binding << 4) | sym.sym_type, other: 0, shndx: SHN_UNDEF,
+        });
+        dynsym_map.insert(name.clone(), idx);
+        dynsym_names.push(name.clone());
+    }
+
+    // All hashed symbols = copy + textrel
+    let mut all_hashed_syms: Vec<String> = Vec::new();
+    all_hashed_syms.extend(copy_syms_for_dynsym.iter().cloned());
+    all_hashed_syms.extend(textrel_syms_for_dynsym.iter().cloned());
+
     // Build .gnu.hash and reorder hashed dynsym entries
-    let (gnu_hash_data, sorted_indices) = build_gnu_hash_32(&copy_syms_for_dynsym, gnu_hash_symoffset as u32);
+    let (gnu_hash_data, sorted_indices) = build_gnu_hash_32(&all_hashed_syms, gnu_hash_symoffset as u32);
 
     if !sorted_indices.is_empty() {
         let hashed_start = gnu_hash_symoffset;
@@ -999,7 +1041,7 @@ fn emit_executable(
     for lib in &needed_libs { dynstr2.add(lib); }
     for name in plt_symbols { dynstr2.add(name); }
     for name in got_symbols { dynstr2.add(name); }
-    for name in &copy_syms_for_dynsym { dynstr2.add(name); }
+    for name in &all_hashed_syms { dynstr2.add(name); }
     for (_, vers) in &lib_ver_list {
         for v in vers { dynstr2.add(v); }
     }
@@ -1155,7 +1197,25 @@ fn emit_executable(
     let rel_dyn_offset = file_offset;
     let rel_dyn_vaddr = vaddr;
     let num_copy_relocs = copy_syms_for_dynsym.len();
-    let num_rel_dyn = got_symbols.len() + num_copy_relocs;
+    // Count actual R_386_32 relocations against textrel symbols
+    let num_text_relocs: usize = if textrel_syms_for_dynsym.is_empty() { 0 } else {
+        let mut count = 0usize;
+        for obj in inputs {
+            for sec in &obj.sections {
+                for &(_, rel_type, sym_idx, _) in &sec.relocations {
+                    if rel_type == R_386_32 {
+                        if let Some(sym) = obj.symbols.get(sym_idx as usize) {
+                            if let Some(gs) = global_symbols.get(&sym.name) {
+                                if gs.uses_textrel { count += 1; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        count
+    };
+    let num_rel_dyn = got_symbols.len() + num_copy_relocs + num_text_relocs;
     let rel_dyn_size = (num_rel_dyn as u32) * 8;
     if !is_static { file_offset += rel_dyn_size; vaddr += rel_dyn_size; }
 
@@ -1314,6 +1374,7 @@ fn emit_executable(
     let num_dynamic_entries = count_dynamic_entries(
         &needed_libs, init_vaddr, init_size, fini_vaddr, fini_size,
         init_array_size, fini_array_size, num_plt, num_rel_dyn, verneed_size,
+        num_text_relocs,
     );
     let dynamic_size = num_dynamic_entries * 8;
     if !is_static { file_offset += dynamic_size; vaddr += dynamic_size; }
@@ -1443,6 +1504,7 @@ fn emit_executable(
         gotplt_vaddr, gotplt_reserved);
 
     // ── Apply relocations ────────────────────────────────────────────────
+    let text_relocs;
     {
         let mut reloc_ctx = RelocContext {
             global_symbols,
@@ -1461,7 +1523,7 @@ fn emit_executable(
             tls_mem_size,
             has_tls,
         };
-        reloc::apply_relocations(inputs, &mut reloc_ctx)?;
+        text_relocs = reloc::apply_relocations(inputs, &mut reloc_ctx)?;
     }
 
     // Build .eh_frame_hdr from relocated .eh_frame data
@@ -1541,6 +1603,14 @@ fn emit_executable(
             }
         }
     }
+    // Text relocations for WEAK dynamic data symbols (R_386_32)
+    for (addr, ref name) in &text_relocs {
+        if let Some(&dynsym_idx) = dynsym_map.get(name) {
+            let r_info = ((dynsym_idx as u32) << 8) | R_386_32;
+            rel_dyn_data.extend_from_slice(&addr.to_le_bytes());
+            rel_dyn_data.extend_from_slice(&r_info.to_le_bytes());
+        }
+    }
 
     // .dynamic data
     let mut dynamic_data: Vec<u8> = Vec::new();
@@ -1577,6 +1647,9 @@ fn emit_executable(
             push_dyn(&mut dynamic_data, DT_VERNEED, verneed_vaddr);
             push_dyn(&mut dynamic_data, DT_VERNEEDNUM, verneed_count);
             push_dyn(&mut dynamic_data, DT_VERSYM, versym_vaddr);
+        }
+        if num_text_relocs > 0 {
+            push_dyn(&mut dynamic_data, DT_TEXTREL, 0);
         }
         push_dyn(&mut dynamic_data, DT_NULL, 0);
     }
@@ -1794,6 +1867,7 @@ fn count_dynamic_entries(
     fini_vaddr: u32, fini_size: u32,
     init_array_size: u32, fini_array_size: u32,
     num_plt: usize, num_rel_dyn: usize, verneed_size: u32,
+    num_text_relocs: usize,
 ) -> u32 {
     let mut n: u32 = needed_libs.len() as u32;
     n += 5; // GNU_HASH, STRTAB, SYMTAB, STRSZ, SYMENT
@@ -1805,6 +1879,7 @@ fn count_dynamic_entries(
     if num_plt > 0 { n += 4; }
     if num_rel_dyn > 0 { n += 3; }
     if verneed_size > 0 { n += 3; }
+    if num_text_relocs > 0 { n += 1; } // DT_TEXTREL
     n += 1; // DT_NULL
     n
 }
@@ -1824,7 +1899,7 @@ fn assign_symbol_addresses(
         address: got_base, size: 0, sym_type: STT_OBJECT, binding: STB_LOCAL,
         visibility: STV_DEFAULT, is_defined: true, needs_plt: false, needs_got: false,
         output_section: usize::MAX, section_offset: 0, plt_index: 0, got_index: 0,
-        is_dynamic: false, dynlib: String::new(), needs_copy: false, copy_addr: 0, version: None,
+        is_dynamic: false, dynlib: String::new(), needs_copy: false, copy_addr: 0, version: None, uses_textrel: false,
     });
     if let Some(sym) = global_symbols.get_mut("_GLOBAL_OFFSET_TABLE_") {
         sym.address = got_base;

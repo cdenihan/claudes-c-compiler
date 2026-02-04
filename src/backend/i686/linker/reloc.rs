@@ -36,10 +36,12 @@ pub(super) struct RelocContext<'a> {
 }
 
 /// Apply all relocations from input objects to the output sections.
+/// Returns a list of text relocations (address, dynsym_index) for symbols using textrel.
 pub(super) fn apply_relocations(
     inputs: &[InputObject],
     ctx: &mut RelocContext,
-) -> Result<(), String> {
+) -> Result<Vec<(u32, String)>, String> {
+    let mut text_relocs: Vec<(u32, String)> = Vec::new();
     for (obj_idx, obj) in inputs.iter().enumerate() {
         for sec in &obj.sections {
             if sec.relocations.is_empty() { continue; }
@@ -54,18 +56,22 @@ pub(super) fn apply_relocations(
             };
 
             for &(rel_offset, rel_type, sym_idx, addend) in &sec.relocations {
-                apply_one_reloc(
+                let tr = apply_one_reloc(
                     obj_idx, obj, sec, out_sec_idx, sec_base_offset,
                     rel_offset, rel_type, sym_idx, addend,
                     ctx,
                 )?;
+                if let Some(t) = tr {
+                    text_relocs.push(t);
+                }
             }
         }
     }
-    Ok(())
+    Ok(text_relocs)
 }
 
 /// Apply a single relocation.
+/// Returns Some((patch_addr, sym_name)) if a text relocation entry is needed.
 fn apply_one_reloc(
     obj_idx: usize,
     obj: &InputObject,
@@ -77,7 +83,7 @@ fn apply_one_reloc(
     sym_idx: u32,
     addend: i32,
     ctx: &mut RelocContext,
-) -> Result<(), String> {
+) -> Result<Option<(u32, String)>, String> {
     let patch_offset = sec_base_offset + rel_offset;
     let patch_addr = ctx.output_sections[out_sec_idx].addr + patch_offset;
 
@@ -94,11 +100,27 @@ fn apply_one_reloc(
         .map(|gs| gs.is_dynamic && gs.needs_plt).unwrap_or(false);
 
     let mut relax_got32x = false;
+    let mut text_reloc: Option<(u32, String)> = None;
 
     let value: u32 = match rel_type {
-        R_386_NONE => return Ok(()),
+        R_386_NONE => return Ok(None),
         R_386_32 => {
-            (sym_addr as i32 + addend) as u32
+            // Check if this symbol uses text relocations (WEAK dynamic data)
+            if !sym.name.is_empty() {
+                if let Some(gs) = ctx.global_symbols.get(&sym.name) {
+                    if gs.uses_textrel {
+                        // Record a text relocation; write 0 for now (dynamic linker fills it)
+                        text_reloc = Some((patch_addr, sym.name.clone()));
+                        addend as u32
+                    } else {
+                        (sym_addr as i32 + addend) as u32
+                    }
+                } else {
+                    (sym_addr as i32 + addend) as u32
+                }
+            } else {
+                (sym_addr as i32 + addend) as u32
+            }
         }
         R_386_PC32 | R_386_PLT32 => {
             let s = if is_dyn {
@@ -168,7 +190,7 @@ fn apply_one_reloc(
         out_sec.data[off..off + 4].copy_from_slice(&value.to_le_bytes());
     }
 
-    Ok(())
+    Ok(text_reloc)
 }
 
 /// Resolve a symbol's address, handling local, section, and global symbols.

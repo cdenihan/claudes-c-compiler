@@ -1,2 +1,0 @@
-Fixing crun project to compile and pass tests with ccc-x86 (and other backends).
-Working on diagnosing and fixing any compiler bugs needed.
