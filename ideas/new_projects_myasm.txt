@@ -14,3 +14,4 @@ Tracking project build/test results with MY_ASM=builtin MY_LD=builtin
 | utf8proc | PASS | FAIL (i686 asm undefined syms) | PASS | PASS | All pass except i686 |
 | chibicc | PASS | TODO | TODO | TODO | Passes x86 |
 | QuickJS | PASS | TODO | TODO | TODO | Passes x86 |
+| monocypher | PASS | PASS | PASS | PASS | Fixed ARM asm: symbol names matching register names (e.g. x16) |

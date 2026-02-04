@@ -400,6 +400,10 @@ fn get_symbol(operands: &[Operand], idx: usize) -> Result<(String, i64), String>
         Some(Operand::SymbolOffset(s, off)) => Ok((s.clone(), *off)),
         Some(Operand::Modifier { symbol, .. }) => Ok((symbol.clone(), 0)),
         Some(Operand::ModifierOffset { symbol, offset, .. }) => Ok((symbol.clone(), *offset)),
+        // A label/symbol name may coincidentally match a register name (e.g. a C function
+        // named `x16`). When the caller expects a symbol (branch targets, adrp, etc.),
+        // treat a register-parsed operand as a symbol reference.
+        Some(Operand::Reg(s)) => Ok((s.clone(), 0)),
         other => Err(format!("expected symbol at operand {}, got {:?}", idx, other)),
     }
 }
