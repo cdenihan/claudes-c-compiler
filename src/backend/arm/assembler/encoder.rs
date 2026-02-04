@@ -713,6 +713,26 @@ fn encode_add_sub(operands: &[Operand], is_sub: bool, set_flags: bool) -> Result
     if let Some(Operand::Reg(rm_name)) = operands.get(2) {
         let rm = parse_reg_num(rm_name).ok_or("invalid rm")?;
 
+        // Check for extended register: add Xd, Xn, Wm, sxtw [#N]
+        if let Some(Operand::Extend { kind, amount }) = operands.get(3) {
+            let option = match kind.as_str() {
+                "uxtb" => 0b000u32,
+                "uxth" => 0b001,
+                "uxtw" => 0b010,
+                "uxtx" => 0b011,
+                "sxtb" => 0b100,
+                "sxth" => 0b101,
+                "sxtw" => 0b110,
+                "sxtx" => 0b111,
+                _ => 0b011, // default UXTX/LSL
+            };
+            let imm3 = (*amount as u32) & 0x7;
+            // Extended register form: sf op S 01011 00 1 Rm option imm3 Rn Rd
+            let word = (sf << 31) | (op << 30) | (s_bit << 29) | (0b01011 << 24)
+                | (0b00 << 22) | (1 << 21) | (rm << 16) | (option << 13) | (imm3 << 10) | (rn << 5) | rd;
+            return Ok(EncodeResult::Word(word));
+        }
+
         // Check for shifted register: add Xd, Xn, Xm, lsl #N
         let (shift_type, shift_amount) = if let Some(Operand::Shift { kind, amount }) = operands.get(3) {
             let st = match kind.as_str() {
@@ -1452,7 +1472,7 @@ fn encode_ldr_str(operands: &[Operand], is_load: bool, size: u32, is_signed: boo
         }
 
         // [base, Xm] register offset
-        Some(Operand::MemRegOffset { base, index, extend: _, shift: _ }) => {
+        Some(Operand::MemRegOffset { base, index, extend, shift }) => {
             // Check if index is a :lo12: modifier
             if index.starts_with(':') {
                 // Parse modifier from the index string
@@ -1504,10 +1524,43 @@ fn encode_ldr_str(operands: &[Operand], is_load: bool, size: u32, is_signed: boo
             let rm = parse_reg_num(index).ok_or("invalid index reg")?;
             let opc = if is_load { 0b01 } else { 0b00 };
             // Register offset: size 111 V opc 1 Rm option S 10 Rn Rt
-            let option = 0b011u32; // LSL
-            let s = 0u32; // no shift
+            // Determine option and S from extend/shift specifiers
+            let is_w_index = index.starts_with('w') || index.starts_with('W');
+            let shift_amount: u8 = match shift { Some(s) => *s, None => 0 };
+            let (option, s_bit) = match extend.as_deref() {
+                Some("lsl") => {
+                    // LSL with shift: S=1 if shift amount > 0
+                    let s_val = if shift_amount > 0 { 1u32 } else { 0u32 };
+                    (0b011u32, s_val)
+                }
+                Some("sxtw") => {
+                    let s_val = if shift_amount > 0 { 1u32 } else { 0u32 };
+                    (0b110u32, s_val)
+                }
+                Some("sxtx") => {
+                    let s_val = if shift_amount > 0 { 1u32 } else { 0u32 };
+                    (0b111u32, s_val)
+                }
+                Some("uxtw") => {
+                    let s_val = if shift_amount > 0 { 1u32 } else { 0u32 };
+                    (0b010u32, s_val)
+                }
+                Some("uxtx") => {
+                    let s_val = if shift_amount > 0 { 1u32 } else { 0u32 };
+                    (0b011u32, s_val)
+                }
+                None => {
+                    // Default: if W register index, use UXTW; if X register, use LSL
+                    if is_w_index {
+                        (0b010u32, 0u32) // UXTW, no shift
+                    } else {
+                        (0b011u32, 0u32) // LSL, no shift
+                    }
+                }
+                _ => (0b011u32, 0u32), // default LSL
+            };
             let word = (actual_size << 30) | (0b111 << 27) | (v << 26) | (opc << 22)
-                | (1 << 21) | (rm << 16) | (option << 13) | (s << 12) | (0b10 << 10) | (rn << 5) | rt;
+                | (1 << 21) | (rm << 16) | (option << 13) | (s_bit << 12) | (0b10 << 10) | (rn << 5) | rt;
             return Ok(EncodeResult::Word(word));
         }
 

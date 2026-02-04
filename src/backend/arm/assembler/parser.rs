@@ -34,6 +34,8 @@ pub enum Operand {
     ModifierOffset { kind: String, symbol: String, offset: i64 },
     /// Shift: lsl #N, lsr #N, asr #N
     Shift { kind: String, amount: u32 },
+    /// Extend: sxtw, uxtw, sxtx, etc. with optional shift amount
+    Extend { kind: String, amount: u32 },
     /// Condition code for csel etc.: eq, ne, lt, gt, ...
     Cond(String),
     /// Barrier option for dmb/dsb: ish, ishld, ishst, sy, etc.
@@ -318,6 +320,26 @@ fn parse_single_operand(s: &str) -> Result<Operand, String> {
         return Ok(Operand::Shift { kind: kind.to_string(), amount: amount as u32 });
     }
 
+    // Extend specifiers: sxtw, uxtw, sxtx, uxtx, sxth, uxth, sxtb, uxtb
+    // May appear alone (sxtw) or with shift (sxtw #2)
+    {
+        let extend_prefixes = ["sxtw", "sxtx", "sxth", "sxtb", "uxtw", "uxtx", "uxth", "uxtb"];
+        for prefix in &extend_prefixes {
+            if lower == *prefix {
+                return Ok(Operand::Extend { kind: prefix.to_string(), amount: 0 });
+            }
+            if lower.starts_with(prefix) && lower.as_bytes().get(prefix.len()) == Some(&b' ') {
+                let amount_str = s[prefix.len()..].trim();
+                let amount = if amount_str.starts_with('#') {
+                    parse_int_literal(&amount_str[1..])?
+                } else {
+                    parse_int_literal(amount_str)?
+                };
+                return Ok(Operand::Extend { kind: prefix.to_string(), amount: amount as u32 });
+            }
+        }
+    }
+
     // Barrier options
     match lower.as_str() {
         "ish" | "ishld" | "ishst" | "sy" | "ld" | "st" | "osh" | "oshld" | "oshst"
@@ -483,12 +505,20 @@ fn parse_memory_operand(s: &str) -> Result<Operand, String> {
     }
 
     // [base, Xm] or [base, Xm, extend #shift]
-    if is_register(second) {
+    // second may be "x0" or "x0, lsl #2" or "w0, sxtw" or "w0, sxtw #2"
+    let sub_parts: Vec<&str> = second.splitn(2, ',').collect();
+    let index_str = sub_parts[0].trim();
+    if is_register(index_str) {
+        let (extend, shift) = if sub_parts.len() > 1 {
+            parse_extend_shift(sub_parts[1].trim())
+        } else {
+            (None, None)
+        };
         return Ok(Operand::MemRegOffset {
             base,
-            index: second.to_string(),
-            extend: None,
-            shift: None,
+            index: index_str.to_string(),
+            extend,
+            shift,
         });
     }
 
@@ -499,6 +529,29 @@ fn parse_memory_operand(s: &str) -> Result<Operand, String> {
         extend: None,
         shift: None,
     })
+}
+
+/// Parse an extend/shift specifier like "lsl #2", "sxtw", "sxtw #0", "uxtx #3"
+fn parse_extend_shift(s: &str) -> (Option<String>, Option<u8>) {
+    let s = s.trim().to_lowercase();
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.is_empty() {
+        return (None, None);
+    }
+    let kind = parts[0];
+    let shift = if parts.len() > 1 {
+        let shift_str = parts[1].trim_start_matches('#');
+        shift_str.parse::<u8>().ok()
+    } else {
+        None
+    };
+    match kind {
+        "lsl" | "lsr" | "asr" | "ror" | "sxtw" | "sxtx" | "sxth" | "sxtb"
+        | "uxtw" | "uxtx" | "uxth" | "uxtb" => {
+            (Some(kind.to_string()), shift)
+        }
+        _ => (None, None),
+    }
 }
 
 fn parse_modifier(s: &str) -> Result<Operand, String> {
