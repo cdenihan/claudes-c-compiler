@@ -99,14 +99,19 @@ impl Driver {
     /// Assemble a .s or .S file to an object file using the target assembler.
     /// For .S files, gcc handles preprocessing (macros, #include, etc.).
     ///
-    /// If the `MY_ASM` environment variable is set, its value is used as the
-    /// assembler command instead of the target's default assembler.
+    /// If the `MY_ASM` environment variable is set to "builtin", uses the
+    /// built-in assembler by reading the file and passing its contents to
+    /// `Target::assemble_with_extra`. For .S files, the built-in C preprocessor
+    /// is run first to expand macros and includes.
+    ///
+    /// If `MY_ASM` is set to any other value, it is used as a custom assembler
+    /// command. If unset, the target's default assembler (gcc) is used.
     pub(super) fn assemble_source_file(&self, input_file: &str, output_path: &str) -> Result<(), String> {
         let config = self.target.assembler_config();
         // Check MY_ASM env var to allow overriding the assembler command.
         let custom_asm = std::env::var("MY_ASM").ok();
 
-        // Route to built-in assembler when MY_ASM=builtin
+        // Handle MY_ASM=builtin: read the file and use the built-in assembler
         if custom_asm.as_deref() == Some("builtin") {
             return self.assemble_source_file_builtin(input_file, output_path);
         }
@@ -186,66 +191,33 @@ impl Driver {
         Ok(())
     }
 
-    /// Assemble a .s/.S source file using the built-in assembler.
-    /// For .S files (uppercase), preprocesses with gcc -E first.
+    /// Assemble a .s or .S source file using the built-in assembler.
+    ///
+    /// For .S files (assembly with C preprocessor directives), runs our built-in
+    /// C preprocessor first to expand macros, includes, and conditionals, then
+    /// passes the result to the target's builtin assembler.
+    ///
+    /// For .s files (pure assembly), reads the file directly and passes it
+    /// to the builtin assembler.
     fn assemble_source_file_builtin(&self, input_file: &str, output_path: &str) -> Result<(), String> {
         let asm_text = if input_file.ends_with(".S") {
-            // .S files need C preprocessing first
-            self.preprocess_asm_file(input_file)?
+            // .S files need C preprocessing before assembly
+            let source = std::fs::read_to_string(input_file)
+                .map_err(|e| format!("Cannot read {}: {}", input_file, e))?;
+            let mut preprocessor = crate::frontend::preprocessor::Preprocessor::new();
+            self.configure_preprocessor(&mut preprocessor);
+            preprocessor.set_filename(input_file);
+            self.process_force_includes(&mut preprocessor)
+                .map_err(|e| format!("Preprocessing {} failed: {}", input_file, e))?;
+            preprocessor.preprocess(&source)
         } else {
+            // .s files are pure assembly - read directly
             std::fs::read_to_string(input_file)
-                .map_err(|e| format!("Failed to read {}: {}", input_file, e))?
+                .map_err(|e| format!("Cannot read {}: {}", input_file, e))?
         };
-        self.target.assemble_with_extra(&asm_text, output_path, &[])
-    }
 
-    /// Preprocess a .S assembly file using gcc -E.
-    fn preprocess_asm_file(&self, input_file: &str) -> Result<String, String> {
-        let config = self.target.assembler_config();
-        let mut cmd = std::process::Command::new(config.command);
-        cmd.args(["-E", "-x", "assembler-with-cpp"]);
-        cmd.args(config.extra_args);
-
-        for path in &self.include_paths {
-            cmd.arg("-I").arg(path);
-        }
-        for path in &self.quote_include_paths {
-            cmd.arg("-iquote").arg(path);
-        }
-        for path in &self.isystem_include_paths {
-            cmd.arg("-isystem").arg(path);
-        }
-        for path in &self.after_include_paths {
-            cmd.arg("-idirafter").arg(path);
-        }
-        for def in &self.defines {
-            if def.value == "1" {
-                cmd.arg(format!("-D{}", def.name));
-            } else {
-                cmd.arg(format!("-D{}={}", def.name, def.value));
-            }
-        }
-        for inc in &self.force_includes {
-            cmd.arg("-include").arg(inc);
-        }
-        if self.nostdinc {
-            cmd.arg("-nostdinc");
-        }
-        for undef in &self.undef_macros {
-            cmd.arg(format!("-U{}", undef));
-        }
-        cmd.arg(input_file);
-
-        let result = cmd.output()
-            .map_err(|e| format!("Failed to preprocess {}: {}", input_file, e))?;
-
-        if !result.status.success() {
-            let stderr = String::from_utf8_lossy(&result.stderr);
-            return Err(format!("Preprocessing of {} failed: {}", input_file, stderr));
-        }
-
-        String::from_utf8(result.stdout)
-            .map_err(|e| format!("Non-UTF8 output from preprocessing {}: {}", input_file, e))
+        let extra = self.build_asm_extra_args();
+        self.target.assemble_with_extra(&asm_text, output_path, &extra)
     }
 
     /// Build extra assembler arguments for RISC-V ABI/arch overrides.

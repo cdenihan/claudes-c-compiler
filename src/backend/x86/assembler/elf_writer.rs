@@ -144,6 +144,179 @@ pub struct ElfWriter {
     aliases: HashMap<String, String>,
 }
 
+/// Check if a string is a numeric local label (just digits, e.g., "1", "42").
+fn is_numeric_label(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Check if a string is a numeric forward/backward reference like "1f" or "2b".
+/// Returns Some((number_str, is_forward)) if it is, None otherwise.
+fn parse_numeric_ref(name: &str) -> Option<(&str, bool)> {
+    if name.len() < 2 {
+        return None;
+    }
+    let last = name.as_bytes()[name.len() - 1];
+    let num_part = &name[..name.len() - 1];
+    if !num_part.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    match last {
+        b'f' => Some((num_part, true)),
+        b'b' => Some((num_part, false)),
+        _ => None,
+    }
+}
+
+/// Resolve numeric local labels (1:, 2:, etc.) and their references (1f, 1b)
+/// into unique internal label names.
+///
+/// GNU assembler numeric labels can be defined multiple times. Each forward
+/// reference `Nf` refers to the next definition of `N`, and each backward
+/// reference `Nb` refers to the most recent definition of `N`.
+///
+/// This function renames each definition to a unique `.Lnum_N_K` name and
+/// updates all references accordingly.
+fn resolve_numeric_labels(items: &[AsmItem]) -> Vec<AsmItem> {
+    // First pass: find all numeric label definitions and assign unique names.
+    // Map from numeric label number to a list of (item_index, unique_name).
+    let mut defs: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+    let mut unique_counter: HashMap<String, usize> = HashMap::new();
+
+    for (i, item) in items.iter().enumerate() {
+        if let AsmItem::Label(name) = item {
+            if is_numeric_label(name) {
+                let count = unique_counter.entry(name.clone()).or_insert(0);
+                let unique_name = format!(".Lnum_{}_{}", name, *count);
+                *count += 1;
+                defs.entry(name.clone()).or_default().push((i, unique_name));
+            }
+        }
+    }
+
+    // If no numeric labels found, return original items unchanged
+    if defs.is_empty() {
+        return items.to_vec();
+    }
+
+    // Build resolver: for any item index and a reference like "1f" or "1b",
+    // find the correct unique name.
+    // For forward refs: find the first definition with item_index > current
+    // For backward refs: find the last definition with item_index <= current
+
+    // Clone items and resolve references
+    let mut result = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        match item {
+            AsmItem::Label(name) if is_numeric_label(name) => {
+                // Replace with unique name
+                if let Some(def_list) = defs.get(name) {
+                    if let Some((_, unique_name)) = def_list.iter().find(|(idx, _)| *idx == i) {
+                        result.push(AsmItem::Label(unique_name.clone()));
+                        continue;
+                    }
+                }
+                result.push(item.clone());
+            }
+            AsmItem::Instruction(instr) => {
+                // Resolve operand references
+                let new_ops: Vec<Operand> = instr.operands.iter().map(|op| {
+                    resolve_numeric_operand(op, i, &defs)
+                }).collect();
+                result.push(AsmItem::Instruction(Instruction {
+                    prefix: instr.prefix.clone(),
+                    mnemonic: instr.mnemonic.clone(),
+                    operands: new_ops,
+                }));
+            }
+            _ => result.push(item.clone()),
+        }
+    }
+
+    result
+}
+
+/// Resolve numeric label references in a single operand.
+fn resolve_numeric_operand(
+    op: &Operand,
+    current_idx: usize,
+    defs: &HashMap<String, Vec<(usize, String)>>,
+) -> Operand {
+    match op {
+        Operand::Label(name) => {
+            if let Some(resolved) = resolve_numeric_name(name, current_idx, defs) {
+                Operand::Label(resolved)
+            } else {
+                op.clone()
+            }
+        }
+        Operand::Memory(mem) => {
+            let new_disp = resolve_numeric_displacement(&mem.displacement, current_idx, defs);
+            if let Some(new_disp) = new_disp {
+                Operand::Memory(MemoryOperand {
+                    segment: mem.segment.clone(),
+                    displacement: new_disp,
+                    base: mem.base.clone(),
+                    index: mem.index.clone(),
+                    scale: mem.scale,
+                })
+            } else {
+                op.clone()
+            }
+        }
+        _ => op.clone(),
+    }
+}
+
+/// Resolve a numeric label reference name (e.g., "1f" -> ".Lnum_1_0").
+fn resolve_numeric_name(
+    name: &str,
+    current_idx: usize,
+    defs: &HashMap<String, Vec<(usize, String)>>,
+) -> Option<String> {
+    let (num, is_forward) = parse_numeric_ref(name)?;
+    let def_list = defs.get(num)?;
+
+    if is_forward {
+        // Find the first definition after current_idx
+        def_list.iter()
+            .find(|(idx, _)| *idx > current_idx)
+            .map(|(_, name)| name.clone())
+    } else {
+        // Find the last definition at or before current_idx
+        def_list.iter()
+            .rev()
+            .find(|(idx, _)| *idx < current_idx)
+            .map(|(_, name)| name.clone())
+    }
+}
+
+/// Resolve numeric label references in a displacement.
+fn resolve_numeric_displacement(
+    disp: &Displacement,
+    current_idx: usize,
+    defs: &HashMap<String, Vec<(usize, String)>>,
+) -> Option<Displacement> {
+    match disp {
+        Displacement::Symbol(name) => {
+            resolve_numeric_name(name, current_idx, defs)
+                .map(Displacement::Symbol)
+        }
+        Displacement::SymbolAddend(name, addend) => {
+            resolve_numeric_name(name, current_idx, defs)
+                .map(|n| Displacement::SymbolAddend(n, *addend))
+        }
+        Displacement::SymbolMod(name, modifier) => {
+            resolve_numeric_name(name, current_idx, defs)
+                .map(|n| Displacement::SymbolMod(n, modifier.clone()))
+        }
+        Displacement::SymbolPlusOffset(name, offset) => {
+            resolve_numeric_name(name, current_idx, defs)
+                .map(|n| Displacement::SymbolPlusOffset(n, *offset))
+        }
+        _ => None,
+    }
+}
+
 impl ElfWriter {
     pub fn new() -> Self {
         ElfWriter {
@@ -167,8 +340,11 @@ impl ElfWriter {
 
     /// Build the ELF object file from parsed assembly items.
     pub fn build(mut self, items: &[AsmItem]) -> Result<Vec<u8>, String> {
+        // Resolve numeric local labels (1:, 2:, etc.) to unique names
+        let items = resolve_numeric_labels(items);
+
         // First pass: process all items
-        for item in items {
+        for item in &items {
             self.process_item(item)?;
         }
 
@@ -186,7 +362,7 @@ impl ElfWriter {
             section_type,
             flags,
             data: Vec::new(),
-            alignment: if flags & SHF_EXECINSTR != 0 { 16 } else { 1 },
+            alignment: if flags & SHF_EXECINSTR != 0 && name != ".init" && name != ".fini" { 16 } else { 1 },
             relocations: Vec::new(),
             jumps: Vec::new(),
             index: 0, // will be set later
@@ -561,9 +737,125 @@ impl ElfWriter {
         // Resolve internal relocations (labels within the same section)
         self.resolve_internal_relocations();
 
+        // Resolve .set aliases into proper symbols with correct binding/visibility.
+        // This must happen here (in emit_elf) because pending_weaks/hidden/globals
+        // are available, and write_object doesn't have access to them.
+        let empty_aliases: HashMap<String, String> = HashMap::new();
+        for (alias, target) in &self.aliases {
+            // Find the target symbol to copy section/value/size from
+            let (section, value, size, target_sym_type) = if let Some(&sym_idx) = self.symbol_map.get(target.as_str()) {
+                let sym = &self.symbols[sym_idx];
+                (sym.section.clone(), sym.value, sym.size, sym.sym_type)
+            } else if let Some(&(sec_idx, offset)) = self.label_positions.get(target.as_str()) {
+                (Some(self.sections[sec_idx].name.clone()), offset, 0u64, STT_NOTYPE)
+            } else {
+                continue;
+            };
+
+            let binding = if self.pending_globals.contains(alias) {
+                STB_GLOBAL
+            } else if self.pending_weaks.contains(alias) {
+                STB_WEAK
+            } else {
+                STB_LOCAL
+            };
+
+            let sym_type = match self.pending_types.get(alias.as_str()) {
+                Some(SymbolKind::Function) => STT_FUNC,
+                Some(SymbolKind::Object) => STT_OBJECT,
+                Some(SymbolKind::TlsObject) => STT_TLS,
+                Some(SymbolKind::NoType) => STT_NOTYPE,
+                None => target_sym_type,
+            };
+
+            let visibility = if self.pending_hidden.contains(alias) {
+                STV_HIDDEN
+            } else if self.pending_protected.contains(alias) {
+                STV_PROTECTED
+            } else if self.pending_internal.contains(alias) {
+                STV_INTERNAL
+            } else {
+                STV_DEFAULT
+            };
+
+            let sym_idx = self.symbols.len();
+            self.symbols.push(SymbolInfo {
+                name: alias.clone(),
+                binding,
+                sym_type,
+                visibility,
+                section,
+                value,
+                size,
+                is_common: false,
+                common_align: 0,
+            });
+            self.symbol_map.insert(alias.clone(), sym_idx);
+        }
+
+        // Create undefined symbols for weak references that aren't defined anywhere.
+        // These come from `.weak name` without a corresponding label or .set.
+        // We need to create them here because write_object doesn't have access to pending_weaks/hidden.
+        for name in &self.pending_weaks {
+            if self.symbol_map.contains_key(name.as_str()) {
+                continue; // Already defined
+            }
+            let visibility = if self.pending_hidden.contains(name) {
+                STV_HIDDEN
+            } else {
+                STV_DEFAULT
+            };
+            let sym_idx = self.symbols.len();
+            self.symbols.push(SymbolInfo {
+                name: name.clone(),
+                binding: STB_WEAK,
+                sym_type: STT_NOTYPE,
+                visibility,
+                section: None,
+                value: 0,
+                size: 0,
+                is_common: false,
+                common_align: 0,
+            });
+            self.symbol_map.insert(name.clone(), sym_idx);
+        }
+
+        // Ensure .hidden symbols have their visibility set correctly.
+        // write_object doesn't have access to pending_hidden, so we must
+        // either update existing symbols or pre-create undefined ones here.
+        for name in &self.pending_hidden {
+            if self.symbol_map.contains_key(name.as_str()) {
+                // Already defined, ensure visibility is set
+                let sym_idx = self.symbol_map[name.as_str()];
+                self.symbols[sym_idx].visibility = STV_HIDDEN;
+                continue;
+            }
+            // Not yet created - pre-create as undefined with STV_HIDDEN.
+            // These will be referenced via relocations; creating them here
+            // prevents write_object from creating them with STV_DEFAULT.
+            let binding = if self.pending_weaks.contains(name) {
+                STB_WEAK
+            } else {
+                STB_GLOBAL
+            };
+            let sym_idx = self.symbols.len();
+            self.symbols.push(SymbolInfo {
+                name: name.clone(),
+                binding,
+                sym_type: STT_NOTYPE,
+                visibility: STV_HIDDEN,
+                section: None,
+                value: 0,
+                size: 0,
+                is_common: false,
+                common_align: 0,
+            });
+            self.symbol_map.insert(name.clone(), sym_idx);
+        }
+
         // Build the ELF file
         let mut elf = ElfByteWriter::new();
-        elf.write_object(&self.sections, &self.symbols, &self.aliases, &self.label_positions)
+        elf.write_object(&self.sections, &self.symbols, &empty_aliases, &self.label_positions)
     }
 
     /// Relax long jumps to short jumps when the displacement fits in a signed byte.
@@ -1417,6 +1709,8 @@ fn parse_section_flags(name: &str, flags_str: Option<&str>, type_str: Option<&st
         ".rodata" => (SHT_PROGBITS, SHF_ALLOC),
         ".tdata" => (SHT_PROGBITS, SHF_ALLOC | SHF_WRITE | SHF_TLS),
         ".tbss" => (SHT_NOBITS, SHF_ALLOC | SHF_WRITE | SHF_TLS),
+        ".init" => (SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR),
+        ".fini" => (SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR),
         ".init_array" => (SHT_INIT_ARRAY, SHF_ALLOC | SHF_WRITE),
         ".fini_array" => (SHT_FINI_ARRAY, SHF_ALLOC | SHF_WRITE),
         n if n.starts_with(".text.") => (SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR),

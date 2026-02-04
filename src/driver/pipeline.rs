@@ -687,7 +687,7 @@ impl Driver {
     }
 
     /// Configure the preprocessor with CLI-defined macros and target.
-    fn configure_preprocessor(&self, preprocessor: &mut Preprocessor) {
+    pub(super) fn configure_preprocessor(&self, preprocessor: &mut Preprocessor) {
         // Set target architecture macros
         match self.target {
             Target::Aarch64 => preprocessor.set_target("aarch64"),
@@ -768,7 +768,7 @@ impl Driver {
     /// The file is searched in this order:
     /// 1. Current working directory (for relative paths)
     /// 2. Include paths (-I, -isystem, system defaults, -idirafter)
-    fn process_force_includes(&self, preprocessor: &mut Preprocessor) -> Result<(), String> {
+    pub(super) fn process_force_includes(&self, preprocessor: &mut Preprocessor) -> Result<(), String> {
         for path in &self.force_includes {
             let resolved = if std::path::Path::new(path).is_absolute() {
                 std::path::PathBuf::from(path)

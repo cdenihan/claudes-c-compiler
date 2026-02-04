@@ -195,9 +195,42 @@ pub enum Displacement {
     SymbolPlusOffset(String, i64),
 }
 
+/// Strip C-style /* */ comments from assembly text.
+/// These are used in hand-written assembly (e.g., musl) but not in
+/// compiler-generated assembly. Handles multi-line comments.
+fn strip_c_comments(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            // Skip until */
+            i += 2;
+            while i + 1 < bytes.len() {
+                if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                    i += 2;
+                    break;
+                }
+                // Preserve newlines so line numbers stay correct
+                if bytes[i] == b'\n' {
+                    result.push('\n');
+                }
+                i += 1;
+            }
+        } else {
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    result
+}
+
 /// Parse assembly text into a list of AsmItems.
 pub fn parse_asm(text: &str) -> Result<Vec<AsmItem>, String> {
     let mut items = Vec::new();
+
+    // Strip C-style /* */ comments (used in hand-written assembly like musl)
+    let text = strip_c_comments(text);
 
     for (line_num, line) in text.lines().enumerate() {
         let line_num = line_num + 1; // 1-based
@@ -219,8 +252,8 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmItem>, String> {
             if part.is_empty() {
                 continue;
             }
-            match parse_line_multi(part) {
-                Ok(sub_items) => items.extend(sub_items),
+            match parse_line_items(part) {
+                Ok(line_items) => items.extend(line_items),
                 Err(e) => {
                     return Err(format!("line {}: {}: '{}'", line_num, e, part));
                 }
@@ -285,48 +318,47 @@ fn strip_comment(line: &str) -> &str {
     line
 }
 
-/// Parse a single non-empty assembly line.
-/// Returns one or more AsmItems (e.g., label followed by instruction on same line).
-fn parse_line(line: &str) -> Result<AsmItem, String> {
-    // Check for label (ends with ':' and possibly followed by instruction)
-    // Labels can be: `name:`, `.LBB42:`, `1:` (numeric labels)
-    if let Some((_label, _rest)) = try_parse_label_with_rest(line) {
-        // If there's something after the label, it gets handled by parse_asm via parse_line_multi
-        return Ok(AsmItem::Label(_label));
-    }
+/// Parse a single non-empty assembly line into one or more AsmItems.
+///
+/// A line may contain a label followed by an instruction on the same line
+/// (e.g., `1: stmxcsr -8(%rsp)`), which produces two items.
+fn parse_line_items(line: &str) -> Result<Vec<AsmItem>, String> {
+    let mut items = Vec::new();
 
-    // Check for directive (starts with '.')
-    let trimmed = line.trim();
-    if trimmed.starts_with('.') {
-        return parse_directive(trimmed);
-    }
+    // Check for label (may be followed by instruction on same line)
+    let rest = if let Some((label, rest)) = try_parse_label(line) {
+        items.push(AsmItem::Label(label));
+        rest
+    } else {
+        line.trim()
+    };
 
-    // Check for instruction with prefix
-    if trimmed.starts_with("lock ") || trimmed.starts_with("rep ") || trimmed.starts_with("repz ") || trimmed.starts_with("repnz ") {
-        return parse_prefixed_instruction(trimmed);
-    }
-
-    // Regular instruction
-    parse_instruction(trimmed, None)
-}
-
-/// Parse a line that may contain "label: instruction" into multiple items.
-fn parse_line_multi(line: &str) -> Result<Vec<AsmItem>, String> {
-    if let Some((label, rest)) = try_parse_label_with_rest(line) {
-        let mut items = vec![AsmItem::Label(label)];
-        let rest = rest.trim();
-        if !rest.is_empty() {
-            // Parse the rest as another line (could be instruction or directive)
-            items.extend(parse_line_multi(rest)?);
-        }
+    // If there's nothing after the label, we're done
+    if rest.is_empty() {
         return Ok(items);
     }
-    // No label prefix - parse as single item
-    Ok(vec![parse_line(line)?])
+
+    // Parse the remaining content as a directive or instruction
+    if rest.starts_with('.') {
+        items.push(parse_directive(rest)?);
+    } else if rest.starts_with("lock ") || rest.starts_with("rep ") || rest.starts_with("repz ") || rest.starts_with("repnz ") {
+        items.push(parse_prefixed_instruction(rest)?);
+    } else {
+        items.push(parse_instruction(rest, None)?);
+    }
+
+    Ok(items)
 }
 
-/// Try to parse a label definition. Returns the label name and any remaining text after it.
-fn try_parse_label_with_rest(line: &str) -> Option<(String, String)> {
+/// Try to parse a label definition. Returns the label name and any remaining
+/// content after the label (which may be an instruction or directive on the same line).
+///
+/// For example:
+///   "foo:"           -> Some(("foo", ""))
+///   "1:  stmxcsr -8(%rsp)"  -> Some(("1", "stmxcsr -8(%rsp)"))
+///   ".Lfoo: ret"     -> Some((".Lfoo", "ret"))
+///   "mov %rax, %rbx" -> None (no label)
+fn try_parse_label(line: &str) -> Option<(String, &str)> {
     let trimmed = line.trim();
     if let Some(colon_pos) = trimmed.find(':') {
         let candidate = &trimmed[..colon_pos];
@@ -338,7 +370,7 @@ fn try_parse_label_with_rest(line: &str) -> Option<(String, String)> {
             && !candidate.starts_with('$')
             && !candidate.starts_with('%')
         {
-            let rest = trimmed[colon_pos + 1..].to_string();
+            let rest = trimmed[colon_pos + 1..].trim();
             return Some((candidate.to_string(), rest));
         }
     }
@@ -943,19 +975,13 @@ fn parse_symbol_offset(s: &str) -> Option<DataValue> {
     None
 }
 
-/// Parse an integer expression (decimal, hex, octal, negative).
-fn parse_integer_expr(s: &str) -> Result<i64, String> {
+/// Parse a single integer token (decimal, hex, octal, binary).
+/// This handles only individual numeric literals without arithmetic operators.
+/// Expression evaluation (+, -, *) is handled by parse_integer_expr and eval_term.
+fn parse_single_integer(s: &str) -> Result<i64, String> {
     let s = s.trim();
     if s.is_empty() {
         return Err("empty integer".to_string());
-    }
-
-    // Check if this is a simple expression with *, +, or -
-    // Handle expressions like "1*8", "4+8", "32-4", "2*8+1"
-    if s.contains('*') || (s.len() > 1 && s[1..].contains('+')) || (s.len() > 1 && s[1..].contains('-')) {
-        if let Ok(val) = eval_simple_expr(s) {
-            return Ok(val);
-        }
     }
 
     // Try parsing the entire string first (handles i64::MIN correctly)
@@ -997,83 +1023,99 @@ fn parse_integer_expr(s: &str) -> Result<i64, String> {
     Ok(if negative { -val } else { val })
 }
 
-/// Evaluate a simple arithmetic expression with *, +, - operators.
-/// Handles expressions like "1*8", "0*8", "3*8+1", "32-4".
+/// Parse an integer expression with +/-, * operators.
+/// Handles expressions like `0x3fff+13`, `0x3fff-64`, `1+2+3`, `1*8`, `3*8+1`, etc.
 /// Operator precedence: * before +/-
-fn eval_simple_expr(s: &str) -> Result<i64, String> {
+fn parse_integer_expr(s: &str) -> Result<i64, String> {
     let s = s.trim();
-    // Split on + or - (but not the leading sign)
-    // First, handle addition/subtraction (lower precedence)
-    let mut result: i64 = 0;
-    let mut current_sign: i64 = 1;
-    let mut start = 0;
-
-    // Handle leading sign
-    let bytes = s.as_bytes();
-    if !bytes.is_empty() && (bytes[0] == b'+' || bytes[0] == b'-') {
-        if bytes[0] == b'-' {
-            current_sign = -1;
-        }
-        start = 1;
+    if s.is_empty() {
+        return Err("empty integer".to_string());
     }
 
-    let mut i = start;
-    let mut term_start = start;
+    // First try as a simple integer (fast path)
+    if let Ok(val) = parse_single_integer(s) {
+        return Ok(val);
+    }
 
-    while i <= bytes.len() {
-        if i == bytes.len() || (i > term_start && (bytes[i] == b'+' || bytes[i] == b'-')) {
-            let term = &s[term_start..i];
-            let term_val = eval_term(term)?;
-            result += current_sign * term_val;
-            if i < bytes.len() {
-                current_sign = if bytes[i] == b'+' { 1 } else { -1 };
-                term_start = i + 1;
-            }
+    // Split on + and - (but not the leading sign or hex digits)
+    // We need to handle: 0x3fff+13, 0x3fff-64, -5+3
+    // Strategy: scan for + or - that is not inside a 0x prefix and not the leading sign
+    let bytes = s.as_bytes();
+    let mut terms: Vec<(bool, &str)> = Vec::new(); // (is_add, term)
+    let mut start = 0;
+    let mut i = 0;
+    let mut is_add = true;
+
+    // Skip leading sign
+    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+        if bytes[i] == b'-' {
+            is_add = false;
         }
         i += 1;
+    }
+
+    while i < bytes.len() {
+        // Skip past hex prefix
+        if i + 1 < bytes.len() && bytes[i] == b'0' && (bytes[i+1] == b'x' || bytes[i+1] == b'X') {
+            i += 2;
+            while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+                i += 1;
+            }
+            continue;
+        }
+
+        if bytes[i] == b'+' || bytes[i] == b'-' {
+            let term = &s[start..i];
+            if !term.is_empty() {
+                terms.push((is_add, term.trim()));
+            }
+            is_add = bytes[i] == b'+';
+            start = i + 1;
+            i += 1;
+            continue;
+        }
+        i += 1;
+    }
+
+    // Last term
+    let term = &s[start..];
+    if !term.is_empty() {
+        terms.push((is_add, term.trim()));
+    }
+
+    if terms.is_empty() {
+        return Err(format!("bad integer expression: {}", s));
+    }
+
+    let mut result: i64 = 0;
+    for (is_add, term) in &terms {
+        // Each term may contain multiplication (e.g., "3*8")
+        let val = eval_term(term)?;
+        if *is_add {
+            result = result.wrapping_add(val);
+        } else {
+            result = result.wrapping_sub(val);
+        }
     }
 
     Ok(result)
 }
 
-/// Evaluate a term (handles multiplication)
+/// Evaluate a term (handles multiplication within a term).
+/// E.g., "3*8" -> 24, "0x10" -> 16, "42" -> 42.
 fn eval_term(s: &str) -> Result<i64, String> {
     let s = s.trim();
     if s.contains('*') {
         let parts: Vec<&str> = s.split('*').collect();
         let mut result: i64 = 1;
         for part in parts {
-            let val = parse_single_number(part.trim())?;
+            let val = parse_single_integer(part.trim())?;
             result *= val;
         }
         Ok(result)
     } else {
-        parse_single_number(s)
+        parse_single_integer(s)
     }
-}
-
-/// Parse a single number (no operators)
-fn parse_single_number(s: &str) -> Result<i64, String> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err("empty number".to_string());
-    }
-    if let Ok(val) = s.parse::<i64>() {
-        return Ok(val);
-    }
-    let (negative, s) = if s.starts_with('-') {
-        (true, &s[1..])
-    } else {
-        (false, s)
-    };
-    let val = if s.starts_with("0x") || s.starts_with("0X") {
-        u64::from_str_radix(&s[2..], 16).map_err(|_| format!("bad hex: {}", s))? as i64
-    } else if s.starts_with('0') && s.len() > 1 && s.chars().all(|c| c.is_ascii_digit()) {
-        i64::from_str_radix(s, 8).map_err(|_| format!("bad octal: {}", s))?
-    } else {
-        s.parse::<u64>().map_err(|_| format!("bad number: {}", s))? as i64
-    };
-    Ok(if negative { -val } else { val })
 }
 
 /// Parse a string literal (with escapes).

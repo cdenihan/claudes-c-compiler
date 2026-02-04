@@ -145,6 +145,58 @@ fn is_st(name: &str) -> bool {
     name == "st" || name.starts_with("st(")
 }
 
+/// Get the operand-size suffix character for a register name.
+/// Returns 'q' for 64-bit, 'l' for 32-bit, 'w' for 16-bit, 'b' for 8-bit.
+fn register_size_suffix(name: &str) -> Option<char> {
+    if is_reg64(name) { return Some('q'); }
+    if is_reg32(name) { return Some('l'); }
+    if is_reg16(name) { return Some('w'); }
+    if is_reg8(name) { return Some('b'); }
+    None
+}
+
+/// Set of base mnemonics that accept AT&T size suffixes (b/w/l/q).
+/// Only these mnemonics will have suffixes inferred from operand types.
+const SUFFIXABLE_MNEMONICS: &[&str] = &[
+    "mov", "add", "sub", "and", "or", "xor", "cmp", "test",
+    "push", "pop", "lea",
+    "shl", "shr", "sar", "rol", "ror",
+    "inc", "dec", "neg", "not",
+    "imul", "mul", "div", "idiv",
+    "adc", "sbb",
+    "xchg", "cmpxchg", "xadd", "bswap",
+    "bsf", "bsr",
+];
+
+/// Infer the AT&T size suffix for an unsuffixed mnemonic from its operands.
+///
+/// Hand-written assembly (e.g., musl's .s files) often omits the size suffix
+/// when it can be inferred from register operands. For example:
+///   push %rax  -> pushq %rax
+///   mov %edi,%ecx -> movl %edi,%ecx
+///   and $0x3f,%ecx -> andl $0x3f,%ecx
+///
+/// Only mnemonics in the SUFFIXABLE_MNEMONICS whitelist are candidates for
+/// suffix inference. All others are returned as-is.
+fn infer_suffix(mnemonic: &str, ops: &[Operand]) -> String {
+    // Check if this is a known suffixable mnemonic
+    if !SUFFIXABLE_MNEMONICS.contains(&mnemonic) {
+        return mnemonic.to_string();
+    }
+
+    // Find the first register operand to determine size
+    for op in ops {
+        if let Operand::Register(r) = op {
+            if let Some(suffix) = register_size_suffix(&r.name) {
+                return format!("{}{}", mnemonic, suffix);
+            }
+        }
+    }
+
+    // No register operand found - return as-is
+    mnemonic.to_string()
+}
+
 /// Get operand size from mnemonic suffix.
 fn mnemonic_size_suffix(mnemonic: &str) -> Option<u8> {
     // Handle mnemonics that don't follow the simple suffix pattern
@@ -152,7 +204,12 @@ fn mnemonic_size_suffix(mnemonic: &str) -> Option<u8> {
         "cltq" | "cqto" | "cltd" | "cdq" | "cqo" | "ret" | "nop" | "ud2"
         | "endbr64" | "pause" | "mfence" | "lfence" | "sfence" | "clflush"
         | "syscall" | "sysenter" | "cpuid" | "rdtsc" | "rdtscp"
-        | "clc" | "stc" | "cld" | "std" | "sahf" | "lahf" | "fninit" | "fwait" | "wait" | "fnstcw"
+        | "clc" | "stc" | "cld" | "std" | "sahf" | "lahf" | "fninit" | "fwait" | "wait" | "fnstcw" | "fstcw"
+        | "fld1" | "fldl2e" | "fldlg2" | "fldln2" | "fldz" | "fldpi" | "fldl2t"
+        | "fabs" | "fsqrt" | "frndint" | "f2xm1" | "fscale" | "fpatan" | "fprem" | "fprem1"
+        | "fyl2x" | "fyl2xp1" | "fptan" | "fsin" | "fcos" | "fxtract" | "fnclex" | "fxch"
+        | "fadd" | "fmul" | "fsub" | "fdiv" | "fnstenv" | "fldenv" | "fnstsw"
+        | "ldmxcsr" | "stmxcsr"
         | "pushf" | "pushfq" | "popf" | "popfq" | "int3"
         | "movsq" | "stosq" | "movsw" | "stosw" | "lodsb" | "lodsw" | "lodsd" | "lodsq"
         | "scasb" | "scasw" | "scasd" | "scasq" | "cmpsb" | "cmpsw" | "cmpsd" | "cmpsq" => return None,
@@ -213,7 +270,10 @@ impl InstructionEncoder {
 
     /// Main mnemonic dispatch.
     fn encode_mnemonic(&mut self, instr: &Instruction) -> Result<(), String> {
-        let mnemonic = instr.mnemonic.as_str();
+        // Infer suffix for unsuffixed mnemonics (e.g., push -> pushq, mov -> movl)
+        // This enables assembling hand-written .s files that omit AT&T size suffixes.
+        let suffixed = infer_suffix(&instr.mnemonic, &instr.operands);
+        let mnemonic = suffixed.as_str();
         let ops = &instr.operands;
 
         match mnemonic {
@@ -290,10 +350,14 @@ impl InstructionEncoder {
             "negl" => self.encode_unary_rm(ops, 3, 4),
             "notq" => self.encode_unary_rm(ops, 2, 8),
             "notl" => self.encode_unary_rm(ops, 2, 4),
-            "incq" => self.encode_unary_rm(ops, 0, 8),
-            "incl" => self.encode_unary_rm(ops, 0, 4),
-            "decq" => self.encode_unary_rm(ops, 1, 8),
-            "decl" => self.encode_unary_rm(ops, 1, 4),
+            "incq" => self.encode_inc_dec(ops, 0, 8),
+            "incl" => self.encode_inc_dec(ops, 0, 4),
+            "incw" => self.encode_inc_dec(ops, 0, 2),
+            "incb" => self.encode_inc_dec(ops, 0, 1),
+            "decq" => self.encode_inc_dec(ops, 1, 8),
+            "decl" => self.encode_inc_dec(ops, 1, 4),
+            "decw" => self.encode_inc_dec(ops, 1, 2),
+            "decb" => self.encode_inc_dec(ops, 1, 1),
 
             // Shifts
             "shlq" | "shll" | "shlw" | "shlb" => self.encode_shift(ops, mnemonic, 4),
@@ -319,6 +383,10 @@ impl InstructionEncoder {
             "lzcntl" | "lzcntq" | "tzcntl" | "tzcntq" | "popcntl" | "popcntq" => {
                 self.encode_bit_count(ops, mnemonic)
             }
+            "bsfl" | "bsfq" | "bsrl" | "bsrq" => self.encode_bsf_bsr(ops, mnemonic),
+            "btq" | "btl" | "btsq" | "btsl" | "btrq" | "btrl" | "btcq" | "btcl" => {
+                self.encode_bt(ops, mnemonic)
+            }
 
             // Conditional set
             "sete" | "setz" | "setne" | "setnz" | "setl" | "setle" | "setg" | "setge"
@@ -334,7 +402,8 @@ impl InstructionEncoder {
             // Jumps (jmpq is a common AT&T alias for jmp on x86-64)
             "jmp" | "jmpq" => self.encode_jmp(ops),
             "je" | "jz" | "jne" | "jnz" | "jl" | "jle" | "jg" | "jge"
-            | "jb" | "jbe" | "ja" | "jae" | "js" | "jns" | "jo" | "jno" | "jp" | "jnp" => {
+            | "jb" | "jbe" | "ja" | "jae" | "js" | "jns" | "jo" | "jno" | "jp" | "jnp"
+            | "jc" | "jnc" => {
                 self.encode_jcc(ops, mnemonic)
             }
 
@@ -353,8 +422,22 @@ impl InstructionEncoder {
                 Ok(())
             }
 
+            // Standalone prefix bytes (used when prefix and instruction are on separate
+            // lines or separated by ; in inline asm, e.g., "lock ; cmpxchg %r, %m")
+            "lock" if ops.is_empty() => { self.bytes.push(0xF0); Ok(()) }
+            "rep" | "repe" | "repz" if ops.is_empty() => { self.bytes.push(0xF3); Ok(()) }
+            "repne" | "repnz" if ops.is_empty() => { self.bytes.push(0xF2); Ok(()) }
+
+            // System instructions
+            "syscall" => { self.bytes.extend_from_slice(&[0x0F, 0x05]); Ok(()) }
+            "sysenter" => { self.bytes.extend_from_slice(&[0x0F, 0x34]); Ok(()) }
+            "cpuid" => { self.bytes.extend_from_slice(&[0x0F, 0xA2]); Ok(()) }
+            "rdtsc" => { self.bytes.extend_from_slice(&[0x0F, 0x31]); Ok(()) }
+            "rdtscp" => { self.bytes.extend_from_slice(&[0x0F, 0x01, 0xF9]); Ok(()) }
+
             // No-ops and misc
             "nop" => { self.bytes.push(0x90); Ok(()) }
+            "hlt" => { self.bytes.push(0xF4); Ok(()) }
             "ud2" => { self.bytes.extend_from_slice(&[0x0F, 0x0B]); Ok(()) }
             "endbr64" => { self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x1E, 0xFA]); Ok(()) }
             "pause" => { self.bytes.extend_from_slice(&[0xF3, 0x90]); Ok(()) }
@@ -363,11 +446,26 @@ impl InstructionEncoder {
             "sfence" => { self.bytes.extend_from_slice(&[0x0F, 0xAE, 0xF8]); Ok(()) }
             "clflush" => self.encode_clflush(ops),
 
+            // Direction flag
+            "cld" => { self.bytes.push(0xFC); Ok(()) }
+            "std" => { self.bytes.push(0xFD); Ok(()) }
+
             // String ops
             "movsb" => { self.bytes.push(0xA4); Ok(()) }
             "movsd" if ops.is_empty() => { self.bytes.push(0xA5); Ok(()) }
+            "movsq" => { self.bytes.extend_from_slice(&[0x48, 0xA5]); Ok(()) }
             "stosb" => { self.bytes.push(0xAA); Ok(()) }
             "stosd" => { self.bytes.push(0xAB); Ok(()) }
+            "stosq" => { self.bytes.extend_from_slice(&[0x48, 0xAB]); Ok(()) }
+            "lodsb" => { self.bytes.push(0xAC); Ok(()) }
+            "lodsd" => { self.bytes.push(0xAD); Ok(()) }
+            "lodsq" => { self.bytes.extend_from_slice(&[0x48, 0xAD]); Ok(()) }
+            "scasb" => { self.bytes.push(0xAE); Ok(()) }
+            "scasd" => { self.bytes.push(0xAF); Ok(()) }
+            "scasq" => { self.bytes.extend_from_slice(&[0x48, 0xAF]); Ok(()) }
+            "cmpsb" => { self.bytes.push(0xA6); Ok(()) }
+            "cmpsd" if ops.is_empty() => { self.bytes.push(0xA7); Ok(()) }
+            "cmpsq" => { self.bytes.extend_from_slice(&[0x48, 0xA7]); Ok(()) }
 
             // Atomic exchange
             "xchgb" | "xchgw" | "xchgl" | "xchgq" => self.encode_xchg(ops, mnemonic),
@@ -407,6 +505,14 @@ impl InstructionEncoder {
             "cvtsi2ssq" => self.encode_sse_cvt_gp_to_xmm(ops, &[0xF3, 0x0F, 0x2A], 8),
             "cvttsd2siq" => self.encode_sse_cvt_xmm_to_gp(ops, &[0xF2, 0x0F, 0x2C], 8),
             "cvttss2siq" => self.encode_sse_cvt_xmm_to_gp(ops, &[0xF3, 0x0F, 0x2C], 8),
+            "cvtsd2siq" | "cvtsd2si" => self.encode_sse_cvt_xmm_to_gp(ops, &[0xF2, 0x0F, 0x2D], 8),
+            "cvtss2siq" | "cvtss2si" => self.encode_sse_cvt_xmm_to_gp(ops, &[0xF3, 0x0F, 0x2D], 8),
+            "cvtsd2sil" => self.encode_sse_cvt_xmm_to_gp(ops, &[0xF2, 0x0F, 0x2D], 4),
+            "cvtss2sil" => self.encode_sse_cvt_xmm_to_gp(ops, &[0xF3, 0x0F, 0x2D], 4),
+            "cvttsd2sil" => self.encode_sse_cvt_xmm_to_gp(ops, &[0xF2, 0x0F, 0x2C], 4),
+            "cvttss2sil" => self.encode_sse_cvt_xmm_to_gp(ops, &[0xF3, 0x0F, 0x2C], 4),
+            "cvtsi2sdl" => self.encode_sse_cvt_gp_to_xmm(ops, &[0xF2, 0x0F, 0x2A], 4),
+            "cvtsi2ssl" => self.encode_sse_cvt_gp_to_xmm(ops, &[0xF3, 0x0F, 0x2A], 4),
 
             // SSE2 integer SIMD
             "paddw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xFD]),
@@ -536,8 +642,9 @@ impl InstructionEncoder {
             "flds" => self.encode_x87_mem(ops, &[0xD9], 0),
             "fstpl" => self.encode_x87_mem(ops, &[0xDD], 3),
             "fstps" => self.encode_x87_mem(ops, &[0xD9], 3),
-            "fildq" => self.encode_x87_mem(ops, &[0xDF], 5),
-            "fisttpq" => self.encode_x87_mem(ops, &[0xDD], 1),
+            "fildq" | "fildll" => self.encode_x87_mem(ops, &[0xDF], 5),
+            "fisttpq" | "fisttpll" => self.encode_x87_mem(ops, &[0xDD], 1),
+            "fistpq" | "fistpll" => self.encode_x87_mem(ops, &[0xDF], 7),
             "faddp" => { self.bytes.extend_from_slice(&[0xDE, 0xC1]); Ok(()) }
             // Note: AT&T syntax swaps the meaning of fsub/fsubr and fdiv/fdivr
             // relative to Intel mnemonics for the *p (pop) forms.
@@ -572,7 +679,13 @@ impl InstructionEncoder {
             "int3" => { self.bytes.push(0xCC); Ok(()) }
             "fninit" => { self.bytes.extend_from_slice(&[0xDB, 0xE3]); Ok(()) }
             "fwait" | "wait" => { self.bytes.push(0x9B); Ok(()) }
-            "fnstcw" => self.encode_x87_mem(ops, &[0xD9], 7),
+            "fnstcw" | "fstcw" => {
+                // fstcw = fwait + fnstcw (wait prefix before the instruction)
+                if mnemonic == "fstcw" {
+                    self.bytes.push(0x9B); // FWAIT
+                }
+                self.encode_x87_mem(ops, &[0xD9], 7)
+            }
             "fldcw" => self.encode_x87_mem(ops, &[0xD9], 5),
 
             // ---- String operations ----
@@ -611,10 +724,10 @@ impl InstructionEncoder {
             "rcrq" | "rcrl" | "rcrw" | "rcrb" => self.encode_shift(ops, mnemonic, 3),
 
             // ---- Bit test operations ----
-            "btl" | "btq" | "btw" => self.encode_bt(ops, mnemonic, 4),
-            "btsl" | "btsq" | "btsw" => self.encode_bt(ops, mnemonic, 5),
-            "btrl" | "btrq" | "btrw" => self.encode_bt(ops, mnemonic, 6),
-            "btcl" | "btcq" | "btcw" => self.encode_bt(ops, mnemonic, 7),
+            "btl" | "btq" | "btw" => self.encode_bt(ops, mnemonic),
+            "btsl" | "btsq" | "btsw" => self.encode_bt(ops, mnemonic),
+            "btrl" | "btrq" | "btrw" => self.encode_bt(ops, mnemonic),
+            "btcl" | "btcq" | "btcw" => self.encode_bt(ops, mnemonic),
 
             // ---- 32-bit double shifts ----
             "shldl" => self.encode_double_shift(ops, 0xA4, 4),
@@ -1088,10 +1201,10 @@ impl InstructionEncoder {
             "paddb" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xFC]),
 
             // ---- Additional suffixless forms ----
-            "bt" => self.encode_bt(ops, "btq", 4),
-            "bts" => self.encode_bt(ops, "btsq", 5),
-            "btr" => self.encode_bt(ops, "btrq", 6),
-            "btc" => self.encode_bt(ops, "btcq", 7),
+            "bt" => self.encode_bt(ops, "btq"),
+            "bts" => self.encode_bt(ops, "btsq"),
+            "btr" => self.encode_bt(ops, "btrq"),
+            "btc" => self.encode_bt(ops, "btcq"),
             "rcl" => self.encode_suffixless_shift(ops, 2),
             "rcr" => self.encode_suffixless_shift(ops, 3),
             "rol" => self.encode_suffixless_shift(ops, 0),
@@ -1110,6 +1223,63 @@ impl InstructionEncoder {
             }
 
             // 1-operand shift forms are now handled in encode_shift directly
+
+            // ---- Additional x87 forms from upstream ----
+            "fsts" => self.encode_x87_mem(ops, &[0xD9], 2),
+
+            // x87 constants
+            "fld1" => { self.bytes.extend_from_slice(&[0xD9, 0xE8]); Ok(()) }
+            "fldl2e" => { self.bytes.extend_from_slice(&[0xD9, 0xEA]); Ok(()) }
+            "fldlg2" => { self.bytes.extend_from_slice(&[0xD9, 0xEC]); Ok(()) }
+            "fldln2" => { self.bytes.extend_from_slice(&[0xD9, 0xED]); Ok(()) }
+            "fldz" => { self.bytes.extend_from_slice(&[0xD9, 0xEE]); Ok(()) }
+            "fldpi" => { self.bytes.extend_from_slice(&[0xD9, 0xEB]); Ok(()) }
+            "fldl2t" => { self.bytes.extend_from_slice(&[0xD9, 0xE9]); Ok(()) }
+
+            // x87 arithmetic (zero-operand forms operate on st(0),st(1))
+            "fabs" => { self.bytes.extend_from_slice(&[0xD9, 0xE1]); Ok(()) }
+            "fsqrt" => { self.bytes.extend_from_slice(&[0xD9, 0xFA]); Ok(()) }
+            "frndint" => { self.bytes.extend_from_slice(&[0xD9, 0xFC]); Ok(()) }
+            "f2xm1" => { self.bytes.extend_from_slice(&[0xD9, 0xF0]); Ok(()) }
+            "fscale" => { self.bytes.extend_from_slice(&[0xD9, 0xFD]); Ok(()) }
+            "fpatan" => { self.bytes.extend_from_slice(&[0xD9, 0xF3]); Ok(()) }
+            "fprem" => { self.bytes.extend_from_slice(&[0xD9, 0xF8]); Ok(()) }
+            "fprem1" => { self.bytes.extend_from_slice(&[0xD9, 0xF5]); Ok(()) }
+            "fyl2x" => { self.bytes.extend_from_slice(&[0xD9, 0xF1]); Ok(()) }
+            "fyl2xp1" => { self.bytes.extend_from_slice(&[0xD9, 0xF9]); Ok(()) }
+            "fptan" => { self.bytes.extend_from_slice(&[0xD9, 0xF2]); Ok(()) }
+            "fsin" => { self.bytes.extend_from_slice(&[0xD9, 0xFE]); Ok(()) }
+            "fcos" => { self.bytes.extend_from_slice(&[0xD9, 0xFF]); Ok(()) }
+            "fxtract" => { self.bytes.extend_from_slice(&[0xD9, 0xF4]); Ok(()) }
+
+            // x87 register-register operations
+            "fadd" => self.encode_x87_arith_reg(ops, 0xD8, 0xDC, 0xC0),
+            "fmul" => self.encode_x87_arith_reg(ops, 0xD8, 0xDC, 0xC8),
+            "fsub" => self.encode_x87_arith_reg(ops, 0xD8, 0xDC, 0xE0),
+            "fdiv" => self.encode_x87_arith_reg(ops, 0xD8, 0xDC, 0xF0),
+
+            // x87 exchange
+            "fxch" => self.encode_fxch(ops),
+
+            // x87 control word / environment
+            "fnclex" => { self.bytes.extend_from_slice(&[0xDB, 0xE2]); Ok(()) }
+            "fnstenv" => self.encode_x87_mem(ops, &[0xD9], 6),
+            "fldenv" => self.encode_x87_mem(ops, &[0xD9], 4),
+            "fnstsw" => {
+                // fnstsw %ax -> DF E0
+                // fnstsw mem -> DD /7
+                if let Some(Operand::Register(r)) = ops.first() {
+                    if r.name == "ax" {
+                        self.bytes.extend_from_slice(&[0xDF, 0xE0]);
+                        return Ok(());
+                    }
+                }
+                self.encode_x87_mem(ops, &[0xDD], 7)
+            }
+
+            // SSE MXCSR control register
+            "ldmxcsr" => self.encode_sse_mem_only(ops, &[0x0F, 0xAE], 2),
+            "stmxcsr" => self.encode_sse_mem_only(ops, &[0x0F, 0xAE], 3),
 
             _ => {
                 // TODO: many more instructions to handle
@@ -1681,6 +1851,12 @@ impl InstructionEncoder {
                 self.bytes.push(0x58 + (num & 7));
                 Ok(())
             }
+            Operand::Memory(mem) => {
+                // pop to memory: 8F /0
+                self.emit_rex_rm(0, "", mem);
+                self.bytes.push(0x8F);
+                self.encode_modrm_mem(0, mem)
+            }
             _ => Err("unsupported pop operand".to_string()),
         }
     }
@@ -1830,6 +2006,32 @@ impl InstructionEncoder {
                 }
                 Ok(())
             }
+            // test %reg, mem -> TEST mem, reg (AT&T: src=reg, dst=mem)
+            (Operand::Register(src), Operand::Memory(mem)) => {
+                let src_num = reg_num(&src.name).ok_or("bad src register")?;
+                self.emit_segment_prefix(mem)?;
+                if size == 2 { self.bytes.push(0x66); }
+                self.emit_rex_rm(size, &src.name, mem);
+                self.bytes.push(if size == 1 { 0x84 } else { 0x85 });
+                self.encode_modrm_mem(src_num, mem)
+            }
+            // test $imm, mem
+            (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Memory(mem)) => {
+                let val = *val;
+                self.emit_segment_prefix(mem)?;
+                if size == 2 { self.bytes.push(0x66); }
+                self.emit_rex_rm(size, "", mem);
+                self.bytes.push(if size == 1 { 0xF6 } else { 0xF7 });
+                self.encode_modrm_mem(0, mem)?;
+                if size == 1 {
+                    self.bytes.push(val as u8);
+                } else if size == 2 {
+                    self.bytes.extend_from_slice(&(val as i16).to_le_bytes());
+                } else {
+                    self.bytes.extend_from_slice(&(val as i32).to_le_bytes());
+                }
+                Ok(())
+            }
             _ => Err(format!("unsupported test operands")),
         }
     }
@@ -1924,6 +2126,30 @@ impl InstructionEncoder {
                 self.encode_modrm_mem(op_ext, mem)
             }
             _ => Err("unsupported unary operand".to_string()),
+        }
+    }
+
+    /// Encode INC/DEC using Group 5 opcode (0xFE/0xFF), not Group 3 (0xF6/0xF7).
+    fn encode_inc_dec(&mut self, ops: &[Operand], op_ext: u8, size: u8) -> Result<(), String> {
+        if ops.len() != 1 {
+            return Err("inc/dec requires 1 operand".to_string());
+        }
+        match &ops[0] {
+            Operand::Register(reg) => {
+                let num = reg_num(&reg.name).ok_or("bad register")?;
+                if size == 2 { self.bytes.push(0x66); }
+                self.emit_rex_unary(size, &reg.name);
+                self.bytes.push(if size == 1 { 0xFE } else { 0xFF });
+                self.bytes.push(self.modrm(3, op_ext, num));
+                Ok(())
+            }
+            Operand::Memory(mem) => {
+                if size == 2 { self.bytes.push(0x66); }
+                self.emit_rex_rm(size, "", mem);
+                self.bytes.push(if size == 1 { 0xFE } else { 0xFF });
+                self.encode_modrm_mem(op_ext, mem)
+            }
+            _ => Err("unsupported inc/dec operand".to_string()),
         }
     }
 
@@ -2758,6 +2984,115 @@ impl InstructionEncoder {
         }
     }
 
+    // ---- SSE memory-only encoding (ldmxcsr, stmxcsr) ----
+
+    /// Encode an SSE instruction with a single memory operand and a ModR/M extension.
+    /// Format: [opcode bytes] ModR/M(ext, mem)
+    /// Used for ldmxcsr (0F AE /2) and stmxcsr (0F AE /3).
+    fn encode_sse_mem_only(&mut self, ops: &[Operand], opcode: &[u8], ext: u8) -> Result<(), String> {
+        if ops.len() != 1 {
+            return Err("SSE mem-only op requires 1 operand".to_string());
+        }
+        match &ops[0] {
+            Operand::Memory(mem) => {
+                self.emit_segment_prefix(mem)?;
+                // No REX.W needed for 32-bit memory operations
+                self.emit_rex_rm(0, "", mem);
+                self.bytes.extend_from_slice(opcode);
+                self.encode_modrm_mem(ext, mem)
+            }
+            _ => Err("SSE mem-only op requires memory operand".to_string()),
+        }
+    }
+
+    // ---- BSF/BSR encoding ----
+
+    /// Encode BSF (Bit Scan Forward) or BSR (Bit Scan Reverse).
+    /// bsfl/bsfq: 0F BC r/m -> reg
+    /// bsrl/bsrq: 0F BD r/m -> reg
+    fn encode_bsf_bsr(&mut self, ops: &[Operand], mnemonic: &str) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err(format!("{} requires 2 operands", mnemonic));
+        }
+        let size = mnemonic_size_suffix(mnemonic).unwrap_or(8);
+        let opcode_byte = if mnemonic.starts_with("bsf") { 0xBC } else { 0xBD };
+
+        match (&ops[0], &ops[1]) {
+            (Operand::Register(src), Operand::Register(dst)) => {
+                let src_num = reg_num(&src.name).ok_or("bad src register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                self.emit_rex_rr(size, &dst.name, &src.name);
+                self.bytes.extend_from_slice(&[0x0F, opcode_byte]);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                Ok(())
+            }
+            (Operand::Memory(mem), Operand::Register(dst)) => {
+                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                self.emit_segment_prefix(mem)?;
+                self.emit_rex_rm(size, &dst.name, mem);
+                self.bytes.extend_from_slice(&[0x0F, opcode_byte]);
+                self.encode_modrm_mem(dst_num, mem)
+            }
+            _ => Err(format!("unsupported {} operands", mnemonic)),
+        }
+    }
+
+    // ---- BT/BTS/BTR/BTC encoding ----
+
+    /// Encode bit test instructions (bt, bts, btr, btc).
+    fn encode_bt(&mut self, ops: &[Operand], mnemonic: &str) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err(format!("{} requires 2 operands", mnemonic));
+        }
+        let size = mnemonic_size_suffix(mnemonic).unwrap_or(8);
+        // Determine which bt variant
+        let base = &mnemonic[..mnemonic.len()-1]; // strip size suffix
+        let (reg_opcode, imm_ext) = match base {
+            "bt"  => (0xA3u8, 4u8),
+            "bts" => (0xAB, 5),
+            "btr" => (0xB3, 6),
+            "btc" => (0xBB, 7),
+            _ => return Err(format!("unknown bt variant: {}", mnemonic)),
+        };
+
+        match (&ops[0], &ops[1]) {
+            // bt $imm, reg/mem
+            (Operand::Immediate(ImmediateValue::Integer(imm)), Operand::Register(dst)) => {
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                self.emit_rex_unary(size, &dst.name);
+                self.bytes.extend_from_slice(&[0x0F, 0xBA]);
+                self.bytes.push(self.modrm(3, imm_ext, dst_num));
+                self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            (Operand::Immediate(ImmediateValue::Integer(imm)), Operand::Memory(mem)) => {
+                self.emit_segment_prefix(mem)?;
+                self.emit_rex_rm(size, "", mem);
+                self.bytes.extend_from_slice(&[0x0F, 0xBA]);
+                self.encode_modrm_mem(imm_ext, mem)?;
+                self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            // bt %reg, reg/mem
+            (Operand::Register(src), Operand::Register(dst)) => {
+                let src_num = reg_num(&src.name).ok_or("bad src register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                self.emit_rex_rr(size, &src.name, &dst.name);
+                self.bytes.extend_from_slice(&[0x0F, reg_opcode]);
+                self.bytes.push(self.modrm(3, src_num, dst_num));
+                Ok(())
+            }
+            (Operand::Register(src), Operand::Memory(mem)) => {
+                let src_num = reg_num(&src.name).ok_or("bad src register")?;
+                self.emit_segment_prefix(mem)?;
+                self.emit_rex_rm(size, &src.name, mem);
+                self.bytes.extend_from_slice(&[0x0F, reg_opcode]);
+                self.encode_modrm_mem(src_num, mem)
+            }
+            _ => Err(format!("unsupported {} operands", mnemonic)),
+        }
+    }
+
     // ---- x87 FPU encoding ----
 
     fn encode_x87_mem(&mut self, ops: &[Operand], opcode: &[u8], ext: u8) -> Result<(), String> {
@@ -2868,54 +3203,6 @@ impl InstructionEncoder {
         }
     }
 
-    // ---- Bit test (BT/BTS/BTR/BTC) ----
-
-    fn encode_bt(&mut self, ops: &[Operand], mnemonic: &str, op_ext: u8) -> Result<(), String> {
-        if ops.len() != 2 {
-            return Err(format!("{} requires 2 operands", mnemonic));
-        }
-        let size = mnemonic_size_suffix(mnemonic).unwrap_or(8);
-        match (&ops[0], &ops[1]) {
-            // bt $imm, r/m
-            (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Register(dst)) => {
-                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                if size == 2 { self.bytes.push(0x66); }
-                self.emit_rex_unary(size, &dst.name);
-                self.bytes.extend_from_slice(&[0x0F, 0xBA]);
-                self.bytes.push(self.modrm(3, op_ext, dst_num));
-                self.bytes.push(*val as u8);
-                Ok(())
-            }
-            (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Memory(mem)) => {
-                if size == 2 { self.bytes.push(0x66); }
-                self.emit_rex_rm(size, "", mem);
-                self.bytes.extend_from_slice(&[0x0F, 0xBA]);
-                self.encode_modrm_mem(op_ext, mem)?;
-                self.bytes.push(*val as u8);
-                Ok(())
-            }
-            // bt r, r/m  (op_ext determines the opcode: bt=0xA3, bts=0xAB, btr=0xB3, btc=0xBB)
-            (Operand::Register(src), Operand::Register(dst)) => {
-                let src_num = reg_num(&src.name).ok_or("bad register")?;
-                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                let opcode2 = match op_ext { 4 => 0xA3, 5 => 0xAB, 6 => 0xB3, 7 => 0xBB, _ => unreachable!() };
-                if size == 2 { self.bytes.push(0x66); }
-                self.emit_rex_rr(size, &src.name, &dst.name);
-                self.bytes.extend_from_slice(&[0x0F, opcode2]);
-                self.bytes.push(self.modrm(3, src_num, dst_num));
-                Ok(())
-            }
-            (Operand::Register(src), Operand::Memory(mem)) => {
-                let src_num = reg_num(&src.name).ok_or("bad register")?;
-                let opcode2 = match op_ext { 4 => 0xA3, 5 => 0xAB, 6 => 0xB3, 7 => 0xBB, _ => unreachable!() };
-                if size == 2 { self.bytes.push(0x66); }
-                self.emit_rex_rm(size, &src.name, mem);
-                self.bytes.extend_from_slice(&[0x0F, opcode2]);
-                self.encode_modrm_mem(src_num, mem)
-            }
-            _ => Err(format!("unsupported {} operands", mnemonic)),
-        }
-    }
 
     // ---- Segment register moves ----
 
@@ -3522,6 +3809,87 @@ impl InstructionEncoder {
         } else {
             Err("AVX shift requires 3 operands".to_string())
         }
+    }
+
+    /// Encode x87 register-register arithmetic (fadd, fmul, fsub, fdiv).
+    ///
+    /// In AT&T syntax:
+    ///   fadd %st(i), %st    -> D8 (base_st0 + i)  -- st(0) = st(0) op st(i)
+    ///   fadd %st, %st(i)    -> DC (base_sti + i)  -- st(i) = st(i) op st(0)
+    ///   fadd %st(i)         -> D8 (base_st0 + i)  -- shorthand for fadd %st(i), %st
+    ///
+    /// `opcode_st0` = D8 (reg field in modrm for st(0) as dest)
+    /// `opcode_sti` = DC (reg field in modrm for st(i) as dest)
+    /// `base_modrm` = base for the modrm second byte (e.g., 0xC0 for fadd)
+    fn encode_x87_arith_reg(&mut self, ops: &[Operand], opcode_st0: u8, opcode_sti: u8, base_modrm: u8) -> Result<(), String> {
+        match ops.len() {
+            0 => {
+                // Default: fadd %st(1), %st (i.e., st(0) = st(0) op st(1))
+                self.bytes.extend_from_slice(&[opcode_st0, base_modrm + 1]);
+                Ok(())
+            }
+            1 => {
+                // fadd %st(i) -> st(0) = st(0) op st(i)
+                match &ops[0] {
+                    Operand::Register(reg) => {
+                        let n = parse_st_num(&reg.name)?;
+                        self.bytes.extend_from_slice(&[opcode_st0, base_modrm + n]);
+                        Ok(())
+                    }
+                    _ => Err("x87 arith requires st register operand".to_string()),
+                }
+            }
+            2 => {
+                // Two operands: fadd %st(i), %st or fadd %st, %st(i)
+                match (&ops[0], &ops[1]) {
+                    (Operand::Register(src), Operand::Register(dst)) => {
+                        let src_n = parse_st_num(&src.name)?;
+                        let dst_n = parse_st_num(&dst.name)?;
+                        if dst_n == 0 {
+                            // fadd %st(i), %st -> D8 (base + i)
+                            self.bytes.extend_from_slice(&[opcode_st0, base_modrm + src_n]);
+                        } else if src_n == 0 {
+                            // fadd %st, %st(i) -> DC (base + i)
+                            // Note: for fsub/fdiv, the DC form uses reversed base
+                            // DC E0+i for fsubr, DC E8+i for fsub (swapped!)
+                            // But base_modrm is from the D8 encoding perspective.
+                            // The DC form for reverse direction:
+                            // fadd: DC C0+i, fmul: DC C8+i, fsub: DC E8+i, fdiv: DC F8+i
+                            // (fsub/fdiv swap: D8 E0 = fsub st(i),st; DC E8 = fsub st,st(i))
+                            let dc_modrm = match base_modrm {
+                                0xC0 => 0xC0, // fadd
+                                0xC8 => 0xC8, // fmul
+                                0xE0 => 0xE8, // fsub -> fsubr encoding in DC
+                                0xF0 => 0xF8, // fdiv -> fdivr encoding in DC
+                                _ => base_modrm,
+                            };
+                            self.bytes.extend_from_slice(&[opcode_sti, dc_modrm + dst_n]);
+                        } else {
+                            return Err("x87 arith: one operand must be st(0)".to_string());
+                        }
+                        Ok(())
+                    }
+                    _ => Err("x87 arith requires st register operands".to_string()),
+                }
+            }
+            _ => Err("x87 arith requires 0-2 operands".to_string()),
+        }
+    }
+
+    /// Encode fxch (exchange st(0) with st(i)).
+    fn encode_fxch(&mut self, ops: &[Operand]) -> Result<(), String> {
+        let n = match ops.len() {
+            0 => 1, // fxch defaults to st(1)
+            1 => {
+                match &ops[0] {
+                    Operand::Register(reg) => parse_st_num(&reg.name)?,
+                    _ => return Err("fxch requires st register".to_string()),
+                }
+            }
+            _ => return Err("fxch requires 0 or 1 operand".to_string()),
+        };
+        self.bytes.extend_from_slice(&[0xD9, 0xC8 + n]);
+        Ok(())
     }
 }
 
