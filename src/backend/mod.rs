@@ -293,16 +293,12 @@ impl Target {
     /// happens in common.rs via `DirectLdArchConfig`, then delegates to the
     /// architecture-specific native linker.
     pub(crate) fn link_with_args(&self, object_files: &[&str], output_path: &str, user_args: &[String]) -> Result<(), String> {
-        // Check if we should use the built-in linker
+        // RISC-V has its own builtin linker; other targets (x86-64, i686)
+        // handle MY_LD=builtin inside common::link_with_args.
         if let Ok(ref val) = std::env::var("MY_LD") {
             if val == "builtin" {
-                match self {
-                    Target::Riscv64 => {
-                        return riscv::linker::link_to_executable(object_files, output_path, user_args);
-                    }
-                    // Other targets: fall through to common::link_with_args which
-                    // handles MY_LD=builtin by invoking ld directly with CRT setup.
-                    _ => {}
+                if let Target::Riscv64 = self {
+                    return riscv::linker::link_to_executable(object_files, output_path, user_args);
                 }
             }
         }
