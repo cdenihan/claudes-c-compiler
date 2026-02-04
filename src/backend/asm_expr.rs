@@ -1,4 +1,4 @@
-/// Shared assembly expression evaluator for ARM and RISC-V backends.
+/// Shared assembly expression evaluator for all assembler backends (x86, i686, ARM, RISC-V).
 ///
 /// Supports arithmetic expressions with proper operator precedence:
 ///   - Parentheses: `(expr)`
@@ -11,7 +11,7 @@
 ///   - Unary: `-`, `+`, `~`
 ///
 /// Integer literals: decimal, hex (0x), binary (0b), octal (leading 0).
-// TODO: migrate x86/i686 assemblers to use this shared module
+/// Used by all four assembler backends (x86, i686, ARM, RISC-V).
 
 /// Token type for the expression evaluator.
 #[derive(Debug)]

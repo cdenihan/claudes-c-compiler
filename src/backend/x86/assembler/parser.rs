@@ -5,6 +5,8 @@
 //! (source, destination).
 
 use std::fmt;
+use crate::backend::asm_expr;
+use crate::backend::asm_preprocess::{self, CommentStyle};
 use crate::backend::elf;
 
 /// A parsed assembly item (one per line, roughly).
@@ -217,35 +219,8 @@ pub enum Displacement {
     SymbolPlusOffset(String, i64),
 }
 
-/// Strip C-style /* */ comments from assembly text.
-/// These are used in hand-written assembly (e.g., musl) but not in
-/// compiler-generated assembly. Handles multi-line comments.
-fn strip_c_comments(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-            // Skip until */
-            i += 2;
-            while i + 1 < bytes.len() {
-                if bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                    i += 2;
-                    break;
-                }
-                // Preserve newlines so line numbers stay correct
-                if bytes[i] == b'\n' {
-                    result.push('\n');
-                }
-                i += 1;
-            }
-        } else {
-            result.push(bytes[i] as char);
-            i += 1;
-        }
-    }
-    result
-}
+/// Comment style for x86 AT&T GAS: `#` only.
+const COMMENT_STYLE: CommentStyle = CommentStyle::Hash;
 
 /// Expand .rept/.endr blocks by repeating contained lines.
 /// Note: .irp/.endr blocks are handled separately by expand_gas_macros, so we must
@@ -311,7 +286,7 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmItem>, String> {
     let mut items = Vec::new();
 
     // Strip C-style /* */ comments (used in hand-written assembly like musl)
-    let text = strip_c_comments(text);
+    let text = asm_preprocess::strip_c_comments(text);
     let lines: Vec<&str> = text.lines().collect();
     let expanded = expand_rept_blocks(&lines)?;
     let expanded = expand_gas_macros(&expanded)?;
@@ -330,7 +305,7 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmItem>, String> {
 
         // Handle ';' as instruction separator (GAS syntax)
         // Split the line on ';' and parse each part independently.
-        let parts: Vec<&str> = split_on_semicolons(trimmed);
+        let parts: Vec<&str> = asm_preprocess::split_on_semicolons(trimmed);
         for part in parts {
             let part = part.trim();
             if part.is_empty() {
@@ -348,58 +323,9 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmItem>, String> {
     Ok(items)
 }
 
-/// Split a line on ';' characters, respecting strings.
-/// In GAS syntax, ';' separates multiple instructions on the same line.
-fn split_on_semicolons(line: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut in_string = false;
-    let mut escape = false;
-    let mut start = 0;
-    for (i, c) in line.char_indices() {
-        if escape {
-            escape = false;
-            continue;
-        }
-        if c == '\\' && in_string {
-            escape = true;
-            continue;
-        }
-        if c == '"' {
-            in_string = !in_string;
-            continue;
-        }
-        if c == ';' && !in_string {
-            parts.push(&line[start..i]);
-            start = i + 1;
-        }
-    }
-    parts.push(&line[start..]);
-    parts
-}
-
-/// Strip trailing comment from a line.
+/// Strip trailing comment from a line using x86 comment style (`#`).
 fn strip_comment(line: &str) -> &str {
-    // Find '#' that's not inside a string
-    let mut in_string = false;
-    let mut escape = false;
-    for (i, c) in line.char_indices() {
-        if escape {
-            escape = false;
-            continue;
-        }
-        if c == '\\' && in_string {
-            escape = true;
-            continue;
-        }
-        if c == '"' {
-            in_string = !in_string;
-            continue;
-        }
-        if c == '#' && !in_string {
-            return &line[..i];
-        }
-    }
-    line
+    asm_preprocess::strip_comment(line, &COMMENT_STYLE)
 }
 
 /// Parse a single non-empty assembly line into one or more AsmItems.
@@ -1236,217 +1162,9 @@ fn parse_symbol_offset(s: &str) -> Option<DataValue> {
     None
 }
 
-/// Parse a single integer token (decimal, hex, octal, binary).
-/// This handles only individual numeric literals without arithmetic operators.
-/// Expression evaluation (+, -, *) is handled by parse_integer_expr and eval_term.
-fn parse_single_integer(s: &str) -> Result<i64, String> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err("empty integer".to_string());
-    }
-
-    // Handle ~ (bitwise NOT) prefix: ~7 = -8, ~0xFFF = -0x1000
-    if let Some(rest) = s.strip_prefix('~') {
-        let inner = parse_integer_expr(rest)?;
-        return Ok(!inner);
-    }
-
-    // Try parsing the entire string first (handles i64::MIN correctly)
-    if let Ok(val) = s.parse::<i64>() {
-        return Ok(val);
-    }
-
-    let (negative, s) = if let Some(rest) = s.strip_prefix('-') {
-        (true, rest)
-    } else {
-        (false, s)
-    };
-
-    let val = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        // Parse as u64 to handle values like 0x8000000000000000
-        let uval = u64::from_str_radix(hex, 16)
-            .map_err(|_| format!("bad hex: {}", s))?;
-        if negative {
-            return Ok(-(uval as i64));
-        }
-        return Ok(uval as i64);
-    } else if let Some(bin) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {
-        i64::from_str_radix(bin, 2)
-            .map_err(|_| format!("bad binary: {}", s))?
-    } else if s.starts_with('0') && s.len() > 1 && s.chars().all(|c| c.is_ascii_digit()) {
-        i64::from_str_radix(s, 8)
-            .map_err(|_| format!("bad octal: {}", s))?
-    } else {
-        // Try parsing unsigned decimal as u64, then cast (for large values)
-        if let Ok(uval) = s.parse::<u64>() {
-            if negative {
-                return Ok(-(uval as i64));
-            }
-            return Ok(uval as i64);
-        }
-        return Err(format!("bad integer: {}", s));
-    };
-
-    Ok(if negative { -val } else { val })
-}
-
-/// Token type for the expression evaluator.
-#[derive(Debug)]
-enum ExprToken {
-    Num(i64),
-    Op(char),
-    Op2(&'static str),
-}
-
-/// Tokenize an expression string into ExprTokens.
-fn tokenize_expr(s: &str) -> Result<Vec<ExprToken>, String> {
-    let mut tokens = Vec::new();
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if c.is_ascii_whitespace() {
-            i += 1;
-            continue;
-        }
-        if c == b'(' || c == b')' || c == b'+' || c == b'-' || c == b'*'
-            || c == b'/' || c == b'%' || c == b'&' || c == b'|' || c == b'^' || c == b'~'
-        {
-            tokens.push(ExprToken::Op(c as char));
-            i += 1;
-        } else if c == b'<' && i + 1 < bytes.len() && bytes[i + 1] == b'<' {
-            tokens.push(ExprToken::Op2("<<"));
-            i += 2;
-        } else if c == b'>' && i + 1 < bytes.len() && bytes[i + 1] == b'>' {
-            tokens.push(ExprToken::Op2(">>"));
-            i += 2;
-        } else if c.is_ascii_digit() || (c == b'0' && i + 1 < bytes.len() && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X')) {
-            let start = i;
-            if c == b'0' && i + 1 < bytes.len() && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X') {
-                i += 2;
-                while i < bytes.len() && bytes[i].is_ascii_hexdigit() { i += 1; }
-            } else {
-                while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
-            }
-            let num_str = &s[start..i];
-            let val = parse_single_integer(num_str)?;
-            tokens.push(ExprToken::Num(val));
-        } else {
-            return Err(format!("unexpected char '{}' in expression", c as char));
-        }
-    }
-    Ok(tokens)
-}
-
-fn eval_tokens(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
-    eval_or(tokens, pos)
-}
-
-fn eval_or(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
-    let mut val = eval_xor(tokens, pos)?;
-    while *pos < tokens.len() {
-        if matches!(&tokens[*pos], ExprToken::Op('|')) {
-            *pos += 1;
-            val |= eval_xor(tokens, pos)?;
-        } else {
-            break;
-        }
-    }
-    Ok(val)
-}
-
-fn eval_xor(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
-    let mut val = eval_and(tokens, pos)?;
-    while *pos < tokens.len() {
-        if matches!(&tokens[*pos], ExprToken::Op('^')) {
-            *pos += 1;
-            val ^= eval_and(tokens, pos)?;
-        } else {
-            break;
-        }
-    }
-    Ok(val)
-}
-
-fn eval_and(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
-    let mut val = eval_shift(tokens, pos)?;
-    while *pos < tokens.len() {
-        if matches!(&tokens[*pos], ExprToken::Op('&')) {
-            *pos += 1;
-            val &= eval_shift(tokens, pos)?;
-        } else {
-            break;
-        }
-    }
-    Ok(val)
-}
-
-fn eval_shift(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
-    let mut val = eval_add(tokens, pos)?;
-    while *pos < tokens.len() {
-        match &tokens[*pos] {
-            ExprToken::Op2("<<") => { *pos += 1; val <<= eval_add(tokens, pos)?; }
-            ExprToken::Op2(">>") => { *pos += 1; val >>= eval_add(tokens, pos)?; }
-            _ => break,
-        }
-    }
-    Ok(val)
-}
-
-fn eval_add(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
-    let mut val = eval_mul(tokens, pos)?;
-    while *pos < tokens.len() {
-        match &tokens[*pos] {
-            ExprToken::Op('+') => { *pos += 1; val += eval_mul(tokens, pos)?; }
-            ExprToken::Op('-') => { *pos += 1; val -= eval_mul(tokens, pos)?; }
-            _ => break,
-        }
-    }
-    Ok(val)
-}
-
-fn eval_mul(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
-    let mut val = eval_unary(tokens, pos)?;
-    while *pos < tokens.len() {
-        match &tokens[*pos] {
-            ExprToken::Op('*') => { *pos += 1; val *= eval_unary(tokens, pos)?; }
-            ExprToken::Op('/') => {
-                *pos += 1;
-                let rhs = eval_unary(tokens, pos)?;
-                if rhs == 0 { return Err("division by zero".to_string()); }
-                val /= rhs;
-            }
-            ExprToken::Op('%') => {
-                *pos += 1;
-                let rhs = eval_unary(tokens, pos)?;
-                if rhs == 0 { return Err("modulo by zero".to_string()); }
-                val %= rhs;
-            }
-            _ => break,
-        }
-    }
-    Ok(val)
-}
-
-fn eval_unary(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
-    if *pos >= tokens.len() {
-        return Err("unexpected end of expression".to_string());
-    }
-    match &tokens[*pos] {
-        ExprToken::Op('-') => { *pos += 1; Ok(-eval_unary(tokens, pos)?) }
-        ExprToken::Op('+') => { *pos += 1; eval_unary(tokens, pos) }
-        ExprToken::Op('~') => { *pos += 1; Ok(!eval_unary(tokens, pos)?) }
-        ExprToken::Op('(') => {
-            *pos += 1;
-            let val = eval_tokens(tokens, pos)?;
-            if *pos < tokens.len() && matches!(&tokens[*pos], ExprToken::Op(')')) {
-                *pos += 1;
-            }
-            Ok(val)
-        }
-        ExprToken::Num(v) => { let v = *v; *pos += 1; Ok(v) }
-        other => Err(format!("unexpected token in expression: {:?}", other)),
-    }
+/// Parse an integer expression (delegates to the shared expression evaluator).
+fn parse_integer_expr(s: &str) -> Result<i64, String> {
+    asm_expr::parse_integer_expr(s)
 }
 
 /// GAS macro definition
@@ -1853,26 +1571,6 @@ fn resolve_set_expr(expr: &str, symbols: &std::collections::HashMap<String, i64>
         result = result.replace(name.as_str(), &val.to_string());
     }
     result
-}
-
-/// Parse an integer expression with full operator precedence.
-/// Supports: |, ^, &, <<, >>, +, -, *, /, %, ~, parentheses.
-fn parse_integer_expr(s: &str) -> Result<i64, String> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err("empty integer".to_string());
-    }
-    // Fast path: try simple integer first
-    if let Ok(val) = parse_single_integer(s) {
-        return Ok(val);
-    }
-    let tokens = tokenize_expr(s)?;
-    if tokens.is_empty() {
-        return Err("empty expression".to_string());
-    }
-    let mut pos = 0;
-    let val = eval_tokens(&tokens, &mut pos)?;
-    Ok(val)
 }
 
 #[cfg(test)]

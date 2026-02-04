@@ -11,6 +11,7 @@
 #![allow(dead_code)]
 
 use crate::backend::asm_expr;
+use crate::backend::asm_preprocess::{self, CommentStyle};
 use crate::backend::elf;
 
 /// A parsed assembly operand.
@@ -178,331 +179,20 @@ pub enum AsmStatement {
     Empty,
 }
 
-/// Parse assembly text into a list of statements.
-/// Expand .rept/.endr blocks by repeating contained lines.
-// TODO: extract expand_rept_blocks to shared module (duplicated in ARM, RISC-V, x86 parsers)
-fn is_rept_start(trimmed: &str) -> bool {
-    trimmed.starts_with(".rept ") || trimmed.starts_with(".rept\t")
-}
-
-fn is_irp_start(trimmed: &str) -> bool {
-    trimmed.starts_with(".irp ") || trimmed.starts_with(".irp\t")
-}
-
-fn is_block_start(trimmed: &str) -> bool {
-    is_rept_start(trimmed) || is_irp_start(trimmed)
-}
-
-/// Collect the body lines of a .rept/.irp block, handling nesting.
-/// Returns the body lines and advances i past the closing .endr.
-fn collect_block_body<'a>(lines: &[&'a str], i: &mut usize) -> Result<Vec<&'a str>, String> {
-    let mut depth = 1;
-    let mut body = Vec::new();
-    *i += 1;
-    while *i < lines.len() {
-        let inner = strip_comment(lines[*i]).trim().to_string();
-        if is_block_start(&inner) {
-            depth += 1;
-        } else if inner == ".endr" {
-            depth -= 1;
-            if depth == 0 {
-                break;
-            }
-        }
-        body.push(lines[*i]);
-        *i += 1;
-    }
-    if depth != 0 {
-        return Err(".rept/.irp without matching .endr".to_string());
-    }
-    Ok(body)
-}
-
-fn expand_rept_blocks(lines: &[&str]) -> Result<Vec<String>, String> {
-    let mut result = Vec::new();
-    let mut i = 0;
-    while i < lines.len() {
-        let trimmed = strip_comment(lines[i]).trim().to_string();
-        if is_rept_start(&trimmed) {
-            let count_str = trimmed[".rept".len()..].trim();
-            let count_val = parse_int_literal(count_str)
-                .map_err(|e| format!(".rept: bad count '{}': {}", count_str, e))?;
-            // Treat negative counts as 0 (matches GNU as behavior)
-            let count = if count_val < 0 { 0usize } else { count_val as usize };
-            let body = collect_block_body(lines, &mut i)?;
-            let expanded_body = expand_rept_blocks(&body)?;
-            for _ in 0..count {
-                result.extend(expanded_body.iter().cloned());
-            }
-        } else if is_irp_start(&trimmed) {
-            // .irp var, val1, val2, ...
-            let args_str = trimmed[".irp".len()..].trim();
-            // Split on first comma to get variable name and values
-            let (var, values_str) = match args_str.find(',') {
-                Some(pos) => (args_str[..pos].trim(), args_str[pos + 1..].trim()),
-                None => (args_str, ""),
-            };
-            let values: Vec<&str> = values_str.split(',').map(|s| s.trim()).collect();
-            let body = collect_block_body(lines, &mut i)?;
-            for val in &values {
-                // Substitute \var with val in each body line
-                let subst_body: Vec<String> = body.iter().map(|line| {
-                    let pattern = format!("\\{}", var);
-                    line.replace(&pattern, val)
-                }).collect();
-                let subst_refs: Vec<&str> = subst_body.iter().map(|s| s.as_str()).collect();
-                let expanded = expand_rept_blocks(&subst_refs)?;
-                result.extend(expanded);
-            }
-        } else if trimmed == ".endr" {
-            // stray .endr without .rept - skip
-        } else {
-            result.push(lines[i].to_string());
-        }
-        i += 1;
-    }
-    Ok(result)
-}
-
-/// Evaluate a simple `.if` condition expression.
-/// Supports: integer literals, `==`, `!=`, comparisons with simple arithmetic.
-fn eval_if_condition(cond: &str) -> bool {
-    let cond = cond.trim();
-    // Try "A == B"
-    if let Some(pos) = cond.find("==") {
-        let lhs = cond[..pos].trim();
-        let rhs = cond[pos + 2..].trim();
-        let l = asm_expr::parse_integer_expr(lhs).unwrap_or(i64::MIN);
-        let r = asm_expr::parse_integer_expr(rhs).unwrap_or(i64::MAX);
-        return l == r;
-    }
-    // Try "A != B"
-    if let Some(pos) = cond.find("!=") {
-        let lhs = cond[..pos].trim();
-        let rhs = cond[pos + 2..].trim();
-        let l = asm_expr::parse_integer_expr(lhs).unwrap_or(i64::MIN);
-        let r = asm_expr::parse_integer_expr(rhs).unwrap_or(i64::MAX);
-        return l != r;
-    }
-    // Simple integer expression: non-zero is true
-    asm_expr::parse_integer_expr(cond).unwrap_or(0) != 0
-}
-
-/// Split macro invocation arguments on commas, respecting quoted strings.
-/// GAS strips one level of quotes from each argument.
-/// Split macro invocation arguments, separating on commas and whitespace.
-/// GAS allows both commas and spaces as macro argument separators.
-/// Quoted strings are kept as a single argument with quotes stripped.
-/// Parenthesized groups like `0(a1)` are kept together.
-fn split_macro_args(s: &str) -> Vec<String> {
-    if s.is_empty() {
-        return Vec::new();
-    }
-    let mut args = Vec::new();
-    let mut current = String::new();
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    let mut paren_depth = 0i32;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'(' => {
-                paren_depth += 1;
-                current.push('(');
-            }
-            b')' => {
-                paren_depth -= 1;
-                current.push(')');
-            }
-            b',' if paren_depth == 0 => {
-                let trimmed = current.trim().to_string();
-                if !trimmed.is_empty() {
-                    args.push(trimmed);
-                }
-                current.clear();
-            }
-            b' ' | b'\t' if paren_depth == 0 => {
-                // Whitespace acts as separator outside parens
-                let trimmed = current.trim().to_string();
-                if !trimmed.is_empty() {
-                    args.push(trimmed);
-                    current.clear();
-                }
-                // Skip remaining whitespace
-                while i + 1 < bytes.len() && (bytes[i + 1] == b' ' || bytes[i + 1] == b'\t') {
-                    i += 1;
-                }
-                // If next char is comma, skip the whitespace-as-separator
-                // (comma takes priority)
-                if i + 1 < bytes.len() && bytes[i + 1] == b',' {
-                    // let the comma handle the split
-                }
-            }
-            b'"' => {
-                // Consume quoted string, stripping the outer quotes
-                i += 1;
-                while i < bytes.len() && bytes[i] != b'"' {
-                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                        current.push(bytes[i + 1] as char);
-                        i += 2;
-                        continue;
-                    }
-                    current.push(bytes[i] as char);
-                    i += 1;
-                }
-                // Skip closing quote
-            }
-            _ => {
-                current.push(bytes[i] as char);
-            }
-        }
-        i += 1;
-    }
-    let trimmed = current.trim().to_string();
-    if !trimmed.is_empty() {
-        args.push(trimmed);
-    }
-    args
-}
-
-/// Macro definition: name, parameter list, and body lines.
-struct MacroDef {
-    params: Vec<String>,
-    body: Vec<String>,
-}
-
-/// Expand .macro/.endm definitions and macro invocations.
-/// First pass: collect macro definitions.
-/// Second pass: expand macro invocations inline.
-fn expand_macros(lines: &[&str]) -> Result<Vec<String>, String> {
-    use std::collections::HashMap;
-    let mut macros: HashMap<String, MacroDef> = HashMap::new();
-    let mut result = Vec::new();
-    let mut i = 0;
-
-    while i < lines.len() {
-        let trimmed = strip_comment(lines[i]).trim().to_string();
-        if trimmed.starts_with(".macro ") || trimmed.starts_with(".macro\t") {
-            // Parse: .macro name [param1[, param2, ...]]
-            let rest = trimmed[".macro".len()..].trim();
-            // First word is the name, remaining (comma or space separated) are params
-            let (name, params_str) = match rest.find(|c: char| c == ' ' || c == '\t' || c == ',') {
-                Some(pos) => (rest[..pos].trim(), rest[pos..].trim().trim_start_matches(',')),
-                None => (rest, ""),
-            };
-            let params: Vec<String> = if params_str.is_empty() {
-                Vec::new()
-            } else {
-                // Parameters can be separated by commas or spaces
-                params_str.split(|c: char| c == ',' || c == ' ' || c == '\t')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            };
-            let mut body = Vec::new();
-            let mut depth = 1;
-            i += 1;
-            while i < lines.len() {
-                let inner = strip_comment(lines[i]).trim().to_string();
-                if inner.starts_with(".macro ") || inner.starts_with(".macro\t") {
-                    depth += 1;
-                } else if inner == ".endm" || inner.starts_with(".endm ") || inner.starts_with(".endm\t") {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                }
-                body.push(lines[i].to_string());
-                i += 1;
-            }
-            macros.insert(name.to_string(), MacroDef { params, body });
-        } else if trimmed == ".endm" || trimmed.starts_with(".endm ") || trimmed.starts_with(".endm\t") {
-            // stray .endm - skip
-        } else if !trimmed.is_empty() && !trimmed.starts_with('.') && !trimmed.starts_with('#') {
-            // Could be a macro invocation: "name args..."
-            // But only if the first word matches a defined macro
-            let first_word = trimmed.split(|c: char| c == ' ' || c == '\t').next().unwrap_or("");
-            // Strip trailing ':' in case it's a label (labels have colons)
-            let potential_name = first_word.trim_end_matches(':');
-            if potential_name != first_word {
-                // It's a label, not a macro invocation
-                result.push(lines[i].to_string());
-            } else if let Some(mac) = macros.get(potential_name) {
-                // Expand macro invocation
-                let args_str = trimmed[first_word.len()..].trim();
-                let args = split_macro_args(args_str);
-                let mut expanded_lines = Vec::new();
-                for body_line in &mac.body {
-                    let mut expanded = body_line.clone();
-                    for (pi, param) in mac.params.iter().enumerate() {
-                        let pattern = format!("\\{}", param);
-                        let replacement = args.get(pi).map(|s| s.as_str()).unwrap_or("0");
-                        expanded = expanded.replace(&pattern, replacement);
-                    }
-                    expanded_lines.push(expanded);
-                }
-                // Recursively expand macros in the expanded output
-                let refs: Vec<&str> = expanded_lines.iter().map(|s| s.as_str()).collect();
-                let re_expanded = expand_macros_with(&refs, &macros)?;
-                result.extend(re_expanded);
-            } else {
-                result.push(lines[i].to_string());
-            }
-        } else {
-            result.push(lines[i].to_string());
-        }
-        i += 1;
-    }
-    Ok(result)
-}
-
-/// Re-expand macro invocations using already-collected macro definitions.
-fn expand_macros_with(lines: &[&str], macros: &std::collections::HashMap<String, MacroDef>) -> Result<Vec<String>, String> {
-    let mut result = Vec::new();
-    for line in lines {
-        let trimmed = strip_comment(line).trim().to_string();
-        if trimmed.is_empty() || trimmed.starts_with('.') || trimmed.starts_with('#') {
-            result.push(line.to_string());
-            continue;
-        }
-        let first_word = trimmed.split(|c: char| c == ' ' || c == '\t').next().unwrap_or("");
-        let potential_name = first_word.trim_end_matches(':');
-        if potential_name != first_word {
-            result.push(line.to_string());
-        } else if let Some(mac) = macros.get(potential_name) {
-            let args_str = trimmed[first_word.len()..].trim();
-            let args = split_macro_args(args_str);
-            let mut expanded_lines = Vec::new();
-            for body_line in &mac.body {
-                let mut expanded = body_line.clone();
-                for (pi, param) in mac.params.iter().enumerate() {
-                    let pattern = format!("\\{}", param);
-                    let replacement = args.get(pi).map(|s| s.as_str()).unwrap_or("0");
-                    expanded = expanded.replace(&pattern, replacement);
-                }
-                expanded_lines.push(expanded);
-            }
-            // Recursively expand (with depth limit to prevent infinite recursion)
-            let refs: Vec<&str> = expanded_lines.iter().map(|s| s.as_str()).collect();
-            let re_expanded = expand_macros_with(&refs, macros)?;
-            result.extend(re_expanded);
-        } else {
-            result.push(line.to_string());
-        }
-    }
-    Ok(result)
-}
+/// Comment style for RISC-V GAS: `#` and `//`.
+const COMMENT_STYLE: CommentStyle = CommentStyle::HashAndSlashSlash;
 
 pub fn parse_asm(text: &str) -> Result<Vec<AsmStatement>, String> {
     // Pre-process: strip C-style /* ... */ comments (may span multiple lines)
-    let text = strip_c_comments(text);
+    let text = asm_preprocess::strip_c_comments(text);
 
     // Expand .macro/.endm definitions and invocations
     let raw_lines: Vec<&str> = text.lines().collect();
-    let macro_expanded = expand_macros(&raw_lines)?;
+    let macro_expanded = asm_preprocess::expand_macros(&raw_lines, &COMMENT_STYLE)?;
     let macro_refs: Vec<&str> = macro_expanded.iter().map(|s| s.as_str()).collect();
 
     // Expand .rept/.endr and .irp/.endr blocks
-    let expanded_lines = expand_rept_blocks(&macro_refs)?;
+    let expanded_lines = asm_preprocess::expand_rept_blocks(&macro_refs, &COMMENT_STYLE, parse_int_literal)?;
 
     let mut statements = Vec::new();
     // Stack for .if/.else/.endif conditional assembly.
@@ -543,7 +233,7 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmStatement>, String> {
             let cond_str = line[3..].trim();
             // Evaluate the condition: if we're already in a false block, push false
             let active = if if_stack.last().copied().unwrap_or(true) {
-                eval_if_condition(cond_str)
+                asm_preprocess::eval_if_condition(cond_str)
             } else {
                 false
             };
@@ -558,7 +248,7 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmStatement>, String> {
 
         // Handle ';' as statement separator (GAS syntax).
         // Split the line on ';' and parse each part independently.
-        let parts = split_on_semicolons(line);
+        let parts = asm_preprocess::split_on_semicolons(line);
         for part in parts {
             let part = part.trim();
             if part.is_empty() {
@@ -573,98 +263,9 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmStatement>, String> {
     Ok(statements)
 }
 
-/// Split a line on ';' characters, respecting strings.
-/// In GAS syntax, ';' separates multiple statements on the same line.
-fn split_on_semicolons(line: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut in_string = false;
-    let mut escape = false;
-    let mut start = 0;
-    for (i, c) in line.char_indices() {
-        if escape {
-            escape = false;
-            continue;
-        }
-        if c == '\\' && in_string {
-            escape = true;
-            continue;
-        }
-        if c == '"' {
-            in_string = !in_string;
-            continue;
-        }
-        if c == ';' && !in_string {
-            parts.push(&line[start..i]);
-            start = i + 1;
-        }
-    }
-    parts.push(&line[start..]);
-    parts
-}
-
-/// Strip C-style /* ... */ comments from assembly text, handling multi-line spans.
-/// Preserves newlines inside comments so line numbers remain correct for error messages.
-fn strip_c_comments(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-            i += 2;
-            while i + 1 < bytes.len() {
-                if bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                    i += 2;
-                    break;
-                }
-                if bytes[i] == b'\n' {
-                    result.push('\n');
-                }
-                i += 1;
-            }
-        } else {
-            result.push(bytes[i] as char);
-            i += 1;
-        }
-    }
-    result
-}
-
+/// Convenience wrapper: strip line comment using RISC-V comment style.
 fn strip_comment(line: &str) -> &str {
-    // Scan character by character, tracking string state to find comments
-    // outside of string literals. This correctly handles escaped quotes (\")
-    // inside strings (e.g. .asciz "a\"b#c" should not strip at #).
-    let bytes = line.as_bytes();
-    let mut in_string = false;
-    let mut i = 0;
-    while i < bytes.len() {
-        if in_string {
-            if bytes[i] == b'\\' {
-                i += 2; // skip escaped character
-                continue;
-            }
-            if bytes[i] == b'"' {
-                in_string = false;
-            }
-            i += 1;
-            continue;
-        }
-        // Not in string
-        if bytes[i] == b'"' {
-            in_string = true;
-            i += 1;
-            continue;
-        }
-        // Check for # comment (GAS RISC-V comment character)
-        if bytes[i] == b'#' {
-            return &line[..i];
-        }
-        // Check for // comment
-        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-            return &line[..i];
-        }
-        i += 1;
-    }
-    line
+    asm_preprocess::strip_comment(line, &COMMENT_STYLE)
 }
 
 fn parse_line(line: &str) -> Result<Vec<AsmStatement>, String> {
@@ -946,14 +547,7 @@ fn parse_data_values(args: &str) -> Result<Vec<DataValue>, String> {
 
 /// Check if a string looks like a GNU numeric label reference (e.g. "2f", "1b", "42f").
 fn is_numeric_label_ref(s: &str) -> bool {
-    if s.len() < 2 {
-        return false;
-    }
-    let last = s.as_bytes()[s.len() - 1];
-    if last != b'f' && last != b'F' && last != b'b' && last != b'B' {
-        return false;
-    }
-    s[..s.len() - 1].bytes().all(|b| b.is_ascii_digit())
+    asm_preprocess::is_numeric_label_ref(s)
 }
 
 /// Strip balanced outer parentheses from an expression.
@@ -1070,31 +664,9 @@ fn parse_data_value_int(s: &str) -> Result<i64, String> {
     asm_expr::parse_integer_expr(s)
 }
 
-/// Find the position of the '-' operator in a symbol difference expression
-/// like "sym_a - sym_b". Returns None if no valid symbol difference is found.
+/// Find the position of the '-' operator in a symbol difference expression.
 fn find_symbol_diff_minus(expr: &str) -> Option<usize> {
-    let bytes = expr.as_bytes();
-    let len = bytes.len();
-    let mut i = 1; // Start at 1 to skip leading '-' (negative)
-
-    while i < len {
-        if bytes[i] == b'-' {
-            let left_char = bytes[i - 1];
-            let left_ok = left_char.is_ascii_alphanumeric() || left_char == b'_' || left_char == b'.' || left_char == b' ' || left_char == b')';
-
-            let right_start = expr[i + 1..].trim_start();
-            if !right_start.is_empty() {
-                let right_char = right_start.as_bytes()[0];
-                let right_ok = right_char.is_ascii_alphabetic() || right_char == b'_' || right_char == b'.' || right_char.is_ascii_digit() || right_char == b'(';
-                if left_ok && right_ok {
-                    return Some(i);
-                }
-            }
-        }
-        i += 1;
-    }
-
-    None
+    asm_preprocess::find_symbol_diff_minus(expr)
 }
 
 fn parse_symbol_addend(s: &str) -> (String, i64) {

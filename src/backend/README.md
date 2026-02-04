@@ -98,7 +98,7 @@ The pipeline is driven from `Target::generate_assembly_with_opts_and_debug` in
 
 ## Directory Layout
 
-The backend is split into 14 shared modules at the top level and 4
+The backend is split into 16 shared modules at the top level and 4
 architecture-specific subdirectories:
 
 ```
@@ -106,6 +106,8 @@ src/backend/
   mod.rs              Target enum, CodegenOptions, top-level dispatch
   elf.rs              Shared ELF constants, StringTable, read/write helpers, archive parsing
   linker_common.rs    Shared linker infrastructure: ELF64 parser, types, DynStrTab, hash, lib resolution
+  asm_expr.rs         Shared integer expression evaluator (all 4 assembler parsers)
+  asm_preprocess.rs   Shared GAS preprocessing: comments, macros, .rept, .if/.else/.endif
   traits.rs           ArchCodegen trait (~185 methods, ~50 default impls)
   generation.rs       Module/function/instruction dispatch (arch-independent)
   state.rs            CodegenState, StackSlot, SlotAddr, RegCache
