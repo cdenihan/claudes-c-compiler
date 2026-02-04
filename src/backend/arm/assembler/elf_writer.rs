@@ -586,11 +586,7 @@ impl ElfWriter {
             }
             Ok(EncodeResult::Skip) => Ok(()),
             Err(e) => {
-                // For now, emit a NOP for unsupported instructions and continue
-                // TODO: remove this fallback once all instructions are supported
-                eprintln!("warning: assembler: {}", e);
-                self.emit_u32_le(0xd503201f); // NOP
-                Ok(())
+                return Err(e);
             }
         }
     }

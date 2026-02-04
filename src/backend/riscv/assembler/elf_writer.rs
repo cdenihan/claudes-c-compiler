@@ -597,11 +597,7 @@ impl ElfWriter {
             }
             Ok(EncodeResult::Skip) => Ok(()),
             Err(e) => {
-                // For unsupported instructions, emit NOP and continue
-                // TODO: remove this fallback once all instructions are supported
-                eprintln!("warning: riscv assembler: {}", e);
-                self.emit_u32_le(0x00000013); // NOP: addi x0, x0, 0
-                Ok(())
+                return Err(e);
             }
         }
     }

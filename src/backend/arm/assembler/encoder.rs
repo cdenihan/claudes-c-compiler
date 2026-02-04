@@ -329,7 +329,7 @@ pub fn encode_instruction(mnemonic: &str, operands: &[Operand], raw_operands: &s
         | "crc32cb" | "crc32ch" | "crc32cw" | "crc32cx" => encode_crc32(mnemonic, operands),
 
         // Prefetch
-        "prfm" => Ok(EncodeResult::Word(0xd503201f)), // Encode as NOP for now
+        "prfm" => encode_prfm(operands),
 
         _ => {
             // TODO: handle remaining instructions
@@ -1746,9 +1746,8 @@ fn encode_fmov(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd_name, rm_name) = match (&operands[0], &operands[1]) {
         (Operand::Reg(a), Operand::Reg(b)) => (a.clone(), b.clone()),
         (Operand::Reg(_a), Operand::Imm(_)) => {
-            // fmov with immediate - encode as immediate float
-            // TODO: implement float immediate encoding
-            return Ok(EncodeResult::Word(0xd503201f)); // NOP placeholder
+            // TODO: implement fmov with float immediate encoding
+            return Err("fmov with immediate operand not yet supported".to_string());
         }
         _ => return Err("fmov needs register operands".to_string()),
     };
@@ -2217,6 +2216,78 @@ fn encode_crc32(mnemonic: &str, operands: &[Operand]) -> Result<EncodeResult, St
     let word = (sf << 31) | (0b0011010110 << 21) | (rm << 16) | (0b010 << 13)
         | (c_bit << 12) | (sz << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
+}
+
+// ── Prefetch ─────────────────────────────────────────────────────────────
+
+/// Encode the PRFM (prefetch memory) instruction.
+/// Format: PRFM <prfop>, [<Xn|SP>{, #<pimm>}]
+/// Encoding: 1111 1001 10 imm12 Rn Rt
+/// where Rt is the 5-bit prefetch operation type.
+fn encode_prfm(operands: &[Operand]) -> Result<EncodeResult, String> {
+    if operands.len() < 2 {
+        return Err("prfm requires 2 operands".to_string());
+    }
+
+    // First operand: prefetch operation type (parsed as Symbol)
+    let prfop = match &operands[0] {
+        Operand::Symbol(s) => encode_prfop(s)?,
+        Operand::Imm(v) => {
+            if *v < 0 || *v > 31 {
+                return Err(format!("prfm: immediate prefetch type out of range: {}", v));
+            }
+            *v as u32
+        }
+        _ => return Err(format!("prfm: expected prefetch operation name, got {:?}", operands[0])),
+    };
+
+    // Second operand: memory address [Xn{, #imm}]
+    match &operands[1] {
+        Operand::Mem { base, offset } => {
+            let rn = parse_reg_num(base).ok_or_else(|| format!("prfm: invalid base register: {}", base))?;
+            let imm = *offset;
+            if imm < 0 || imm % 8 != 0 {
+                return Err(format!("prfm: offset must be non-negative and 8-byte aligned, got {}", imm));
+            }
+            let imm12 = (imm / 8) as u32;
+            if imm12 > 0xFFF {
+                return Err(format!("prfm: offset too large: {}", imm));
+            }
+            // PRFM (imm): 1111 1001 10 imm12(12) Rn(5) Rt(5)
+            let word = 0xF9800000 | (imm12 << 10) | (rn << 5) | prfop;
+            Ok(EncodeResult::Word(word))
+        }
+        Operand::Symbol(_sym) => {
+            // PRFM (literal) with symbol reference is not yet supported
+            Err("prfm with symbol/label operand not yet supported".to_string())
+        }
+        _ => Err(format!("prfm: expected memory operand, got {:?}", operands[1])),
+    }
+}
+
+/// Map prefetch operation name to its 5-bit encoding.
+fn encode_prfop(name: &str) -> Result<u32, String> {
+    match name.to_lowercase().as_str() {
+        "pldl1keep" => Ok(0b00000),
+        "pldl1strm" => Ok(0b00001),
+        "pldl2keep" => Ok(0b00010),
+        "pldl2strm" => Ok(0b00011),
+        "pldl3keep" => Ok(0b00100),
+        "pldl3strm" => Ok(0b00101),
+        "plil1keep" => Ok(0b01000),
+        "plil1strm" => Ok(0b01001),
+        "plil2keep" => Ok(0b01010),
+        "plil2strm" => Ok(0b01011),
+        "plil3keep" => Ok(0b01100),
+        "plil3strm" => Ok(0b01101),
+        "pstl1keep" => Ok(0b10000),
+        "pstl1strm" => Ok(0b10001),
+        "pstl2keep" => Ok(0b10010),
+        "pstl2strm" => Ok(0b10011),
+        "pstl3keep" => Ok(0b10100),
+        "pstl3strm" => Ok(0b10101),
+        _ => Err(format!("prfm: unknown prefetch operation: {}", name)),
+    }
 }
 
 // ── NEON three-same register operations ──────────────────────────────────
