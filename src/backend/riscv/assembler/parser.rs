@@ -4,6 +4,7 @@
 //! structured `AsmStatement` values. The parser handles:
 //! - Labels (global and local)
 //! - Directives (.section, .globl, .type, .align, .byte, .long, .dword, etc.)
+//!   with fully typed representation (no string re-parsing in ELF writer)
 //! - RISC-V instructions (add, sub, ld, sd, beq, call, ret, etc.)
 //! - CFI directives (passed through as-is for DWARF unwind info)
 
@@ -35,16 +36,122 @@ pub enum Operand {
     RoundingMode(String),
 }
 
+/// A data value in a .byte/.short/.long/.quad directive.
+/// Can be a literal integer, a symbol reference (with optional addend),
+/// or a symbol difference expression (A - B, with optional addend on A).
+#[derive(Debug, Clone)]
+pub enum DataValue {
+    /// A literal integer value.
+    Integer(i64),
+    /// A symbol reference, possibly with an addend: `sym` or `sym+4` or `sym-8`.
+    Symbol { name: String, addend: i64 },
+    /// A symbol difference: `sym_a - sym_b`, possibly with addend on sym_a.
+    SymbolDiff { sym_a: String, sym_b: String, addend: i64 },
+}
+
+/// Symbol type as parsed from `.type sym, @function` etc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolType {
+    Function,
+    Object,
+    TlsObject,
+    NoType,
+}
+
+/// Symbol visibility as parsed from `.hidden`, `.protected`, `.internal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Visibility {
+    Hidden,
+    Protected,
+    Internal,
+}
+
+/// A size expression from `.size sym, expr`.
+#[derive(Debug, Clone)]
+pub enum SizeExpr {
+    /// `.- label` — current position minus label
+    CurrentMinus(String),
+    /// A literal size value.
+    Absolute(u64),
+}
+
+/// Section type from `.section` directive.
+#[derive(Debug, Clone)]
+pub struct SectionInfo {
+    pub name: String,
+    pub flags: String,
+    pub sec_type: String,
+    /// True when the directive explicitly included a flags field (even if empty).
+    pub flags_explicit: bool,
+}
+
+/// A typed assembly directive. All argument parsing happens in the parser,
+/// so the ELF writer only needs to pattern-match on these variants.
+#[derive(Debug, Clone)]
+pub enum Directive {
+    /// `.section name, "flags", @type`
+    Section(SectionInfo),
+    /// `.text`
+    Text,
+    /// `.data`
+    Data,
+    /// `.bss`
+    Bss,
+    /// `.rodata`
+    Rodata,
+    /// `.globl sym` or `.global sym`
+    Globl(String),
+    /// `.weak sym`
+    Weak(String),
+    /// `.hidden sym`, `.protected sym`, `.internal sym`
+    SymVisibility(String, Visibility),
+    /// `.type sym, @function` etc.
+    Type(String, SymbolType),
+    /// `.size sym, expr`
+    Size(String, SizeExpr),
+    /// `.align N` or `.p2align N` — power-of-2 alignment
+    Align(u64),
+    /// `.balign N` — byte alignment
+    Balign(u64),
+    /// `.byte val, val, ...`
+    Byte(Vec<DataValue>),
+    /// `.short val, ...` / `.hword` / `.2byte` / `.half`
+    Short(Vec<DataValue>),
+    /// `.long val, ...` / `.4byte` / `.word`
+    Long(Vec<DataValue>),
+    /// `.quad val, ...` / `.8byte` / `.xword` / `.dword`
+    Quad(Vec<DataValue>),
+    /// `.zero N[, fill]` / `.space N[, fill]`
+    Zero { size: usize, fill: u8 },
+    /// `.asciz "str"` / `.string "str"` — null-terminated string
+    Asciz(String),
+    /// `.ascii "str"` — string without null terminator
+    Ascii(String),
+    /// `.comm sym, size[, align]`
+    Comm { sym: String, size: u64, align: u64 },
+    /// `.local sym`
+    Local(String),
+    /// `.set sym, val` / `.equ sym, val`
+    Set(String, String),
+    /// `.option ...` — RISC-V specific
+    ArchOption(String),
+    /// `.attribute ...` — RISC-V attribute
+    Attribute(String),
+    /// CFI directives — silently ignored
+    Cfi,
+    /// Other ignorable directives: .file, .loc, .ident, etc.
+    Ignored,
+    /// Unknown directive — preserved for forward compatibility
+    Unknown { name: String, args: String },
+}
+
 /// A parsed assembly statement.
 #[derive(Debug, Clone)]
 pub enum AsmStatement {
     /// A label definition: "name:"
     Label(String),
-    /// A directive: .section, .globl, .align, .byte, etc.
-    Directive {
-        name: String,
-        args: String,
-    },
+    /// A typed assembly directive.
+    Directive(Directive),
     /// A RISC-V instruction with mnemonic and operands
     Instruction {
         mnemonic: String,
@@ -180,8 +287,8 @@ fn parse_line(line: &str) -> Result<Vec<AsmStatement>, String> {
     Ok(vec![parse_instruction(trimmed)?])
 }
 
+/// Split a directive line into name and args, then dispatch to typed parsing.
 fn parse_directive(line: &str) -> Result<AsmStatement, String> {
-    // Split directive name from arguments
     let (name, args) = if let Some(space_pos) = line.find(|c: char| c == ' ' || c == '\t') {
         let name = &line[..space_pos];
         let args = line[space_pos..].trim();
@@ -190,10 +297,380 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
         (line, "")
     };
 
-    Ok(AsmStatement::Directive {
-        name: name.to_string(),
-        args: args.to_string(),
-    })
+    let directive = match name {
+        ".section" => {
+            let info = parse_section_args(args);
+            Directive::Section(info)
+        }
+        ".text" => Directive::Text,
+        ".data" => Directive::Data,
+        ".bss" => Directive::Bss,
+        ".rodata" => Directive::Rodata,
+
+        ".globl" | ".global" => Directive::Globl(args.trim().to_string()),
+        ".weak" => Directive::Weak(args.trim().to_string()),
+        ".hidden" => Directive::SymVisibility(args.trim().to_string(), Visibility::Hidden),
+        ".protected" => Directive::SymVisibility(args.trim().to_string(), Visibility::Protected),
+        ".internal" => Directive::SymVisibility(args.trim().to_string(), Visibility::Internal),
+
+        ".type" => parse_type_directive(args),
+
+        ".size" => parse_size_directive(args),
+
+        ".align" | ".p2align" => {
+            let val: u64 = args.trim().split(',').next()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
+            Directive::Align(val)
+        }
+        ".balign" => {
+            let val: u64 = args.trim().parse().unwrap_or(1);
+            Directive::Balign(val)
+        }
+
+        ".byte" => {
+            let values = parse_data_values(args)?;
+            Directive::Byte(values)
+        }
+        ".short" | ".hword" | ".2byte" | ".half" => {
+            let values = parse_data_values(args)?;
+            Directive::Short(values)
+        }
+        ".long" | ".4byte" | ".word" => {
+            let values = parse_data_values(args)?;
+            Directive::Long(values)
+        }
+        ".quad" | ".8byte" | ".xword" | ".dword" => {
+            let values = parse_data_values(args)?;
+            Directive::Quad(values)
+        }
+
+        ".zero" | ".space" => {
+            let parts: Vec<&str> = args.trim().split(',').collect();
+            let size: usize = parts[0].trim().parse()
+                .map_err(|_| format!("invalid .zero size: {}", args))?;
+            let fill: u8 = if parts.len() > 1 {
+                parse_data_value_int(parts[1].trim())? as u8
+            } else {
+                0
+            };
+            Directive::Zero { size, fill }
+        }
+
+        ".asciz" | ".string" => {
+            let s = parse_string_literal(args)?;
+            Directive::Asciz(s)
+        }
+        ".ascii" => {
+            let s = parse_string_literal(args)?;
+            Directive::Ascii(s)
+        }
+
+        ".comm" => {
+            let parts: Vec<&str> = args.split(',').collect();
+            let sym = if !parts.is_empty() { parts[0].trim().to_string() } else { String::new() };
+            let size: u64 = if parts.len() >= 2 { parts[1].trim().parse().unwrap_or(0) } else { 0 };
+            let align: u64 = if parts.len() > 2 { parts[2].trim().parse().unwrap_or(1) } else { 1 };
+            Directive::Comm { sym, size, align }
+        }
+
+        ".local" => Directive::Local(args.trim().to_string()),
+
+        ".set" | ".equ" => {
+            let parts: Vec<&str> = args.splitn(2, ',').collect();
+            let sym = if !parts.is_empty() { parts[0].trim().to_string() } else { String::new() };
+            let val = if parts.len() > 1 { parts[1].trim().to_string() } else { String::new() };
+            Directive::Set(sym, val)
+        }
+
+        ".option" => Directive::ArchOption(args.to_string()),
+        ".attribute" => Directive::Attribute(args.to_string()),
+
+        // CFI directives
+        ".cfi_startproc" | ".cfi_endproc" | ".cfi_def_cfa_offset"
+        | ".cfi_offset" | ".cfi_def_cfa_register" | ".cfi_restore"
+        | ".cfi_remember_state" | ".cfi_restore_state"
+        | ".cfi_adjust_cfa_offset" | ".cfi_def_cfa"
+        | ".cfi_sections" | ".cfi_personality" | ".cfi_lsda"
+        | ".cfi_rel_offset" | ".cfi_register" | ".cfi_return_column"
+        | ".cfi_undefined" | ".cfi_same_value" | ".cfi_escape" => Directive::Cfi,
+
+        // Other ignorable directives
+        ".file" | ".loc" | ".ident" | ".addrsig" | ".addrsig_sym"
+        | ".build_attributes" | ".eabi_attribute" => Directive::Ignored,
+
+        _ => Directive::Unknown {
+            name: name.to_string(),
+            args: args.to_string(),
+        },
+    };
+
+    Ok(AsmStatement::Directive(directive))
+}
+
+/// Parse `.section name, "flags", @type` arguments.
+fn parse_section_args(args: &str) -> SectionInfo {
+    let parts: Vec<&str> = args.split(',').collect();
+    let name = parts[0].trim().to_string();
+    let flags_explicit = parts.len() > 1;
+    let flags = if flags_explicit {
+        parts[1].trim().trim_matches('"').to_string()
+    } else {
+        String::new()
+    };
+    let sec_type = if parts.len() > 2 {
+        parts[2].trim().to_string()
+    } else {
+        // Default type based on section name
+        if name == ".bss" || name.starts_with(".bss.") || name.starts_with(".tbss") {
+            "@nobits".to_string()
+        } else {
+            "@progbits".to_string()
+        }
+    };
+    SectionInfo { name, flags, sec_type, flags_explicit }
+}
+
+/// Parse `.type sym, @function` etc.
+fn parse_type_directive(args: &str) -> Directive {
+    let parts: Vec<&str> = args.splitn(2, ',').collect();
+    if parts.len() == 2 {
+        let sym = parts[0].trim().to_string();
+        let ty = parts[1].trim();
+        let st = match ty {
+            "%function" | "@function" => SymbolType::Function,
+            "%object" | "@object" => SymbolType::Object,
+            "@tls_object" => SymbolType::TlsObject,
+            _ => SymbolType::NoType,
+        };
+        Directive::Type(sym, st)
+    } else {
+        // Malformed .type directive — treat as no-type
+        Directive::Type(args.trim().to_string(), SymbolType::NoType)
+    }
+}
+
+/// Parse `.size sym, expr`.
+fn parse_size_directive(args: &str) -> Directive {
+    let parts: Vec<&str> = args.splitn(2, ',').collect();
+    if parts.len() == 2 {
+        let sym = parts[0].trim().to_string();
+        let size_expr = parts[1].trim();
+        if size_expr.starts_with(".-") {
+            let label = &size_expr[2..];
+            Directive::Size(sym, SizeExpr::CurrentMinus(label.to_string()))
+        } else if let Ok(size) = size_expr.parse::<u64>() {
+            Directive::Size(sym, SizeExpr::Absolute(size))
+        } else {
+            // Can't parse — use 0
+            Directive::Size(sym, SizeExpr::Absolute(0))
+        }
+    } else {
+        // Malformed .size directive
+        Directive::Size(args.trim().to_string(), SizeExpr::Absolute(0))
+    }
+}
+
+/// Parse a comma-separated list of data values for .byte/.short/.long/.quad.
+/// Each value can be an integer, a symbol reference, or a symbol difference.
+fn parse_data_values(args: &str) -> Result<Vec<DataValue>, String> {
+    let mut values = Vec::new();
+    for part in args.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        values.push(parse_single_data_value(trimmed)?);
+    }
+    Ok(values)
+}
+
+/// Parse a single data value: integer, symbol, symbol+offset, or symbol_diff.
+fn parse_single_data_value(s: &str) -> Result<DataValue, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(DataValue::Integer(0));
+    }
+
+    // First check if this could be a symbol difference: A - B
+    // The first char must be a symbol-start character (letter, _, .)
+    let first = s.chars().next().unwrap();
+    if first.is_ascii_alphabetic() || first == '_' || first == '.' {
+        // Try to find a symbol difference expression
+        if let Some(minus_pos) = find_symbol_diff_minus(s) {
+            let sym_a_raw = s[..minus_pos].trim();
+            let rest = s[minus_pos + 1..].trim();
+
+            // rest might be "B" or "B + offset"
+            let (sym_b, addend) = if let Some(plus_pos) = rest.find('+') {
+                let b = rest[..plus_pos].trim();
+                let add_str = rest[plus_pos + 1..].trim();
+                let add_val: i64 = add_str.parse().unwrap_or(0);
+                (b, add_val)
+            } else {
+                (rest, 0i64)
+            };
+
+            // Verify sym_b looks like a symbol
+            if !sym_b.is_empty() {
+                let b_first = sym_b.chars().next().unwrap();
+                if b_first.is_ascii_alphabetic() || b_first == '_' || b_first == '.' {
+                    return Ok(DataValue::SymbolDiff {
+                        sym_a: sym_a_raw.to_string(),
+                        sym_b: sym_b.to_string(),
+                        addend,
+                    });
+                }
+            }
+        }
+
+        // Not a symbol diff — parse as symbol reference with optional addend
+        let (sym, addend) = parse_symbol_addend(s);
+        return Ok(DataValue::Symbol { name: sym, addend });
+    }
+
+    // Try to parse as integer
+    parse_data_value_int(s).map(DataValue::Integer)
+}
+
+/// Parse a data value as a plain integer (used by .byte, .zero fill, etc).
+fn parse_data_value_int(s: &str) -> Result<i64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(0);
+    }
+
+    let (negative, s) = if s.starts_with('-') {
+        (true, &s[1..])
+    } else {
+        (false, s)
+    };
+
+    let val = if s.starts_with("0x") || s.starts_with("0X") {
+        u64::from_str_radix(&s[2..], 16)
+            .map_err(|e| format!("invalid hex: {}: {}", s, e))?
+    } else {
+        s.parse::<u64>()
+            .map_err(|e| format!("invalid integer: {}: {}", s, e))?
+    };
+
+    if negative {
+        Ok(-(val as i64))
+    } else {
+        Ok(val as i64)
+    }
+}
+
+/// Find the position of the '-' operator in a symbol difference expression
+/// like "sym_a - sym_b". Returns None if no valid symbol difference is found.
+fn find_symbol_diff_minus(expr: &str) -> Option<usize> {
+    let bytes = expr.as_bytes();
+    let len = bytes.len();
+    let mut i = 1; // Start at 1 to skip leading '-' (negative)
+
+    while i < len {
+        if bytes[i] == b'-' {
+            let left_char = bytes[i - 1];
+            let left_ok = left_char.is_ascii_alphanumeric() || left_char == b'_' || left_char == b'.' || left_char == b' ';
+
+            let right_start = expr[i + 1..].trim_start();
+            if !right_start.is_empty() {
+                let right_char = right_start.as_bytes()[0];
+                let right_ok = right_char.is_ascii_alphabetic() || right_char == b'_' || right_char == b'.';
+                if left_ok && right_ok {
+                    return Some(i);
+                }
+            }
+        }
+        i += 1;
+    }
+
+    None
+}
+
+fn parse_symbol_addend(s: &str) -> (String, i64) {
+    if let Some(plus_pos) = s.find('+') {
+        let sym = s[..plus_pos].trim().to_string();
+        let off: i64 = s[plus_pos + 1..].trim().parse().unwrap_or(0);
+        (sym, off)
+    } else if let Some(minus_pos) = s.find('-') {
+        if minus_pos > 0 {
+            let sym = s[..minus_pos].trim().to_string();
+            let off_str = &s[minus_pos..];
+            let off: i64 = off_str.parse().unwrap_or(0);
+            (sym, off)
+        } else {
+            (s.to_string(), 0)
+        }
+    } else {
+        (s.to_string(), 0)
+    }
+}
+
+/// Parse a string literal: "..." with escape sequences.
+pub fn parse_string_literal(s: &str) -> Result<String, String> {
+    let s = s.trim();
+    if !s.starts_with('"') || !s.ends_with('"') {
+        return Err(format!("expected string literal: {}", s));
+    }
+    let inner = &s[1..s.len() - 1];
+    let mut result = String::new();
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => result.push('\n'),
+                Some('t') => result.push('\t'),
+                Some('r') => result.push('\r'),
+                Some('0') => result.push('\0'),
+                Some('\\') => result.push('\\'),
+                Some('"') => result.push('"'),
+                Some(c) if c.is_ascii_digit() => {
+                    let mut octal = String::new();
+                    octal.push(c);
+                    while octal.len() < 3 {
+                        if let Some(&next) = chars.peek() {
+                            if next.is_ascii_digit() && next <= '7' {
+                                octal.push(chars.next().unwrap());
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Ok(val) = u8::from_str_radix(&octal, 8) {
+                        result.push(val as char);
+                    }
+                }
+                Some('x') => {
+                    let mut hex = String::new();
+                    while hex.len() < 2 {
+                        if let Some(&next) = chars.peek() {
+                            if next.is_ascii_hexdigit() {
+                                hex.push(chars.next().unwrap());
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Ok(val) = u8::from_str_radix(&hex, 16) {
+                        result.push(val as char);
+                    }
+                }
+                Some(c) => {
+                    result.push('\\');
+                    result.push(c);
+                }
+                None => result.push('\\'),
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    Ok(result)
 }
 
 fn parse_instruction(line: &str) -> Result<AsmStatement, String> {
