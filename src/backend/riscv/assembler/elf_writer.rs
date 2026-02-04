@@ -115,6 +115,8 @@ pub struct ElfWriter {
     symbol_sizes: HashMap<String, u64>,
     /// Symbol visibility from .hidden/.protected/.internal
     symbol_visibility: HashMap<String, u8>,
+    /// Counter for generating synthetic pcrel_hi labels
+    pcrel_hi_counter: u32,
 }
 
 struct PendingReloc {
@@ -123,6 +125,10 @@ struct PendingReloc {
     reloc_type: u32,
     symbol: String,
     addend: i64,
+    /// For pcrel_lo12 relocations resolved locally: the offset of the
+    /// corresponding auipc (pcrel_hi) instruction. The lo12 value is
+    /// computed relative to the auipc's PC, not the pcrel_lo instruction's PC.
+    pcrel_hi_offset: Option<u64>,
 }
 
 impl ElfWriter {
@@ -139,6 +145,7 @@ impl ElfWriter {
             symbol_types: HashMap::new(),
             symbol_sizes: HashMap::new(),
             symbol_visibility: HashMap::new(),
+            pcrel_hi_counter: 0,
         }
     }
 
@@ -550,6 +557,19 @@ impl ElfWriter {
                 Ok(())
             }
             Ok(EncodeResult::WordWithReloc { word, reloc }) => {
+                let elf_type = reloc.reloc_type.elf_type();
+                let is_pcrel_hi = elf_type == 23 || elf_type == 20 || elf_type == 22 || elf_type == 21;
+
+                if is_pcrel_hi {
+                    // Create a synthetic label at this auipc instruction so that
+                    // subsequent %pcrel_lo references can find the matching %pcrel_hi.
+                    let label = format!(".Lpcrel_hi{}", self.pcrel_hi_counter);
+                    self.pcrel_hi_counter += 1;
+                    let section = self.current_section.clone();
+                    let offset = self.current_offset();
+                    self.labels.insert(label, (section, offset));
+                }
+
                 let is_local = reloc.symbol.starts_with(".L") || reloc.symbol.starts_with(".l");
 
                 if is_local {
@@ -557,13 +577,14 @@ impl ElfWriter {
                     self.pending_branch_relocs.push(PendingReloc {
                         section: self.current_section.clone(),
                         offset,
-                        reloc_type: reloc.reloc_type.elf_type(),
+                        reloc_type: elf_type,
                         symbol: reloc.symbol.clone(),
                         addend: reloc.addend,
+                        pcrel_hi_offset: None,
                     });
                     self.emit_u32_le(word);
                 } else {
-                    self.add_reloc(reloc.reloc_type.elf_type(), reloc.symbol, reloc.addend);
+                    self.add_reloc(elf_type, reloc.symbol, reloc.addend);
                     self.emit_u32_le(word);
                 }
                 Ok(())
@@ -575,23 +596,67 @@ impl ElfWriter {
                 Ok(())
             }
             Ok(EncodeResult::WordsWithRelocs(items)) => {
-                for (word, reloc_opt) in items {
+                // Handle pcrel_hi20+pcrel_lo12 pairs. When found, create a
+                // synthetic local label at the auipc offset and redirect the
+                // pcrel_lo12 relocation to reference that label.
+                //
+                // Both pcrel_hi and pcrel_lo are always emitted as external
+                // relocations for the linker. This avoids inconsistency
+                // when pcrel_hi is resolved locally but pcrel_lo isn't.
+                let mut pcrel_hi_label: Option<String> = None;
+
+                for (word, reloc_opt) in &items {
                     if let Some(reloc) = reloc_opt {
+                        let elf_type = reloc.reloc_type.elf_type();
+                        let is_pcrel_hi = elf_type == 23; // R_RISCV_PCREL_HI20
+                        let is_got_hi = elf_type == 20;   // R_RISCV_GOT_HI20
+                        let is_tls_gd_hi = elf_type == 22; // R_RISCV_TLS_GD_HI20
+                        let is_tls_got_hi = elf_type == 21; // R_RISCV_TLS_GOT_HI20
+
+                        if is_pcrel_hi || is_got_hi || is_tls_gd_hi || is_tls_got_hi {
+                            // Create synthetic label at the auipc offset
+                            let label = format!(".Lpcrel_hi{}", self.pcrel_hi_counter);
+                            self.pcrel_hi_counter += 1;
+                            let section = self.current_section.clone();
+                            let offset = self.current_offset();
+                            self.labels.insert(label.clone(), (section, offset));
+                            pcrel_hi_label = Some(label);
+
+                            // Always emit as a relocation (never resolve locally)
+                            // so the paired pcrel_lo can also be resolved by the linker.
+                            self.add_reloc(elf_type, reloc.symbol.clone(), reloc.addend);
+                            self.emit_u32_le(*word);
+                            continue;
+                        }
+
+                        let is_pcrel_lo12_i = elf_type == 24; // R_RISCV_PCREL_LO12_I
+                        let is_pcrel_lo12_s = elf_type == 25; // R_RISCV_PCREL_LO12_S
+
+                        if (is_pcrel_lo12_i || is_pcrel_lo12_s) && pcrel_hi_label.is_some() {
+                            // Emit pcrel_lo referencing the synthetic label
+                            let hi_label = pcrel_hi_label.as_ref().unwrap().clone();
+                            self.add_reloc(elf_type, hi_label, 0);
+                            self.emit_u32_le(*word);
+                            continue;
+                        }
+
+                        // Non-pcrel relocation, handle normally
                         let is_local = reloc.symbol.starts_with(".L") || reloc.symbol.starts_with(".l");
                         if is_local {
                             let offset = self.current_offset();
                             self.pending_branch_relocs.push(PendingReloc {
                                 section: self.current_section.clone(),
                                 offset,
-                                reloc_type: reloc.reloc_type.elf_type(),
+                                reloc_type: elf_type,
                                 symbol: reloc.symbol.clone(),
                                 addend: reloc.addend,
+                                pcrel_hi_offset: None,
                             });
                         } else {
-                            self.add_reloc(reloc.reloc_type.elf_type(), reloc.symbol, reloc.addend);
+                            self.add_reloc(elf_type, reloc.symbol.clone(), reloc.addend);
                         }
                     }
-                    self.emit_u32_le(word);
+                    self.emit_u32_le(*word);
                 }
                 Ok(())
             }
@@ -713,7 +778,10 @@ impl ElfWriter {
                 continue;
             }
 
-            let pc_offset = (target_offset as i64) - (reloc.offset as i64) + reloc.addend;
+            // For pcrel_lo12 with a stored pcrel_hi_offset, compute the offset
+            // from the auipc instruction's PC (not the pcrel_lo instruction's PC).
+            let ref_offset = reloc.pcrel_hi_offset.unwrap_or(reloc.offset);
+            let pc_offset = (target_offset as i64) - (ref_offset as i64) + reloc.addend;
 
             if let Some(section) = self.sections.get_mut(&reloc.section) {
                 let instr_offset = reloc.offset as usize;
@@ -799,16 +867,31 @@ impl ElfWriter {
                     }
                     24 => {
                         // R_RISCV_PCREL_LO12_I (ADDI/LD lo12 I-type)
-                        // The addend refers to the AUIPC label, need the lo12 of the same offset
                         if instr_offset + 4 > section.data.len() { continue; }
-                        let lo = ((pc_offset as i32) << 20 >> 20) as u32;
+                        let lo = (pc_offset as i32) & 0xFFF;
                         let mut word = u32::from_le_bytes([
                             section.data[instr_offset],
                             section.data[instr_offset + 1],
                             section.data[instr_offset + 2],
                             section.data[instr_offset + 3],
                         ]);
-                        word = (word & 0xFFFFF) | ((lo & 0xFFF) << 20);
+                        word = (word & 0xFFFFF) | (((lo as u32) & 0xFFF) << 20);
+                        section.data[instr_offset..instr_offset + 4].copy_from_slice(&word.to_le_bytes());
+                    }
+                    25 => {
+                        // R_RISCV_PCREL_LO12_S (SW/SD lo12 S-type)
+                        if instr_offset + 4 > section.data.len() { continue; }
+                        let lo = (pc_offset as i32) & 0xFFF;
+                        let mut word = u32::from_le_bytes([
+                            section.data[instr_offset],
+                            section.data[instr_offset + 1],
+                            section.data[instr_offset + 2],
+                            section.data[instr_offset + 3],
+                        ]);
+                        let imm_lo = (lo as u32) & 0x1F;
+                        let imm_hi = ((lo as u32) >> 5) & 0x7F;
+                        word &= 0x01FFF07F; // Clear imm bits
+                        word |= (imm_hi << 25) | (imm_lo << 7);
                         section.data[instr_offset..instr_offset + 4].copy_from_slice(&word.to_le_bytes());
                     }
                     _ => {
@@ -1103,9 +1186,21 @@ impl ElfWriter {
     }
 
     fn build_symbol_table(&mut self) {
+        // Collect local labels that are referenced by relocations (e.g., synthetic
+        // pcrel_hi labels used by pcrel_lo12 relocations). These must appear in
+        // the symbol table even though they start with ".L".
+        let mut referenced_local_labels: HashMap<String, bool> = HashMap::new();
+        for sec in self.sections.values() {
+            for reloc in &sec.relocs {
+                if reloc.symbol_name.starts_with(".L") || reloc.symbol_name.starts_with(".l") {
+                    referenced_local_labels.insert(reloc.symbol_name.clone(), true);
+                }
+            }
+        }
+
         let labels = self.labels.clone();
         for (name, (section, offset)) in &labels {
-            if name.starts_with(".L") || name.starts_with(".l") {
+            if (name.starts_with(".L") || name.starts_with(".l")) && !referenced_local_labels.contains_key(name) {
                 continue;
             }
 
