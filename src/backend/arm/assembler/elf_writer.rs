@@ -1155,6 +1155,10 @@ impl ElfWriter {
             .collect();
 
         for (name, _) in &referenced {
+            // Skip section names - they already have section symbols in the symtab
+            if self.sections.contains_key(name) {
+                continue;
+            }
             if !defined.contains_key(name) {
                 let binding = if self.weak_symbols.contains_key(name) {
                     STB_WEAK
@@ -1323,23 +1327,55 @@ fn parse_string_literal(s: &str) -> Result<String, String> {
     }
     let inner = &s[1..s.len() - 1];
     let mut result = String::new();
-    let mut chars = inner.chars();
+    let mut chars = inner.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\\' {
             match chars.next() {
                 Some('n') => result.push('\n'),
                 Some('t') => result.push('\t'),
                 Some('r') => result.push('\r'),
-                Some('0') => result.push('\0'),
                 Some('\\') => result.push('\\'),
                 Some('"') => result.push('"'),
-                Some(c) if c.is_ascii_digit() => {
-                    // Octal escape
+                Some('a') => result.push('\x07'),
+                Some('b') => result.push('\x08'),
+                Some('f') => result.push('\x0c'),
+                Some('v') => result.push('\x0b'),
+                Some(c) if c >= '0' && c <= '7' => {
+                    // Octal escape: up to 3 octal digits
                     let mut octal = String::new();
                     octal.push(c);
-                    // Read up to 2 more octal digits
-                    // This is tricky with the chars iterator - simplify
-                    result.push(c); // TODO: proper octal parsing
+                    while octal.len() < 3 {
+                        if let Some(&next) = chars.peek() {
+                            if next >= '0' && next <= '7' {
+                                octal.push(chars.next().unwrap());
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Ok(val) = u8::from_str_radix(&octal, 8) {
+                        result.push(val as char);
+                    }
+                }
+                Some('x') => {
+                    // Hex escape: up to 2 hex digits
+                    let mut hex = String::new();
+                    while hex.len() < 2 {
+                        if let Some(&next) = chars.peek() {
+                            if next.is_ascii_hexdigit() {
+                                hex.push(chars.next().unwrap());
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Ok(val) = u8::from_str_radix(&hex, 16) {
+                        result.push(val as char);
+                    }
                 }
                 Some(c) => {
                     result.push('\\');
