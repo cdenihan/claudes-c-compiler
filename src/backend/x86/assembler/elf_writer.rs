@@ -129,6 +129,9 @@ pub struct ElfWriter {
     current_section: Option<usize>,
     /// Map from label name to (section_index, offset).
     label_positions: HashMap<String, (usize, u64)>,
+    /// All positions for numeric labels (for 1b/1f resolution).
+    /// Maps label name to Vec of (section_index, offset).
+    numeric_label_positions: HashMap<String, Vec<(usize, u64)>>,
     /// Pending symbol attributes (.globl, .type, .size, etc.) that apply to the next label.
     pending_globals: Vec<String>,
     pending_weaks: Vec<String>,
@@ -150,6 +153,7 @@ impl ElfWriter {
             symbol_map: HashMap::new(),
             current_section: None,
             label_positions: HashMap::new(),
+            numeric_label_positions: HashMap::new(),
             pending_globals: Vec::new(),
             pending_weaks: Vec::new(),
             pending_types: HashMap::new(),
@@ -249,6 +253,14 @@ impl ElfWriter {
                 let sec_idx = self.current_section.unwrap();
                 let offset = self.sections[sec_idx].data.len() as u64;
                 self.label_positions.insert(name.clone(), (sec_idx, offset));
+
+                // Track numeric label positions for 1b/1f resolution
+                if name.chars().all(|c| c.is_ascii_digit()) {
+                    self.numeric_label_positions
+                        .entry(name.clone())
+                        .or_insert_with(Vec::new)
+                        .push((sec_idx, offset));
+                }
 
                 // Create/update symbol
                 self.ensure_symbol(name, sec_idx, offset);
@@ -585,7 +597,13 @@ impl ElfWriter {
                     if jump.relaxed {
                         continue;
                     }
-                    if let Some(&target_off) = local_labels.get(&jump.target) {
+                    let target_off_opt = local_labels.get(&jump.target).copied()
+                        .or_else(|| {
+                            // Try numeric label resolution
+                            self.resolve_numeric_label(&jump.target, jump.offset as u64, sec_idx)
+                                .map(|(_, off)| off as usize)
+                        });
+                    if let Some(target_off) = target_off_opt {
                         // Compute displacement from end of the SHORT instruction
                         // Short form is always 2 bytes, so end = jump.offset + 2
                         let short_end = jump.offset as i64 + 2;
@@ -637,6 +655,14 @@ impl ElfWriter {
                             pos.1 -= shrink as u64;
                         }
                     }
+                    // Also update numeric label positions
+                    for (_, positions) in self.numeric_label_positions.iter_mut() {
+                        for pos in positions.iter_mut() {
+                            if pos.0 == sec_idx && (pos.1 as usize) > offset {
+                                pos.1 -= shrink as u64;
+                            }
+                        }
+                    }
 
                     // Update all relocation offsets after this point
                     // Also remove the relocation for this jump (it becomes inline displacement)
@@ -684,7 +710,12 @@ impl ElfWriter {
             let patches: Vec<(usize, u8)> = self.sections[sec_idx].jumps.iter()
                 .filter(|j| j.relaxed)
                 .filter_map(|jump| {
-                    local_labels.get(&jump.target).map(|&target_off| {
+                    let target = local_labels.get(&jump.target).copied()
+                        .or_else(|| {
+                            self.resolve_numeric_label(&jump.target, jump.offset as u64, sec_idx)
+                                .map(|(_, off)| off as usize)
+                        });
+                    target.map(|target_off| {
                         let end_of_instr = jump.offset + 2;
                         let disp = (target_off as i64 - end_of_instr as i64) as i8;
                         (jump.offset + 1, disp as u8)
@@ -716,12 +747,55 @@ impl ElfWriter {
         }
     }
 
+    /// Resolve a numeric label reference like "1b" or "1f".
+    /// Returns the (section_index, offset) of the target label.
+    fn resolve_numeric_label(&self, symbol: &str, reloc_offset: u64, sec_idx: usize) -> Option<(usize, u64)> {
+        let len = symbol.len();
+        if len < 2 {
+            return None;
+        }
+        let suffix = symbol.as_bytes()[len - 1];
+        if suffix != b'b' && suffix != b'f' {
+            return None;
+        }
+        let label_num = &symbol[..len - 1];
+        if !label_num.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+
+        let positions = self.numeric_label_positions.get(label_num)?;
+        if suffix == b'b' {
+            // Backward: find the nearest label BEFORE (or at) reloc_offset in the same section
+            let mut best: Option<(usize, u64)> = None;
+            for &(s_idx, off) in positions {
+                if s_idx == sec_idx && off <= reloc_offset {
+                    if best.is_none() || off > best.unwrap().1 {
+                        best = Some((s_idx, off));
+                    }
+                }
+            }
+            best
+        } else {
+            // Forward: find the nearest label AFTER reloc_offset in the same section
+            let mut best: Option<(usize, u64)> = None;
+            for &(s_idx, off) in positions {
+                if s_idx == sec_idx && off > reloc_offset {
+                    if best.is_none() || off < best.unwrap().1 {
+                        best = Some((s_idx, off));
+                    }
+                }
+            }
+            best
+        }
+    }
+
     /// Resolve relocations that reference internal labels (same-section).
     /// Only resolves relocations for local symbols; global/weak symbols
     /// keep their relocations so the linker can handle interposition/PLT.
     fn resolve_internal_relocations(&mut self) {
         for sec_idx in 0..self.sections.len() {
             let mut resolved = Vec::new();
+            let mut pc8_patches: Vec<(usize, u8)> = Vec::new();
             let mut unresolved = Vec::new();
 
             for reloc in &self.sections[sec_idx].relocations {
@@ -746,8 +820,22 @@ impl ElfWriter {
                     continue;
                 }
 
-                if let Some(&(target_sec, target_off)) = self.label_positions.get(&reloc.symbol) {
+                // Try regular label lookup first, then numeric label resolution (1b, 1f, etc.)
+                let label_pos = self.label_positions.get(&reloc.symbol).copied()
+                    .or_else(|| self.resolve_numeric_label(&reloc.symbol, reloc.offset, sec_idx));
+                if let Some((target_sec, target_off)) = label_pos {
                     let is_local = self.is_local_symbol(&reloc.symbol);
+
+                    // Handle internal PC8 relocations (loop/jrcxz)
+                    if reloc.reloc_type == R_X86_64_PC8_INTERNAL && target_sec == sec_idx {
+                        let rel = (target_off as i64) + reloc.addend - (reloc.offset as i64);
+                        if rel >= -128 && rel <= 127 {
+                            pc8_patches.push((reloc.offset as usize, rel as u8));
+                        }
+                        // Either way, don't keep as unresolved
+                        continue;
+                    }
+
                     if target_sec == sec_idx && is_local
                         && (reloc.reloc_type == R_X86_64_PC32 || reloc.reloc_type == R_X86_64_PLT32)
                     {
@@ -770,6 +858,10 @@ impl ElfWriter {
             for (offset, value) in resolved {
                 let bytes = value.to_le_bytes();
                 self.sections[sec_idx].data[offset..offset + 4].copy_from_slice(&bytes);
+            }
+            // Patch PC8 relocations (single-byte patches for loop/jrcxz)
+            for (offset, value) in pc8_patches {
+                self.sections[sec_idx].data[offset] = value;
             }
 
             self.sections[sec_idx].relocations = unresolved;

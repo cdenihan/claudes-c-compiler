@@ -220,7 +220,7 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmItem>, String> {
                 continue;
             }
             match parse_line(part) {
-                Ok(item) => items.push(item),
+                Ok(parsed_items) => items.extend(parsed_items),
                 Err(e) => {
                     return Err(format!("line {}: {}: '{}'", line_num, e, part));
                 }
@@ -286,30 +286,37 @@ fn strip_comment(line: &str) -> &str {
 }
 
 /// Parse a single non-empty assembly line.
-fn parse_line(line: &str) -> Result<AsmItem, String> {
+fn parse_line(line: &str) -> Result<Vec<AsmItem>, String> {
     // Check for label (ends with ':' and doesn't start with '.')
     // Labels can be: `name:`, `.LBB42:`, `1:` (numeric labels)
-    if let Some(label) = try_parse_label(line) {
-        return Ok(AsmItem::Label(label));
+    // Labels can also be followed by an instruction: `1: movl $1, %ecx`
+    if let Some((label, rest)) = try_parse_label(line) {
+        let mut items = vec![AsmItem::Label(label)];
+        if !rest.is_empty() {
+            // Parse the rest as an instruction following the label
+            items.extend(parse_line(rest)?);
+        }
+        return Ok(items);
     }
 
     // Check for directive (starts with '.')
     let trimmed = line.trim();
     if trimmed.starts_with('.') {
-        return parse_directive(trimmed);
+        return Ok(vec![parse_directive(trimmed)?]);
     }
 
     // Check for instruction with prefix
-    if trimmed.starts_with("lock ") || trimmed.starts_with("rep ") || trimmed.starts_with("repz ") || trimmed.starts_with("repnz ") {
-        return parse_prefixed_instruction(trimmed);
+    if trimmed.starts_with("lock ") || trimmed.starts_with("rep ") || trimmed.starts_with("repe ") || trimmed.starts_with("repz ") || trimmed.starts_with("repnz ") || trimmed.starts_with("repne ") {
+        return Ok(vec![parse_prefixed_instruction(trimmed)?]);
     }
 
     // Regular instruction
-    parse_instruction(trimmed, None)
+    Ok(vec![parse_instruction(trimmed, None)?])
 }
 
-/// Try to parse a label definition. Returns the label name if successful.
-fn try_parse_label(line: &str) -> Option<String> {
+/// Try to parse a label definition. Returns (label_name, rest_of_line) if successful.
+/// rest_of_line is non-empty when a label is followed by an instruction (e.g., "1: movl $1, %ecx").
+fn try_parse_label(line: &str) -> Option<(String, &str)> {
     let trimmed = line.trim();
     // A label is at the end of the line (or followed by whitespace/instruction)
     if let Some(colon_pos) = trimmed.find(':') {
@@ -322,11 +329,8 @@ fn try_parse_label(line: &str) -> Option<String> {
             && !candidate.starts_with('$')
             && !candidate.starts_with('%')
         {
-            // Make sure the colon is at the end (or followed by only whitespace/comment)
             let rest = trimmed[colon_pos + 1..].trim();
-            if rest.is_empty() {
-                return Some(candidate.to_string());
-            }
+            return Some((candidate.to_string(), rest));
         }
     }
     None
@@ -935,6 +939,62 @@ fn parse_integer_expr(s: &str) -> Result<i64, String> {
     let s = s.trim();
     if s.is_empty() {
         return Err("empty integer".to_string());
+    }
+
+    // Handle ~ (bitwise NOT) prefix
+    if s.starts_with('~') {
+        let inner = parse_integer_expr(&s[1..])?;
+        return Ok(!inner);
+    }
+
+    // Handle parenthesized expressions
+    if s.starts_with('(') && s.ends_with(')') {
+        return parse_integer_expr(&s[1..s.len()-1]);
+    }
+
+    // Try simple arithmetic: look for + or - (not at position 0) at the top level
+    // Scan right-to-left to maintain left-to-right associativity
+    {
+        let mut paren_depth = 0i32;
+        let bytes = s.as_bytes();
+        let mut i = bytes.len() as isize - 1;
+        while i > 0 {
+            let c = bytes[i as usize];
+            if c == b')' { paren_depth += 1; }
+            else if c == b'(' { paren_depth -= 1; }
+            else if paren_depth == 0 && (c == b'+' || c == b'-') {
+                let left = s[..i as usize].trim();
+                let right = s[i as usize + 1..].trim();
+                if !left.is_empty() && !right.is_empty() {
+                    if let (Ok(l), Ok(r)) = (parse_integer_expr(left), parse_integer_expr(right)) {
+                        return Ok(if c == b'+' { l + r } else { l - r });
+                    }
+                }
+            }
+            i -= 1;
+        }
+    }
+
+    // Handle * for multiplication (scan right-to-left)
+    {
+        let mut paren_depth = 0i32;
+        let bytes = s.as_bytes();
+        let mut i = bytes.len() as isize - 1;
+        while i > 0 {
+            let c = bytes[i as usize];
+            if c == b')' { paren_depth += 1; }
+            else if c == b'(' { paren_depth -= 1; }
+            else if paren_depth == 0 && c == b'*' {
+                let left = s[..i as usize].trim();
+                let right = s[i as usize + 1..].trim();
+                if !left.is_empty() && !right.is_empty() {
+                    if let (Ok(l), Ok(r)) = (parse_integer_expr(left), parse_integer_expr(right)) {
+                        return Ok(l * r);
+                    }
+                }
+            }
+            i -= 1;
+        }
     }
 
     // Try parsing the entire string first (handles i64::MIN correctly)
