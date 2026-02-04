@@ -1,0 +1,14 @@
+Fix ARM assembler: extended register and shifted register addressing modes
+
+The ARM assembler fails to encode instructions with register offsets that include
+extend/shift specifiers. This breaks switch/jump table compilation with MY_ASM=builtin.
+
+Issues to fix:
+1. Parser: [base, Xm, lsl #N] and [base, Wm, sxtw] memory operands not parsed correctly
+   - The second comma inside brackets is not recognized as part of the memory operand
+   - extend/shift info is lost in the MemRegOffset operand
+2. Encoder: ldr/str with register offset + shift/extend not handled
+3. Encoder: add/sub with extended register (e.g., add x17, x17, w16, sxtw) not handled
+4. Parser: sxtw/uxtw/sxtb/sxth/etc. not recognized as extend specifiers in operand parsing
+5. Symbol difference expressions (.word A - B) need proper relocation pairs
+6. .bss default section type should be @nobits
