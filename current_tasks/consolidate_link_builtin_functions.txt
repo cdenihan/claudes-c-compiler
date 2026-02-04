@@ -1,0 +1,13 @@
+Consolidate 5 near-identical link_builtin_* functions in common.rs into a single generic function.
+
+The functions link_builtin_x86, link_builtin_i686, link_builtin_aarch64, link_builtin_riscv,
+and link_builtin_riscv_shared duplicate ~210 lines with only minor variations:
+- Which DirectLdArchConfig constant to use
+- Which extra libraries to add (gcc_eh/gcc_s)
+- Whether shared library output is supported
+- Slight API differences in per-arch linker::link_builtin signatures
+
+Also:
+- Replace magic ELF machine numbers (62, 243, 183, 3) with named constants from elf.rs
+- Clean up link_with_args dispatch to be less verbose
+- Remove unnecessary #[allow(dead_code)] where possible
