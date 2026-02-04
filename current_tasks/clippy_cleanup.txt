@@ -1,0 +1,8 @@
+Fix all clippy warnings across the codebase to achieve a clean build.
+This includes:
+- Dead code warnings (unused functions, structs, enums, variants, fields)
+- Redundant field names in struct initialization
+- Unnecessary casts
+- Code style issues (collapsed if, map_or simplification, etc.)
+- Unreachable patterns
+- Other misc clippy lints
