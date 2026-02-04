@@ -1,0 +1,7 @@
+Task: Get FFmpeg compiling and working with ccc-arm (AArch64 backend)
+
+FFmpeg currently compiles and passes all checkasm tests on x86-64.
+This task is to:
+1. Get FFmpeg configure + make working with ccc-arm
+2. Fix any ARM-specific compilation/codegen issues
+3. Verify resulting binaries work via QEMU
