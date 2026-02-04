@@ -1,0 +1,9 @@
+Add big WARNING messages when MY_ASM/MY_LD are not set and the compiler
+falls back to calling GCC-backed assembler or linker.
+
+The warnings should be loud and obvious so developers immediately notice
+when they're not using the builtin assembler/linker.
+
+Files to modify:
+- src/backend/common.rs (assemble_with_extra, link_with_args GCC paths)
+- src/driver/external_tools.rs (assemble_source_file GCC path)
