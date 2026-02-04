@@ -168,10 +168,14 @@ pass pipeline:
 
 For architecture-specific details, see:
 
-- [`x86/README.md`](x86/README.md) -- x86-64 (SysV AMD64 ABI)
-- [`i686/README.md`](i686/README.md) -- i686 (cdecl, ILP32)
-- [`arm/README.md`](arm/README.md) -- AArch64 (AAPCS64)
-- [`riscv/README.md`](riscv/README.md) -- RISC-V 64 (LP64D)
+| Architecture | Overview | Code Generation | Assembler | Linker |
+|-------------|----------|----------------|-----------|--------|
+| x86-64 | [`x86/README.md`](x86/README.md) | [`x86/codegen/README.md`](x86/codegen/README.md) | [`x86/assembler/README.md`](x86/assembler/README.md) | [`x86/linker/README.md`](x86/linker/README.md) |
+| i686 | [`i686/README.md`](i686/README.md) | [`i686/codegen/README.md`](i686/codegen/README.md) | [`i686/assembler/README.md`](i686/assembler/README.md) | [`i686/linker/README.md`](i686/linker/README.md) |
+| AArch64 | [`arm/README.md`](arm/README.md) | [`arm/codegen/README.md`](arm/codegen/README.md) | [`arm/assembler/README.md`](arm/assembler/README.md) | [`arm/linker/README.md`](arm/linker/README.md) |
+| RISC-V 64 | [`riscv/README.md`](riscv/README.md) | [`riscv/codegen/README.md`](riscv/codegen/README.md) | [`riscv/assembler/README.md`](riscv/assembler/README.md) | [`riscv/linker/README.md`](riscv/linker/README.md) |
+
+The x86-64 peephole optimizer has its own detailed documentation: [`x86/codegen/peephole/README.md`](x86/codegen/peephole/README.md).
 
 ---
 

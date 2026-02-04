@@ -367,9 +367,11 @@ Each compiler subsystem has its own detailed design document:
 
 Per-architecture backend documentation:
 
-| Architecture | README |
-|-------------|--------|
-| x86-64 | [`src/backend/x86/README.md`](src/backend/x86/README.md) |
-| i686 | [`src/backend/i686/README.md`](src/backend/i686/README.md) |
-| AArch64 | [`src/backend/arm/README.md`](src/backend/arm/README.md) |
-| RISC-V 64 | [`src/backend/riscv/README.md`](src/backend/riscv/README.md) |
+| Architecture | Overview | Code Generation | Assembler | Linker |
+|-------------|----------|----------------|-----------|--------|
+| x86-64 | [`x86/README.md`](src/backend/x86/README.md) | [`x86/codegen/README.md`](src/backend/x86/codegen/README.md) | [`x86/assembler/README.md`](src/backend/x86/assembler/README.md) | [`x86/linker/README.md`](src/backend/x86/linker/README.md) |
+| i686 | [`i686/README.md`](src/backend/i686/README.md) | [`i686/codegen/README.md`](src/backend/i686/codegen/README.md) | [`i686/assembler/README.md`](src/backend/i686/assembler/README.md) | [`i686/linker/README.md`](src/backend/i686/linker/README.md) |
+| AArch64 | [`arm/README.md`](src/backend/arm/README.md) | [`arm/codegen/README.md`](src/backend/arm/codegen/README.md) | [`arm/assembler/README.md`](src/backend/arm/assembler/README.md) | [`arm/linker/README.md`](src/backend/arm/linker/README.md) |
+| RISC-V 64 | [`riscv/README.md`](src/backend/riscv/README.md) | [`riscv/codegen/README.md`](src/backend/riscv/codegen/README.md) | [`riscv/assembler/README.md`](src/backend/riscv/assembler/README.md) | [`riscv/linker/README.md`](src/backend/riscv/linker/README.md) |
+
+The x86-64 peephole optimizer has its own detailed documentation: [`src/backend/x86/codegen/peephole/README.md`](src/backend/x86/codegen/peephole/README.md).
