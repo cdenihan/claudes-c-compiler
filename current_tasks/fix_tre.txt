@@ -1,0 +1,3 @@
+Fixing tre project: test-limits segfaults when compiled with ccc-x86.
+The segfault occurs at iteration 16 of the test-limits program.
+This is a codegen/frontend bug (same issue with and without builtin asm/ld).
