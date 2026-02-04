@@ -1,0 +1,9 @@
+Fix x86 linker COPY relocation for weak alias symbols (e.g. environ -> __environ)
+
+When the linker creates a COPY relocation for a symbol that is a WEAK alias
+in a shared library (like `environ` which is a weak alias for `__environ` in libc),
+we need to also emit the canonical GLOBAL name in the dynamic symbol table.
+Otherwise, the shared library's internal references to the GLOBAL name won't
+be redirected to our BSS copy, causing NULL pointer crashes.
+
+Test case: dash shell (uses `environ` which is weak alias of `__environ` in glibc)
