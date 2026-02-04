@@ -15,3 +15,6 @@ Tracking project build/test results with MY_ASM=builtin MY_LD=builtin
 | chibicc | PASS | TODO | TODO | TODO | Passes x86 |
 | QuickJS | PASS | TODO | TODO | TODO | Passes x86 |
 | monocypher | PASS | PASS | PASS | PASS | Fixed ARM asm: symbol names matching register names (e.g. x16) |
+| sundown | PASS | PASS | PASS | PASS | All architectures pass out of the box |
+| termbox | PASS | PASS | PASS | PASS | All architectures pass out of the box |
+| dash    | PASS | FAIL | PASS | FAIL | Fixed x86: COPY reloc weak alias resolution (environ/__environ) |

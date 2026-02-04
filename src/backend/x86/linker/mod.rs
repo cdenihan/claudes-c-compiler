@@ -47,13 +47,16 @@ struct GlobalSymbol {
     size: u64,
     info: u8,
     defined_in: Option<usize>,
-    #[allow(dead_code)]
     from_lib: Option<String>,
     plt_idx: Option<usize>,
     got_idx: Option<usize>,
     section_idx: u16,
     is_dynamic: bool,
     copy_reloc: bool,
+    /// For dynamic symbols from shared libraries: the symbol's value (address)
+    /// in the shared library. Used to identify aliases (multiple names at the
+    /// same address, e.g., `environ` and `__environ` in libc).
+    lib_sym_value: u64,
 }
 
 fn map_section_name(name: &str) -> String {
@@ -338,7 +341,7 @@ fn register_symbols(obj_idx: usize, obj: &ElfObject, globals: &mut HashMap<Strin
                     value: sym.value, size: sym.size, info: sym.info,
                     defined_in: Some(obj_idx), from_lib: None,
                     plt_idx: None, got_idx: None,
-                    section_idx: sym.shndx, is_dynamic: false, copy_reloc: false,
+                    section_idx: sym.shndx, is_dynamic: false, copy_reloc: false, lib_sym_value: 0,
                 });
             }
         } else if sym.shndx == SHN_COMMON {
@@ -347,7 +350,7 @@ fn register_symbols(obj_idx: usize, obj: &ElfObject, globals: &mut HashMap<Strin
                     value: sym.value, size: sym.size, info: sym.info,
                     defined_in: Some(obj_idx), from_lib: None,
                     plt_idx: None, got_idx: None,
-                    section_idx: SHN_COMMON, is_dynamic: false, copy_reloc: false,
+                    section_idx: SHN_COMMON, is_dynamic: false, copy_reloc: false, lib_sym_value: 0,
                 });
             }
         } else if !globals.contains_key(&sym.name) {
@@ -355,7 +358,7 @@ fn register_symbols(obj_idx: usize, obj: &ElfObject, globals: &mut HashMap<Strin
                 value: 0, size: 0, info: sym.info,
                 defined_in: None, from_lib: None,
                 plt_idx: None, got_idx: None,
-                section_idx: SHN_UNDEF, is_dynamic: false, copy_reloc: false,
+                section_idx: SHN_UNDEF, is_dynamic: false, copy_reloc: false, lib_sym_value: 0,
             });
         }
     }
@@ -390,6 +393,8 @@ fn load_shared_library(
     if !needed_sonames.contains(&soname) { needed_sonames.push(soname.clone()); }
 
     let dyn_syms = parse_shared_library_symbols(&data, path)?;
+    // First pass: match undefined symbols against shared library exports
+    let mut matched_weak_objects: Vec<(u64, u64)> = Vec::new(); // (value, size) of matched WEAK STT_OBJECT syms
     for dsym in &dyn_syms {
         if let Some(existing) = globals.get(&dsym.name) {
             if existing.defined_in.is_none() && !existing.is_dynamic {
@@ -397,8 +402,36 @@ fn load_shared_library(
                     value: 0, size: dsym.size, info: dsym.info,
                     defined_in: None, from_lib: Some(soname.clone()),
                     plt_idx: None, got_idx: None,
-                    section_idx: SHN_UNDEF, is_dynamic: true, copy_reloc: false,
+                    section_idx: SHN_UNDEF, is_dynamic: true, copy_reloc: false, lib_sym_value: dsym.value,
                 });
+                // If this is a WEAK STT_OBJECT, we need to also register any GLOBAL
+                // aliases at the same address. This ensures COPY relocations work
+                // correctly (e.g., `environ` is WEAK, `__environ` is GLOBAL in libc;
+                // both must be in our dynsym so the dynamic linker redirects all refs).
+                let bind = dsym.info >> 4;
+                let stype = dsym.info & 0xf;
+                if bind == STB_WEAK && stype == STT_OBJECT {
+                    if !matched_weak_objects.contains(&(dsym.value, dsym.size)) {
+                        matched_weak_objects.push((dsym.value, dsym.size));
+                    }
+                }
+            }
+        }
+    }
+    // Second pass: register all aliases for any matched WEAK STT_OBJECT symbols
+    if !matched_weak_objects.is_empty() {
+        for dsym in &dyn_syms {
+            let stype = dsym.info & 0xf;
+            if stype == STT_OBJECT && matched_weak_objects.contains(&(dsym.value, dsym.size)) {
+                if !globals.contains_key(&dsym.name) {
+                    // Register the alias (e.g. __environ for environ)
+                    globals.insert(dsym.name.clone(), GlobalSymbol {
+                        value: 0, size: dsym.size, info: dsym.info,
+                        defined_in: None, from_lib: Some(soname.clone()),
+                        plt_idx: None, got_idx: None,
+                        section_idx: SHN_UNDEF, is_dynamic: true, copy_reloc: false, lib_sym_value: dsym.value,
+                    });
+                }
             }
         }
     }
@@ -451,6 +484,7 @@ fn resolve_dynamic_symbols(
         let dyn_syms = match parse_shared_library_symbols(&data, lib_path) { Ok(s) => s, Err(_) => continue };
 
         let mut lib_needed = false;
+        let mut matched_weak_objects: Vec<(u64, u64)> = Vec::new();
         for dsym in &dyn_syms {
             if let Some(existing) = globals.get(&dsym.name) {
                 if existing.defined_in.is_none() && !existing.is_dynamic {
@@ -459,8 +493,33 @@ fn resolve_dynamic_symbols(
                         value: 0, size: dsym.size, info: dsym.info,
                         defined_in: None, from_lib: Some(soname.clone()),
                         plt_idx: None, got_idx: None,
-                        section_idx: SHN_UNDEF, is_dynamic: true, copy_reloc: false,
+                        section_idx: SHN_UNDEF, is_dynamic: true, copy_reloc: false, lib_sym_value: dsym.value,
                     });
+                    // Track WEAK STT_OBJECT matches for alias registration
+                    let bind = dsym.info >> 4;
+                    let stype = dsym.info & 0xf;
+                    if bind == STB_WEAK && stype == STT_OBJECT {
+                        if !matched_weak_objects.contains(&(dsym.value, dsym.size)) {
+                            matched_weak_objects.push((dsym.value, dsym.size));
+                        }
+                    }
+                }
+            }
+        }
+        // Register all aliases for matched WEAK STT_OBJECT symbols
+        if !matched_weak_objects.is_empty() {
+            for dsym in &dyn_syms {
+                let stype = dsym.info & 0xf;
+                if stype == STT_OBJECT && matched_weak_objects.contains(&(dsym.value, dsym.size)) {
+                    if !globals.contains_key(&dsym.name) {
+                        lib_needed = true;
+                        globals.insert(dsym.name.clone(), GlobalSymbol {
+                            value: 0, size: dsym.size, info: dsym.info,
+                            defined_in: None, from_lib: Some(soname.clone()),
+                            plt_idx: None, got_idx: None,
+                            section_idx: SHN_UNDEF, is_dynamic: true, copy_reloc: false, lib_sym_value: dsym.value,
+                        });
+                    }
                 }
             }
         }
@@ -640,10 +699,40 @@ fn create_plt_got(
         }
     }
 
-    // Mark copy relocation symbols
+    // Mark copy relocation symbols and their aliases.
+    // When a symbol like `environ` (WEAK) needs a COPY relocation, we must also
+    // mark aliases like `__environ` (GLOBAL) at the same shared library address.
+    // This ensures the dynamic linker redirects all references to our BSS copy.
+    let mut copy_reloc_lib_addrs: Vec<(String, u64)> = Vec::new(); // (from_lib, lib_sym_value)
     for name in &copy_reloc_names {
         if let Some(gsym) = globals.get_mut(name) {
             gsym.copy_reloc = true;
+            if let Some(ref lib) = gsym.from_lib {
+                if (gsym.info & 0xf) == STT_OBJECT && gsym.lib_sym_value != 0 {
+                    let key = (lib.clone(), gsym.lib_sym_value);
+                    if !copy_reloc_lib_addrs.contains(&key) {
+                        copy_reloc_lib_addrs.push(key);
+                    }
+                }
+            }
+        }
+    }
+    // Also mark aliases (other dynamic STT_OBJECT symbols at the same library address)
+    if !copy_reloc_lib_addrs.is_empty() {
+        let alias_names: Vec<String> = globals.iter()
+            .filter(|(name, g)| {
+                g.is_dynamic && !g.copy_reloc && (g.info & 0xf) == STT_OBJECT
+                    && !copy_reloc_names.contains(name)
+                    && g.from_lib.is_some() && g.lib_sym_value != 0
+                    && copy_reloc_lib_addrs.contains(
+                        &(g.from_lib.as_ref().unwrap().clone(), g.lib_sym_value))
+            })
+            .map(|(n, _)| n.clone())
+            .collect();
+        for name in alias_names {
+            if let Some(gsym) = globals.get_mut(&name) {
+                gsym.copy_reloc = true;
+            }
         }
     }
 
@@ -958,12 +1047,30 @@ fn emit_executable(
         }
     }
 
-    // Allocate BSS space for copy-relocated symbols
+    // Allocate BSS space for copy-relocated symbols.
+    // Symbols that are aliases (same from_lib + lib_sym_value) share the same BSS slot.
+    let mut copy_reloc_addr_map: HashMap<(String, u64), u64> = HashMap::new(); // (lib, lib_value) -> bss_addr
     for (name, size) in &copy_reloc_syms {
-        let aligned = (bss_addr + bss_size + 7) & !7; // 8-byte align
-        bss_size = aligned - bss_addr + size;
+        let gsym = globals.get(name).cloned();
+        let key = gsym.as_ref().and_then(|g| {
+            g.from_lib.as_ref().map(|lib| (lib.clone(), g.lib_sym_value))
+        });
+        let addr = if let Some(ref k) = key {
+            if let Some(&existing_addr) = copy_reloc_addr_map.get(k) {
+                existing_addr // reuse existing BSS slot for alias
+            } else {
+                let aligned = (bss_addr + bss_size + 7) & !7;
+                bss_size = aligned - bss_addr + size;
+                copy_reloc_addr_map.insert(k.clone(), aligned);
+                aligned
+            }
+        } else {
+            let aligned = (bss_addr + bss_size + 7) & !7;
+            bss_size = aligned - bss_addr + size;
+            aligned
+        };
         if let Some(gsym) = globals.get_mut(name) {
-            gsym.value = aligned;
+            gsym.value = addr;
             gsym.defined_in = Some(usize::MAX); // sentinel: defined via copy reloc
         }
     }
@@ -1005,7 +1112,7 @@ fn emit_executable(
         let entry = globals.entry(name.to_string()).or_insert(GlobalSymbol {
             value: 0, size: 0, info: (STB_GLOBAL << 4),
             defined_in: None, from_lib: None, plt_idx: None, got_idx: None,
-            section_idx: SHN_ABS, is_dynamic: false, copy_reloc: false,
+            section_idx: SHN_ABS, is_dynamic: false, copy_reloc: false, lib_sym_value: 0,
         });
         if entry.defined_in.is_none() && !entry.is_dynamic {
             entry.value = value;
