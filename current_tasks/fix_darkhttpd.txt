@@ -1,0 +1,3 @@
+Fix darkhttpd project: i686 linker fails on output to /dev/null due to
+set_permissions error propagation. All other arches (x86, arm, riscv) pass.
+Fix: ignore set_permissions errors like other backends do.
