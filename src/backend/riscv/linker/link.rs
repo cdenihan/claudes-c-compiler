@@ -195,7 +195,7 @@ pub fn link_builtin(
 
     // ── Phase 1: Read all input object files ────────────────────────────
 
-    let mut input_objs: Vec<(String, ObjFile)> = Vec::new();
+    let mut input_objs: Vec<(String, ElfObject)> = Vec::new();
 
     for path in &all_inputs {
         if !std::path::Path::new(path).exists() {
@@ -210,7 +210,7 @@ pub fn link_builtin(
                 .map_err(|e| format!("{}: {}", path, e))?;
             input_objs.extend(members);
         } else if data.len() >= 4 && &data[0..4] == b"\x7fELF" {
-            let obj = parse_obj(&data)
+            let obj = parse_object(&data, path)
                 .map_err(|e| format!("{}: {}", path, e))?;
             input_objs.push((path.clone(), obj));
         }
@@ -225,14 +225,14 @@ pub fn link_builtin(
 
     for (_, obj) in &input_objs {
         for sym in &obj.symbols {
-            if sym.section_idx != SHN_UNDEF && sym.binding != STB_LOCAL && !sym.name.is_empty() {
+            if sym.shndx != SHN_UNDEF && sym.binding() != STB_LOCAL && !sym.name.is_empty() {
                 defined_syms.insert(sym.name.clone());
             }
         }
     }
     for (_, obj) in &input_objs {
         for sym in &obj.symbols {
-            if sym.section_idx == SHN_UNDEF && !sym.name.is_empty() && sym.binding != STB_LOCAL
+            if sym.shndx == SHN_UNDEF && !sym.name.is_empty() && sym.binding() != STB_LOCAL
                 && !defined_syms.contains(&sym.name) {
                     undefined_syms.insert(sym.name.clone());
                 }
@@ -241,7 +241,7 @@ pub fn link_builtin(
 
     // ── Phase 1b: Discover shared library symbols ─────────────────────
 
-    let mut shared_lib_syms: HashMap<String, SharedSymInfo> = HashMap::new();
+    let mut shared_lib_syms: HashMap<String, DynSymbol> = HashMap::new();
     let mut actual_needed_libs: Vec<String> = Vec::new();
 
     if !is_static {
@@ -471,10 +471,12 @@ pub fn link_builtin(
                 continue;
             }
 
-            let out_name = match output_section_name(&sec.name, sec.sh_type, sec.sh_flags) {
+            let out_name = match output_section_name(&sec.name, sec.sh_type, sec.flags) {
                 Some(n) => n,
                 None => continue,
             };
+
+            let sec_data = &obj.section_data[sec_idx];
 
             // Skip .riscv.attributes and .note.* for merging (handled separately)
             if out_name == ".riscv.attributes" || out_name.starts_with(".note.") {
@@ -489,10 +491,10 @@ pub fn link_builtin(
                     merged_sections.push(MergedSection {
                         name: out_name.clone(),
                         sh_type: sec.sh_type,
-                        sh_flags: sec.sh_flags,
-                        data: sec.data.clone(),
+                        sh_flags: sec.flags,
+                        data: sec_data.clone(),
                         vaddr: 0,
-                        align: sec.sh_addralign.max(1),
+                        align: sec.addralign.max(1),
                     });
                     input_sec_refs.push(InputSecRef {
                         obj_idx,
@@ -513,21 +515,21 @@ pub fn link_builtin(
                 merged_sections.push(MergedSection {
                     name: out_name.clone(),
                     sh_type: if is_bss { SHT_NOBITS } else { sec.sh_type },
-                    sh_flags: sec.sh_flags,
+                    sh_flags: sec.flags,
                     data: Vec::new(),
                     vaddr: 0,
-                    align: sec.sh_addralign.max(1),
+                    align: sec.addralign.max(1),
                 });
                 idx
             };
 
             let ms = &mut merged_sections[merged_idx];
             // Update flags (union of all inputs)
-            ms.sh_flags |= sec.sh_flags & (SHF_WRITE | SHF_ALLOC | SHF_EXECINSTR | SHF_TLS);
-            ms.align = ms.align.max(sec.sh_addralign.max(1));
+            ms.sh_flags |= sec.flags & (SHF_WRITE | SHF_ALLOC | SHF_EXECINSTR | SHF_TLS);
+            ms.align = ms.align.max(sec.addralign.max(1));
 
             // Align data
-            let align = sec.sh_addralign.max(1) as usize;
+            let align = sec.addralign.max(1) as usize;
             let cur_len = ms.data.len();
             let aligned = (cur_len + align - 1) & !(align - 1);
             if aligned > cur_len {
@@ -537,10 +539,10 @@ pub fn link_builtin(
 
             // Append section data
             if sec.sh_type == SHT_NOBITS {
-                // For BSS, just extend with zeros
-                ms.data.resize(ms.data.len() + sec.data.len(), 0);
+                // For BSS, just extend with zeros (use section size since NOBITS has no data)
+                ms.data.resize(ms.data.len() + sec.size as usize, 0);
             } else {
-                ms.data.extend_from_slice(&sec.data);
+                ms.data.extend_from_slice(sec_data);
             }
 
             input_sec_refs.push(InputSecRef {
@@ -565,17 +567,17 @@ pub fn link_builtin(
     // First pass: define symbols
     for (obj_idx, (_, obj)) in input_objs.iter().enumerate() {
         for sym in &obj.symbols {
-            if sym.name.is_empty() || sym.binding == STB_LOCAL {
+            if sym.name.is_empty() || sym.binding() == STB_LOCAL {
                 continue;
             }
-            if sym.section_idx == SHN_UNDEF {
+            if sym.shndx == SHN_UNDEF {
                 // Just register as undefined if not yet defined
                 global_syms.entry(sym.name.clone()).or_insert_with(|| GlobalSym {
                     value: 0,
                     size: 0,
-                    binding: sym.binding,
-                    sym_type: sym.sym_type,
-                    visibility: sym.visibility,
+                    binding: sym.binding(),
+                    sym_type: sym.sym_type(),
+                    visibility: sym.visibility(),
                     defined: false,
                     needs_plt: false,
                     plt_idx: 0,
@@ -585,34 +587,34 @@ pub fn link_builtin(
                 continue;
             }
 
-            let sec_idx = sym.section_idx as usize;
+            let sec_idx = sym.shndx as usize;
             let (merged_idx, offset) = match sec_mapping.get(&(obj_idx, sec_idx)) {
                 Some(&v) => v,
                 None => {
-                    if sym.section_idx == SHN_ABS {
+                    if sym.shndx == SHN_ABS {
                         // Absolute symbol
                         let entry = global_syms.entry(sym.name.clone()).or_insert_with(|| GlobalSym {
                             value: sym.value,
                             size: sym.size,
-                            binding: sym.binding,
-                            sym_type: sym.sym_type,
-                            visibility: sym.visibility,
+                            binding: sym.binding(),
+                            sym_type: sym.sym_type(),
+                            visibility: sym.visibility(),
                             defined: true,
                             needs_plt: false,
                             plt_idx: 0,
                             got_offset: None,
                             section_idx: None,
                         });
-                        if !entry.defined || (entry.binding == STB_WEAK && sym.binding == STB_GLOBAL) {
+                        if !entry.defined || (entry.binding == STB_WEAK && sym.binding() == STB_GLOBAL) {
                             entry.value = sym.value;
                             entry.size = sym.size;
-                            entry.binding = sym.binding;
-                            entry.sym_type = sym.sym_type;
+                            entry.binding = sym.binding();
+                            entry.sym_type = sym.sym_type();
                             entry.defined = true;
                         }
                         continue;
                     }
-                    if sym.section_idx == SHN_COMMON {
+                    if sym.shndx == SHN_COMMON {
                         // COMMON symbol: allocate in .bss
                         let bss_idx = *merged_map.entry(".bss".into()).or_insert_with(|| {
                             let idx = merged_sections.len();
@@ -636,15 +638,15 @@ pub fn link_builtin(
                         ms.align = ms.align.max(align as u64);
 
                         let entry = global_syms.entry(sym.name.clone()).or_insert_with(|| GlobalSym {
-                            value: off, size: sym.size, binding: sym.binding,
-                            sym_type: STT_OBJECT, visibility: sym.visibility,
+                            value: off, size: sym.size, binding: sym.binding(),
+                            sym_type: STT_OBJECT, visibility: sym.visibility(),
                             defined: true, needs_plt: false, plt_idx: 0,
                             got_offset: None, section_idx: Some(bss_idx),
                         });
-                        if !entry.defined || (entry.binding == STB_WEAK && sym.binding == STB_GLOBAL) {
+                        if !entry.defined || (entry.binding == STB_WEAK && sym.binding() == STB_GLOBAL) {
                             entry.value = off; // Will be fixed up when vaddr is assigned
                             entry.size = sym.size.max(entry.size); // Use largest size
-                            entry.binding = sym.binding;
+                            entry.binding = sym.binding();
                             entry.defined = true;
                             entry.section_idx = Some(bss_idx);
                         }
@@ -655,22 +657,22 @@ pub fn link_builtin(
             };
 
             let entry = global_syms.entry(sym.name.clone()).or_insert_with(|| GlobalSym {
-                value: 0, size: sym.size, binding: sym.binding,
-                sym_type: sym.sym_type, visibility: sym.visibility,
+                value: 0, size: sym.size, binding: sym.binding(),
+                sym_type: sym.sym_type(), visibility: sym.visibility(),
                 defined: false, needs_plt: false, plt_idx: 0,
                 got_offset: None, section_idx: None,
             });
 
             // Don't override a strong definition with a weak one
-            if entry.defined && entry.binding == STB_GLOBAL && sym.binding == STB_WEAK {
+            if entry.defined && entry.binding == STB_GLOBAL && sym.binding() == STB_WEAK {
                 continue;
             }
 
             entry.value = offset + sym.value;
             entry.size = sym.size;
-            entry.binding = sym.binding;
-            entry.sym_type = sym.sym_type;
-            entry.visibility = sym.visibility;
+            entry.binding = sym.binding();
+            entry.sym_type = sym.sym_type();
+            entry.visibility = sym.visibility();
             entry.defined = true;
             entry.section_idx = Some(merged_idx);
         }
@@ -685,7 +687,7 @@ pub fn link_builtin(
     for (name, sym) in global_syms.iter_mut() {
         if !sym.defined {
             if let Some(shlib_sym) = shared_lib_syms.get(name) {
-                if shlib_sym.sym_type == STT_OBJECT {
+                if shlib_sym.sym_type() == STT_OBJECT {
                     // Data symbol: will use COPY relocation
                     copy_symbols.push((name.clone(), shlib_sym.size));
                 } else {
@@ -737,24 +739,24 @@ pub fn link_builtin(
     {
         let mut got_set: HashSet<String> = HashSet::new();
         for (obj_idx, (_, obj)) in input_objs.iter().enumerate() {
-            for relocs in obj.relocs.values() {
+            for relocs in &obj.relocations {
                 for reloc in relocs {
-                    if reloc.reloc_type == R_RISCV_GOT_HI20
-                        || reloc.reloc_type == R_RISCV_TLS_GOT_HI20
-                        || reloc.reloc_type == R_RISCV_TLS_GD_HI20
+                    if reloc.rela_type == R_RISCV_GOT_HI20
+                        || reloc.rela_type == R_RISCV_TLS_GOT_HI20
+                        || reloc.rela_type == R_RISCV_TLS_GD_HI20
                     {
-                        let sym = &obj.symbols[reloc.symbol_idx as usize];
+                        let sym = &obj.symbols[reloc.sym_idx as usize];
                         let (name, is_local) = got_sym_key(obj_idx, sym, reloc.addend);
                         if !name.is_empty() && !got_set.contains(&name) {
                             got_set.insert(name.clone());
                             got_symbols.push(name.clone());
                             if is_local {
-                                local_got_sym_info.insert(name.clone(), (obj_idx, reloc.symbol_idx as usize, reloc.addend));
+                                local_got_sym_info.insert(name.clone(), (obj_idx, reloc.sym_idx as usize, reloc.addend));
                             }
                         }
                         // Track TLS GOT symbols so we can fill them with TP offsets
-                        if reloc.reloc_type == R_RISCV_TLS_GOT_HI20
-                            || reloc.reloc_type == R_RISCV_TLS_GD_HI20
+                        if reloc.rela_type == R_RISCV_TLS_GOT_HI20
+                            || reloc.rela_type == R_RISCV_TLS_GD_HI20
                         {
                             tls_got_symbols.insert(name);
                         }
@@ -1337,20 +1339,20 @@ pub fn link_builtin(
     for (obj_idx, (_, obj)) in input_objs.iter().enumerate() {
         let mut sym_vaddrs = vec![0u64; obj.symbols.len()];
         for (si, sym) in obj.symbols.iter().enumerate() {
-            if sym.section_idx == SHN_UNDEF || sym.section_idx == SHN_ABS {
-                if sym.section_idx == SHN_ABS {
+            if sym.shndx == SHN_UNDEF || sym.shndx == SHN_ABS {
+                if sym.shndx == SHN_ABS {
                     sym_vaddrs[si] = sym.value;
                 }
                 continue;
             }
-            if sym.section_idx == SHN_COMMON {
+            if sym.shndx == SHN_COMMON {
                 // COMMON symbols were already placed in .bss
                 if let Some(gs) = global_syms.get(&sym.name) {
                     sym_vaddrs[si] = gs.value;
                 }
                 continue;
             }
-            let sec_idx = sym.section_idx as usize;
+            let sec_idx = sym.shndx as usize;
             if let Some(&(merged_idx, offset)) = sec_mapping.get(&(obj_idx, sec_idx)) {
                 sym_vaddrs[si] = section_vaddrs[merged_idx] + offset + sym.value;
             }
@@ -1362,7 +1364,8 @@ pub fn link_builtin(
 
     // We need to collect all relocations and apply them to the merged section data
     for (obj_idx, (obj_name, obj)) in input_objs.iter().enumerate() {
-        for (&sec_idx, relocs) in &obj.relocs {
+        for (sec_idx, relocs) in obj.relocations.iter().enumerate() {
+            if relocs.is_empty() { continue; }
             let (merged_idx, sec_offset) = match sec_mapping.get(&(obj_idx, sec_idx)) {
                 Some(&v) => v,
                 None => continue,
@@ -1375,16 +1378,16 @@ pub fn link_builtin(
                 let p = ms_vaddr + offset; // PC (address of the relocation site)
 
                 // Resolve symbol value
-                let sym_idx = reloc.symbol_idx as usize;
+                let sym_idx = reloc.sym_idx as usize;
                 if sym_idx >= obj.symbols.len() {
                     continue;
                 }
                 let sym = &obj.symbols[sym_idx];
 
-                let s = if sym.sym_type == STT_SECTION {
+                let s = if sym.sym_type() == STT_SECTION {
                     // Section symbol: value is the section's vaddr
-                    if (sym.section_idx as usize) < obj.sections.len() {
-                        if let Some(&(mi, mo)) = sec_mapping.get(&(obj_idx, sym.section_idx as usize)) {
+                    if (sym.shndx as usize) < obj.sections.len() {
+                        if let Some(&(mi, mo)) = sec_mapping.get(&(obj_idx, sym.shndx as usize)) {
                             section_vaddrs[mi] + mo
                         } else {
                             0
@@ -1392,7 +1395,7 @@ pub fn link_builtin(
                     } else {
                         0
                     }
-                } else if !sym.name.is_empty() && sym.binding != STB_LOCAL {
+                } else if !sym.name.is_empty() && sym.binding() != STB_LOCAL {
                     // Global symbol
                     if let Some(gs) = global_syms.get(&sym.name) {
                         if gs.needs_plt || gs.defined {
@@ -1413,7 +1416,7 @@ pub fn link_builtin(
                 let data = &mut merged_sections[merged_idx].data;
                 let off = offset as usize;
 
-                match reloc.reloc_type {
+                match reloc.rela_type {
                     R_RISCV_RELAX | R_RISCV_ALIGN => {
                         // Linker relaxation hints - skip (no relaxation performed)
                         continue;
@@ -1484,7 +1487,7 @@ pub fn link_builtin(
                     }
                     R_RISCV_CALL_PLT => {
                         // AUIPC + JALR pair (8 bytes)
-                        let target = if !sym.name.is_empty() && sym.binding != STB_LOCAL {
+                        let target = if !sym.name.is_empty() && sym.binding() != STB_LOCAL {
                             if let Some(gs) = global_syms.get(&sym.name) {
                                 gs.value as i64
                             } else {
@@ -1755,18 +1758,18 @@ pub fn link_builtin(
             // Local symbol: compute value from object's symbol table and section mapping
             let obj = &input_objs[obj_idx].1;
             let sym = &obj.symbols[sym_idx];
-            let final_val = if sym.sym_type == STT_SECTION {
+            let final_val = if sym.sym_type() == STT_SECTION {
                 // Section symbol: vaddr = merged_base + sec_offset + addend
                 // sec_offset is where this object's contribution starts in merged section
                 // addend is the offset within the original section
-                if let Some(&(merged_idx, sec_offset)) = sec_mapping.get(&(obj_idx, sym.section_idx as usize)) {
+                if let Some(&(merged_idx, sec_offset)) = sec_mapping.get(&(obj_idx, sym.shndx as usize)) {
                     (section_vaddrs[merged_idx] + sec_offset) as i64 + addend
                 } else {
                     0
                 }
             } else {
                 // Regular local symbol: vaddr = merged_base + sec_offset + sym.value + addend
-                if let Some(&(merged_idx, sec_offset)) = sec_mapping.get(&(obj_idx, sym.section_idx as usize)) {
+                if let Some(&(merged_idx, sec_offset)) = sec_mapping.get(&(obj_idx, sym.shndx as usize)) {
                     (section_vaddrs[merged_idx] + sec_offset + sym.value) as i64 + addend
                 } else {
                     0
@@ -2599,10 +2602,10 @@ fn encode_uleb128_in_place(data: &mut [u8], off: usize, value: u64) {
 /// entries pointing to different addresses.
 ///
 /// Returns (key, is_local) where is_local indicates the symbol won't be in global_syms.
-fn got_sym_key(obj_idx: usize, sym: &ObjSymbol, addend: i64) -> (String, bool) {
-    if sym.sym_type == STT_SECTION {
-        (format!("__local_sec_{}_{}_{}", obj_idx, sym.section_idx, addend), true)
-    } else if sym.binding == STB_LOCAL {
+fn got_sym_key(obj_idx: usize, sym: &Symbol, addend: i64) -> (String, bool) {
+    if sym.sym_type() == STT_SECTION {
+        (format!("__local_sec_{}_{}_{}", obj_idx, sym.shndx, addend), true)
+    } else if sym.binding() == STB_LOCAL {
         (format!("__local_{}_{}_{}", obj_idx, sym.name, addend), true)
     } else {
         (sym.name.clone(), false)
@@ -2613,7 +2616,7 @@ fn got_sym_key(obj_idx: usize, sym: &ObjSymbol, addend: i64) -> (String, bool) {
 /// The pcrel_lo12 references an auipc instruction; we need to find the hi20
 /// relocation at that auipc and compute the full offset, then return the low 12 bits.
 fn find_hi20_value(
-    obj: &ObjFile,
+    obj: &ElfObject,
     obj_idx: usize,
     sec_idx: usize,
     sec_mapping: &HashMap<(usize, usize), (usize, u64)>,
@@ -2627,7 +2630,8 @@ fn find_hi20_value(
     got_plt_vaddr: u64,
 ) -> i64 {
     // Find the hi20 relocation targeting the same address
-    if let Some(relocs) = obj.relocs.get(&sec_idx) {
+    if sec_idx < obj.relocations.len() {
+        let relocs = &obj.relocations[sec_idx];
         for reloc in relocs {
             let reloc_vaddr = sec_offset + reloc.offset;
             let (mi, _mo) = match sec_mapping.get(&(obj_idx, sec_idx)) {
@@ -2640,9 +2644,9 @@ fn find_hi20_value(
                 continue;
             }
 
-            match reloc.reloc_type {
+            match reloc.rela_type {
                 R_RISCV_PCREL_HI20 => {
-                    let hi_sym_idx = reloc.symbol_idx as usize;
+                    let hi_sym_idx = reloc.sym_idx as usize;
                     let sym = &obj.symbols[hi_sym_idx];
                     let s = resolve_symbol_value(sym, hi_sym_idx, obj, obj_idx, sec_mapping, section_vaddrs, local_sym_vaddrs, global_syms);
                     let target = s as i64 + reloc.addend;
@@ -2651,7 +2655,7 @@ fn find_hi20_value(
                 }
                 R_RISCV_GOT_HI20 | R_RISCV_TLS_GOT_HI20 | R_RISCV_TLS_GD_HI20 => {
                     // For GOT references, the target is the GOT entry address
-                    let hi_sym_idx = reloc.symbol_idx as usize;
+                    let hi_sym_idx = reloc.sym_idx as usize;
                     let sym = &obj.symbols[hi_sym_idx];
                     let (sym_name, _) = got_sym_key(obj_idx, sym, reloc.addend);
 
@@ -2683,23 +2687,23 @@ fn find_hi20_value(
 }
 
 fn resolve_symbol_value(
-    sym: &ObjSymbol,
+    sym: &Symbol,
     sym_idx: usize,
-    obj: &ObjFile,
+    obj: &ElfObject,
     obj_idx: usize,
     sec_mapping: &HashMap<(usize, usize), (usize, u64)>,
     section_vaddrs: &[u64],
     local_sym_vaddrs: &[Vec<u64>],
     global_syms: &HashMap<String, GlobalSym>,
 ) -> u64 {
-    if sym.sym_type == STT_SECTION {
-        if (sym.section_idx as usize) < obj.sections.len() {
-            if let Some(&(mi, mo)) = sec_mapping.get(&(obj_idx, sym.section_idx as usize)) {
+    if sym.sym_type() == STT_SECTION {
+        if (sym.shndx as usize) < obj.sections.len() {
+            if let Some(&(mi, mo)) = sec_mapping.get(&(obj_idx, sym.shndx as usize)) {
                 return section_vaddrs[mi] + mo;
             }
         }
         0
-    } else if !sym.name.is_empty() && sym.binding != STB_LOCAL {
+    } else if !sym.name.is_empty() && sym.binding() != STB_LOCAL {
         global_syms.get(&sym.name).map(|gs| gs.value).unwrap_or(0)
     } else {
         // Local symbol - index by symbol index, not section index
@@ -2750,8 +2754,8 @@ fn elf_hash_gnu(name: &[u8]) -> u32 {
 
 /// Resolve archive members: iteratively pull in members that define currently-undefined symbols.
 fn resolve_archive_members(
-    members: Vec<(String, ObjFile)>,
-    input_objs: &mut Vec<(String, ObjFile)>,
+    members: Vec<(String, ElfObject)>,
+    input_objs: &mut Vec<(String, ElfObject)>,
     defined_syms: &mut HashSet<String>,
     undefined_syms: &mut HashSet<String>,
 ) {
@@ -2761,20 +2765,20 @@ fn resolve_archive_members(
         let mut remaining = Vec::new();
         for (name, obj) in pool {
             let needed = obj.symbols.iter().any(|sym| {
-                sym.section_idx != SHN_UNDEF
-                    && sym.binding != STB_LOCAL
+                sym.shndx != SHN_UNDEF
+                    && sym.binding() != STB_LOCAL
                     && !sym.name.is_empty()
                     && undefined_syms.contains(&sym.name)
             });
             if needed {
                 for sym in &obj.symbols {
-                    if sym.section_idx != SHN_UNDEF && sym.binding != STB_LOCAL && !sym.name.is_empty() {
+                    if sym.shndx != SHN_UNDEF && sym.binding() != STB_LOCAL && !sym.name.is_empty() {
                         defined_syms.insert(sym.name.clone());
                         undefined_syms.remove(&sym.name);
                     }
                 }
                 for sym in &obj.symbols {
-                    if sym.section_idx == SHN_UNDEF && !sym.name.is_empty() && sym.binding != STB_LOCAL
+                    if sym.shndx == SHN_UNDEF && !sym.name.is_empty() && sym.binding() != STB_LOCAL
                         && !defined_syms.contains(&sym.name) {
                             undefined_syms.insert(sym.name.clone());
                         }

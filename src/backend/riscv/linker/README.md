@@ -46,7 +46,7 @@ RISC-V backend.
 |                Phase 1b: Library Resolution                              |
 |  - Scan shared libraries (.so) for exported symbols                      |
 |  - Parse linker scripts embedded in .so stubs                            |
-|  - Build shared_lib_syms: HashMap<name, SharedSymInfo>                   |
+|  - Build shared_lib_syms: HashMap<name, DynSymbol>                       |
 |  - Iteratively resolve .a archive members against undefined symbols      |
 +--------------------------------------------------------------------------+
       |
@@ -127,78 +127,80 @@ RISC-V backend.
 |---------------|-------|---------------------------------------------------------------|
 | `mod.rs`      | ~13   | Module declaration; re-exports `link_to_executable` as the public API |
 | `link.rs`     | ~2570 | Core linker implementation: all 14 phases from input reading through ELF emission |
-| `elf_read.rs` | ~450  | ELF object file parser, ar archive parser, shared library symbol reader |
+| `elf_read.rs` | ~67   | Re-exports shared linker_common types; delegates parsing to shared infrastructure |
 
 ## Key Data Structures
 
-### `ObjFile` (elf_read.rs)
+### `ElfObject` (linker_common via elf_read.rs)
 
-A fully parsed relocatable ELF object file.
+A fully parsed relocatable ELF64 object file. This type is shared with the
+x86 and ARM backends via `linker_common::Elf64Object`.
 
 ```
-ObjFile {
-    sections:   Vec<ObjSection>,                 // all parsed sections
-    symbols:    Vec<ObjSymbol>,                  // full symbol table
-    relocs:     HashMap<usize, Vec<ObjReloc>>,   // relocs keyed by target section index
-    elf_flags:  u32,                              // e_flags from the ELF header
+ElfObject {
+    sections:      Vec<Elf64Section>,          // parsed section headers
+    symbols:       Vec<Elf64Symbol>,           // full symbol table
+    section_data:  Vec<Vec<u8>>,               // raw data for each section (empty for NOBITS)
+    relocations:   Vec<Vec<Elf64Rela>>,        // relocs indexed by target section
+    source_name:   String,                     // source file name
 }
 ```
 
-### `ObjSection` (elf_read.rs)
+### `Elf64Section` (linker_common)
 
-A single section from an input object file.
+A single section header from an input object file.
 
 ```
-ObjSection {
-    name:          String,    // e.g., ".text", ".rodata", ".rela.text"
-    sh_type:       u32,       // SHT_PROGBITS, SHT_NOBITS, SHT_RELA, ...
-    sh_flags:      u64,       // SHF_ALLOC | SHF_WRITE | SHF_EXECINSTR | SHF_TLS
-    data:          Vec<u8>,   // raw section bytes (zero-filled for SHT_NOBITS)
-    sh_addralign:  u64,       // required alignment
-    sh_entsize:    u64,       // entry size for uniform-entry sections
-    sh_link:       u32,       // linked section index (e.g., .symtab -> .strtab)
-    sh_info:       u32,       // extra info (e.g., .rela.text -> .text section index)
+Elf64Section {
+    name:       String,    // e.g., ".text", ".rodata", ".rela.text"
+    sh_type:    u32,       // SHT_PROGBITS, SHT_NOBITS, SHT_RELA, ...
+    flags:      u64,       // SHF_ALLOC | SHF_WRITE | SHF_EXECINSTR | SHF_TLS
+    size:       u64,       // section size in bytes
+    addralign:  u64,       // required alignment
+    entsize:    u64,       // entry size for uniform-entry sections
+    link:       u32,       // linked section index (e.g., .symtab -> .strtab)
+    info:       u32,       // extra info (e.g., .rela.text -> .text section index)
 }
 ```
 
-### `ObjSymbol` (elf_read.rs)
+### `Elf64Symbol` (linker_common)
 
-A parsed ELF symbol table entry.
+A parsed ELF symbol table entry. Binding, type, and visibility are accessed
+via methods: `binding()`, `sym_type()`, `visibility()`.
 
 ```
-ObjSymbol {
-    name:         String,   // symbol name from .strtab
-    value:        u64,      // st_value (offset within section, or alignment for COMMON)
-    size:         u64,      // st_size
-    binding:      u8,       // STB_LOCAL / STB_GLOBAL / STB_WEAK
-    sym_type:     u8,       // STT_NOTYPE / STT_FUNC / STT_OBJECT / STT_SECTION / STT_TLS
-    visibility:   u8,       // STV_DEFAULT / STV_HIDDEN
-    section_idx:  u16,      // section index, or SHN_UNDEF / SHN_ABS / SHN_COMMON
+Elf64Symbol {
+    name:   String,   // symbol name from .strtab
+    value:  u64,      // st_value (offset within section, or alignment for COMMON)
+    size:   u64,      // st_size
+    info:   u8,       // packed binding (>>4) and type (&0xf)
+    other:  u8,       // packed visibility (&0x3)
+    shndx:  u16,      // section index, or SHN_UNDEF / SHN_ABS / SHN_COMMON
 }
 ```
 
-### `ObjReloc` (elf_read.rs)
+### `Elf64Rela` (linker_common)
 
 A single relocation entry from a `.rela.*` section.
 
 ```
-ObjReloc {
-    offset:       u64,     // byte offset within the target section
-    reloc_type:   u32,     // R_RISCV_* relocation type
-    symbol_idx:   u32,     // index into the object's symbol table
-    addend:       i64,     // explicit addend (Elf64_Rela format)
+Elf64Rela {
+    offset:     u64,     // byte offset within the target section
+    rela_type:  u32,     // R_RISCV_* relocation type
+    sym_idx:    u32,     // index into the object's symbol table
+    addend:     i64,     // explicit addend (Elf64_Rela format)
 }
 ```
 
-### `SharedSymInfo` (elf_read.rs)
+### `DynSymbol` (linker_common)
 
 Information about a symbol exported by a shared library.
 
 ```
-SharedSymInfo {
-    name:      String,    // symbol name
-    sym_type:  u8,        // STT_FUNC or STT_OBJECT (determines PLT vs. COPY strategy)
-    size:      u64,       // st_size (needed for COPY relocation allocation)
+DynSymbol {
+    name:   String,    // symbol name
+    info:   u8,        // packed type; use sym_type() method for STT_FUNC/STT_OBJECT
+    size:   u64,       // st_size (needed for COPY relocation allocation)
 }
 ```
 
@@ -633,7 +635,7 @@ function is large (~2500 lines), but it reads top-to-bottom as a pipeline.
 
 ### 2. In-memory linking
 
-All input objects are fully parsed into memory (`Vec<ObjFile>`) before any
+All input objects are fully parsed into memory (`Vec<ElfObject>`) before any
 processing begins. Section merging happens by copying data into new `Vec<u8>`
 buffers. This is simple and fast for the object file sizes typical of a C
 compiler, but would not scale to very large link jobs (millions of lines of
