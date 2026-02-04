@@ -5,7 +5,9 @@
 The i686 backend targets 32-bit x86 (IA-32) processors, emitting AT&T-syntax
 GNU assembly.  It implements the `ArchCodegen` trait that the shared code
 generation framework dispatches to, producing one `.s` file per translation
-unit.
+unit.  The backend includes a builtin 32-bit assembler and linker
+(`MY_ASM=builtin` / `MY_LD=builtin`) that reuses the x86-64 AT&T parser
+with a 32-bit encoder and produces ELFCLASS32 executables.
 
 The default calling convention is **cdecl** (System V i386 ABI): all arguments
 are passed on the stack, pushed right-to-left, and the caller cleans up.

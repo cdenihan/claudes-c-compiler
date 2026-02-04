@@ -1,9 +1,13 @@
 # Backend Subsystem Design
 
 The backend transforms SSA IR produced by the compiler's middle-end into
-target-specific assembly text, then delegates to an external GCC toolchain for
-assembling to object code and linking into executables. Four architectures are
-supported: x86-64, i686, AArch64, and RISC-V 64.
+target-specific assembly text, then assembles and links it into ELF
+executables. Four architectures are supported: x86-64, i686, AArch64, and
+RISC-V 64. Each architecture has a builtin assembler (instruction encoder +
+ELF object file writer) and a builtin linker (symbol resolution + relocation
+application + ELF executable writer), enabling fully self-contained
+compilation with no external toolchain. An external GCC toolchain can be used
+as a fallback.
 
 ---
 
@@ -56,9 +60,18 @@ supported: x86-64, i686, AArch64, and RISC-V 64.
                      +------------+-----------+
                                   |
                      +------------v-----------+
-                     |   External Toolchain    |
-                     |  gcc -c  (assemble)     |
-                     |  gcc     (link)         |
+                     |   Builtin Assembler     |
+                     |  parse asm text         |
+                     |  encode instructions    |
+                     |  write ELF .o           |
+                     +------------+-----------+
+                                  |
+                     +------------v-----------+
+                     |   Builtin Linker        |
+                     |  read .o + CRT + libs   |
+                     |  resolve symbols        |
+                     |  apply relocations      |
+                     |  write ELF executable   |
                      +------------+-----------+
                                   |
                          +--------v---------+
@@ -77,8 +90,9 @@ The pipeline is driven from `Target::generate_assembly_with_opts_and_debug` in
    `ArchCodegen` trait.
 4. Passes the resulting assembly text through the architecture's peephole
    optimizer.
-5. Returns the final assembly string, which is then assembled and linked
-   through the target's GCC cross-compiler.
+5. Returns the final assembly string, which is then assembled (via the
+   builtin assembler or an external toolchain) and linked (via the builtin
+   linker or an external toolchain) into an ELF executable.
 
 ---
 
@@ -104,9 +118,21 @@ src/backend/
   x86_common.rs       Shared x86/i686 register names, condition codes
 
   x86/                x86-64 backend (SysV AMD64 ABI)
+    codegen/          Code generation (~16 files) + peephole optimizer
+    assembler/        Builtin assembler (parser, encoder, ELF writer)
+    linker/           Builtin linker (dynamic linking, PLT/GOT, TLS)
   i686/               i686 backend (cdecl, ILP32)
+    codegen/          Code generation (~17 files) + peephole optimizer
+    assembler/        Builtin assembler (reuses x86 parser, 32-bit encoder)
+    linker/           Builtin linker (32-bit ELF, R_386 relocations)
   arm/                AArch64 backend (AAPCS64)
+    codegen/          Code generation (~18 files) + peephole optimizer
+    assembler/        Builtin assembler (parser, encoder, ELF writer)
+    linker/           Builtin linker (static linking, IFUNC/TLS)
   riscv/              RISC-V 64 backend (LP64D)
+    codegen/          Code generation (~18 files) + peephole optimizer
+    assembler/        Builtin assembler (parser, encoder, RV64C compress)
+    linker/           Builtin linker (dynamic linking)
 ```
 
 Each architecture subdirectory contains approximately 18-19 codegen files
@@ -925,115 +951,196 @@ that affect code generation. These are propagated to the backends via
 
 ---
 
-## External Toolchain Integration (common.rs)
+## Builtin Assembler
 
-Assembly and linking are delegated to the target's GCC cross-compiler.
-Each target provides an `AssemblerConfig` and `LinkerConfig` that specify:
+Each architecture has a native assembler that parses the generated assembly
+text into instructions, encodes them into machine code, and writes ELF
+object files directly. The builtin assembler is activated with
+`MY_ASM=builtin`. When not set, the compiler falls back to the GCC
+toolchain.
 
-- The toolchain command (e.g., `gcc`, `aarch64-linux-gnu-gcc`,
-  `riscv64-linux-gnu-gcc`, `i686-linux-gnu-gcc`).
-- Static extra flags: `-march=rv64gc -mabi=lp64d` for RISC-V,
-  `-march=armv8-a+crc` for AArch64, `-m32` for i686.
-- Dynamic extra args from the CLI (e.g., `-mabi=lp64` overrides).
-- Expected ELF `e_machine` value for input validation (EM_X86_64 = 62,
-  EM_386 = 3, EM_AARCH64 = 183, EM_RISCV = 243).
+### Architecture
 
-The assembly path:
-1. Writes the generated assembly text to an RAII-guarded temporary file
-   (`TempFile`) that auto-deletes on drop (even on early error returns or
-   panics).
-2. Invokes `gcc -c -o output.o tempfile.s` with the configured flags.
-3. Validates the result.
+Each assembler follows a three-stage pipeline:
 
-The linker validates input object files by checking their ELF `e_machine`
-header against the expected value for the target architecture, producing
-clear error messages when wrong-architecture objects are accidentally
-passed.
+```
+  Assembly text (String)
+       |
+       |  Parser (parser.rs)
+       v
+  Vec<AsmStatement>  (parsed instructions, directives, labels)
+       |
+       |  Encoder (encoder.rs)
+       v
+  Vec<u8>  (encoded machine code bytes + relocation entries)
+       |
+       |  ELF Writer (elf_writer.rs)
+       v
+  ELF object file (.o)
+```
+
+**Parser**: Tokenizes and parses the assembly text into structured
+`AsmStatement` items. Each statement is either an instruction (with
+opcode, operands, and optional size suffix), a directive (`.section`,
+`.globl`, `.byte`, `.long`, `.ascii`, `.align`, etc.), or a label
+definition. The x86 and i686 backends share the same AT&T syntax parser
+(i686 reuses `x86::assembler::parser`). AArch64 and RISC-V have
+architecture-specific parsers.
+
+**Encoder**: Translates parsed instructions into machine code bytes. For
+x86-64, this involves REX prefix generation, ModR/M and SIB byte
+construction, and displacement/immediate encoding. For i686, REX prefixes
+are omitted and the default operand size is 32-bit. For AArch64,
+instructions are encoded as fixed-width 32-bit words. For RISC-V,
+instructions are 32-bit words with an optional compression pass
+(`compress.rs`) that converts eligible instructions to 16-bit RV64C
+compact form.
+
+**ELF Writer**: Collects encoded sections (`.text`, `.data`, `.rodata`,
+`.bss`, etc.), builds the symbol table and relocation entries, and writes
+a complete ELF object file. x86-64 produces ELFCLASS64 with `EM_X86_64`;
+i686 produces ELFCLASS32 with `EM_386` using `Elf32_Sym` and `Elf32_Rel`;
+AArch64 produces ELFCLASS64 with `EM_AARCH64`; RISC-V produces ELFCLASS64
+with `EM_RISCV`.
+
+### Per-Architecture Assembler Details
+
+| Architecture | Parser | Encoder | Extra Features |
+|-------------|--------|---------|---------------|
+| x86-64 | AT&T syntax, shared | REX prefixes, ModR/M, SIB | SSE/AES-NI encoding |
+| i686 | Reuses x86 parser | No REX, 32-bit operands | ELFCLASS32, Elf32_Rel |
+| AArch64 | ARM assembly syntax | Fixed 32-bit encoding | imm12 auto-shift |
+| RISC-V | RV assembly syntax | Fixed 32-bit encoding | RV64C compression |
+
+### Assembler Files
+
+Each backend's `assembler/` directory contains:
+
+| File | Purpose |
+|------|---------|
+| `mod.rs` | Entry point: `assemble(asm_text, output_path)` |
+| `parser.rs` | Tokenize + parse assembly text (absent in i686; reuses x86) |
+| `encoder.rs` | Instruction-to-bytes encoding |
+| `elf_writer.rs` | ELF object file generation |
+| `compress.rs` | RV64C instruction compression (RISC-V only) |
+
+---
+
+## Builtin Linker
+
+Each architecture has a native ELF linker that reads object files and
+static archives, resolves symbols, applies relocations, and writes a
+complete ELF executable. The builtin linker is activated with
+`MY_LD=builtin`.
+
+### Architecture
+
+The linker pipeline processes input files in this order:
+
+```
+  Input .o files + CRT objects + static archives (.a)
+       |
+       |  Read ELF headers and sections
+       v
+  Collected sections, symbols, and relocations
+       |
+       |  Symbol resolution (strong/weak, local/global)
+       v
+  Resolved symbol table
+       |
+       |  Apply relocations (per-architecture relocation types)
+       v
+  Linked sections with resolved addresses
+       |
+       |  Write ELF executable (program headers, dynamic section if needed)
+       v
+  ELF executable
+```
+
+### Common Linker Responsibilities
+
+All four linker implementations handle:
+
+- **CRT object discovery**: Locates and includes `crt1.o`, `crti.o`,
+  `crtbegin.o`, `crtend.o`, and `crtn.o` from standard system paths
+  (probing both native and cross-compilation directories).
+- **Static archive processing** (`.a` files): Reads ar-format archives and
+  selectively includes object files that define needed symbols.
+- **Symbol resolution**: Handles strong vs. weak symbols, local vs. global
+  visibility, COMMON symbols, and undefined symbol diagnostics.
+- **Section merging**: Merges `.text`, `.data`, `.rodata`, `.bss`, and
+  custom sections from multiple input objects.
+- **Relocation application**: Applies all architecture-specific relocation
+  types to produce position-correct machine code.
+
+### Per-Architecture Linker Details
+
+| Architecture | Link Mode | Key Relocations | Special Features |
+|-------------|-----------|-----------------|-----------------|
+| x86-64 | Dynamic | R_X86_64_64, PC32, PLT32, GOTPCREL, GOTTPOFF, TPOFF32 | PLT/GOT, TLS (IE-to-LE relaxation), copy relocations |
+| i686 | Dynamic | R_386_32, PC32, PLT32, GOTPC, GOTOFF, GOT32X, GOT32 | 32-bit ELF, `.rel` (not `.rela`) |
+| AArch64 | Static | ADR_PREL_PG_HI21, ADD_ABS_LO12_NC, CALL26, JUMP26, LDST* | IFUNC/IPLT support, IRELATIVE relocations, TLS |
+| RISC-V | Dynamic | HI20, LO12_I, LO12_S, CALL, PCREL_HI20, GOT_HI20, BRANCH | Linker relaxation markers |
+
+### Linker Files
+
+Each backend's `linker/` directory contains:
+
+| File | Purpose |
+|------|---------|
+| `mod.rs` | Entry point and/or main linker implementation |
+| `elf.rs` | ELF parsing, constants, and helper types |
+| `reloc.rs` | Relocation application (AArch64 only; others inline) |
+| `link.rs` | Main linker implementation (RISC-V) |
+| `elf_read.rs` | ELF reading utilities (RISC-V) |
+
+---
+
+## Assembler and Linker Selection (common.rs + mod.rs)
+
+The `MY_ASM` and `MY_LD` environment variables control which assembler
+and linker are used:
+
+| Variable | Value | Behavior |
+|----------|-------|----------|
+| `MY_ASM` | `builtin` | Use per-architecture builtin assembler |
+| `MY_ASM` | path/command | Use a custom external assembler |
+| `MY_ASM` | unset | Fall back to GCC cross-compiler |
+| `MY_LD` | `builtin` | Use per-architecture builtin linker |
+| `MY_LD` | `1`/`true`/`yes` | Auto-detect system `ld` for the target |
+| `MY_LD` | path/command | Use a specific external linker |
+| `MY_LD` | unset | Fall back to GCC cross-compiler |
+
+When using the GCC fallback, each target provides an `AssemblerConfig`
+and `LinkerConfig` that specify the toolchain command, static flags,
+and expected ELF `e_machine` value for input validation.
+
+When using an external `ld` directly (`MY_LD=1` or a path), the compiler
+automatically discovers CRT startup objects, adds library search paths,
+converts `-Wl,` flags, sets the dynamic linker and emulation mode, and
+handles `-nostdlib`, `-shared`, `-static`, and `-r` modes.
 
 The `CCC_KEEP_ASM` environment variable preserves the intermediate `.s`
 file next to the output for debugging.
 
-### Custom Assembler / Linker Override
-
-The `MY_ASM` and `MY_LD` environment variables allow overriding the
-assembler and linker commands respectively.
-
-**`MY_ASM`**: When set, its value is used as the assembler command instead
-of the target's default GCC toolchain command.
-
-**`MY_LD`** (x86-64, i686, AArch64, and RISC-V 64): When set, the linker is
-invoked directly (ld-style) instead of going through GCC. The value can be:
-- A boolean flag (`1`, `true`, `yes`, `on`) to auto-detect the correct ld
-  for the target architecture (e.g., `ld` for x86-64, `aarch64-linux-gnu-ld`
-  for AArch64)
-- A command name (`ld`, `ld.bfd`, `riscv64-linux-gnu-ld`)
-- A full path (`/usr/bin/ld`)
-
-The compiler automatically:
-- Discovers and adds CRT startup/finalization objects (crt1.o, crti.o,
-  crtbegin.o, crtend.o, crtn.o) from standard system paths
-- Adds library search paths for GCC and system libraries
-- Converts `-Wl,` prefixed flags to direct ld flags
-- Adds the dynamic linker, emulation mode (`-m elf_x86_64`, `-m elf_i386`,
-  or `-m elf64lriscv`), and security hardening flags (`-z relro`,
-  `-z noexecstack`)
-- Handles `-nostdlib`, `-shared`, `-static`, and `-r` (relocatable) modes
-- Uses appropriate CRT variants (crtbeginT.o for -static, crtbeginS.o
-  for -shared)
-
-The i686 path probes both cross-compiler paths
-(`/usr/lib/gcc-cross/i686-linux-gnu`) and native paths
-(`/usr/lib/gcc/i686-linux-gnu`), and uses the i386 dynamic linker
-(`/lib/ld-linux.so.2`).
-
-For RISC-V cross-compilation, CRT discovery probes both `gcc-cross` paths
-(Debian/Ubuntu) and native GCC paths, with the dynamic linker set to
-`/lib/ld-linux-riscv64-lp64d.so.1`.
-
-Usage examples:
+### Usage Examples
 
 ```bash
-# Auto-detect ld for each architecture (boolean flag)
-MY_LD=1 ccc-x86 file.c -o file
-MY_LD=1 ccc-i686 file.c -o file
-MY_LD=1 ccc-arm file.c -o file
+# Builtin assembler and linker (fully self-contained)
+MY_ASM=builtin MY_LD=builtin ccc -o output input.c
+
+# GCC fallback (default when MY_ASM/MY_LD not set)
+ccc -o output input.c
+
+# External ld (auto-detect for target)
 MY_LD=1 ccc-riscv file.c -o file
 
-# Use a specific ld command name
-MY_LD=ld ccc-x86 file.c -o file
+# Specific external linker
 MY_LD=ld.bfd ccc-x86 file.c -o file
 
-# Use a full path
-MY_LD=/usr/bin/ld ccc-x86 file.c -o file
-
-# Use ld with static linking
-MY_LD=1 ccc-x86 -static file.c -o file
-
-# Use ld with shared library
-MY_LD=1 ccc-x86 -fPIC -shared file.c -o file.so
-
-# Use ld with kernel-style -nostdlib
-MY_LD=1 ccc-x86 -nostdlib file.o -o file -lgcc
-
-# Use RISC-V cross-linker directly
-MY_LD=riscv64-linux-gnu-ld ccc-riscv file.c -o file
-
-# Custom assembler
-MY_ASM=src/backend/x86/asm_stub.sh ccc-x86 -c file.c -o file.o
+# Static linking with builtin linker
+MY_ASM=builtin MY_LD=builtin ccc -static file.c -o file
 ```
-
-Each backend directory also contains placeholder stub scripts for testing:
-
-- `x86/asm_stub.sh` / `x86/ld_stub.sh`
-- `i686/asm_stub.sh` / `i686/ld_stub.sh`
-- `arm/asm_stub.sh` / `arm/ld_stub.sh`
-- `riscv/asm_stub.sh` / `riscv/ld_stub.sh`
-
-### Linker Flags
-
-All targets pass `-no-pie` by default to match the non-PIC code generation
-model. Cross-compilation targets use the appropriate prefixed GCC command.
-The linker accepts additional user-provided arguments via `link_with_args`.
 
 ---
 

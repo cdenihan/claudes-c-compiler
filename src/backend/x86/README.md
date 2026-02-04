@@ -3,7 +3,9 @@
 Code generation targeting x86-64 (AMD64) with the System V AMD64 ABI. This backend
 translates the compiler's IR into AT&T-syntax assembly, handling everything from
 register allocation and calling conventions to 128-bit arithmetic, x87 long double,
-inline assembly, and hardware intrinsics.
+inline assembly, and hardware intrinsics. The backend includes a builtin assembler
+and dynamic linker (`MY_ASM=builtin` / `MY_LD=builtin`) with PLT/GOT, TLS, and
+copy relocation support, producing ELF executables directly.
 
 ---
 

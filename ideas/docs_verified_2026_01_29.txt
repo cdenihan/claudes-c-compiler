@@ -1,10 +1,54 @@
 Documentation Verification Changelog
 =====================================
 
-Last audited: 2026-02-03
+Last audited: 2026-02-04
 
 All README.md files have been systematically verified against the actual
 source code. This file tracks what was checked and what was fixed.
+
+Builtin Assembler/Linker Documentation Update (2026-02-04):
+  README.md (top-level):
+  - Fixed false claim "Assembly and linking currently delegate to GNU toolchain"
+  - Removed "External toolchain required" from Known Limitations
+  - Updated pipeline diagram to show builtin assembler and linker stages
+  - Added "Assembler and Linker Selection" section with MY_ASM/MY_LD docs
+  - Updated source tree to include assembler/ and linker/ per architecture
+  - Updated data flow diagram to show builtin assembler/linker path
+  - Added "Builtin assembler and linker" to Key Design Decisions
+  - Fixed "No compiler-specific dependencies" to "Zero external dependencies"
+  - Removed reference to ideas/native_elf_writer.txt (now completed)
+
+  src/backend/README.md:
+  - Fixed opening paragraph: "delegates to external GCC" -> "assembles and links
+    into ELF executables" with builtin assembler/linker description
+  - Updated pipeline diagram to show builtin assembler and linker stages
+  - Updated step 5 description to mention builtin or external toolchain
+  - Added assembler/linker subdirectories to directory layout
+  - Replaced "External Toolchain Integration" section with comprehensive
+    "Builtin Assembler" and "Builtin Linker" design sections
+  - Added "Assembler and Linker Selection" section
+
+  src/backend/x86/README.md:
+  - Added builtin assembler/linker mention to opening paragraph
+
+  src/backend/arm/README.md:
+  - Fixed "assembled by the system assembler" to mention builtin assembler/linker
+
+  src/backend/i686/README.md:
+  - Added builtin assembler/linker mention to overview
+
+  New design documents:
+  - src/backend/x86/assembler/README.md (new)
+  - src/backend/x86/linker/README.md (new)
+  - src/backend/arm/assembler/README.md (new)
+  - src/backend/arm/linker/README.md (new)
+  - src/backend/riscv/assembler/README.md (new)
+  - src/backend/riscv/linker/README.md (new)
+  - src/backend/i686/assembler/README.md (new)
+  - src/backend/i686/linker/README.md (new)
+
+  Deleted completed ideas:
+  - ideas/native_elf_writer.txt (all 4 architectures now have builtin asm+ld)
 
 Accuracy Audit (2026-02-03):
   src/frontend/README.md:
