@@ -13,9 +13,39 @@ use crate::backend::inline_asm::{InlineAsmEmitter, AsmOperandKind, AsmOperand};
 use super::emit::RiscvCodegen;
 use super::inline_asm::{RvConstraintKind, classify_rv_constraint};
 
-/// RISC-V scratch registers for inline asm.
-const RISCV_GP_SCRATCH: &[&str] = &["t0", "t1", "t2", "t3", "t4", "t5", "t6", "a2", "a3", "a4", "a5", "a6", "a7"];
+/// RISC-V scratch registers for inline asm operand allocation.
+/// The order matters: t-registers first (least likely to conflict), then a-registers.
+/// a0/a1 are included as the last resort before overflowing to callee-saved registers,
+/// since inline asm with many operands (e.g., 8 outputs + 8 inputs = 16 total) can
+/// exhaust the first 13 entries. Without a0/a1, the allocator would overflow to
+/// callee-saved registers (s2-s11) which may already be in use by the register
+/// allocator for other live values, causing silent clobbering.
+const RISCV_GP_SCRATCH: &[&str] = &["t0", "t1", "t2", "t3", "t4", "t5", "t6", "a2", "a3", "a4", "a5", "a6", "a7", "a0", "a1"];
 const RISCV_FP_SCRATCH: &[&str] = &["ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7"];
+
+/// Find a GP scratch register for storing inline asm output values that doesn't
+/// conflict with any output register or the current output being stored.
+///
+/// Uses a candidate list (t0-t6, a0, a1) to find a register not in the output
+/// set. Since outputs are assigned from RISCV_GP_SCRATCH starting at t0, the
+/// first 8 outputs use t0-t6 and a2. a0/a1 are at the end of RISCV_GP_SCRATCH
+/// so they're unlikely to be output registers unless there are 14+ operands.
+///
+/// If no safe candidate is found, returns a fallback ("t0" or "t1"). The caller
+/// must check whether the returned register is in all_output_regs and use a
+/// stack-based spill if so.
+fn find_gp_scratch_for_output(current_output_reg: &str, all_output_regs: &[&str]) -> String {
+    const CANDIDATES: &[&str] = &["t0", "t1", "t2", "t3", "t4", "t5", "t6", "a0", "a1"];
+    for &c in CANDIDATES {
+        if !all_output_regs.contains(&c) && c != current_output_reg {
+            return c.to_string();
+        }
+    }
+    // Fallback: return the first candidate not equal to current_output_reg.
+    // Caller must handle the case where this register is an output (stack spill).
+    let fallback = if current_output_reg != "t0" { "t0" } else { "t1" };
+    fallback.to_string()
+}
 
 impl InlineAsmEmitter for RiscvCodegen {
     fn asm_state(&mut self) -> &mut CodegenState { &mut self.state }
@@ -147,15 +177,59 @@ impl InlineAsmEmitter for RiscvCodegen {
                 }
             }
             _ => {
+                // Collect callee-saved registers already allocated by the register
+                // allocator. When the scratch pool overflows to s2, s3, ... we must
+                // skip any that hold live values to avoid clobbering them.
+                let allocated_callee_saved: Vec<String> = self.reg_assignments.values()
+                    .map(|phys| super::emit::callee_saved_name(*phys).to_string())
+                    .collect();
                 loop {
                     let idx = self.asm_gp_scratch_idx;
                     self.asm_gp_scratch_idx += 1;
                     let reg = if idx < RISCV_GP_SCRATCH.len() {
                         RISCV_GP_SCRATCH[idx].to_string()
                     } else {
-                        format!("s{}", 2 + idx - RISCV_GP_SCRATCH.len())
+                        // Overflow into callee-saved registers s2-s11.
+                        // First try unallocated callee-saved registers.
+                        let overflow_idx = idx - RISCV_GP_SCRATCH.len();
+                        let mut available = Vec::new();
+                        for n in 2..=11u32 {
+                            let name = format!("s{}", n);
+                            if !allocated_callee_saved.contains(&name)
+                                && !excluded.iter().any(|e| e == &name)
+                            {
+                                available.push(name);
+                            }
+                        }
+                        if overflow_idx < available.len() {
+                            return available.into_iter().nth(overflow_idx).unwrap();
+                        }
+                        // All unallocated callee-saved exhausted. Borrow one that IS
+                        // allocated — we'll save/restore it around the inline asm.
+                        // Pick from least-likely-to-conflict candidates.
+                        let borrow_candidates = ["s7", "s6", "s1", "s2", "s3", "s4", "s5",
+                                                  "s8", "s9", "s10", "s11"];
+                        for &bc in &borrow_candidates {
+                            if !excluded.iter().any(|e| e == bc)
+                                && !self.asm_borrowed_callee_saved.iter().any(|e| e == bc)
+                            {
+                                self.asm_borrowed_callee_saved.push(bc.to_string());
+                                return bc.to_string();
+                            }
+                        }
+                        // TODO: all borrow candidates exhausted, this may generate
+                        // incorrect code if s7 is in use. This requires 26+ operands
+                        // to trigger (15 caller-saved + 11 callee-saved) so it's
+                        // extremely unlikely in practice.
+                        return "s7".to_string();
                     };
-                    if !excluded.iter().any(|e| e == &reg) {
+                    if !excluded.iter().any(|e| e == &reg)
+                        && !allocated_callee_saved.contains(&reg)
+                    {
+                        return reg;
+                    }
+                    // Safety bail: avoid infinite loops
+                    if idx > 30 {
                         return reg;
                     }
                 }
@@ -166,6 +240,21 @@ impl InlineAsmEmitter for RiscvCodegen {
     fn load_input_to_reg(&mut self, op: &AsmOperand, val: &Operand, _constraint: &str) {
         let reg = &op.reg;
         let is_fp = matches!(op.kind, AsmOperandKind::FpReg);
+
+        // If this register was borrowed from the register allocator (it's a
+        // callee-saved register already holding a live value), save that value
+        // to the stack before we overwrite it. The restore happens after
+        // emit_inline_asm_common returns (in emit_inline_asm).
+        // TODO: if a borrowed register is allocated during resolve_memory_operand
+        // (not for an input), this save won't be reached. Currently only input
+        // operands trigger overflow in practice.
+        if let Some(pos) = self.asm_borrowed_callee_saved.iter().position(|r| r == reg) {
+            self.state.emit("    addi sp, sp, -16");
+            self.state.emit_fmt(format_args!("    sd {}, 0(sp)", reg));
+            // Move from "pending save" to "saved" by marking with a prefix
+            // so we don't save again but still know to restore.
+            self.asm_borrowed_callee_saved[pos] = format!("saved:{}", reg);
+        }
         let is_addr = matches!(op.kind, AsmOperandKind::Address);
 
         match val {
@@ -316,22 +405,32 @@ impl InlineAsmEmitter for RiscvCodegen {
                         self.emit_store_to_s0(&reg, slot.0, store_op);
                     }
                 } else if let Some(&phys) = self.reg_assignments.get(&ptr.0) {
-                    let candidates = ["t0", "t1", "t2", "t3", "t4", "t5", "t6"];
-                    let scratch = candidates.iter()
-                        .find(|&&c| !all_output_regs.contains(&c))
-                        .copied()
-                        .unwrap_or("t0");
+                    let scratch = find_gp_scratch_for_output("", all_output_regs);
                     let src_name = super::emit::callee_saved_name(phys);
-                    self.state.emit_fmt(format_args!("    mv {}, {}", scratch, src_name));
-                    self.state.emit_fmt(format_args!("    {} {}, 0({})", store_op, reg, scratch));
+                    if all_output_regs.contains(&scratch.as_str()) {
+                        self.state.emit_fmt(format_args!("    addi sp, sp, -16"));
+                        self.state.emit_fmt(format_args!("    sd {}, 0(sp)", scratch));
+                        self.state.emit_fmt(format_args!("    mv {}, {}", scratch, src_name));
+                        self.state.emit_fmt(format_args!("    {} {}, 0({})", store_op, reg, scratch));
+                        self.state.emit_fmt(format_args!("    ld {}, 0(sp)", scratch));
+                        self.state.emit_fmt(format_args!("    addi sp, sp, 16"));
+                    } else {
+                        self.state.emit_fmt(format_args!("    mv {}, {}", scratch, src_name));
+                        self.state.emit_fmt(format_args!("    {} {}, 0({})", store_op, reg, scratch));
+                    }
                 } else if let Some(slot) = slot {
-                    let candidates = ["t0", "t1", "t2", "t3", "t4", "t5", "t6"];
-                    let scratch = candidates.iter()
-                        .find(|&&c| !all_output_regs.contains(&c))
-                        .copied()
-                        .unwrap_or("t0");
-                    self.emit_load_from_s0(scratch, slot.0, "ld");
-                    self.state.emit_fmt(format_args!("    {} {}, 0({})", store_op, reg, scratch));
+                    let scratch = find_gp_scratch_for_output("", all_output_regs);
+                    if all_output_regs.contains(&scratch.as_str()) {
+                        self.state.emit_fmt(format_args!("    addi sp, sp, -16"));
+                        self.state.emit_fmt(format_args!("    sd {}, 0(sp)", scratch));
+                        self.emit_load_from_s0(&scratch, slot.0, "ld");
+                        self.state.emit_fmt(format_args!("    {} {}, 0({})", store_op, reg, &scratch));
+                        self.state.emit_fmt(format_args!("    ld {}, 0(sp)", scratch));
+                        self.state.emit_fmt(format_args!("    addi sp, sp, 16"));
+                    } else {
+                        self.emit_load_from_s0(&scratch, slot.0, "ld");
+                        self.state.emit_fmt(format_args!("    {} {}, 0({})", store_op, reg, &scratch));
+                    }
                 }
             }
             _ => {
@@ -346,23 +445,39 @@ impl InlineAsmEmitter for RiscvCodegen {
                     // Pointer lives in a callee-saved register. Store the asm
                     // output through the pointer. This avoids stack access
                     // after CSR writes (e.g., csrw satp changing page tables).
-                    let candidates = ["t0", "t1", "t2", "t3", "t4", "t5", "t6"];
-                    let scratch = candidates.iter()
-                        .find(|&&c| !all_output_regs.contains(&c) && c != reg.as_str())
-                        .copied()
-                        .unwrap_or(if reg != "t0" { "t0" } else { "t1" });
-                    let src_name = super::emit::callee_saved_name(phys);
-                    self.state.emit_fmt(format_args!("    mv {}, {}", scratch, src_name));
-                    self.state.emit_fmt(format_args!("    sd {}, 0({})", reg, scratch));
+                    let scratch = find_gp_scratch_for_output(&reg, all_output_regs);
+                    if all_output_regs.contains(&scratch.as_str()) {
+                        // All candidates are output registers. Use stack-based spill:
+                        // save the scratch output on stack, use it as address, then restore.
+                        let src_name = super::emit::callee_saved_name(phys);
+                        self.state.emit_fmt(format_args!("    addi sp, sp, -16"));
+                        self.state.emit_fmt(format_args!("    sd {}, 0(sp)", scratch));
+                        self.state.emit_fmt(format_args!("    mv {}, {}", scratch, src_name));
+                        self.state.emit_fmt(format_args!("    sd {}, 0({})", reg, scratch));
+                        self.state.emit_fmt(format_args!("    ld {}, 0(sp)", scratch));
+                        self.state.emit_fmt(format_args!("    addi sp, sp, 16"));
+                    } else {
+                        let src_name = super::emit::callee_saved_name(phys);
+                        self.state.emit_fmt(format_args!("    mv {}, {}", scratch, src_name));
+                        self.state.emit_fmt(format_args!("    sd {}, 0({})", reg, scratch));
+                    }
                 } else if let Some(slot) = slot {
                     // Non-alloca: slot holds a pointer, store through it.
-                    let candidates = ["t0", "t1", "t2", "t3", "t4", "t5", "t6"];
-                    let scratch = candidates.iter()
-                        .find(|&&c| !all_output_regs.contains(&c) && c != reg.as_str())
-                        .copied()
-                        .unwrap_or(if reg != "t0" { "t0" } else { "t1" });
-                    self.emit_load_from_s0(scratch, slot.0, "ld");
-                    self.state.emit_fmt(format_args!("    sd {}, 0({})", reg, scratch));
+                    let scratch = find_gp_scratch_for_output(&reg, all_output_regs);
+                    if all_output_regs.contains(&scratch.as_str()) {
+                        // All candidates are output registers. Use stack-based spill:
+                        // save the scratch output on stack, load address into it,
+                        // store through it, then restore the scratch output.
+                        self.state.emit_fmt(format_args!("    addi sp, sp, -16"));
+                        self.state.emit_fmt(format_args!("    sd {}, 0(sp)", scratch));
+                        self.emit_load_from_s0(&scratch, slot.0, "ld");
+                        self.state.emit_fmt(format_args!("    sd {}, 0({})", reg, scratch));
+                        self.state.emit_fmt(format_args!("    ld {}, 0(sp)", scratch));
+                        self.state.emit_fmt(format_args!("    addi sp, sp, 16"));
+                    } else {
+                        self.emit_load_from_s0(&scratch, slot.0, "ld");
+                        self.state.emit_fmt(format_args!("    sd {}, 0({})", reg, scratch));
+                    }
                 }
             }
         }
@@ -371,6 +486,7 @@ impl InlineAsmEmitter for RiscvCodegen {
     fn reset_scratch_state(&mut self) {
         self.asm_gp_scratch_idx = 0;
         self.asm_fp_scratch_idx = 0;
+        self.asm_borrowed_callee_saved.clear();
     }
 
     /// RISC-V-specific immediate constraint ranges.

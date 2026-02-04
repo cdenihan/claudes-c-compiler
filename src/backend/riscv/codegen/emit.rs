@@ -101,6 +101,11 @@ pub struct RiscvCodegen {
     /// Scratch register indices for inline asm allocation.
     pub(super) asm_gp_scratch_idx: usize,
     pub(super) asm_fp_scratch_idx: usize,
+    /// Callee-saved registers borrowed by inline asm scratch allocation that need
+    /// save/restore. When all caller-saved registers are exhausted, the scratch
+    /// allocator borrows a callee-saved register, saves it to the stack before
+    /// input loading, and restores it after output storing.
+    pub(super) asm_borrowed_callee_saved: Vec<String>,
     /// Register allocation results for the current function.
     pub(super) reg_assignments: FxHashMap<u32, PhysReg>,
     /// Which callee-saved registers are used and need save/restore.
@@ -120,6 +125,7 @@ impl RiscvCodegen {
             is_variadic: false,
             asm_gp_scratch_idx: 0,
             asm_fp_scratch_idx: 0,
+            asm_borrowed_callee_saved: Vec::new(),
             reg_assignments: FxHashMap::default(),
             used_callee_saved: Vec::new(),
             no_relax: false,
@@ -605,6 +611,19 @@ impl ArchCodegen for RiscvCodegen {
     // ---- Inline asm / intrinsics ----
     fn emit_inline_asm(&mut self, template: &str, outputs: &[(String, Value, Option<String>)], inputs: &[(String, Operand, Option<String>)], clobbers: &[String], operand_types: &[IrType], goto_labels: &[(String, BlockId)], input_symbols: &[Option<String>]) {
         emit_inline_asm_common(self, template, outputs, inputs, clobbers, operand_types, goto_labels, input_symbols);
+        // Restore any callee-saved registers that were borrowed by the scratch
+        // allocator. These were saved to the stack before input loading and need
+        // to be restored now that all output stores are complete.
+        // Entries are "saved:<reg>" after the save was emitted in load_input_to_reg.
+        let borrowed = std::mem::take(&mut self.asm_borrowed_callee_saved);
+        if !borrowed.is_empty() {
+            for entry in borrowed.iter().rev() {
+                if let Some(reg) = entry.strip_prefix("saved:") {
+                    self.state.emit_fmt(format_args!("    ld {}, 0(sp)", reg));
+                    self.state.emit("    addi sp, sp, 16");
+                }
+            }
+        }
     }
     fn emit_intrinsic(&mut self, dest: &Option<Value>, op: &IntrinsicOp, dest_ptr: &Option<Value>, args: &[Operand]) {
         self.emit_intrinsic_rv(dest, op, dest_ptr, args);
