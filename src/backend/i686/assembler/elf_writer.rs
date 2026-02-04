@@ -84,6 +84,8 @@ pub struct ElfWriter {
     /// Whether we're in .code16gcc mode
     #[allow(dead_code)]
     code16gcc: bool,
+    /// Section stack for .pushsection/.popsection.
+    section_stack: Vec<Option<usize>>,
 }
 
 impl ElfWriter {
@@ -103,6 +105,7 @@ impl ElfWriter {
             pending_protected: Vec::new(),
             pending_internal: Vec::new(),
             aliases: HashMap::new(),
+            section_stack: Vec::new(),
             code16gcc: false,
         }
     }
@@ -148,6 +151,15 @@ impl ElfWriter {
         match item {
             AsmItem::Section(dir) => {
                 self.switch_section(dir);
+            }
+            AsmItem::PushSection(dir) => {
+                self.section_stack.push(self.current_section);
+                self.switch_section(dir);
+            }
+            AsmItem::PopSection => {
+                if let Some(prev) = self.section_stack.pop() {
+                    self.current_section = prev;
+                }
             }
             AsmItem::Global(name) => {
                 self.pending_globals.push(name.clone());

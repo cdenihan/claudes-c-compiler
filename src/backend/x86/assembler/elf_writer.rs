@@ -100,6 +100,8 @@ pub struct ElfWriter {
     pending_internal: Vec<String>,
     /// Set aliases.
     aliases: HashMap<String, String>,
+    /// Section stack for .pushsection/.popsection.
+    section_stack: Vec<Option<usize>>,
 }
 
 /// Check if a string is a numeric local label (just digits, e.g., "1", "42").
@@ -186,6 +188,14 @@ fn resolve_numeric_labels(items: &[AsmItem]) -> Vec<AsmItem> {
                     operands: new_ops,
                 }));
             }
+            AsmItem::Long(vals) => {
+                let new_vals = resolve_numeric_data_values(vals, i, &defs);
+                result.push(AsmItem::Long(new_vals));
+            }
+            AsmItem::Quad(vals) => {
+                let new_vals = resolve_numeric_data_values(vals, i, &defs);
+                result.push(AsmItem::Quad(new_vals));
+            }
             _ => result.push(item.clone()),
         }
     }
@@ -223,6 +233,38 @@ fn resolve_numeric_operand(
         }
         _ => op.clone(),
     }
+}
+
+/// Resolve numeric label references in data values (.long, .quad directives).
+fn resolve_numeric_data_values(
+    vals: &[DataValue],
+    current_idx: usize,
+    defs: &HashMap<String, Vec<(usize, String)>>,
+) -> Vec<DataValue> {
+    vals.iter().map(|val| {
+        match val {
+            DataValue::Symbol(name) => {
+                if let Some(resolved) = resolve_numeric_name(name, current_idx, defs) {
+                    DataValue::Symbol(resolved)
+                } else {
+                    val.clone()
+                }
+            }
+            DataValue::SymbolDiff(lhs, rhs) => {
+                let new_lhs = resolve_numeric_name(lhs, current_idx, defs).unwrap_or_else(|| lhs.clone());
+                let new_rhs = resolve_numeric_name(rhs, current_idx, defs).unwrap_or_else(|| rhs.clone());
+                DataValue::SymbolDiff(new_lhs, new_rhs)
+            }
+            DataValue::SymbolOffset(name, offset) => {
+                if let Some(resolved) = resolve_numeric_name(name, current_idx, defs) {
+                    DataValue::SymbolOffset(resolved, *offset)
+                } else {
+                    val.clone()
+                }
+            }
+            _ => val.clone(),
+        }
+    }).collect()
 }
 
 /// Resolve a numeric label reference name (e.g., "1f" -> ".Lnum_1_0").
@@ -293,6 +335,7 @@ impl ElfWriter {
             pending_protected: Vec::new(),
             pending_internal: Vec::new(),
             aliases: HashMap::new(),
+            section_stack: Vec::new(),
         }
     }
 
@@ -344,6 +387,18 @@ impl ElfWriter {
         match item {
             AsmItem::Section(dir) => {
                 self.switch_section(dir);
+            }
+            AsmItem::PushSection(dir) => {
+                // Save the current section and switch to the new one
+                self.section_stack.push(self.current_section);
+                self.switch_section(dir);
+            }
+            AsmItem::PopSection => {
+                // Restore the previous section from the stack
+                if let Some(prev) = self.section_stack.pop() {
+                    self.current_section = prev;
+                }
+                // If stack is empty, silently keep current section (matches GNU as behavior)
             }
             AsmItem::Global(name) => {
                 self.pending_globals.push(name.clone());
