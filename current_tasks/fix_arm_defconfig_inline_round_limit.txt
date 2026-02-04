@@ -1,0 +1,9 @@
+Fix ARM64 defconfig kernel BRK crash caused by inline round limit
+
+The ARM64 defconfig kernel crashes with BRK #0 in cpucap_is_possible() because
+the inliner's max_rounds=200 limit is reached for ___slab_alloc, which has 200+
+inline call sites. This leaves 7 cpucap_is_possible calls un-inlined, and their
+standalone function body contains a BRK trap from the unresolved compiletime_assert.
+
+Fix: Increase max_rounds from 200 to a higher value to allow all always_inline
+call sites to be processed.
