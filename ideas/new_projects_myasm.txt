@@ -19,3 +19,6 @@ Tracking project build/test results with MY_ASM=builtin MY_LD=builtin
 | sundown | PASS | PASS | PASS | PASS | All architectures pass out of the box |
 | termbox | PASS | PASS | PASS | PASS | All architectures pass out of the box |
 | dash    | PASS | FAIL | PASS | FAIL | Fixed x86: COPY reloc weak alias resolution (environ/__environ) |
+| cmark   | PASS | FAIL (i686 group info) | PASS | PASS | Fixed x86/riscv asm octal escape parsing (\0 prefix consumed too early) |
+| Duktape | PASS | PASS | PASS | PASS | Passes all architectures out of the box |
+| Wren    | PASS | TODO | TODO | TODO | Passes x86 (minor flaky timing tests, pass on retry) |

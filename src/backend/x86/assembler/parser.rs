@@ -1384,15 +1384,14 @@ fn parse_string_literal(s: &str) -> Result<Vec<u8>, String> {
                     Some('n') => bytes.push(b'\n'),
                     Some('t') => bytes.push(b'\t'),
                     Some('r') => bytes.push(b'\r'),
-                    Some('0') => bytes.push(0),
                     Some('\\') => bytes.push(b'\\'),
                     Some('"') => bytes.push(b'"'),
                     Some('a') => bytes.push(7),  // bell
                     Some('b') => bytes.push(8),  // backspace
                     Some('f') => bytes.push(12), // form feed
                     Some('v') => bytes.push(11), // vertical tab
-                    Some(c) if c.is_ascii_digit() => {
-                        // Octal escape: \NNN
+                    Some(c) if c >= '0' && c <= '7' => {
+                        // Octal escape: \N, \NN, or \NNN (handles \0, \014, etc.)
                         let mut val = c as u32 - '0' as u32;
                         for _ in 0..2 {
                             if let Some(&next) = chars.as_str().as_bytes().first() {

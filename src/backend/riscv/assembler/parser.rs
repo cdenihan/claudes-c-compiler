@@ -621,10 +621,10 @@ pub fn parse_string_literal(s: &str) -> Result<String, String> {
                 Some('n') => result.push('\n'),
                 Some('t') => result.push('\t'),
                 Some('r') => result.push('\r'),
-                Some('0') => result.push('\0'),
                 Some('\\') => result.push('\\'),
                 Some('"') => result.push('"'),
-                Some(c) if c.is_ascii_digit() => {
+                Some(c) if c >= '0' && c <= '7' => {
+                    // Octal escape: \N, \NN, or \NNN (handles \0, \014, etc.)
                     let mut octal = String::new();
                     octal.push(c);
                     while octal.len() < 3 {
