@@ -161,6 +161,16 @@ pub(crate) fn encode_mrs(operands: &[Operand]) -> Result<EncodeResult, String> {
         "fpcr" => 0xda20,
         "fpsr" => 0xda21,
         "nzcv" => 0xda10,
+        "spsel" => 0xc210,
+        "mdccint_el1" => 0x8010,
+        "fpexc32_el2" => 0xe298,
+        "dbgauthstatus_el1" => 0x83f6,
+        "spsr_abt" => 0xe219,
+        "spsr_und" => 0xe21a,
+        "spsr_irq" => 0xe218,
+        "spsr_fiq" => 0xe21b,
+        "ifsr32_el2" => 0xe281,
+        "dacr32_el2" => 0xe180,
         _ => parse_generic_sysreg(&sysreg)?,
     };
 
@@ -270,10 +280,13 @@ pub(crate) fn encode_msr(operands: &[Operand]) -> Result<EncodeResult, String> {
             return Ok(EncodeResult::Word(word));
         }
         "spsel" => {
-            // SPSel: op1=0, op2=5
-            let imm = get_imm(operands, 1)? as u32 & 0xF;
-            let word = 0xd5004000 | (imm << 8) | (0b101 << 5) | 0x1F;
-            return Ok(EncodeResult::Word(word));
+            // SPSel: op1=0, op2=5 (MSR immediate form)
+            // If the second operand is a register, fall through to MSR register form
+            if let Ok(imm) = get_imm(operands, 1) {
+                let imm = imm as u32 & 0xF;
+                let word = 0xd5004000 | (imm << 8) | (0b101 << 5) | 0x1F;
+                return Ok(EncodeResult::Word(word));
+            }
         }
         _ => {}
     }
@@ -355,6 +368,15 @@ pub(crate) fn encode_msr(operands: &[Operand]) -> Result<EncodeResult, String> {
         "fpcr" => 0xda20,
         "fpsr" => 0xda21,
         "nzcv" => 0xda10,
+        "spsel" => 0xc210,
+        "mdccint_el1" => 0x8010,
+        "fpexc32_el2" => 0xe298,
+        "spsr_abt" => 0xe219,
+        "spsr_und" => 0xe21a,
+        "spsr_irq" => 0xe218,
+        "spsr_fiq" => 0xe21b,
+        "ifsr32_el2" => 0xe281,
+        "dacr32_el2" => 0xe180,
         _ => parse_generic_sysreg(&sysreg)?,
     };
 
