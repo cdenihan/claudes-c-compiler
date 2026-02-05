@@ -1,7 +1,7 @@
 //! RISC-V instruction encoder.
 //!
 //! Encodes RISC-V instructions into 32-bit machine code words.
-//! This covers the subset of instructions emitted by our codegen (RV64GC).
+//! This covers the subset of instructions emitted by our codegen (RV64GC + Zbb).
 //!
 //! RISC-V base instructions are always 4 bytes (32 bits), little-endian.
 //! The encoding uses six main formats: R, I, S, B, U, J.
@@ -544,6 +544,45 @@ pub fn encode_instruction(mnemonic: &str, operands: &[Operand], raw_operands: &s
         "remw" => encode_alu_reg_w(operands, 0b110, 0b0000001),
         "remuw" => encode_alu_reg_w(operands, 0b111, 0b0000001),
 
+        // ── Zbb Extension (basic bit manipulation) ──
+        // Unary operations (encoded as I-type with rs2 field in immediate)
+        "clz" => encode_zbb_unary(operands, 0x600),   // clz rd, rs1
+        "ctz" => encode_zbb_unary(operands, 0x601),   // ctz rd, rs1
+        "cpop" => encode_zbb_unary(operands, 0x602),  // cpop rd, rs1
+        "sext.b" => encode_zbb_unary(operands, 0x604), // sext.b rd, rs1
+        "sext.h" => encode_zbb_unary(operands, 0x605), // sext.h rd, rs1
+        "rev8" => encode_zbb_unary_f5(operands, 0x6B8),  // rev8 rd, rs1 (RV64, funct3=101)
+        "orc.b" => encode_zbb_unary_f5(operands, 0x287), // orc.b rd, rs1 (funct3=101)
+        // Unary word operations
+        "clzw" => encode_zbb_unary_w(operands, 0x600),  // clzw rd, rs1
+        "ctzw" => encode_zbb_unary_w(operands, 0x601),  // ctzw rd, rs1
+        "cpopw" => encode_zbb_unary_w(operands, 0x602), // cpopw rd, rs1
+        // Register-register operations
+        "andn" => encode_alu_reg(operands, 0b111, 0b0100000),
+        "orn" => encode_alu_reg(operands, 0b110, 0b0100000),
+        "xnor" => encode_alu_reg(operands, 0b100, 0b0100000),
+        "max" => encode_alu_reg(operands, 0b110, 0b0000101),
+        "maxu" => encode_alu_reg(operands, 0b111, 0b0000101),
+        "min" => encode_alu_reg(operands, 0b100, 0b0000101),
+        "minu" => encode_alu_reg(operands, 0b101, 0b0000101),
+        "rol" => encode_alu_reg(operands, 0b001, 0b0110000),
+        "ror" => if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
+            encode_shift_imm(operands, 0b101, 0b011000) // -> rori
+        } else {
+            encode_alu_reg(operands, 0b101, 0b0110000)
+        },
+        "rolw" => encode_alu_reg_w(operands, 0b001, 0b0110000),
+        "rorw" => if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
+            encode_shift_imm_w(operands, 0b101, 0b0110000) // -> roriw
+        } else {
+            encode_alu_reg_w(operands, 0b101, 0b0110000)
+        },
+        // Shift-immediate rotate
+        "rori" => encode_shift_imm(operands, 0b101, 0b011000),
+        "roriw" => encode_shift_imm_w(operands, 0b101, 0b0110000),
+        // zext.h is R-type with rs2=0 on OP-32
+        "zext.h" => encode_zbb_zexth(operands),
+
         // ── A Extension (atomics) ──
         "lr.w" => encode_lr(operands, 0b010),
         "lr.d" => encode_lr(operands, 0b011),
@@ -1068,6 +1107,38 @@ fn encode_alu_reg_w(operands: &[Operand], funct3: u32, funct7: u32) -> Result<En
     let rs1 = get_reg(operands, 1)?;
     let rs2 = get_reg(operands, 2)?;
     Ok(EncodeResult::Word(encode_r(OP_OP_32, rd, funct3, rs1, rs2, funct7)))
+}
+
+// ── Zbb (bit manipulation) helpers ──
+
+/// Encode a Zbb unary instruction (clz, ctz, cpop, sext.b, sext.h, rev8).
+/// These are I-type with funct3=001 and the 12-bit immediate encoding the operation.
+fn encode_zbb_unary(operands: &[Operand], imm12: u32) -> Result<EncodeResult, String> {
+    let rd = get_reg(operands, 0)?;
+    let rs1 = get_reg(operands, 1)?;
+    Ok(EncodeResult::Word(encode_i(OP_OP_IMM, rd, 0b001, rs1, imm12 as i32)))
+}
+
+/// Encode a Zbb unary instruction with funct3=101 (rev8, orc.b).
+fn encode_zbb_unary_f5(operands: &[Operand], imm12: u32) -> Result<EncodeResult, String> {
+    let rd = get_reg(operands, 0)?;
+    let rs1 = get_reg(operands, 1)?;
+    Ok(EncodeResult::Word(encode_i(OP_OP_IMM, rd, 0b101, rs1, imm12 as i32)))
+}
+
+/// Encode a Zbb unary word instruction (clzw, ctzw, cpopw).
+/// These are I-type on OP-IMM-32 with funct3=001.
+fn encode_zbb_unary_w(operands: &[Operand], imm12: u32) -> Result<EncodeResult, String> {
+    let rd = get_reg(operands, 0)?;
+    let rs1 = get_reg(operands, 1)?;
+    Ok(EncodeResult::Word(encode_i(OP_OP_IMM_32, rd, 0b001, rs1, imm12 as i32)))
+}
+
+/// Encode zext.h rd, rs1 (R-type on OP-32: funct7=0000100, rs2=0, funct3=100).
+fn encode_zbb_zexth(operands: &[Operand]) -> Result<EncodeResult, String> {
+    let rd = get_reg(operands, 0)?;
+    let rs1 = get_reg(operands, 1)?;
+    Ok(EncodeResult::Word(encode_r(OP_OP_32, rd, 0b100, rs1, 0, 0b0000100)))
 }
 
 // ── Atomics ──

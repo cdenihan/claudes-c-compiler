@@ -10,14 +10,14 @@ removes a hard dependency on a host `as` binary and dramatically improves
 compilation latency on cross-compilation setups.
 
 The assembler supports the full RV64I base integer ISA, the M (multiply/divide),
-A (atomics), F (single-precision float), D (double-precision float), and
-C (compressed 16-bit) standard extensions.  It handles all standard assembler
+A (atomics), F (single-precision float), D (double-precision float),
+C (compressed 16-bit), and Zbb (basic bit manipulation) standard extensions.  It handles all standard assembler
 directives, pseudo-instructions, relocation modifiers, numeric local labels,
 macro expansion, and conditional assembly.
 
 ### Capabilities at a glance
 
-- Full RV64IMAFDC instruction encoding
+- Full RV64IMAFDC + Zbb instruction encoding
 - 40+ pseudo-instructions (li, la, call, tail, mv, not, negw, seqz, ...)
 - All standard assembler directives (.text, .data, .globl, .align, .byte, ...)
 - Preprocessor: `.macro/.endm`, `.rept/.irp/.endr`, `.if/.else/.endif`
