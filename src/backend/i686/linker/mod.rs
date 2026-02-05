@@ -113,7 +113,7 @@ pub fn link_builtin(
     check_undefined_symbols(&global_symbols)?;
 
     // Phase 8: Build PLT/GOT structures
-    let (plt_symbols, got_symbols, num_plt, num_got_total) = build_plt_got_lists(&mut global_symbols);
+    let (plt_symbols, got_dyn_symbols, got_local_symbols, num_plt, num_got_total) = build_plt_got_lists(&mut global_symbols);
 
     // Phase 8b: Mark WEAK dynamic data symbols for text relocations instead of COPY
     if !is_static {
@@ -137,7 +137,7 @@ pub fn link_builtin(
     emit_executable(
         &inputs, &mut output_sections, &section_name_to_idx, &section_map,
         &mut global_symbols, &sym_resolution,
-        &dynlib_syms, &plt_symbols, &got_symbols,
+        &dynlib_syms, &plt_symbols, &got_dyn_symbols, &got_local_symbols,
         num_plt, num_got_total, &ifunc_symbols,
         is_static, is_nostdlib, needed_libs_param,
         output_path,
@@ -808,19 +808,25 @@ fn check_undefined_symbols(global_symbols: &HashMap<String, LinkerSymbol>) -> Re
 
 fn build_plt_got_lists(
     global_symbols: &mut HashMap<String, LinkerSymbol>,
-) -> (Vec<String>, Vec<String>, usize, usize) {
+) -> (Vec<String>, Vec<String>, Vec<String>, usize, usize) {
     let mut plt_symbols: Vec<String> = Vec::new();
-    let mut got_symbols: Vec<String> = Vec::new();
+    let mut got_dyn_symbols: Vec<String> = Vec::new();
+    let mut got_local_symbols: Vec<String> = Vec::new();
 
     for (name, sym) in global_symbols.iter() {
         if sym.needs_plt {
             plt_symbols.push(name.clone());
         } else if sym.needs_got && !sym.needs_plt {
-            got_symbols.push(name.clone());
+            if sym.is_dynamic {
+                got_dyn_symbols.push(name.clone());
+            } else {
+                got_local_symbols.push(name.clone());
+            }
         }
     }
     plt_symbols.sort();
-    got_symbols.sort();
+    got_dyn_symbols.sort();
+    got_local_symbols.sort();
 
     for (i, name) in plt_symbols.iter().enumerate() {
         if let Some(sym) = global_symbols.get_mut(name) {
@@ -828,15 +834,22 @@ fn build_plt_got_lists(
             sym.got_index = i;
         }
     }
-    for (i, name) in got_symbols.iter().enumerate() {
+    // Dynamic GOT symbols come first (they need .dynsym entries + GLOB_DAT)
+    for (i, name) in got_dyn_symbols.iter().enumerate() {
         if let Some(sym) = global_symbols.get_mut(name) {
             sym.got_index = plt_symbols.len() + i;
         }
     }
+    // Local GOT symbols come after (filled at link time, no .dynsym needed)
+    for (i, name) in got_local_symbols.iter().enumerate() {
+        if let Some(sym) = global_symbols.get_mut(name) {
+            sym.got_index = plt_symbols.len() + got_dyn_symbols.len() + i;
+        }
+    }
 
     let num_plt = plt_symbols.len();
-    let num_got_total = plt_symbols.len() + got_symbols.len();
-    (plt_symbols, got_symbols, num_plt, num_got_total)
+    let num_got_total = plt_symbols.len() + got_dyn_symbols.len() + got_local_symbols.len();
+    (plt_symbols, got_dyn_symbols, got_local_symbols, num_plt, num_got_total)
 }
 
 fn collect_ifunc_symbols(
@@ -866,7 +879,8 @@ fn emit_executable(
     _sym_resolution: &HashMap<(usize, usize), String>,
     _dynlib_syms: &HashMap<String, (String, u8, u32, Option<String>, bool, u8)>,
     plt_symbols: &[String],
-    got_symbols: &[String],
+    got_dyn_symbols: &[String],
+    got_local_symbols: &[String],
     num_plt: usize,
     _num_got_total: usize,
     ifunc_symbols: &[String],
@@ -920,15 +934,16 @@ fn emit_executable(
         dynsym_names.push(name.clone());
     }
 
-    // GOT-only symbols (unhashed imports)
-    for name in got_symbols {
+    // GOT-only symbols: only dynamic (imported) symbols go in .dynsym
+    // Local GOT symbols are resolved at link time and don't need dynamic entries
+    for name in got_dyn_symbols {
         let idx = dynsym_entries.len();
         let name_off = dynstr.add(name);
         let sym = &global_symbols[name];
         dynsym_entries.push(Elf32Sym {
             name: name_off, value: 0, size: sym.size,
             info: (sym.binding << 4) | sym.sym_type, other: 0,
-            shndx: if sym.is_dynamic { SHN_UNDEF } else { 1 },
+            shndx: SHN_UNDEF,
         });
         dynsym_map.insert(name.clone(), idx);
         dynsym_names.push(name.clone());
@@ -1034,7 +1049,7 @@ fn emit_executable(
     let _ = dynstr2.add("");
     for lib in &needed_libs { dynstr2.add(lib); }
     for name in plt_symbols { dynstr2.add(name); }
-    for name in got_symbols { dynstr2.add(name); }
+    for name in got_dyn_symbols { dynstr2.add(name); }
     for name in &all_hashed_syms { dynstr2.add(name); }
     for (_, vers) in &lib_ver_list {
         for v in vers { dynstr2.add(v); }
@@ -1209,7 +1224,7 @@ fn emit_executable(
         }
         count
     };
-    let num_rel_dyn = got_symbols.len() + num_copy_relocs + num_text_relocs;
+    let num_rel_dyn = got_dyn_symbols.len() + num_copy_relocs + num_text_relocs;
     let rel_dyn_size = (num_rel_dyn as u32) * 8;
     if !is_static { file_offset += rel_dyn_size; vaddr += rel_dyn_size; }
 
@@ -1378,7 +1393,7 @@ fn emit_executable(
     let got_offset = file_offset;
     let got_vaddr = vaddr;
     let got_reserved: usize = 1;
-    let got_non_plt_entries = got_symbols.len();
+    let got_non_plt_entries = got_dyn_symbols.len() + got_local_symbols.len();
     let got_entry_size: u32 = 4;
     let got_size = (got_reserved + got_non_plt_entries) as u32 * got_entry_size;
     let needs_got_section = !is_static || got_non_plt_entries > 0 || num_plt > 0;
@@ -1541,13 +1556,25 @@ fn emit_executable(
     let mut got_data: Vec<u8> = Vec::new();
     if needs_got_section {
         got_data.extend_from_slice(&(if is_static { 0u32 } else { dynamic_vaddr }).to_le_bytes());
-        for name in got_symbols {
+        // Dynamic GOT symbols first (filled by dynamic linker via GLOB_DAT)
+        for name in got_dyn_symbols {
             if let Some(gs) = global_symbols.get(name) {
                 if has_tls && gs.sym_type == STT_TLS {
                     let tpoff = gs.address as i32 - tls_addr as i32 - tls_mem_size as i32;
                     got_data.extend_from_slice(&(tpoff as u32).to_le_bytes());
-                } else if gs.is_dynamic {
+                } else {
                     got_data.extend_from_slice(&0u32.to_le_bytes());
+                }
+            } else {
+                got_data.extend_from_slice(&0u32.to_le_bytes());
+            }
+        }
+        // Local GOT symbols (filled at link time with resolved addresses)
+        for name in got_local_symbols {
+            if let Some(gs) = global_symbols.get(name) {
+                if has_tls && gs.sym_type == STT_TLS {
+                    let tpoff = gs.address as i32 - tls_addr as i32 - tls_mem_size as i32;
+                    got_data.extend_from_slice(&(tpoff as u32).to_le_bytes());
                 } else {
                     got_data.extend_from_slice(&gs.address.to_le_bytes());
                 }
@@ -1579,9 +1606,9 @@ fn emit_executable(
         rel_plt_data.extend_from_slice(&r_info.to_le_bytes());
     }
 
-    // .rel.dyn data
+    // .rel.dyn data (only dynamic GOT symbols need GLOB_DAT)
     let mut rel_dyn_data: Vec<u8> = Vec::new();
-    for (i, name) in got_symbols.iter().enumerate() {
+    for (i, name) in got_dyn_symbols.iter().enumerate() {
         let got_entry_addr = got_vaddr + (got_reserved as u32 + i as u32) * 4;
         let dynsym_idx = dynsym_map[name] as u32;
         let r_info = (dynsym_idx << 8) | 6; // R_386_GLOB_DAT

@@ -632,6 +632,43 @@ impl Lowerer {
         decl: &Declaration,
         declarator_name: &str,
     ) {
+        // Handle brace-wrapped string literal for char arrays: char b[5] = {"def"}
+        // The C standard (C11 6.7.9 p14) allows a string literal optionally enclosed
+        // in braces as an initializer for an array of character type. Redirect to
+        // lower_char_array_init_expr which uses the full array size (da.alloc_size)
+        // rather than the per-element size (da.elem_size = 1).
+        if (da.base_ty == IrType::I8 || da.base_ty == IrType::U8) && !da.is_array_of_pointers {
+            if items.len() == 1 && items[0].designators.is_empty() {
+                if let Initializer::Expr(ref expr) = items[0].init {
+                    match expr {
+                        Expr::StringLiteral(..) | Expr::WideStringLiteral(..) | Expr::Char16StringLiteral(..) => {
+                            self.lower_char_array_init_expr(expr, alloca, da);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        // Also handle brace-wrapped wide string for wchar_t (I32/U32) arrays
+        if (da.base_ty == IrType::I32 || da.base_ty == IrType::U32) && !da.is_array_of_pointers {
+            if items.len() == 1 && items[0].designators.is_empty() {
+                if let Initializer::Expr(ref expr @ Expr::WideStringLiteral(..)) = items[0].init {
+                    self.lower_wchar_array_init_expr(expr, alloca, da);
+                    return;
+                }
+            }
+        }
+        // Also handle brace-wrapped char16_t string for char16_t (I16/U16) arrays
+        if (da.base_ty == IrType::I16 || da.base_ty == IrType::U16) && !da.is_array_of_pointers {
+            if items.len() == 1 && items[0].designators.is_empty() {
+                if let Initializer::Expr(ref expr @ Expr::Char16StringLiteral(..)) = items[0].init {
+                    self.lower_char16_array_init_expr(expr, alloca, da);
+                    return;
+                }
+            }
+        }
+
         // For arrays of function pointers or pointer arrays, the struct layout
         // (from the return type or pointee type) must not trigger struct init path.
         let elem_struct_layout = if da.is_array_of_func_ptrs || da.is_array_of_pointers {
