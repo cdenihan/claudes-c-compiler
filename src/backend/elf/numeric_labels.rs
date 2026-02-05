@@ -157,6 +157,10 @@ fn resolve_numeric_operand(
                 op.clone()
             }
         }
+        Operand::Indirect(inner) => {
+            let resolved_inner = resolve_numeric_operand(inner, current_idx, defs);
+            Operand::Indirect(Box::new(resolved_inner))
+        }
         _ => op.clone(),
     }
 }
