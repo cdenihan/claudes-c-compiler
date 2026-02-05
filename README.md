@@ -128,9 +128,11 @@ components use GCC (e.g., `Backend: gcc_assembler, gcc_linker`).
 ## Status
 
 The compiler can build real-world C codebases across all four architectures,
-including the Linux kernel. FFmpeg compiles and passes all 7331 FATE checkasm
-tests on both x86-64 and AArch64 (ARM), using the fully standalone
-assembler and linker.
+including the Linux kernel. Other projects that build and pass tests include
+FFmpeg (all 7331 FATE checkasm tests on x86-64 and AArch64), PostgreSQL
+(all 237 regression tests), SQLite, GNU coreutils, Busybox, CPython, QEMU,
+LuaJIT, QuickJS, and more — all using the fully standalone assembler and
+linker with no external toolchain.
 
 ### Known Limitations
 
@@ -138,8 +140,8 @@ assembler and linker.
   the same optimization pipeline. Separate tiers will be added as the compiler
   matures.
 - **Long double**: x86 80-bit extended precision is supported via x87 FPU
-  instructions. On ARM/RISC-V, `long double` is IEEE binary128 via compiler-rt
-  soft-float libcalls.
+  instructions. On ARM/RISC-V, `long double` is IEEE binary128 via
+  compiler-rt/libgcc soft-float libcalls.
 - **Complex numbers**: `_Complex` arithmetic has some edge-case failures.
 - **GNU extensions**: Partial `__attribute__` support. NEON intrinsics are
   partially implemented (core 128-bit operations work).
@@ -187,12 +189,12 @@ and comparing stdout and the exit code against the expected files.
 src/                Compiler source code (Rust)
   frontend/         C source -> typed AST (preprocessor, lexer, parser, sema)
   ir/               Target-independent SSA IR (lowering, mem2reg)
-  passes/           SSA optimization passes (16 passes)
+  passes/           SSA optimization passes (15 passes + shared loop analysis)
   backend/          IR -> assembly -> machine code -> ELF (4 architectures)
   common/           Shared types, symbol table, diagnostics
   driver/           CLI parsing, pipeline orchestration
 
-include/            Bundled C headers (SSE/AVX/NEON intrinsic stubs)
+include/            Bundled C headers (x86 SIMD: SSE through AVX-512, AES-NI, FMA, SHA, BMI2; ARM NEON)
 tests/              Compiler tests (each test is a directory with main.c and expected output)
 ideas/              Future work proposals and improvement notes
 ```
