@@ -41,7 +41,7 @@ Tracking project build/test results with MY_ASM=builtin MY_LD=builtin
 | yyjson  | PASS | PASS | PASS | PASS | Fixed i686: incl/decl peephole broke carry flag for 64-bit negation (addl $1 before adcl) |
 | smaz    | PASS | PASS | PASS | PASS | All architectures pass out of the box |
 | heatshrink | PASS | PASS | PASS | PASS | Fixed i686: linker rejected .os/.od archive members and input files (extension-based filters) |
-| bearssl | PASS | TODO (slow) | PASS | PASS | Build script fix: -DBR_GCC=0 to disable GCC vector type intrinsics. i686 correct but crypto tests too slow (~15x vs GCC) |
+| bearssl | PASS | TODO (slow) | PASS | PASS | Fixed: added bundled x86intrin.h + _mm_cmpeq_epi64 + RDRAND/RDSEED intrinsics (no build script fix needed). i686 correct but crypto tests too slow (~15x vs GCC) |
 | tinyexpr | PASS | PASS | PASS | PASS | All architectures pass out of the box |
 | sqlite  | PASS | PASS | PASS | PASS | All architectures pass out of the box |
 | genann  | PASS | PASS | PASS | PASS | All architectures pass out of the box |
