@@ -1,0 +1,11 @@
+Fix i686 packed bitfield storage type for >32-bit bitfields
+
+Bug: On i686, packed bitfields wider than 32 bits (e.g., uint64_t : 64)
+get incorrect storage types. smallest_int_ctype_for_bytes() returns
+CType::Long (4 bytes on i686) instead of CType::LongLong (8 bytes)
+for bitfields needing 5+ bytes of storage. This causes the
+store_bitfield_split path to use I32 operations, truncating 64-bit
+values to 32 bits.
+
+Fix: Change smallest_int_ctype_for_bytes to return LongLong/ULongLong
+for the >4 byte case, since Long is only 4 bytes on i686 (ILP32).
