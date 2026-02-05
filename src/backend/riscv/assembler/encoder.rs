@@ -1373,6 +1373,15 @@ fn encode_sfence_vma(operands: &[Operand]) -> Result<EncodeResult, String> {
 fn encode_csr(operands: &[Operand], funct3: u32) -> Result<EncodeResult, String> {
     let rd = get_reg(operands, 0)?;
     let csr = get_csr_num(operands, 1)?;
+    // If operand 2 is a bare immediate (not a register name), use the immediate
+    // CSR encoding (csrrwi/csrrsi/csrrci) instead of the register form.
+    // GNU as allows e.g. `csrrc t0, sstatus, 2` and auto-selects the immediate form.
+    if matches!(operands.get(2), Some(Operand::Imm(_))) {
+        let zimm = get_imm(operands, 2)? as u32;
+        let rs1 = zimm & 0x1F;
+        let imm_funct3 = funct3 | 0b100; // 001->101, 010->110, 011->111
+        return Ok(EncodeResult::Word(encode_i(OP_SYSTEM, rd, imm_funct3, rs1, csr as i32)));
+    }
     let rs1 = get_reg(operands, 2)?;
     Ok(EncodeResult::Word(encode_i(OP_SYSTEM, rd, funct3, rs1, csr as i32)))
 }
@@ -2127,18 +2136,30 @@ fn encode_csrr(operands: &[Operand]) -> Result<EncodeResult, String> {
 
 fn encode_csrw(operands: &[Operand]) -> Result<EncodeResult, String> {
     let csr = get_csr_num(operands, 0)?;
+    if matches!(operands.get(1), Some(Operand::Imm(_))) {
+        let zimm = get_imm(operands, 1)? as u32 & 0x1F;
+        return Ok(EncodeResult::Word(encode_i(OP_SYSTEM, 0, 0b101, zimm, csr as i32)));
+    }
     let rs1 = get_reg(operands, 1)?;
     Ok(EncodeResult::Word(encode_i(OP_SYSTEM, 0, 0b001, rs1, csr as i32)))
 }
 
 fn encode_csrs(operands: &[Operand]) -> Result<EncodeResult, String> {
     let csr = get_csr_num(operands, 0)?;
+    if matches!(operands.get(1), Some(Operand::Imm(_))) {
+        let zimm = get_imm(operands, 1)? as u32 & 0x1F;
+        return Ok(EncodeResult::Word(encode_i(OP_SYSTEM, 0, 0b110, zimm, csr as i32)));
+    }
     let rs1 = get_reg(operands, 1)?;
     Ok(EncodeResult::Word(encode_i(OP_SYSTEM, 0, 0b010, rs1, csr as i32)))
 }
 
 fn encode_csrc(operands: &[Operand]) -> Result<EncodeResult, String> {
     let csr = get_csr_num(operands, 0)?;
+    if matches!(operands.get(1), Some(Operand::Imm(_))) {
+        let zimm = get_imm(operands, 1)? as u32 & 0x1F;
+        return Ok(EncodeResult::Word(encode_i(OP_SYSTEM, 0, 0b111, zimm, csr as i32)));
+    }
     let rs1 = get_reg(operands, 1)?;
     Ok(EncodeResult::Word(encode_i(OP_SYSTEM, 0, 0b011, rs1, csr as i32)))
 }
