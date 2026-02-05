@@ -3431,8 +3431,9 @@ fn encode_tlbi(_operands: &[Operand], raw_operands: &str) -> Result<EncodeResult
         31 // xzr
     };
     // TLBI encoding: SYS instruction with fixed fields
-    // Full word from GCC objdump for known ops:
+    // Full word from GCC objdump for known ops (with Rt=x0):
     let base = match op_name.as_str() {
+        // Standard ARMv8.0 TLBI operations
         "vmalle1is" => 0xd508831fu32,
         "vmalle1"   => 0xd508871f,
         "alle1is"   => 0xd50c839f,
@@ -3441,16 +3442,42 @@ fn encode_tlbi(_operands: &[Operand], raw_operands: &str) -> Result<EncodeResult
         "vale1is"   => 0xd50883a0,
         "vale1"     => 0xd50887a0,
         "vale2is"   => 0xd50c83a0,
+        "vale2"     => 0xd50c87a0,
         "vaae1is"   => 0xd5088360,
         "vaae1"     => 0xd5088760,
         "vaale1is"  => 0xd50883e0,
         "vaale1"    => 0xd50887e0,
         "vae1is"    => 0xd5088320,
         "vae1"      => 0xd5088720,
+        "vae2is"    => 0xd50c8320,
+        "vae2"      => 0xd50c8720,
         "aside1is"  => 0xd5088340,
         "aside1"    => 0xd5088740,
         "vmalls12e1is" => 0xd50c83df,
         "vmalls12e1"   => 0xd50c87df,
+        "ipas2e1is"    => 0xd50c8020,
+        "ipas2e1"      => 0xd50c8420,
+        "ipas2le1is"   => 0xd50c80a0,
+        "ipas2le1"     => 0xd50c84a0,
+        // FEAT_TLBIRANGE: range TLBI operations (ARMv8.4-A)
+        "rvae1is"      => 0xd5088220,
+        "rvale1is"     => 0xd50882a0,
+        "rvaae1is"     => 0xd5088260,
+        "rvaale1is"    => 0xd50882e0,
+        "rvae1"        => 0xd5088620,
+        "rvale1"       => 0xd50886a0,
+        "rvaae1"       => 0xd5088660,
+        "rvaale1"      => 0xd50886e0,
+        "rvae1os"      => 0xd5088520,
+        "rvale1os"     => 0xd50885a0,
+        "rvaae1os"     => 0xd5088560,
+        "rvaale1os"    => 0xd50885e0,
+        "ripas2e1is"   => 0xd50c8040,
+        "ripas2e1"     => 0xd50c8440,
+        "ripas2e1os"   => 0xd50c8460,
+        "ripas2le1is"  => 0xd50c80c0,
+        "ripas2le1"    => 0xd50c84c0,
+        "ripas2le1os"  => 0xd50c84e0,
         _ => return Err(format!("unsupported tlbi operation: {}", op_name)),
     };
     // Replace Rt field (bits 4:0)

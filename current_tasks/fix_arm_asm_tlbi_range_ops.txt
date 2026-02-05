@@ -1,9 +1,0 @@
-Fix ARM assembler: add FEAT_TLBIRANGE TLBI operations
-
-The ARM assembler's encode_tlbi function is missing FEAT_TLBIRANGE operations
-(rvale1is, rvae1is, rvaae1is, etc.) needed for arm64 defconfig kernel builds.
-The kernel's __flush_tlb_range_op macro generates these by concatenating 'r'
-with base operation names.
-
-Also adding missing standard operations: vale2, vae2, vae2is, ipas2e1is,
-ipas2e1, ipas2le1is, ipas2le1.
