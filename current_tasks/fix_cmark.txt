@@ -1,0 +1,2 @@
+Verifying cmark project on x86 with standalone assembler/linker.
+If it fails, diagnosing and fixing the issue.
