@@ -1,0 +1,7 @@
+Fix x86 assembler: jmp and jcc instructions should strip @PLT suffix from labels
+and emit R_X86_64_PLT32 relocations instead of R_X86_64_PC32.
+
+Also fix linker to handle any remaining @PLT-suffixed symbols from object files.
+
+This is needed for Redis to build, since hiredis is compiled with -fPIC and
+our codegen emits `jmp foo@PLT` for tail calls.
