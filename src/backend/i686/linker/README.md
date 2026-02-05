@@ -542,7 +542,7 @@ headers matter) and reduces file size.
 | File         | Lines | Role                                                        |
 |--------------|-------|-------------------------------------------------------------|
 | `mod.rs`     | ~50   | Module declarations, `DynStrTab` u32 wrapper, public re-exports |
-| `types.rs`   | ~323  | ELF32-specific constants (relocation types, dynamic tags,   |
+| `types.rs`   | ~332  | ELF32-specific constants (relocation types, dynamic tags,   |
 |              |       | section flags), struct definitions (`InputObject`,          |
 |              |       | `LinkerSymbol`, `OutputSection`, etc.), helper functions    |
 | `parse.rs`   | ~195  | ELF32 object file parsing (`parse_elf32`), regular and      |
@@ -557,10 +557,10 @@ headers matter) and reduces file size.
 |              |       | loading, shared lib scanning, archive resolution            |
 | `sections.rs`| ~131  | Phase 5: section merging, COMDAT deduplication,             |
 |              |       | output section type/flag assignment                         |
-| `symbols.rs` | ~344  | Phases 6-9: symbol resolution, COMMON allocation,           |
+| `symbols.rs` | ~356  | Phases 6-9: symbol resolution, COMMON allocation,           |
 |              |       | PLT/GOT marking, undefined check, PLT/GOT list building    |
 | `link.rs`    | ~216  | Orchestration: `link_builtin` and `link_shared` entry points|
-| `emit.rs`    | ~1,188| Phase 10: executable layout, address assignment,            |
+| `emit.rs`    | ~1,248| Phase 10: executable layout, address assignment,            |
 |              |       | relocation application, ELF32 emission                      |
-| `shared.rs`  | ~1,046| Shared library (.so) emission: PIC layout, dynamic          |
+| `shared.rs`  | ~1,058| Shared library (.so) emission: PIC layout, dynamic          |
 |              |       | relocations, symbol export, NEEDED discovery                |
