@@ -1,4 +1,0 @@
-Fixing libvorbis_libogg project for x86 target.
-The project fails on x86 but passes on i686/arm/riscv.
-Need to diagnose whether it's a compiler bug or build script issue.
-Started 2026-02-05.
