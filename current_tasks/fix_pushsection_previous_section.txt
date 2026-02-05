@@ -1,0 +1,14 @@
+Fix .pushsection/.popsection to save/restore previous_section
+
+When .pushsection is used, it calls process_section_directive which
+clobbers previous_section. After .popsection restores current_section,
+a subsequent .previous would go to the wrong section because
+previous_section was not saved/restored.
+
+This is an assembler conformance issue: GNU as saves and restores
+both current_section and previous_section in push/pop.
+
+Fix: save previous_section alongside current_section in push_section,
+and restore it in pop_section.
+
+Started: 2026-02-05
