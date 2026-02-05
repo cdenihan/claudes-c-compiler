@@ -281,9 +281,11 @@ relocation types cover the full AArch64 static-linking relocation model:
 3. **Condition codes**: 16 codes (`eq`, `ne`, `cs`/`hs`, `cc`/`lo`, ...,
    `al`, `nv`) are mapped to their 4-bit encoding.
 
-4. **Wide immediates**: `mov Xd, #large` generates a `movz`+`movk` sequence
-   (up to 4 instructions for a 64-bit constant), returned as
-   `EncodeResult::Words`.
+4. **Wide immediates**: `mov Xd, #large` first tries single-instruction
+   encodings (MOVZ for 0..0xFFFF, MOVN for bitwise-NOT in 16-bit range,
+   ORR with bitmask immediate for repeating patterns like 0x0101010101010101),
+   then falls back to a `movz`+`movk` sequence (up to 4 instructions for a
+   64-bit constant), returned as `EncodeResult::Words`.
 
 5. **MOV special cases**: `mov` to/from `sp` encodes as `add Xd, Xn, #0`;
    register-to-register `mov` encodes as `orr Rd, xzr, Rm`.  NEON `mov`

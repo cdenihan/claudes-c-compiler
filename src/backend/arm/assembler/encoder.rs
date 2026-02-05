@@ -1054,6 +1054,15 @@ fn encode_mov(operands: &[Operand]) -> Result<EncodeResult, String> {
             }
         }
 
+        // Try encoding as ORR Rd, XZR, #imm (logical/bitmask immediate)
+        // This handles patterns like 0x0101010101010101 in a single instruction
+        if let Some((n, immr, imms)) = encode_bitmask_imm(imm as u64, is_64) {
+            let sf = sf_bit(is_64);
+            // ORR Rd, XZR, #imm: sf 01 100100 N immr imms 11111 Rd
+            let word = (sf << 31) | (0b01 << 29) | (0b100100 << 23) | (n << 22) | (immr << 16) | (imms << 10) | (0b11111 << 5) | rd;
+            return Ok(EncodeResult::Word(word));
+        }
+
         // Need movz + movk sequence for large immediates
         return encode_mov_wide_imm(rd, is_64, imm as u64);
     }
