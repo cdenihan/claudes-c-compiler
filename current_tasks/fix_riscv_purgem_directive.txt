@@ -1,0 +1,11 @@
+Add .purgem assembler directive support to the shared asm_preprocess::expand_macros() function.
+
+The RISC-V kernel build fails because inline assembly in arch/riscv/include/asm/insn-def.h
+uses .purgem to undefine macros after use. The shared expand_macros() function in
+asm_preprocess.rs does not handle .purgem, causing "unsupported RISC-V assembler directive: .purgem"
+errors.
+
+Both ARM and x86 assemblers have their own macro expansion that handles .purgem, but since
+RISC-V delegates to the shared module, we need to add .purgem support there.
+
+Started: 2026-02-05
