@@ -23,11 +23,11 @@ pub(super) struct RelocContext<'a> {
     pub gotplt_vaddr: u32,
     pub got_reserved: usize,
     pub gotplt_reserved: u32,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Set by linker layout; available for future PLT-relative relocations
     pub plt_vaddr: u32,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Set by linker layout; available for future PLT-relative relocations
     pub plt_header_size: u32,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Set by linker layout; available for future PLT-relative relocations
     pub plt_entry_size: u32,
     pub num_plt: usize,
     pub tls_addr: u32,

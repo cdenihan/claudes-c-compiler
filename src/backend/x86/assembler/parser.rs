@@ -56,18 +56,18 @@ pub enum AsmItem {
     /// Symbol alias: `.set alias, target`
     Set(String, String),
     /// CFI directive (ignored for code generation, kept for .eh_frame)
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Parsed by parser but skipped during encoding (DWARF .eh_frame not yet emitted)
     Cfi(CfiDirective),
     /// Debug file directive: `.file N "filename"`
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Parsed but skipped during encoding (debug info not yet emitted)
     File(u32, String),
     /// Debug location: `.loc filenum line column`
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Parsed but skipped during encoding (debug info not yet emitted)
     Loc(u32, u32, u32),
     /// x86-64 instruction
     Instruction(Instruction),
     /// `.option norelax` (RISC-V, ignored for x86)
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Parsed for RISC-V compatibility in shared parser; ignored on x86
     OptionDirective(String),
     /// Push current section and switch to a new one: `.pushsection name,"flags",@type`
     PushSection(SectionDirective),
@@ -91,7 +91,7 @@ pub struct SectionDirective {
     pub section_type: Option<String>,
     /// For sections with linked-to or group info (4th arg), e.g.
     /// `__patchable_function_entries,"awo",@progbits,.LPFE0`
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Parsed for completeness; will be used for SHF_LINK_ORDER sections
     pub extra: Option<String>,
     /// COMDAT group name from `.section name,"axG",@progbits,group_name,comdat`
     /// Set when flags contain 'G' and a 5th argument is "comdat".
@@ -133,7 +133,7 @@ pub enum DataValue {
 
 /// CFI directives (call frame information).
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[allow(dead_code)] // Variants constructed by parser; not yet consumed for .eh_frame emission
 pub enum CfiDirective {
     StartProc,
     EndProc,
@@ -193,7 +193,7 @@ pub enum ImmediateValue {
     Integer(i64),
     Symbol(String),
     /// Symbol with @modifier, e.g., symbol@GOTPCREL
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Constructed by parser; handled by encoder for GOT/TLS relocations
     SymbolMod(String, String),
     /// Symbol difference: sym_a - sym_b (e.g., $_DYNAMIC-1b)
     SymbolDiff(String, String),
@@ -216,7 +216,7 @@ pub enum Displacement {
     Integer(i64),
     Symbol(String),
     /// Symbol with an addend offset: symbol+offset or symbol-offset (e.g., GD_struct+128(%rip))
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Constructed by elf.rs numeric label resolver; consumed by encoder
     SymbolAddend(String, i64),
     /// Symbol with relocation modifier: symbol@GOT, symbol@GOTPCREL, symbol@TPOFF, etc.
     SymbolMod(String, String),

@@ -1,10 +1,10 @@
 pub(crate) mod asm_expr;        // Shared assembly expression evaluator (arithmetic, bitwise, parens)
 pub(crate) mod asm_preprocess;  // Shared GAS preprocessing: comments, macros, rept, conditionals
 pub(crate) mod common;
-#[allow(dead_code)]
+#[allow(dead_code)] // Defines ELF standard constants/helpers; not all used by every backend
 pub(crate) mod elf;
 pub(crate) mod elf_writer_common; // Shared x86/i686 assembler ELF writer
-#[cfg_attr(feature = "gcc_linker", allow(dead_code))]
+#[cfg_attr(feature = "gcc_linker", allow(dead_code))] // Built-in linker code unused when gcc handles linking
 pub(crate) mod linker_common;
 pub(crate) mod peephole_common; // Shared peephole optimizer utilities (word matching, LineStore)
 
@@ -230,7 +230,7 @@ impl Target {
 
     /// Get the assembler config for this target.
     /// Only used when the `gcc_assembler` feature is enabled for GCC fallback.
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "gcc_assembler"), allow(dead_code))]
     pub(crate) fn assembler_config(&self) -> common::AssemblerConfig {
         match self {
             Target::X86_64 => common::AssemblerConfig {

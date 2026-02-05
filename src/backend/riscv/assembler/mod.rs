@@ -19,14 +19,6 @@ use parser::parse_asm;
 use elf_writer::{ElfWriter, EF_RISCV_RVC, EF_RISCV_FLOAT_ABI_SINGLE, EF_RISCV_FLOAT_ABI_DOUBLE, EF_RISCV_FLOAT_ABI_QUAD};
 use crate::backend::elf::{ELFCLASS32, ELFCLASS64};
 
-/// Assemble RISC-V assembly text into an ELF object file.
-///
-/// This is the default assembler (used when the `gcc_assembler` feature is disabled).
-#[allow(dead_code)]
-pub fn assemble(asm_text: &str, output_path: &str) -> Result<(), String> {
-    assemble_with_args(asm_text, output_path, &[])
-}
-
 /// Assemble RISC-V assembly text into an ELF object file, with extra args.
 ///
 /// Supports `-mabi=` to control ELF float ABI flags and ELF class (32/64-bit),

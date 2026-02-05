@@ -7,6 +7,8 @@
 //! - AArch64 instructions (mov, add, sub, ldr, str, bl, ret, etc.)
 //! - CFI directives (passed through as-is for DWARF unwind info)
 
+// Some parser helper functions and enum variants are defined for completeness
+// and used only by the encoder or ELF writer, not the parser entry point itself.
 #![allow(dead_code)]
 
 use crate::backend::asm_expr;

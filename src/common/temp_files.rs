@@ -54,20 +54,20 @@ impl TempFile {
 
     /// Create a TempFile with a specific path (for cases where the caller
     /// controls the path but wants RAII cleanup).
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "gcc_assembler"), allow(dead_code))] // Used by gcc_assembler's CCC_KEEP_ASM path
     pub fn with_path(path: PathBuf) -> Self {
         Self { path, keep: false }
     }
 
     /// Mark this temp file to be kept (not deleted on drop).
     /// Useful for debugging with CCC_KEEP_ASM etc.
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "gcc_assembler"), allow(dead_code))] // Used by gcc_assembler's CCC_KEEP_ASM path
     pub fn set_keep(&mut self, keep: bool) {
         self.keep = keep;
     }
 
     /// Get the path as a Path reference.
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "gcc_assembler"), allow(dead_code))] // Used by gcc_assembler's assemble_with_extra()
     pub fn path(&self) -> &Path {
         &self.path
     }

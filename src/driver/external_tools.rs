@@ -211,7 +211,7 @@ impl Driver {
     ///
     /// For .s files (pure assembly), reads the file directly and passes it
     /// to the builtin assembler.
-    #[allow(dead_code)]
+    #[cfg_attr(feature = "gcc_assembler", allow(dead_code))] // Only called in standalone (non-gcc) assembler mode
     fn assemble_source_file_builtin(&self, input_file: &str, output_path: &str) -> Result<(), String> {
         let asm_text = if input_file.ends_with(".S") {
             // .S files need C preprocessing before assembly

@@ -8,6 +8,7 @@
 //! contains RISC-V-specific logic: instruction encoding dispatch, pcrel_hi/lo
 //! pairing, RV64C compression, GNU numeric labels, and branch resolution.
 
+// ELF writer helpers; some section/relocation utilities defined for completeness.
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};

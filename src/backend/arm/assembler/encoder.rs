@@ -6,6 +6,7 @@
 //! AArch64 instructions are always 4 bytes (32 bits), little-endian.
 //! The encoding format varies by instruction class.
 
+// Encoding helpers for all AArch64 instruction formats; not all formats used yet.
 #![allow(dead_code)]
 
 use super::parser::Operand;

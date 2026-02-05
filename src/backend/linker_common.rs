@@ -60,7 +60,7 @@ use crate::backend::elf::{
 
 /// Parsed ELF64 section header.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[allow(dead_code)] // All fields populated during parsing; not every backend reads every field
 pub struct Elf64Section {
     pub name_idx: u32,
     pub name: String,
@@ -77,7 +77,7 @@ pub struct Elf64Section {
 
 /// Parsed ELF64 symbol.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[allow(dead_code)] // All fields populated during parsing; not every backend reads every field
 pub struct Elf64Symbol {
     pub name_idx: u32,
     pub name: String,
@@ -88,7 +88,7 @@ pub struct Elf64Symbol {
     pub size: u64,
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // Convenience accessors; not all used by every backend yet
 impl Elf64Symbol {
     pub fn binding(&self) -> u8 { self.info >> 4 }
     pub fn sym_type(&self) -> u8 { self.info & 0xf }
@@ -129,11 +129,11 @@ pub struct DynSymbol {
     /// GLIBC version string for this symbol (e.g. "GLIBC_2.3"), if any.
     pub version: Option<String>,
     /// Whether this is the default version (@@GLIBC_x.y vs @GLIBC_x.y).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Populated during .so parsing; used by i686 linker's version preference logic
     pub is_default_ver: bool,
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // Convenience accessor; used by x86/ARM linkers via type alias
 impl DynSymbol {
     pub fn sym_type(&self) -> u8 { self.info & 0xf }
 }
@@ -1420,7 +1420,7 @@ pub fn load_thin_archive_elf64<G: GlobalSymbolOps>(
 ///
 /// Currently unused: x86 and ARM linkers have their own `load_file` implementations.
 /// This generic version will be used as those linkers migrate to shared infrastructure.
-#[allow(dead_code)]
+#[allow(dead_code)] // Planned shared infrastructure; x86/ARM linkers will migrate to this
 pub fn load_file_elf64<G: GlobalSymbolOps>(
     path: &str,
     objects: &mut Vec<Elf64Object>,

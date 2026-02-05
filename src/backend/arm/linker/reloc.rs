@@ -34,7 +34,6 @@ pub const R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC: u32 = 542;
 /// TLS layout info needed for relocation processing
 pub struct TlsInfo {
     pub tls_addr: u64,
-    #[allow(dead_code)]
     pub tls_size: u64,
 }
 

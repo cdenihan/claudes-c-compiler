@@ -8,6 +8,7 @@
 //! contains AArch64-specific logic: instruction encoding dispatch, branch
 //! resolution (AArch64 relocation types), and symbol difference resolution.
 
+// ELF writer helpers; some section/relocation utilities defined for completeness.
 #![allow(dead_code)]
 
 use super::parser::{AsmStatement, AsmDirective, SymbolKind, SizeExpr, DataValue, Operand};

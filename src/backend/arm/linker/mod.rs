@@ -13,7 +13,7 @@
 //! CRT object discovery and library path resolution are handled by
 //! common.rs's `resolve_builtin_link_setup`.
 
-#[allow(dead_code)]
+#[allow(dead_code)] // Re-exports ELF constants/types; not all constants used by every linker path
 pub mod elf;
 pub mod reloc;
 

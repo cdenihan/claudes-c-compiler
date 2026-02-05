@@ -3,11 +3,14 @@
 //! This module contains various optimization passes that transform the IR
 //! to produce better code.
 //!
-//! All optimization levels (-O0 through -O3, -Os, -Oz) run the same full set
-//! of passes. While the compiler is still maturing, having separate tiers
-//! creates hard-to-find bugs where code works at one level but breaks at
-//! another. We always run all passes to maximize test coverage of the
-//! optimizer and catch issues early.
+//! Optimization levels control which passes run:
+//! - `-O0`: Minimal passes only (constant fold for `__builtin_constant_p`,
+//!   dead static elimination for correctness). Fast compile for debugging.
+//! - `-O1`: Core passes (cfg_simplify, copy_prop, simplify, constant_fold,
+//!   dce) with 1 iteration. Skips expensive analyses (GVN, LICM, IVSR).
+//! - `-O2`: Full pipeline with all passes and up to 3 iterations.
+//! - `-O3`: Same as -O2 (aggressive inlining thresholds may be added later).
+//! - `-Os`/`-Oz`: Same as -O2 (size-oriented tuning may be added later).
 
 pub(crate) mod cfg_simplify;
 pub(crate) mod constant_fold;
@@ -239,27 +242,123 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str) {
     resolve_asm::resolve_inline_asm_symbols(module);
 }
 
-/// All optimization levels run the same pipeline with the same number of
-/// iterations. The `opt_level` parameter is accepted for API compatibility
-/// but currently ignored -- all levels behave identically. This is intentional:
-/// while the compiler is still maturing, running all optimizations at every
-/// level maximizes test coverage and avoids bugs that only surface at specific
-/// optimization tiers.
-// TODO: Restore per-level optimization tiers once the compiler is stable enough
-// to warrant differentiated behavior (e.g., -O0 skipping passes for faster builds).
-pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::backend::Target) {
+/// Run optimization passes on the module based on the optimization level.
+///
+/// - `opt_level == 0` (-O0): Minimal passes for fast debug builds. Only runs
+///   constant folding (needed for `__builtin_constant_p`) and dead static
+///   elimination (correctness for static inline functions). Skips inlining
+///   and the iterative optimization loop entirely.
+///
+/// - `opt_level == 1` (-O1): Core passes with a single iteration. Runs
+///   inlining, then cfg_simplify, copy_prop, simplify, constant_fold, and
+///   DCE. Skips expensive analyses (GVN, LICM, IVSR, if-convert, narrow,
+///   IPCP, div-by-const).
+///
+/// - `opt_level >= 2` (-O2, -O3, -Os, -Oz): Full pipeline with all passes
+///   and up to 3 iterations with diminishing-returns early exit.
+pub(crate) fn run_passes(module: &mut IrModule, opt_level: u32, target: crate::backend::Target) {
     let disabled = std::env::var("CCC_DISABLE_PASSES").unwrap_or_default();
     if disabled.contains("all") {
+        return;
+    }
+
+    // -O0: minimal passes only
+    if opt_level == 0 {
+        run_o0_passes(module, &disabled);
         return;
     }
 
     run_inline_phase(module, &disabled);
     constant_fold::resolve_remaining_is_constant(module);
 
+    // -O1: core passes, single iteration
+    if opt_level == 1 {
+        run_o1_passes(module, &disabled);
+        return;
+    }
+
+    // -O2 and above: full pipeline
+    run_full_pipeline(module, &disabled, target);
+}
+
+/// -O0 pass pipeline: minimal passes for fast debug builds.
+///
+/// Only runs constant folding (needed for `__builtin_constant_p` evaluation)
+/// and dead static elimination (correctness for static inline functions that
+/// reference undefined symbols). Inline asm symbols are resolved so that
+/// references to C symbols inside inline asm are correctly linked.
+///
+/// Note: Without inlining and cfg_simplify, dead branches guarded by
+/// constant-returning inline functions (e.g., kernel's `IS_ENABLED()` patterns)
+/// will not be eliminated. This is acceptable at -O0 since the kernel and most
+/// projects always build with -O2. If -O0 link errors arise from undefined
+/// symbols in dead branches, the workaround is to use -O1 or higher.
+// TODO: If -O0 link errors become common, consider running a lightweight
+// cfg_simplify + dce pass to eliminate obviously-dead branches.
+fn run_o0_passes(module: &mut IrModule, disabled: &str) {
+    // Still need to resolve __builtin_constant_p and inline asm symbols
+    if !disabled.contains("constfold") {
+        constant_fold::run(module);
+    }
+    constant_fold::resolve_remaining_is_constant(module);
+    resolve_asm::resolve_inline_asm_symbols(module);
+
+    // Dead static elimination is needed for correctness: static inline
+    // functions from headers may reference undefined external symbols
+    // that would cause link errors if not eliminated.
+    dead_statics::eliminate_dead_static_functions(module);
+}
+
+/// -O1 pass pipeline: core passes with a single iteration.
+///
+/// Runs the essential optimization passes that provide the best
+/// cost/benefit ratio: CFG simplification, copy propagation, algebraic
+/// simplification, constant folding, and dead code elimination.
+/// Skips expensive analyses like GVN (dominator-based), LICM (loop
+/// analysis), IVSR, if-conversion, narrowing, IPCP, and div-by-const.
+fn run_o1_passes(module: &mut IrModule, disabled: &str) {
+    let num_funcs = module.functions.len();
+    let dirty = vec![true; num_funcs];
+    // `changed` is required by run_on_visited's signature but not used for
+    // convergence since -O1 runs only a single iteration.
+    let mut changed = vec![false; num_funcs];
+
+    // Single iteration of core passes
+    if !disabled.contains("cfg") {
+        run_on_visited(module, &dirty, &mut changed, cfg_simplify::run_function);
+    }
+    if !disabled.contains("copyprop") {
+        run_on_visited(module, &dirty, &mut changed, copy_prop::propagate_copies);
+    }
+    if !disabled.contains("simplify") {
+        run_on_visited(module, &dirty, &mut changed, simplify::simplify_function);
+    }
+    if !disabled.contains("constfold") {
+        run_on_visited(module, &dirty, &mut changed, constant_fold::fold_function);
+    }
+    if !disabled.contains("copyprop") {
+        run_on_visited(module, &dirty, &mut changed, copy_prop::propagate_copies);
+    }
+    if !disabled.contains("dce") {
+        run_on_visited(module, &dirty, &mut changed, dce::eliminate_dead_code);
+    }
+    if !disabled.contains("cfg") {
+        run_on_visited(module, &dirty, &mut changed, cfg_simplify::run_function);
+    }
+
+    dead_statics::eliminate_dead_static_functions(module);
+}
+
+/// -O2 and above: full optimization pipeline with iterative convergence.
+///
+/// Runs all optimization passes (including GVN, LICM, IVSR, if-conversion,
+/// narrowing, IPCP, div-by-const) with up to 3 iterations and a
+/// diminishing-returns early exit heuristic.
+fn run_full_pipeline(module: &mut IrModule, disabled: &str, target: crate::backend::Target) {
     let iterations = 3;
     let num_funcs = module.functions.len();
     let mut dirty = vec![true; num_funcs];
-    let dis = DisabledPasses::from_env(&disabled);
+    let dis = DisabledPasses::from_env(disabled);
 
     // `changed` accumulates which functions were modified during each iteration.
     let mut changed = vec![false; num_funcs];

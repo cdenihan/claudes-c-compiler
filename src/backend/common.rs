@@ -49,7 +49,7 @@ fn warn_gcc_linker(command: &str) {
 }
 
 /// Configuration for an external assembler.
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "gcc_assembler"), allow(dead_code))] // Only constructed/used when gcc_assembler enabled
 pub struct AssemblerConfig {
     /// The assembler command (e.g., "gcc", "aarch64-linux-gnu-gcc")
     pub command: &'static str,
@@ -61,7 +61,7 @@ pub struct AssemblerConfig {
 ///
 /// The `command` and `extra_args` fields are only used when linking via GCC
 /// (`gcc_linker` feature). The built-in linker dispatches by `expected_elf_machine`.
-#[allow(dead_code)]
+#[allow(dead_code)] // `command`/`extra_args` fields only read under gcc_linker feature
 pub struct LinkerConfig {
     /// The linker command (e.g., "gcc", "aarch64-linux-gnu-gcc")
     pub command: &'static str,
@@ -202,7 +202,7 @@ pub fn link_with_args(config: &LinkerConfig, object_files: &[&str], output_path:
     let is_shared = user_args.iter().any(|a| a == "-shared");
     let is_nostdlib = user_args.iter().any(|a| a == "-nostdlib");
     let is_relocatable = user_args.iter().any(|a| a == "-r");
-    #[allow(unused_variables)]
+    #[allow(unused_variables)] // Only used in the non-gcc_linker path below
     let is_static = user_args.iter().any(|a| a == "-static");
 
     // When gcc_linker feature is enabled, use GCC for ALL linking

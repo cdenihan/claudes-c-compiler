@@ -573,7 +573,7 @@ pub fn section_order(name: &str, flags: u64) -> u64 {
 }
 
 /// Decode a ULEB128 value from data at offset.
-#[allow(dead_code)]
+#[allow(dead_code)] // Infrastructure for RISC-V linker relaxation (R_RISCV_SET_ULEB128/R_RISCV_SUB_ULEB128)
 pub fn decode_uleb128(data: &[u8], off: usize) -> u64 {
     let mut result: u64 = 0;
     let mut shift = 0u32;
@@ -592,7 +592,7 @@ pub fn decode_uleb128(data: &[u8], off: usize) -> u64 {
 
 /// Encode a ULEB128 value in place, reusing the same number of bytes as the
 /// existing ULEB128 at that offset.
-#[allow(dead_code)]
+#[allow(dead_code)] // Infrastructure for RISC-V linker relaxation (R_RISCV_SET_ULEB128/R_RISCV_SUB_ULEB128)
 pub fn encode_uleb128_in_place(data: &mut [u8], off: usize, value: u64) {
     // Count how many bytes the existing ULEB128 occupies.
     let mut num_bytes = 0;

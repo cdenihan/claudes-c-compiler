@@ -18,12 +18,12 @@ pub struct Relocation {
     pub addend: i64,
 }
 
-// ELF x86-64 relocation types
-#[allow(dead_code)]
+// ELF x86-64 relocation types (standard constants; not all emitted by assembler yet)
+#[allow(dead_code)] // ELF standard constant, defined for reference/future use
 pub const R_X86_64_NONE: u32 = 0;
 pub const R_X86_64_64: u32 = 1;
 pub const R_X86_64_PC32: u32 = 2;
-#[allow(dead_code)]
+#[allow(dead_code)] // ELF standard constant, defined for reference/future use
 pub const R_X86_64_GOT32: u32 = 3;
 pub const R_X86_64_PLT32: u32 = 4;
 pub const R_X86_64_32: u32 = 10;
@@ -31,7 +31,7 @@ pub const R_X86_64_32S: u32 = 11;
 pub const R_X86_64_GOTPCREL: u32 = 9;
 pub const R_X86_64_TPOFF32: u32 = 23;
 pub const R_X86_64_GOTTPOFF: u32 = 22;
-#[allow(dead_code)]
+#[allow(dead_code)] // ELF standard constant, defined for reference/future use
 pub const R_X86_64_TPOFF64: u32 = 18;
 // Internal-only: 8-bit PC-relative relocation for jrcxz/loop (never emitted to ELF)
 pub const R_X86_64_PC8_INTERNAL: u32 = 0x8000_0001;
@@ -137,21 +137,18 @@ fn is_reg64(name: &str) -> bool {
 }
 
 /// Is this a 32-bit GP register?
-#[allow(dead_code)]
 fn is_reg32(name: &str) -> bool {
     matches!(name, "eax" | "ecx" | "edx" | "ebx" | "esp" | "ebp" | "esi" | "edi"
         | "r8d" | "r9d" | "r10d" | "r11d" | "r12d" | "r13d" | "r14d" | "r15d")
 }
 
 /// Is this a 16-bit GP register?
-#[allow(dead_code)]
 fn is_reg16(name: &str) -> bool {
     matches!(name, "ax" | "cx" | "dx" | "bx" | "sp" | "bp" | "si" | "di"
         | "r8w" | "r9w" | "r10w" | "r11w" | "r12w" | "r13w" | "r14w" | "r15w")
 }
 
 /// Is this an 8-bit GP register?
-#[allow(dead_code)]
 fn is_reg8(name: &str) -> bool {
     matches!(name, "al" | "cl" | "dl" | "bl" | "ah" | "ch" | "dh" | "bh"
         | "spl" | "bpl" | "sil" | "dil"
@@ -171,12 +168,6 @@ fn is_xmm(name: &str) -> bool {
 /// Is this an XMM or YMM register?
 fn is_xmm_or_ymm(name: &str) -> bool {
     name.starts_with("xmm") || name.starts_with("ymm")
-}
-
-/// Is this an x87 FPU register?
-#[allow(dead_code)]
-fn is_st(name: &str) -> bool {
-    name == "st" || name.starts_with("st(")
 }
 
 /// Get the operand-size suffix character for a register name.

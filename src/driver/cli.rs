@@ -254,13 +254,25 @@ impl Driver {
 
                 // Optimization levels
                 "-O0" => {
-                    self.opt_level = 2; // internally always optimize
+                    self.opt_level = 0;
                     self.optimize = false;
                     self.optimize_size = false;
                     self.omit_frame_pointer = false;
                 }
-                "-O" | "-O1" | "-O2" | "-O3" => {
+                "-O" | "-O1" => {
+                    self.opt_level = 1;
+                    self.optimize = true;
+                    self.optimize_size = false;
+                    self.omit_frame_pointer = true;
+                }
+                "-O2" => {
                     self.opt_level = 2;
+                    self.optimize = true;
+                    self.optimize_size = false;
+                    self.omit_frame_pointer = true;
+                }
+                "-O3" => {
+                    self.opt_level = 3;
                     self.optimize = true;
                     self.optimize_size = false;
                     self.omit_frame_pointer = true;

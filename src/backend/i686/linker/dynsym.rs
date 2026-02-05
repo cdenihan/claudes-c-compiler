@@ -10,13 +10,6 @@
 
 use super::types::*;
 
-/// Read dynamic symbol info from a shared library ELF file.
-/// Also handles GNU linker scripts (GROUP/INPUT directives).
-#[allow(dead_code)]
-pub(super) fn read_dynsyms(path: &str) -> Result<Vec<DynSymInfo>, String> {
-    read_dynsyms_with_search(path, &[])
-}
-
 /// Read dynamic symbol info, with library search paths for resolving linker script entries.
 pub(super) fn read_dynsyms_with_search(path: &str, lib_search_paths: &[&str]) -> Result<Vec<DynSymInfo>, String> {
     const LOCAL_SHT_GNU_VERSYM: u32 = 0x6fffffff;

@@ -165,7 +165,7 @@ layout phase.  Each segment and synthetic section has corresponding `*_offset`,
 Archive members are placed into an archive pool for demand-driven extraction
 (see Step 2).
 
-**Shared libraries** are scanned by `read_dynsyms()`:
+**Shared libraries** are scanned by `read_dynsyms_with_search()`:
 
 1. Validate ELF magic, ELFCLASS32, ET_DYN.  If the file is a GNU linker script
    (GROUP/INPUT directives), resolve the referenced `.so` files recursively.
@@ -449,7 +449,7 @@ portion so the dynamic linker can find them for symbol interposition.
 The linker emits `.gnu.version` (versym) and `.gnu.version_r` (verneed)
 sections when dynamic symbols have GLIBC version annotations (e.g.,
 `GLIBC_2.0`, `GLIBC_2.17`).  Version information is extracted from the shared
-library's `.gnu.verdef` section during `read_dynsyms()`.
+library's `.gnu.verdef` section during `read_dynsyms_with_search()`.
 
 Symbols without version annotations use `VER_NDX_GLOBAL` (index 1) in the
 versym table, which means "any version" to the dynamic linker.

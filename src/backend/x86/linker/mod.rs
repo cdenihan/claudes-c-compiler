@@ -4,7 +4,7 @@
 /// a dynamically-linked ELF executable. Resolves undefined symbols against
 /// shared libraries (e.g., libc.so.6) and generates PLT/GOT entries for
 /// dynamic function calls.
-#[allow(dead_code)]
+#[allow(dead_code)] // Re-exports ELF constants/types; not all constants used by every linker path
 pub mod elf;
 
 use std::collections::{HashMap, HashSet, BTreeSet};

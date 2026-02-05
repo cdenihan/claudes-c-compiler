@@ -24,20 +24,16 @@ pub struct Relocation {
 // ELF i386 relocation types
 pub const R_386_32: u32 = 1;
 pub const R_386_PC32: u32 = 2;
-#[allow(dead_code)]
 pub const R_386_GOT32: u32 = 3;
 pub const R_386_PLT32: u32 = 4;
-#[allow(dead_code)]
 pub const R_386_GOTOFF: u32 = 9;
-#[allow(dead_code)]
 pub const R_386_GOTPC: u32 = 10;
 pub const R_386_TLS_LE_32: u32 = 37;
-#[allow(dead_code)]
 pub const R_386_TLS_IE: u32 = 15;
 pub const R_386_TLS_GD: u32 = 18;
 pub const R_386_TLS_LDM: u32 = 19;
 pub const R_386_TLS_LDO_32: u32 = 32;
-#[allow(dead_code)]
+#[allow(dead_code)] // ELF standard constant; not yet emitted by assembler but used by linker
 pub const R_386_TLS_GOTIE: u32 = 16;
 pub const R_386_32S: u32 = 38; // R_386_TLS_LE (negative offset from TP)
 
@@ -147,6 +143,8 @@ pub struct InstructionEncoder {
     /// Current offset within the section.
     pub offset: u64,
     /// Whether we are in .code16gcc mode (16-bit real mode with 32-bit instructions).
+    /// Currently .code16gcc is handled at the assembly text level (prepended to asm output);
+    /// this field is infrastructure for future per-instruction operand size overrides.
     #[allow(dead_code)]
     pub code16gcc: bool,
 }

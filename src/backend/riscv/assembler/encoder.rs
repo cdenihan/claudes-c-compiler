@@ -6,6 +6,7 @@
 //! RISC-V base instructions are always 4 bytes (32 bits), little-endian.
 //! The encoding uses six main formats: R, I, S, B, U, J.
 
+// Encoding helpers for all RISC-V instruction formats; not all formats used yet.
 #![allow(dead_code)]
 
 use super::parser::Operand;

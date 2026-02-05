@@ -86,7 +86,7 @@ compression would conflict with the linker's relaxation pass.
 
 | File            | Lines  | Role                                                    |
 |-----------------|--------|---------------------------------------------------------|
-| `mod.rs`        | ~110   | Public `assemble()` / `assemble_with_args()` entry points; orchestrates parser → ELF writer pipeline, handles `-mabi=` flag for float ABI selection and `-march=` for RV32/RV64 and RVC detection |
+| `mod.rs`        | ~100   | Public `assemble_with_args()` entry point; orchestrates parser → ELF writer pipeline, handles `-mabi=` flag for float ABI selection and `-march=` for RV32/RV64 and RVC detection |
 | `parser.rs`     | ~1025  | Line tokenizer and operand parser; splits assembly text into `AsmStatement` records, evaluates `.if/.else/.endif` conditionals |
 | `encoder.rs`    | ~2250  | Instruction encoder; maps every mnemonic to its binary encoding, handles pseudo-instruction expansion, relocation emission |
 | `compress.rs`   | ~850   | Post-encoding RV64C compression pass; rewrites eligible 32-bit instructions to 16-bit compressed equivalents (currently disabled) |

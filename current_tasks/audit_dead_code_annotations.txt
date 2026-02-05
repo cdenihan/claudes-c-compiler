@@ -1,6 +1,0 @@
-Task: Audit and clean up #[allow(dead_code)] annotations across the codebase
-
-- Remove truly dead code (unused functions/constants with no callers under any feature flag)
-- Add explanatory comments to justified dead_code annotations (feature-gated code,
-  disabled-but-planned optimizations, ELF standard constants, public API surface)
-- Verify no regressions with build + test suite
