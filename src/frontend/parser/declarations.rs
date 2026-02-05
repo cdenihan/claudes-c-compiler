@@ -7,7 +7,7 @@
 // K&R-style function parameters are also handled here, where parameter types
 // are declared separately after the parameter name list.
 
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::source::Span;
 use crate::common::types::AddressSpace;
 use crate::frontend::lexer::token::TokenKind;
@@ -1151,34 +1151,38 @@ impl Parser {
     fn expr_has_non_const_identifier(
         expr: &Expr,
         enum_consts: Option<&FxHashMap<String, i64>>,
+        unevaluable_consts: Option<&FxHashSet<String>>,
     ) -> bool {
         match expr {
             Expr::Identifier(name, _) => {
                 // It's a variable/parameter reference if not in enum constants
-                !enum_consts.is_some_and(|m| m.contains_key(name.as_str()))
+                // (either evaluated or unevaluable)
+                let in_evaluated = enum_consts.is_some_and(|m| m.contains_key(name.as_str()));
+                let in_unevaluable = unevaluable_consts.is_some_and(|m| m.contains(name.as_str()));
+                !(in_evaluated || in_unevaluable)
             }
             Expr::BinaryOp(_, lhs, rhs, _) => {
-                Self::expr_has_non_const_identifier(lhs, enum_consts)
-                    || Self::expr_has_non_const_identifier(rhs, enum_consts)
+                Self::expr_has_non_const_identifier(lhs, enum_consts, unevaluable_consts)
+                    || Self::expr_has_non_const_identifier(rhs, enum_consts, unevaluable_consts)
             }
             Expr::UnaryOp(_, inner, _) => {
-                Self::expr_has_non_const_identifier(inner, enum_consts)
+                Self::expr_has_non_const_identifier(inner, enum_consts, unevaluable_consts)
             }
             Expr::Conditional(cond, then_expr, else_expr, _) => {
-                Self::expr_has_non_const_identifier(cond, enum_consts)
-                    || Self::expr_has_non_const_identifier(then_expr, enum_consts)
-                    || Self::expr_has_non_const_identifier(else_expr, enum_consts)
+                Self::expr_has_non_const_identifier(cond, enum_consts, unevaluable_consts)
+                    || Self::expr_has_non_const_identifier(then_expr, enum_consts, unevaluable_consts)
+                    || Self::expr_has_non_const_identifier(else_expr, enum_consts, unevaluable_consts)
             }
             Expr::GnuConditional(cond, fallback, _) => {
-                Self::expr_has_non_const_identifier(cond, enum_consts)
-                    || Self::expr_has_non_const_identifier(fallback, enum_consts)
+                Self::expr_has_non_const_identifier(cond, enum_consts, unevaluable_consts)
+                    || Self::expr_has_non_const_identifier(fallback, enum_consts, unevaluable_consts)
             }
             Expr::Cast(_, inner, _) => {
-                Self::expr_has_non_const_identifier(inner, enum_consts)
+                Self::expr_has_non_const_identifier(inner, enum_consts, unevaluable_consts)
             }
             Expr::Comma(lhs, rhs, _) => {
-                Self::expr_has_non_const_identifier(lhs, enum_consts)
-                    || Self::expr_has_non_const_identifier(rhs, enum_consts)
+                Self::expr_has_non_const_identifier(lhs, enum_consts, unevaluable_consts)
+                    || Self::expr_has_non_const_identifier(rhs, enum_consts, unevaluable_consts)
             }
             // Sizeof, literals, builtin calls, function calls, etc. that aren't
             // evaluable still don't make the expression "definitely non-constant"
@@ -1234,6 +1238,11 @@ impl Parser {
         } else {
             Some(&self.struct_tag_alignments)
         };
+        let unevaluable = if self.unevaluable_enum_constants.is_empty() {
+            None
+        } else {
+            Some(&self.unevaluable_enum_constants)
+        };
         if let Some(value) = Self::eval_const_int_expr_with_enums(&expr, enums, tag_aligns) {
             if value == 0 {
                 // Static assertion failed
@@ -1244,7 +1253,7 @@ impl Parser {
                 };
                 self.emit_error(msg, assert_span);
             }
-        } else if Self::expr_has_non_const_identifier(&expr, enums) {
+        } else if Self::expr_has_non_const_identifier(&expr, enums, unevaluable) {
             // The expression references variables or non-enum identifiers, which
             // means it's definitely not a valid integer constant expression (C11 6.6).
             self.emit_error("expression in static assertion is not an integer constant expression", assert_span);

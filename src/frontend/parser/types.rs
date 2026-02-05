@@ -828,8 +828,9 @@ impl Parser {
                 next_value = Some(val + 1);
             } else {
                 // Value not evaluable at parse time (e.g., sizeof(struct)).
-                // Don't store in the map so that references to this constant
-                // will return None, causing _Static_assert to silently accept.
+                // Don't store in the value map, but record the name so that
+                // expr_has_non_const_identifier knows this is a constant (not a variable).
+                self.unevaluable_enum_constants.insert(variant.name.clone());
                 next_value = None;
             }
         }

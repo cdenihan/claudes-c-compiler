@@ -273,6 +273,10 @@ pub struct Parser {
     /// Populated as enum definitions are parsed, so that later constant expressions
     /// (e.g., in __attribute__((aligned(1 << ENUM_CONST)))) can resolve them.
     pub(super) enum_constants: FxHashMap<String, i64>,
+    /// Set of enum constant names whose values couldn't be evaluated at parse time
+    /// (e.g., `MY_SIZE = sizeof(some_typedef)`). These are still valid constants,
+    /// just not evaluable by our constant-expression evaluator.
+    pub(super) unevaluable_enum_constants: FxHashSet<String>,
     /// Map of struct/union tag names to their computed alignments.
     /// Populated when a struct/union with fields is parsed, so that later
     /// __alignof__(struct tag) references can look up the correct alignment
@@ -296,6 +300,7 @@ impl Parser {
             error_count: 0,
             diagnostics: DiagnosticEngine::new(),
             enum_constants: FxHashMap::default(),
+            unevaluable_enum_constants: FxHashSet::default(),
             struct_tag_alignments: FxHashMap::default(),
         }
     }

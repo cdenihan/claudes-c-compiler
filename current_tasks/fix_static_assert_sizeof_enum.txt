@@ -1,4 +1,0 @@
-Fix _Static_assert failing when enum constants are initialized from sizeof(typedef) expressions.
-wolfssl fails because WOLFSSL_WORD_SIZE = sizeof(wolfssl_word) can't be evaluated at parse time,
-and then _Static_assert rejects it as 'not an integer constant expression'.
-Fix: track unevaluable enum constant names so expr_has_non_const_identifier knows they're constants.

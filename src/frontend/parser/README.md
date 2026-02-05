@@ -114,6 +114,7 @@ pub struct Parser {
     diagnostics: DiagnosticEngine,
 
     enum_constants: FxHashMap<String, i64>,          // For constant-expr eval
+    unevaluable_enum_constants: FxHashSet<String>,   // Enum consts with unknown values
     struct_tag_alignments: FxHashMap<String, usize>, // For __alignof__ lookups
 }
 ```
@@ -145,7 +146,10 @@ Key design points:
 - **Semantic caches.**  `enum_constants` maps enum constant names to their
   integer values, enabling the parser to evaluate constant expressions in
   contexts like `__attribute__((aligned(1 << ENUM_CONST)))`.
-  `struct_tag_alignments` stores computed struct/union alignments for
+  `unevaluable_enum_constants` tracks enum constants whose values couldn't be
+  computed at parse time (e.g., `SIZE = sizeof(some_typedef)`); these are
+  recognized as constants by `_Static_assert` even though their values are
+  unknown.  `struct_tag_alignments` stores computed struct/union alignments for
   `__alignof__` lookups on tag-only references.
 
 The main entry point is `Parser::parse()`, which loops over
