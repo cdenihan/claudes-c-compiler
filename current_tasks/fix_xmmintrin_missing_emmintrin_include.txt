@@ -1,0 +1,11 @@
+Fix xmmintrin.h: add missing #include <emmintrin.h> for GCC compatibility
+
+GCC's xmmintrin.h includes emmintrin.h at the end of the file, so code that
+includes only <xmmintrin.h> still gets access to __m128i and SSE2 intrinsics.
+Our xmmintrin.h is missing this include, causing pixman (and likely other
+projects) to fail to compile when they include xmmintrin.h and use __m128i.
+
+Fix: Add #include <emmintrin.h> at the end of xmmintrin.h, matching GCC's
+behavior.
+
+Started: 2026-02-05
