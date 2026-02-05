@@ -189,7 +189,7 @@ width, which makes encoding straightforward compared to variable-length ISAs.
 | Type | Role |
 |------|------|
 | `EncodeResult` | Outcome of encoding one instruction. |
-| `RelocType` | AArch64 ELF relocation types (20 variants). |
+| `RelocType` | AArch64 ELF relocation types (21 variants). |
 | `Relocation` | A relocation request: type + symbol + addend. |
 
 The `EncodeResult` enum has four variants:
@@ -243,7 +243,7 @@ The dispatch table in `encode_instruction()` maps ~400 base mnemonics
 ### Relocation Types Emitted
 
 When an instruction references an external symbol (e.g., `bl printf` or
-`adrp x0, :got:variable`), the encoder returns `WordWithReloc`.  The 20
+`adrp x0, :got:variable`), the encoder returns `WordWithReloc`.  The 21
 relocation types cover the full AArch64 static-linking relocation model:
 
 | Relocation | ELF Number | Usage |
@@ -268,6 +268,7 @@ relocation types cover the full AArch64 static-linking relocation model:
 | `Abs64` | 257 | 64-bit absolute |
 | `Abs32` | 258 | 32-bit absolute |
 | `Prel32` | 261 | 32-bit PC-relative |
+| `Prel64` | 260 | 64-bit PC-relative |
 
 ### Encoding Approach
 
@@ -366,7 +367,7 @@ process_statements(statements):
 
   resolve_sym_diffs():   resolve all A-B expressions
     same-section     -> patch data in place
-    cross-section    -> emit R_AARCH64_PREL32 relocation
+    cross-section    -> emit R_AARCH64_PREL32 or PREL64 relocation (based on data size)
 
   resolve_local_branches():   resolve all .L* branch targets
     same-section     -> compute PC-relative offset, patch instruction word
@@ -430,9 +431,11 @@ Two resolution passes run after all statements are processed:
   section symbol plus the label's offset as addend.  This matches the behavior
   of GCC's assembler.
 
-- **`resolve_sym_diffs()`**: Handles `.long .LA - .LB` style expressions.
-  Same-section differences are computed and patched directly.  Cross-section
-  differences produce `R_AARCH64_PREL32` relocations.
+- **`resolve_sym_diffs()`**: Handles `.long .LA - .LB` and `.quad sym+off - .`
+  style expressions.  Same-section differences are computed and patched directly.
+  Cross-section and external-symbol differences produce `R_AARCH64_PREL32`
+  relocations for 4-byte data or `R_AARCH64_PREL64` for 8-byte data.  Composite
+  symbol names like `sym+offset` are decomposed into a base symbol and numeric addend.
 
 
 ---

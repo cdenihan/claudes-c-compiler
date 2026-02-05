@@ -68,6 +68,8 @@ pub enum RelocType {
     Abs32,
     /// R_AARCH64_PREL32 - 32-bit PC-relative
     Prel32,
+    /// R_AARCH64_PREL64 - 64-bit PC-relative
+    Prel64,
     /// R_AARCH64_LD_PREL_LO19 - LDR literal, 19-bit PC-relative
     Ldr19,
 }
@@ -79,6 +81,7 @@ impl RelocType {
             RelocType::Abs64 => 257,           // R_AARCH64_ABS64
             RelocType::Abs32 => 258,           // R_AARCH64_ABS32
             RelocType::Prel32 => 261,          // R_AARCH64_PREL32
+            RelocType::Prel64 => 260,          // R_AARCH64_PREL64
             RelocType::Call26 => 283,          // R_AARCH64_CALL26
             RelocType::Jump26 => 282,          // R_AARCH64_JUMP26
             RelocType::AdrPrelLo21 => 274,      // R_AARCH64_ADR_PREL_LO21

@@ -2456,7 +2456,7 @@ fn try_parse_symbol_diff(expr: &str) -> Option<DataValue> {
         return None;
     }
     let minus_pos = find_symbol_diff_minus(expr)?;
-    let sym_a = strip_sym_parens(expr[..minus_pos].trim()).to_string();
+    let sym_a_raw = strip_sym_parens(expr[..minus_pos].trim()).to_string();
     let rest = expr[minus_pos + 1..].trim();
     // rest might be "B" or "B + offset"
     let (sym_b, extra_addend) = if let Some(plus_pos) = rest.find('+') {
@@ -2466,6 +2466,35 @@ fn try_parse_symbol_diff(expr: &str) -> Option<DataValue> {
         (b, add_val)
     } else {
         (strip_sym_parens(rest).to_string(), 0i64)
+    };
+    // Decompose sym_a into symbol+offset if it contains a '+' or '-' with a numeric suffix.
+    // ELF relocations require separate symbol name and numeric addend, so composite
+    // names like "cgroup_bpf_enabled_key+48" must be split into ("cgroup_bpf_enabled_key", 48).
+    let (sym_a, extra_addend) = {
+        let mut sym = sym_a_raw.clone();
+        let mut addend = extra_addend;
+        if let Some(plus_idx) = sym_a_raw.rfind('+') {
+            let left = sym_a_raw[..plus_idx].trim();
+            let right = sym_a_raw[plus_idx + 1..].trim();
+            if let Ok(val) = right.parse::<i64>() {
+                if !left.is_empty() {
+                    addend += val;
+                    sym = left.to_string();
+                }
+            }
+        } else if let Some(minus_idx) = sym_a_raw.rfind('-') {
+            if minus_idx > 0 {
+                let left = sym_a_raw[..minus_idx].trim();
+                let right = sym_a_raw[minus_idx + 1..].trim();
+                if let Ok(val) = right.parse::<i64>() {
+                    if !left.is_empty() {
+                        addend -= val;
+                        sym = left.to_string();
+                    }
+                }
+            }
+        }
+        (sym, addend)
     };
     if sym_b.is_empty() {
         return None;

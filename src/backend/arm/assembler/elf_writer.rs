@@ -104,12 +104,17 @@ impl ElfWriter {
                             }
                         }
                     } else {
-                        // Cross-section: emit R_AARCH64_PREL32
+                        // Cross-section: emit R_AARCH64_PREL32 or PREL64 based on size
                         let addend = off_a as i64 + diff.offset as i64 - off_b as i64 + diff.extra_addend;
+                        let reloc_type = if diff.size == 8 {
+                            RelocType::Prel64.elf_type()
+                        } else {
+                            RelocType::Prel32.elf_type()
+                        };
                         if let Some(section) = self.base.sections.get_mut(&diff.section) {
                             section.relocs.push(ObjReloc {
                                 offset: diff.offset,
-                                reloc_type: RelocType::Prel32.elf_type(),
+                                reloc_type,
                                 symbol_name: sec_a.clone(),
                                 addend,
                             });
@@ -117,11 +122,16 @@ impl ElfWriter {
                     }
                 }
                 _ => {
-                    // Forward-referenced or external symbols: emit PREL32
+                    // Forward-referenced or external symbols: emit PREL32 or PREL64 based on size
+                    let reloc_type = if diff.size == 8 {
+                        RelocType::Prel64.elf_type()
+                    } else {
+                        RelocType::Prel32.elf_type()
+                    };
                     if let Some(section) = self.base.sections.get_mut(&diff.section) {
                         section.relocs.push(ObjReloc {
                             offset: diff.offset,
-                            reloc_type: RelocType::Prel32.elf_type(),
+                            reloc_type,
                             symbol_name: diff.sym_a.clone(),
                             addend: diff.extra_addend,
                         });
