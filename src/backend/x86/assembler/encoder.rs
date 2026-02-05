@@ -2959,13 +2959,12 @@ impl InstructionEncoder {
         match &ops[0] {
             Operand::Label(label) => {
                 // Near jump with 32-bit displacement (will be resolved by linker/relocator)
-                // Strip @PLT suffix and use PLT32 relocation, same as call
+                // Always use PLT32 relocation for symbol references, same as call/jcc.
+                // Modern GAS uses PLT32 for all branches - this is required for PIE
+                // compatibility when the system linker links our .o files.
                 self.bytes.push(0xE9);
-                let (sym, reloc_type) = if let Some(stripped) = label.strip_suffix("@PLT") {
-                    (stripped, R_X86_64_PLT32)
-                } else {
-                    (label.as_str(), R_X86_64_PC32)
-                };
+                let reloc_type = R_X86_64_PLT32;
+                let sym = label.trim_end_matches("@PLT");
                 self.add_relocation(sym, reloc_type, -4);
                 self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                 Ok(())
