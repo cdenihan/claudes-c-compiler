@@ -93,6 +93,9 @@ pub(super) fn emit_shared_library(
                 if si >= obj.symbols.len() { continue; }
                 let sym = &obj.symbols[si];
                 if sym.name.is_empty() { continue; }
+                // Skip local symbols - they don't need GOT entries in dynsym
+                // (e.g. static _Thread_local variables referenced via GOTTPOFF)
+                if sym.is_local() { continue; }
                 match rela.rela_type {
                     R_X86_64_GOTPCREL | R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX | R_X86_64_GOTTPOFF => {
                         if !got_needed_names.contains(&sym.name) {

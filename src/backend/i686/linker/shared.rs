@@ -37,7 +37,7 @@ pub(super) fn resolve_dynamic_symbols_for_shared(
     if undefined.is_empty() { return; }
 
     // Search system libraries for these symbols
-    let lib_names = ["libc.so.6", "libm.so.6", "libpthread.so.0", "libdl.so.2", "librt.so.1", "libgcc_s.so.1"];
+    let lib_names = ["libc.so.6", "libm.so.6", "libpthread.so.0", "libdl.so.2", "librt.so.1", "libgcc_s.so.1", "ld-linux.so.2"];
     let mut libs: Vec<String> = Vec::new();
     for lib_name in &lib_names {
         for dir in lib_paths {

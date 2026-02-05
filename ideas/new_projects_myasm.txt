@@ -272,3 +272,4 @@ Tracking project build/test results with MY_ASM=builtin MY_LD=builtin
 | ldns    | PASS | TODO | TODO | TODO | Passes x86 out of the box (was previously failing, now fixed by other improvements) |
 | io_uring_liburing | PASS | TODO | TODO | TODO | Passes x86 out of the box (was previously failing, now fixed by other improvements) |
 | libexpat | PASS | TODO | TODO | TODO | Fixed x86: GOTPCREL codegen for external function address-of (PIE-compatible); linker GOTPCREL+PLT coexistence (dedicated GOT entry filled with PLT address) |
+| criterion | FAIL | TODO | TODO | TODO | Fixed: (1) _r_debug undefined - added ld-linux-x86-64.so.2 to default dynamic symbol search, (2) LOCAL TLS symbols incorrectly exported as undefined in shared lib dynsym - added is_local() guard to GOT collection. Remaining: boxfort subprocess re-exec segfaults (likely PIE/relocation issue) |

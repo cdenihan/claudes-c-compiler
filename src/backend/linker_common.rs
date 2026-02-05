@@ -948,6 +948,8 @@ pub const LINKER_DEFINED_SYMBOLS: &[&str] = &[
     "__pthread_initialize_minimal", "_dl_rtld_map",
     "__GNU_EH_FRAME_HDR",
     "__getauxval",
+    // Dynamic linker debug interface (provided by ld-linux*.so at runtime)
+    "_r_debug", "_dl_debug_state", "_dl_mcount",
 ];
 
 /// Check whether a symbol name is one that the linker provides during layout.

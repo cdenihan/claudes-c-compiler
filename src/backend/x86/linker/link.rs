@@ -102,7 +102,7 @@ pub fn link_builtin(
     // Resolve remaining undefined symbols from default system libraries
     // (only when dynamically linking)
     if !is_static {
-        let default_libs = ["libc.so.6", "libm.so.6", "libgcc_s.so.1"];
+        let default_libs = ["libc.so.6", "libm.so.6", "libgcc_s.so.1", "ld-linux-x86-64.so.2"];
         linker_common::resolve_dynamic_symbols_elf64(
             &mut globals, &mut needed_sonames, &all_lib_paths, &default_libs,
         )?;
@@ -321,7 +321,7 @@ pub fn link_shared(
 
     // Resolve remaining undefined symbols against system libraries (libc, libm,
     // libgcc_s) and add DT_NEEDED entries for any that provide matched symbols.
-    let default_libs = ["libc.so.6", "libm.so.6", "libgcc_s.so.1"];
+    let default_libs = ["libc.so.6", "libm.so.6", "libgcc_s.so.1", "ld-linux-x86-64.so.2"];
     linker_common::resolve_dynamic_symbols_elf64(
         &mut globals, &mut needed_sonames, &all_lib_paths, &default_libs,
     )?;

@@ -163,7 +163,7 @@ pub fn link_builtin(
 
     // For dynamic linking, resolve remaining undefined symbols against system libs
     if !is_static {
-        let default_libs = ["libc.so.6", "libm.so.6", "libgcc_s.so.1"];
+        let default_libs = ["libc.so.6", "libm.so.6", "libgcc_s.so.1", "ld-linux-aarch64.so.1"];
         linker_common::resolve_dynamic_symbols_elf64(
             &mut globals, &mut needed_sonames, &combined_lib_paths, &default_libs,
         )?;
@@ -383,7 +383,7 @@ fn resolve_dynamic_symbols_for_shared(
     }
     if undefined.is_empty() { return; }
 
-    let lib_names = ["libc.so.6", "libm.so.6", "libpthread.so.0", "libdl.so.2", "librt.so.1"];
+    let lib_names = ["libc.so.6", "libm.so.6", "libpthread.so.0", "libdl.so.2", "librt.so.1", "ld-linux-aarch64.so.1"];
     let mut libs: Vec<String> = Vec::new();
     for lib_name in &lib_names {
         for dir in lib_paths {

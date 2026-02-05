@@ -419,6 +419,9 @@ pub(super) fn emit_shared_library(
                 if si >= obj.symbols.len() { continue; }
                 let sym = &obj.symbols[si];
                 if sym.name.is_empty() { continue; }
+                // Skip local symbols - they don't need GOT entries in dynsym
+                // (e.g. static _Thread_local variables)
+                if sym.is_local() { continue; }
                 match rela.rela_type {
                     R_AARCH64_ADR_GOT_PAGE | R_AARCH64_LD64_GOT_LO12_NC => {
                         if !got_needed.contains(&sym.name) { got_needed.push(sym.name.clone()); }
