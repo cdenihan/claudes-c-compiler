@@ -1,0 +1,13 @@
+Add missing ARM64 system registers needed for kernel defconfig build.
+
+The ARM64 kernel defconfig build fails because the assembler is missing:
+1. Debug breakpoint control/value registers: dbgbcr0_el1..dbgbcr15_el1,
+   dbgbvr0_el1..dbgbvr15_el1, dbgwcr0_el1..dbgwcr15_el1,
+   dbgwvr0_el1..dbgwvr15_el1
+2. MSR SPSel immediate form: `msr spsel, #<imm>` (PSTATE field)
+3. par_el1 in MSR table (currently only in MRS)
+4. Any other missing registers identified during testing
+
+Files to modify: src/backend/arm/assembler/encoder.rs
+
+Started: 2026-02-05

@@ -463,6 +463,21 @@ impl MacroTable {
             return i;
         }
 
+        // C11 string/char encoding prefixes: u8, u, U, L.
+        // When an identifier matches one of these and is immediately followed by
+        // a quote ('"' or '\''), it's a string/char literal prefix, not a macro name.
+        // The preprocessor must not expand it; let the lexer handle it as a token.
+        if i < len && (bytes[i] == b'"' || bytes[i] == b'\'') {
+            let is_encoding_prefix = match ident {
+                "u8" | "u" | "U" | "L" => true,
+                _ => false,
+            };
+            if is_encoding_prefix {
+                result.push_str(ident);
+                return i;
+            }
+        }
+
         // Try macro expansion
         if !expanding.contains(ident) {
             if let Some(mac) = self.macros.get(ident) {

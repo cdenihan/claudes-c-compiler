@@ -1069,8 +1069,10 @@ impl Parser {
         }
     }
 
-    /// Check if an expression has unsigned int type (32-bit).
-    /// Used by the parser-level constant evaluator to truncate bitwise NOT results.
+    /// Check if an expression has unsigned type.
+    /// Used by the parser-level constant evaluator for:
+    /// - Truncating bitwise NOT results to the correct width
+    /// - Using unsigned comparison semantics for relational operators
     /// Only detects obvious cases from the AST structure; non-obvious cases are
     /// handled by the sema-level evaluator which has full type information.
     fn is_unsigned_int_expr(expr: &Expr) -> bool {
@@ -1079,11 +1081,18 @@ impl Parser {
             Expr::Cast(ts, _, _) => {
                 Self::is_unsigned_type_spec(ts)
             }
-            Expr::UnaryOp(UnaryOp::Plus, inner, _) => Self::is_unsigned_int_expr(inner),
+            // Unary +/- preserve the signedness of the operand.
+            // In C, -size_t still has type size_t (unsigned wraparound).
+            Expr::UnaryOp(UnaryOp::Plus, inner, _)
+            | Expr::UnaryOp(UnaryOp::Neg, inner, _) => Self::is_unsigned_int_expr(inner),
             // Binary ops: unsigned if either operand is unsigned (C promotion)
             Expr::BinaryOp(_, lhs, rhs, _) => {
                 Self::is_unsigned_int_expr(lhs) || Self::is_unsigned_int_expr(rhs)
             }
+            // sizeof yields size_t (unsigned). _Alignof yields size_t (unsigned).
+            // These are unsigned per C11 6.5.3.4 and 6.5.3.
+            Expr::Sizeof(..) | Expr::Alignof(..) | Expr::GnuAlignof(..)
+            | Expr::AlignofExpr(..) | Expr::GnuAlignofExpr(..) => true,
             _ => false,
         }
     }
