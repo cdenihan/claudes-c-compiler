@@ -1,7 +1,9 @@
-Task: Fix x86 assembler error for kernel defconfig in standalone mode
+Task: Fix x86 assembler crash for kernel defconfig in standalone mode
 
-Find and fix exactly one x86 assembler error that causes kernel defconfig
-to fail in standalone assembler mode but pass with gcc_assembler.
+Bug: relax_jumps() shrinks section data but does not update deferred_skips
+and deferred_byte_diffs offsets. This causes resolve_deferred_skips() to
+panic with "range end index out of range" when the stale offsets point past
+the shortened data.
 
-Approach: Compare assembly output between gcc and standalone assembler,
-identify byte-level differences, and fix the root cause.
+Fix: Update deferred_skips and deferred_byte_diffs offsets during jump
+relaxation, matching the pattern used for relocations and alignment markers.
