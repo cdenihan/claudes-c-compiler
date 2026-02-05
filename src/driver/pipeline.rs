@@ -395,15 +395,11 @@ impl Driver {
             } else {
                 let preprocessed = preprocessor.preprocess(&source);
 
-                // Check for preprocessor errors (missing includes, #error, etc.)
-                let pp_errors = preprocessor.errors();
-                if !pp_errors.is_empty() {
-                    for err in pp_errors {
-                        eprintln!("{}:{}:{}: error: {}", err.file, err.line, err.col, err.message);
-                    }
-                    return Err(format!("{} preprocessor error(s) in {}", pp_errors.len(), filename));
-                }
-
+                // Output the preprocessed text first, even if there are #error
+                // directives. GCC and Clang also emit the full preprocessed
+                // output before exiting non-zero, and many configure scripts
+                // (e.g., privoxy) rely on grepping this output while ignoring
+                // the exit code.
                 let output = if self.suppress_line_markers {
                     Self::strip_line_markers(&preprocessed)
                 } else {
@@ -419,6 +415,17 @@ impl Driver {
                     self.write_dep_file(input_file, &self.output_path);
                 } else {
                     print!("{}", output);
+                }
+
+                // Check for preprocessor errors (missing includes, #error,
+                // etc.) AFTER emitting output so the result is still available
+                // for downstream tools that ignore the exit code.
+                let pp_errors = preprocessor.errors();
+                if !pp_errors.is_empty() {
+                    for err in pp_errors {
+                        eprintln!("{}:{}:{}: error: {}", err.file, err.line, err.col, err.message);
+                    }
+                    return Err(format!("{} preprocessor error(s) in {}", pp_errors.len(), filename));
                 }
             }
         }

@@ -261,3 +261,5 @@ Tracking project build/test results with MY_ASM=builtin MY_LD=builtin
 | libnl   | PASS | TODO | TODO | TODO | Fixed: (1) compound literal zero-fill for arrays with fewer initializers than elements (C11 6.7.9p21), (2) linker -Wl,-rpath -Wl,/path two-arg form parsing |
 | FreeBSD_kernel | PASS | TODO | TODO | TODO | Passes x86 out of the box (builds contrib/bearssl component) |
 | diffutils | PASS | TODO | TODO | TODO | Fixed: LDBL_MAX/MIN/EPSILON predefined macros had truncated decimal values causing rounding errors; added IEEE 754 round-to-nearest-even in decimal-to-f128 bigint conversion |
+| privoxy | PASS | TODO | TODO | TODO | Fixed: preprocessor -E mode now outputs text even when #error directives encountered (matching GCC behavior); configure scripts grep preprocessed output ignoring exit code |
+| libtasn1 | PASS | TODO | TODO | TODO | Passes x86 out of the box |
