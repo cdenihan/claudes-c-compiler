@@ -86,8 +86,8 @@ compression would conflict with the linker's relaxation pass.
 
 | File            | Lines  | Role                                                    |
 |-----------------|--------|---------------------------------------------------------|
-| `mod.rs`        | ~60    | Public `assemble()` / `assemble_with_args()` entry points; orchestrates parser → ELF writer pipeline, handles `-mabi=` flag for float ABI selection |
-| `parser.rs`     | ~980   | Line tokenizer and operand parser; splits assembly text into `AsmStatement` records, evaluates `.if/.else/.endif` conditionals |
+| `mod.rs`        | ~110   | Public `assemble()` / `assemble_with_args()` entry points; orchestrates parser → ELF writer pipeline, handles `-mabi=` flag for float ABI selection and `-march=` for RV32/RV64 and RVC detection |
+| `parser.rs`     | ~1025  | Line tokenizer and operand parser; splits assembly text into `AsmStatement` records, evaluates `.if/.else/.endif` conditionals |
 | `encoder.rs`    | ~2250  | Instruction encoder; maps every mnemonic to its binary encoding, handles pseudo-instruction expansion, relocation emission |
 | `compress.rs`   | ~850   | Post-encoding RV64C compression pass; rewrites eligible 32-bit instructions to 16-bit compressed equivalents (currently disabled) |
 | `elf_writer.rs` | ~1210  | ELF object file builder; composes with `ElfWriterBase` (from shared `elf.rs`) for section/symbol management, adds RISC-V-specific pcrel_hi/lo pairing, branch resolution, numeric label handling, and ELF serialization |
@@ -107,6 +107,7 @@ ElfWriter {
     numeric_labels:        HashMap<String, Vec<(String, u64)>>,  // "1" -> [(sec, off), ...]
     deferred_exprs:        Vec<DeferredExpr>,            // forward label data expressions (.word sym - .)
     elf_flags:             u32,                          // ELF e_flags (default: RVC | FLOAT_ABI_DOUBLE)
+    elf_class:             u8,                           // ELFCLASS64 (default) or ELFCLASS32 for RV32
     no_relax:              bool,                         // suppress R_RISCV_RELAX (via .option norelax)
 }
 ```
@@ -297,7 +298,7 @@ For each instruction mnemonic, the encoder:
    | Pseudo         | Expansion                                            |
    |----------------|------------------------------------------------------|
    | `li rd, imm`   | `lui + addi(w)` or single `addi`, up to 3-instruction sequences for 64-bit constants |
-   | `mv rd, rs`    | `addi rd, rs, 0`                                     |
+   | `mv rd, rs`    | `add rd, x0, rs` (uses ADD form for RV64C eligibility)|
    | `not rd, rs`   | `xori rd, rs, -1`                                    |
    | `neg rd, rs`   | `sub rd, x0, rs`                                     |
    | `negw rd, rs`  | `subw rd, x0, rs`                                    |
