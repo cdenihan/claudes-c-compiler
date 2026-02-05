@@ -53,7 +53,7 @@ Linker (linker/)               -- ELF .o files -> executable or .so
   (`rbx`, `r12`-`r15`) and caller-saved registers (`r8`-`r11`, `rdi`, `rsi`)
 - **F128 (long double)**: Native x87 80-bit extended precision via
   `fldt`/`fstpt`
-- **Peephole optimizer**: 15 passes in 8 phases (local pattern matching,
+- **Peephole optimizer**: 15 passes in 7 phases (local pattern matching,
   global store forwarding / copy propagation / dead code elimination,
   loop trampoline coalescing, tail call optimization, never-read store
   elimination, callee-save elimination, frame compaction)
