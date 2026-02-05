@@ -2058,8 +2058,8 @@ pub struct ElfWriterBase {
     pub symbol_visibility: HashMap<String, u8>,
     /// Symbol aliases from .set/.equ directives
     pub aliases: HashMap<String, String>,
-    /// Section stack for .pushsection/.popsection
-    section_stack: Vec<String>,
+    /// Section stack for .pushsection/.popsection (saves both current and previous section)
+    section_stack: Vec<(String, String)>,
     /// Previous section for .section/.previous swapping
     previous_section: String,
     /// NOP instruction bytes for code section alignment padding.
@@ -2238,15 +2238,18 @@ impl ElfWriterBase {
     }
 
     /// Push current section onto the stack and switch to a new section.
+    /// Saves both current_section and previous_section so that .popsection
+    /// fully restores the section state (matching GNU as behavior).
     pub fn push_section(&mut self, name: &str, flags_str: &str, flags_explicit: bool, sec_type: Option<&str>) {
-        self.section_stack.push(self.current_section.clone());
+        self.section_stack.push((self.current_section.clone(), self.previous_section.clone()));
         self.process_section_directive(name, flags_str, flags_explicit, sec_type);
     }
 
-    /// Pop the section stack and restore the previous section.
+    /// Pop the section stack and restore both current and previous sections.
     pub fn pop_section(&mut self) {
-        if let Some(prev) = self.section_stack.pop() {
-            self.current_section = prev;
+        if let Some((saved_current, saved_previous)) = self.section_stack.pop() {
+            self.current_section = saved_current;
+            self.previous_section = saved_previous;
         }
     }
 
