@@ -1,0 +1,14 @@
+Fix ARM64 sret+variadic: float stack args incorrectly promoted to GP register
+
+When a variadic function returns a struct via sret on AArch64, the sret pointer
+goes in x8 (not x0), freeing one GP register slot. The emit_call code in traits.rs
+promotes the first Stack-classified arg to the freed GP register (x7). But this is
+wrong when the first Stack arg is a float/double that overflowed from FP registers.
+
+The bug causes the 9th floating-point argument to be passed in x0 (GP register)
+instead of on the stack, shifting all subsequent stack args by 8 bytes.
+
+Fix: check arg_types before promoting a Stack arg to IntReg in the sret fixup.
+Only promote non-float Stack args.
+
+Started: 2026-02-05
