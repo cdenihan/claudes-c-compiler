@@ -1,0 +1,2 @@
+Fix sed_GNU project compilation and testing.
+Diagnose build failures with ccc-x86 and fix compiler bugs as needed.
