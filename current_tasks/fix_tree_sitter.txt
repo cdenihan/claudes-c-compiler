@@ -1,0 +1,4 @@
+Fixing tree-sitter project for x86 target.
+tree-sitter is a parser generator tool and incremental parsing library.
+Status: TODO on x86, PASS on i686.
+Started: 2026-02-05
