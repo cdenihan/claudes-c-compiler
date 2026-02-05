@@ -213,10 +213,11 @@ impl Driver {
     /// to the builtin assembler.
     #[cfg_attr(feature = "gcc_assembler", allow(dead_code))] // Only called in standalone (non-gcc) assembler mode
     fn assemble_source_file_builtin(&self, input_file: &str, output_path: &str) -> Result<(), String> {
-        let asm_text = if input_file.ends_with(".S") {
-            // .S files need C preprocessing before assembly
-            let source = std::fs::read_to_string(input_file)
-                .map_err(|e| format!("Cannot read {}: {}", input_file, e))?;
+        let needs_cpp = input_file.ends_with(".S")
+            || self.explicit_language.as_deref() == Some("assembler-with-cpp");
+        let asm_text = if needs_cpp {
+            // .S files (or -x assembler-with-cpp) need C preprocessing before assembly
+            let source = Self::read_source(input_file)?;
             let mut preprocessor = crate::frontend::preprocessor::Preprocessor::new();
             self.configure_preprocessor(&mut preprocessor);
             // GCC defines __ASSEMBLER__ when preprocessing assembly source files (.S).
@@ -245,8 +246,7 @@ impl Driver {
             preprocessor.preprocess(&source)
         } else {
             // .s files are pure assembly - read directly
-            std::fs::read_to_string(input_file)
-                .map_err(|e| format!("Cannot read {}: {}", input_file, e))?
+            Self::read_source(input_file)?
         };
 
         // Debug: dump preprocessed assembly to /tmp/asm_debug_<basename>.s

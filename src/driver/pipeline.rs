@@ -453,8 +453,7 @@ impl Driver {
         // Default: use built-in preprocessor
         #[cfg(not(feature = "gcc_assembler"))]
         {
-            let source = std::fs::read_to_string(input_file)
-                .map_err(|e| format!("Cannot read {}: {}", input_file, e))?;
+            let source = Self::read_source(input_file)?;
             let mut preprocessor = Preprocessor::new();
             self.configure_preprocessor(&mut preprocessor);
             preprocessor.define_macro("__ASSEMBLER__", "1");
@@ -762,7 +761,7 @@ impl Driver {
     }
 
     /// Read source from an input file. If the file is "-", reads from stdin.
-    fn read_source(input_file: &str) -> Result<String, String> {
+    pub(super) fn read_source(input_file: &str) -> Result<String, String> {
         if input_file == "-" {
             use std::io::Read;
             let mut bytes = Vec::new();
