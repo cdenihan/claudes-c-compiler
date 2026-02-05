@@ -51,10 +51,10 @@ The optimizer executes in four sequential phases:
    |  2b. narrow                                           |
    |  3.  simplify                                         |
    |  4.  constant_fold                                    |
-   |  5.  gvn            \                                 |
-   |  6.  licm             > shared CFG analysis           |
-   |  6a. iv_strength_reduce (iteration 0 only)            |
-   |  7.  if_convert          /                            |
+   |  5.  gvn              \                               |
+   |  6.  licm               > shared CFG analysis         |
+   |  6a. iv_strength_reduce /  (iteration 0 only)         |
+   |  7.  if_convert                                       |
    |  8.  copy_prop        (second round)                  |
    |  9.  dce                                              |
    | 10.  cfg_simplify     (second round)                  |
