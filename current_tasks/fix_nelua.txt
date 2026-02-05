@@ -1,0 +1,1 @@
+Fixing nelua project for x86 target. Investigating compilation failures.
