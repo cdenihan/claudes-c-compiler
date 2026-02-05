@@ -1,9 +1,0 @@
-Fix ARM -fPIC codegen: use GOT-indirect references for external symbols in shared library mode
-
-The needs_got_aarch64() function in state.rs doesn't check pic_mode, so when compiling
-with -fPIC for shared libraries, external symbol references use direct ADRP+ADD instead
-of GOT-indirect ADRP+LDR :got:. This produces R_AARCH64_ADR_PREL_PG_HI21 relocations
-that the linker rejects for shared objects (e.g., postgres dict_snowball.so).
-
-Fix: Update needs_got_aarch64() to check pic_mode for non-local symbols, and update
-ARM call emission to use @PLT for PIC mode.
