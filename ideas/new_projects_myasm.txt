@@ -7,12 +7,12 @@ Tracking project build/test results with MY_ASM=builtin MY_LD=builtin
 | tomlc99 | PASS | PASS | PASS | PASS | i686 fixed by local symbol reloc fix |
 | parson  | PASS | PASS | PASS | PASS | i686 fixed by local symbol reloc fix |
 | jsmn    | PASS | PASS | N/A  | N/A  | Fixed i686: IFUNC support (IPLT/IRELATIVE), TLS, local sym resolution, generic section writes |
-| zstd    | PASS | TODO | FAIL (runtime) | FAIL (runtime) | Fixed __ASSEMBLER__ for .S files, .pushsection/.popsection, BMI2 instrs, bitwise expr parsing; ARM now compiles (added missing NEON u16 intrinsics), runtime crash in fullbench; RISC-V compiles, fuzzer crashes at test335 |
+| zstd    | PASS | TODO | FAIL (runtime) | PASS | Fixed __ASSEMBLER__ for .S files, .pushsection/.popsection, BMI2 instrs, bitwise expr parsing; ARM now compiles (added missing NEON u16 intrinsics), runtime crash in fullbench; RISC-V fixed: get_expr_type returned U64 for UIntLiteral on 64-bit targets (should be U32), causing narrow pass to miss LShr narrowing → mulw sign-extended result fed into 64-bit srl → DeBruijn array OOB segfault |
 | 8cc     | PASS | PASS | TODO | TODO | Fixed x86 builtin linker copy-reloc st_shndx and .gnu.hash; i686 fixed by COMDAT groups + GOTPC + PIC codegen fixes |
 | bzip2   | PASS | PASS | PASS | PASS | i686 fixed by local symbol reloc fix |
 | miniz   | PASS | PASS | PASS | PASS | i686 fixed by COMDAT groups + GOTPC + PIC codegen fixes |
 | utf8proc | PASS | PASS | PASS | PASS | i686 fixed by local symbol reloc fix |
-| chibicc | PASS | TODO | TODO | TODO | Passes x86 |
+| chibicc | PASS | TODO | TODO | PASS | Passes x86; riscv now passes |
 | QuickJS | PASS | PASS | FAIL (frontend codegen bug: test_cyclic_import.js) | PASS | Fixed i686: added --defsym linker support for fmod=__ieee754_fmod alias |
 | cJSON   | PASS | PASS | PASS | PASS | All arches pass with builtin asm/ld |
 | monocypher | PASS | PASS | PASS | PASS | Fixed ARM asm: symbol names matching register names (e.g. x16) |
@@ -232,7 +232,7 @@ Tracking project build/test results with MY_ASM=builtin MY_LD=builtin
 | libtomcrypt | PASS | PASS | PASS | PASS | Fixed RISC-V: narrow pass incorrectly eliminated AND zero-extension mask (uint32 & 0xFFFFFFFF) when narrowing I64→U32, causing sign-extended addw results to leak |
 | libpng  | PASS | PASS | PASS | PASS | Fixed: -Wl flag splitting broke -soname/-rpath multi-arg flags; inliner now avoids bloating recursive function frames |
 | s2n-tls | PASS* | TODO | TODO | TODO | x86: 281/282 tests pass (1 codegen segfault in s2n_tls13_key_schedule_test). Fixed: COMMON symbol archive extraction, decimal constant type promotion (C11 6.4.4.1), nested designated initializer pointer placement |
-| crun    | PASS | PASS | PASS | FAIL | Fixed i686: DT_TEXTREL for WEAK dynamic data symbols (environ) referenced by R_386_32 |
+| crun    | PASS | PASS | PASS | PASS | Fixed i686: DT_TEXTREL for WEAK dynamic data symbols (environ) referenced by R_386_32; riscv now passes |
 | lame    | PASS | PASS | PASS | PASS | All architectures pass out of the box |
 | sdcc    | PASS (build script fix) | TODO | TODO | TODO | Build script fix: repo has stale RISC-V .o files; distclean bug (clean.mk lists "pic" not "pic14") leaves them; need find . -name "*.o" -delete before build |
 | blosc   | PASS | PASS | PASS | PASS | Fixed: weak undefined symbols in shared library .dynsym were emitted as STB_GLOBAL instead of STB_WEAK, causing runtime "undefined symbol" errors for ZSTD_trace_*; also fixed x86/i686 asm jmp/jcc @PLT suffix not stripped (baked @PLT into symbol name instead of using R_X86_64_PLT32/R_386_PLT32) |

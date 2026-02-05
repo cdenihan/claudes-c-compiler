@@ -687,11 +687,9 @@ impl Lowerer {
             }
             Expr::CharLiteral(_, _) => if is_32bit { IrType::I32 } else { IrType::I64 },
             Expr::UIntLiteral(val, _) => {
-                if is_32bit {
-                    if *val <= u32::MAX as u64 { IrType::U32 } else { IrType::U64 }
-                } else {
-                    IrType::U64
-                }
+                // C `unsigned int` is 32-bit on both ILP32 and LP64.
+                // Values that fit in U32 have type U32; larger ones promote to U64.
+                if *val <= u32::MAX as u64 { IrType::U32 } else { IrType::U64 }
             }
             Expr::LongLiteral(val, _) => {
                 if is_32bit {
