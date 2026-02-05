@@ -158,6 +158,7 @@ string literals, and linker directives for a translation unit.
 | `aliases` | `Vec<(String, String, bool)>` | Symbol aliases: `(alias_name, target_name, is_weak)` |
 | `toplevel_asm` | `Vec<String>` | Top-level `asm("...")` directives, emitted verbatim |
 | `symbol_attrs` | `Vec<(String, bool, Option<String>)>` | Symbol attribute directives: `(name, is_weak, visibility)` |
+| `symver_directives` | `Vec<(String, String)>` | `__attribute__((symver(...)))` directives: `(symbol_name, version_string)` |
 
 `IrModule` provides a `for_each_function` method that runs a transformation on
 each defined (non-declaration) function, returning the total count of changes
@@ -495,7 +496,7 @@ Key methods on `IrConst`:
 
 ## Intrinsics
 
-`IntrinsicOp` defines **80 target-independent intrinsic operations**. Each
+`IntrinsicOp` defines **81 target-independent intrinsic operations**. Each
 backend emits the appropriate native instructions for its architecture. The
 variants are organized by ISA extension:
 
@@ -503,16 +504,16 @@ variants are organized by ISA extension:
 |----------|-------|---------|
 | Fences and barriers | 5 | `Lfence`, `Mfence`, `Sfence`, `Pause`, `Clflush` |
 | Non-temporal stores | 4 | `Movnti`, `Movnti64`, `Movntdq`, `Movntpd` |
-| 128-bit load/store | 2 | `Loaddqu`, `Storedqu` |
-| SSE2 packed integer | 12 | `Pcmpeqb128`, `Pand128`, `Pmovmskb128`, `SetEpi8`, `SetEpi32`, `SetEpi16`, ... |
+| 128-bit load/store | 4 | `Loaddqu`, `Storedqu`, `Loadldi128`, `Storeldi128` |
+| SSE2 packed integer | 10 | `Pcmpeqb128`, `Pcmpeqd128`, `Psubusb128`, `Psubsb128`, `Por128`, `Pand128`, `Pxor128`, `Pmovmskb128`, `SetEpi8`, `SetEpi32` |
 | SSE2 packed 16-bit | 6 | `Paddw128`, `Psubw128`, `Pmulhw128`, `Pmaddwd128`, `Pcmpgtw128`, `Pcmpgtb128` |
 | SSE2 packed 16-bit shifts | 3 | `Psllwi128`, `Psrlwi128`, `Psrawi128` |
 | SSE2 packed 32-bit | 2 | `Paddd128`, `Psubd128` |
 | SSE2 packed 32-bit shifts | 3 | `Psradi128`, `Pslldi128`, `Psrldi128` |
 | SSE2 byte/bit shifts | 4 | `Pslldqi128`, `Psrldqi128`, `Psllqi128`, `Psrlqi128` |
 | SSE2 shuffle | 3 | `Pshufd128`, `Pshuflw128`, `Pshufhw128` |
-| SSE2 pack/unpack | 6 | `Packssdw128`, `Packuswb128`, `Punpcklbw128`, ... |
-| SSE2 insert/extract/convert | 6 | `Pinsrw128`, `Pextrw128`, `Cvtsi128Si32`, `Cvtsi32Si128`, ... |
+| SSE2 pack/unpack | 7 | `Packssdw128`, `Packsswb128`, `Packuswb128`, `Punpcklbw128`, `Punpckhbw128`, `Punpcklwd128`, `Punpckhwd128` |
+| SSE2 insert/extract/convert | 6 | `SetEpi16`, `Pinsrw128`, `Pextrw128`, `Cvtsi128Si32`, `Cvtsi32Si128`, `Cvtsi128Si64` |
 | SSE4.1 insert/extract | 6 | `Pinsrd128`, `Pextrd128`, `Pinsrb128`, `Pextrb128`, `Pinsrq128`, `Pextrq128` |
 | AES-NI | 6 | `Aesenc128`, `Aesenclast128`, `Aesdec128`, `Aesdeclast128`, `Aesimc128`, `Aeskeygenassist128` |
 | CLMUL | 1 | `Pclmulqdq128` |
