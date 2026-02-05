@@ -119,8 +119,22 @@ src/backend/
     numeric_labels.rs GAS numeric label (1:, 2f, 3b) support
     object_writer.rs  High-level ELF object file writer
     writer_base.rs    Low-level ELF writer (headers, sections, relocations)
-  linker_common/      Shared linker infrastructure: ELF64 parser, types, DynStrTab, hash
-    mod.rs            ELF64 object parsing, linker types, dynamic string/hash tables
+  linker_common/      Shared linker infrastructure (17 files, see linker_common/README.md)
+    mod.rs            Re-exports, linker-defined symbol detection
+    types.rs          Core ELF64 types: Elf64Section, Elf64Symbol, Elf64Object, DynSymbol
+    parse_object.rs   Parse ELF64 relocatable objects (.o)
+    parse_shared.rs   Extract dynamic symbols and SONAME from shared libraries (.so)
+    symbols.rs        GlobalSymbolOps trait, InputSection/OutputSection
+    merge.rs          Merge input sections into output sections, COMMON symbols
+    dynamic.rs        Match undefined globals against shared library exports
+    archive.rs        Load archives (.a, thin archives), iterative resolution
+    resolve_lib.rs    Resolve -l library names to filesystem paths
+    args.rs           Parse -Wl, linker flags into structured LinkerArgs
+    check.rs          Post-link undefined symbol validation
+    section_map.rs    Section ordering and address assignment
+    write.rs          Shared ELF executable writing helpers
+    dynstr.rs         Dynamic string table builder
+    hash.rs           GNU hash table and SysV hash table generation
     eh_frame.rs       .eh_frame FDE counting and .eh_frame_hdr builder
     gc_sections.rs    --gc-sections BFS reachability analysis
   peephole_common.rs  Shared peephole optimizer utilities: word matching, register replacement, LineStore
@@ -130,8 +144,12 @@ src/backend/
   traits.rs           ArchCodegen trait (~185 methods, ~64 default impls)
   generation.rs       Module/function/instruction dispatch (arch-independent)
   state.rs            CodegenState, StackSlot, SlotAddr, RegCache
-  stack_layout/       Three-tier stack slot allocation
-    mod.rs            Stack space calculation, alloca/multi-block/block-local allocation
+  stack_layout/       Three-tier stack slot allocation (7 files, see stack_layout/README.md)
+    mod.rs            Entry point, calculate_stack_space_common driver
+    analysis.rs       Use counting, immediately-consumed detection, block analysis
+    alloca_coalescing.rs  Escape analysis for non-escaping single-block allocas
+    copy_coalescing.rs    Copy alias tracking (share source slot)
+    slot_assignment.rs    Tier 2 liveness packing, Tier 3 block-local reuse
     inline_asm.rs     Inline asm callee-saved register scanning
     regalloc_helpers.rs Register allocation setup and parameter alloca lookup
   call_abi.rs         Unified ABI classification (CallArgClass, ParamClass)
@@ -175,7 +193,7 @@ pass pipeline:
 | `calls.rs` | Function call emission, argument marshalling |
 | `cast_ops.rs` (`casts.rs` on i686) | Type casts (int widening/narrowing, int-float conversions) |
 | `comparison.rs` | Comparison and fused compare-and-branch |
-| `f128.rs` | F128 (long double) operations |
+| `f128.rs` | F128 (long double) operations (absent on i686, which uses x87) |
 | `float_ops.rs` | Floating-point arithmetic |
 | `globals.rs` | Global address materialization, TLS access |
 | `i128_ops.rs` | 128-bit integer operations |
@@ -371,7 +389,7 @@ operations) invalidate the cache.
 
 ---
 
-## Three-Tier Stack Slot Allocation (stack_layout.rs)
+## Three-Tier Stack Slot Allocation (stack_layout/)
 
 All four backends share a unified stack layout algorithm that assigns stack
 slots to IR values. The algorithm is implemented in
@@ -688,10 +706,10 @@ simultaneously. This handles cascading opportunities where one optimization
 (e.g., removing a redundant load) exposes another (e.g., making a store
 dead).
 
-### x86-64 Pass Structure (Eight Phases)
+### x86-64 Pass Structure (Seven Phases)
 
 The x86-64 peephole (in `x86/codegen/peephole/`) is the most
-comprehensive, organized into eight phases:
+comprehensive, organized into seven phases:
 
 **Phase 1 -- Local passes** (iterative, up to 8 rounds):
 `combined_local_pass` merges several single-scan patterns into one:
@@ -730,17 +748,16 @@ load dead).
 trampolines created during code generation, followed by additional local
 cleanup if changes were made.
 
-**Phase 5 -- Tail call optimization**: Converts `call` + `ret` sequences
-into `jmp` (tail calls).
+**Phase 5 -- Tail call optimization + never-read store elimination**:
+Converts `call` + `ret` sequences into `jmp` (tail calls), then performs
+whole-function analysis removing stores to stack slots that are never
+subsequently loaded.
 
-**Phase 6 -- Never-read store elimination**: Whole-function analysis
-removing stores to stack slots that are never subsequently loaded.
-
-**Phase 7 -- Unused callee-save elimination**: Removes prologue
+**Phase 6 -- Unused callee-save elimination**: Removes prologue
 push/epilogue pop pairs for callee-saved registers that are never actually
 referenced in the function body.
 
-**Phase 8 -- Frame compaction**: Reassigns stack slot offsets to eliminate
+**Phase 7 -- Frame compaction**: Reassigns stack slot offsets to eliminate
 gaps left by eliminated stores, reducing total frame size.
 
 ### Other Architectures
@@ -906,7 +923,7 @@ library function, and storing the result -- is identical between the two
 architectures; only the register names, instruction mnemonics, and F128
 register representation differ.
 
-The `F128SoftFloat` trait captures approximately 45 architecture-specific
+The `F128SoftFloat` trait captures approximately 48 architecture-specific
 primitive methods (each 1--5 instructions), organized into categories:
 
 - **State access**: `f128_get_slot`, `f128_get_source`,
@@ -1089,9 +1106,13 @@ Each backend's `assembler/` directory contains:
 |------|---------|
 | `mod.rs` | Entry point: `assemble(asm_text, output_path)` |
 | `parser.rs` | Tokenize + parse assembly text (absent in i686; reuses x86) |
-| `encoder.rs` | Instruction-to-bytes encoding |
+| `encoder/` | Instruction-to-bytes encoding (directory with 7--8 submodules per arch) |
 | `elf_writer.rs` | ELF object file generation |
 | `compress.rs` | RV64C instruction compression (RISC-V only) |
+
+The `encoder/` directory splits encoding by instruction category (e.g., GP
+integer, SSE/NEON, FP, system, atomics) to keep each file focused. See
+each architecture's assembler README for details.
 
 ---
 
@@ -1153,16 +1174,23 @@ All four linker implementations handle:
 
 ### Linker Files
 
-Each backend's `linker/` directory has different structure:
+Each backend's `linker/` directory has a similar structure. Common files
+include `mod.rs` (entry point), `link.rs` (main link driver), and
+`input.rs` (input object/archive loading). See each architecture's
+linker README for file-level details.
 
-- **x86-64**: `mod.rs` (main implementation), `elf.rs` (ELF helpers)
-- **i686**: `mod.rs` (entry point), `parse.rs` (ELF parsing), `types.rs`
-  (type definitions), `reloc.rs` (relocation application), `dynsym.rs`
-  (dynamic symbol table), `gnu_hash.rs` (GNU hash table for shared libs)
-- **AArch64**: `mod.rs` (main implementation), `elf.rs` (ELF helpers),
-  `reloc.rs` (relocation application)
-- **RISC-V**: `mod.rs` (entry point), `link.rs` (main implementation),
-  `elf_read.rs` (ELF reading), `relocations.rs` (relocation application)
+- **x86-64** (8 files): `mod.rs`, `link.rs`, `input.rs`, `types.rs`,
+  `elf.rs` (ELF helpers), `plt_got.rs` (PLT/GOT construction),
+  `emit_exec.rs`, `emit_shared.rs`
+- **i686** (12 files): `mod.rs`, `link.rs`, `input.rs`, `parse.rs`,
+  `types.rs`, `reloc.rs`, `emit.rs`, `sections.rs`, `symbols.rs`,
+  `shared.rs`, `dynsym.rs`, `gnu_hash.rs`
+- **AArch64** (10 files): `mod.rs`, `link.rs`, `input.rs`, `types.rs`,
+  `elf.rs`, `reloc.rs`, `plt_got.rs`, `emit_dynamic.rs`,
+  `emit_shared.rs`, `emit_static.rs`
+- **RISC-V** (10 files): `mod.rs`, `link.rs`, `input.rs`, `elf_read.rs`,
+  `relocations.rs`, `reloc.rs`, `sections.rs`, `symbols.rs`,
+  `emit_exec.rs`, `emit_shared.rs`
 
 ---
 

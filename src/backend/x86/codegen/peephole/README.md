@@ -39,7 +39,7 @@ The optimizer has two architectural layers:
    re-parsing the assembly text.
 
 2. **Optimization passes** (`passes/`): A pipeline of 15 distinct pass functions
-   organized into 8 phases. Passes range from simple single-line pattern matching (self-move
+   organized into 7 phases. Passes range from simple single-line pattern matching (self-move
    elimination) to whole-function analysis (never-read store elimination and
    loop trampoline coalescing).
 
