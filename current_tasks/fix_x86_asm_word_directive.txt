@@ -1,0 +1,12 @@
+Fix x86 assembler: .word directive silently ignored
+
+The x86 assembler parser does not handle .word or .hword directives.
+On x86 GAS, .word is a synonym for .short (2 bytes), and .hword is also
+a 2-byte data directive. Both fall through to the catch-all _ => branch
+and are silently dropped as AsmItem::Empty.
+
+This causes the asm-immediate-string-literal-x86 unit test to SIGSEGV
+because the .word 99 in the .pushsection block is skipped, causing
+the struct layout to be wrong.
+
+Fix: add ".word" | ".hword" as aliases alongside ".short" | ".value" | ".2byte".
