@@ -1,0 +1,8 @@
+Fix ARM assembler .space/.zero directive hex literal parsing
+
+The .space/.zero directive parser fails to parse hex literals like 0x400,
+producing "invalid .zero size: 0x400" errors. This is seen when building
+the ARM64 kernel defconfig (arch/arm64/kernel/entry.o uses .space 0x400).
+
+Fix: update the .space/.zero parser to use a hex-aware integer parsing
+function instead of plain str::parse().
