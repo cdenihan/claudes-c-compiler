@@ -1,0 +1,4 @@
+Fixing c-algorithms project for x86 architecture.
+Fails only on x86, passes on i686/arm/riscv - likely a codegen or linker issue.
+
+Started: 2026-02-05

@@ -1,5 +1,0 @@
-Fixing Wren programming language project.
-Previously passed x86 but now shows as failing all 4 architectures.
-Investigating whether this is a regression or timing issue.
-
-Started: 2026-02-05
