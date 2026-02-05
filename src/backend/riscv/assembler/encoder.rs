@@ -70,6 +70,10 @@ pub enum RelocType {
     TprelLo12S,
     /// R_RISCV_TPREL_ADD
     TprelAdd,
+    /// R_RISCV_ADD16 - 16-bit addition (for symbol differences)
+    Add16,
+    /// R_RISCV_SUB16 - 16-bit subtraction (for symbol differences)
+    Sub16,
     /// R_RISCV_ADD32 - 32-bit addition (for symbol differences)
     Add32,
     /// R_RISCV_SUB32 - 32-bit subtraction (for symbol differences)
@@ -102,6 +106,8 @@ impl RelocType {
             RelocType::TprelAdd => 32,    // R_RISCV_TPREL_ADD
             RelocType::Abs32 => 1,        // R_RISCV_32
             RelocType::Abs64 => 2,        // R_RISCV_64
+            RelocType::Add16 => 34,       // R_RISCV_ADD16
+            RelocType::Sub16 => 38,       // R_RISCV_SUB16
             RelocType::Add32 => 35,       // R_RISCV_ADD32
             RelocType::Sub32 => 39,       // R_RISCV_SUB32
             RelocType::Add64 => 36,       // R_RISCV_ADD64

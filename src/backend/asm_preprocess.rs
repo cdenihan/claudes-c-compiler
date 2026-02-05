@@ -498,15 +498,40 @@ fn parse_macro_params(params_str: &str) -> (Vec<String>, Vec<Option<String>>) {
 /// GAS allows both commas and spaces as macro argument separators.
 /// Quoted strings are kept as a single argument with quotes stripped.
 /// Parenthesized groups like `0(a1)` are kept together.
+///
+/// When the invocation uses commas, each comma-separated field is one argument
+/// (spaces within a field are preserved). When no commas are present, spaces
+/// serve as separators. This matches GAS behavior where `\arg` can receive
+/// an expression like `889f - 888f` when commas delimit the arguments.
 pub fn split_macro_args(s: &str) -> Vec<String> {
     if s.is_empty() {
         return Vec::new();
     }
+
+    // Determine whether the invocation uses commas as separators by checking
+    // for commas outside quotes and parentheses.
+    let has_commas = {
+        let mut paren_depth = 0i32;
+        let mut in_quote = false;
+        let mut found = false;
+        for &b in s.as_bytes() {
+            match b {
+                b'"' => in_quote = !in_quote,
+                b'(' if !in_quote => paren_depth += 1,
+                b')' if !in_quote => paren_depth -= 1,
+                b',' if !in_quote && paren_depth == 0 => { found = true; break; }
+                _ => {}
+            }
+        }
+        found
+    };
+
     let mut args = Vec::new();
     let mut current = String::new();
     let bytes = s.as_bytes();
     let mut i = 0;
     let mut paren_depth = 0i32;
+
     while i < bytes.len() {
         match bytes[i] {
             b'(' => {
@@ -517,14 +542,15 @@ pub fn split_macro_args(s: &str) -> Vec<String> {
                 paren_depth -= 1;
                 current.push(')');
             }
-            b',' if paren_depth == 0 => {
+            b',' if paren_depth == 0 && has_commas => {
                 let trimmed = current.trim().to_string();
                 if !trimmed.is_empty() {
                     args.push(trimmed);
                 }
                 current.clear();
             }
-            b' ' | b'\t' if paren_depth == 0 => {
+            b' ' | b'\t' if paren_depth == 0 && !has_commas => {
+                // Space-separated mode: split on whitespace
                 let trimmed = current.trim().to_string();
                 if !trimmed.is_empty() {
                     args.push(trimmed);
@@ -533,10 +559,6 @@ pub fn split_macro_args(s: &str) -> Vec<String> {
                 // Skip remaining whitespace
                 while i + 1 < bytes.len() && (bytes[i + 1] == b' ' || bytes[i + 1] == b'\t') {
                     i += 1;
-                }
-                // If next char is comma, let the comma handle the split
-                if i + 1 < bytes.len() && bytes[i + 1] == b',' {
-                    // skip
                 }
             }
             b'"' => {
@@ -1062,6 +1084,11 @@ mod tests {
         assert_eq!(split_macro_args("a, b, c"), vec!["a", "b", "c"]);
         assert_eq!(split_macro_args("0(a1), x, y"), vec!["0(a1)", "x", "y"]);
         assert_eq!(split_macro_args(""), Vec::<String>::new());
+        // When commas are used, spaces within a field are preserved
+        assert_eq!(split_macro_args("886b, 888f, 0x1234, 0, 889f - 888f"),
+            vec!["886b", "888f", "0x1234", "0", "889f - 888f"]);
+        // Without commas, spaces are separators
+        assert_eq!(split_macro_args("a b c"), vec!["a", "b", "c"]);
     }
 
     #[test]

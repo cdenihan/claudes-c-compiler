@@ -690,7 +690,15 @@ impl ElfWriter {
                                 self.base.emit_placeholder(2);
                             }
                         }
-                        _ => self.base.emit_bytes(&0u16.to_le_bytes()),
+                        DataValue::SymbolDiff { sym_a, sym_b, addend } => {
+                            let add_type = RelocType::Add16.elf_type();
+                            let sub_type = RelocType::Sub16.elf_type();
+                            let (base_a, extra_a) = decompose_symbol_addend(sym_a);
+                            let (base_b, extra_b) = decompose_symbol_addend(sym_b);
+                            self.base.add_reloc(add_type, base_a, *addend + extra_a);
+                            self.base.add_reloc(sub_type, base_b, extra_b);
+                            self.base.emit_placeholder(2);
+                        }
                     }
                 }
                 Ok(())

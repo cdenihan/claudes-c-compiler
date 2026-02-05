@@ -206,9 +206,11 @@ RelocType::TlsGdHi20       -> R_RISCV_TLS_GD_HI20
 RelocType::TlsGotHi20      -> R_RISCV_TLS_GOT_HI20
 RelocType::Abs32           -> R_RISCV_32
 RelocType::Abs64           -> R_RISCV_64
-RelocType::Add32           -> R_RISCV_ADD32   (symbol difference expressions)
+RelocType::Add16           -> R_RISCV_ADD16   (16-bit symbol difference, e.g. .2byte)
+RelocType::Sub16           -> R_RISCV_SUB16
+RelocType::Add32           -> R_RISCV_ADD32   (32-bit symbol difference, e.g. .4byte)
 RelocType::Sub32           -> R_RISCV_SUB32
-RelocType::Add64           -> R_RISCV_ADD64
+RelocType::Add64           -> R_RISCV_ADD64   (64-bit symbol difference, e.g. .8byte)
 RelocType::Sub64           -> R_RISCV_SUB64
 ```
 
