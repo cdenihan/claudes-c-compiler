@@ -1,9 +1,0 @@
-Fix __attribute__((noreturn)) on function pointer parameter leaking to enclosing function.
-
-When a function is declared with a noreturn function pointer parameter like:
-  void set_die_routine(__attribute__((__noreturn__)) report_fn routine);
-the noreturn attribute incorrectly applies to set_die_routine itself,
-causing ud2 to be emitted after calls to it.
-
-Fix: save/restore the noreturn parser flag around parameter list parsing
-in parse_param_list(), similar to how parsing_const is already handled.

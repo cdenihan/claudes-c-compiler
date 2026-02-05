@@ -345,10 +345,15 @@ impl Parser {
                 break;
             }
 
+            // Save noreturn before skip_gcc_extensions() so that a noreturn attribute
+            // on a function pointer parameter (e.g. `__attribute__((__noreturn__)) fn_ptr_t`)
+            // doesn't leak to the enclosing function declaration.
+            let saved_noreturn = self.attrs.parsing_noreturn();
             self.skip_gcc_extensions();
             // Save and reset parsing_const to detect if this parameter's base type is const.
             let saved_const = self.attrs.parsing_const();
             self.attrs.set_const(false);
+            self.attrs.set_noreturn(saved_noreturn);
             if let Some(mut type_spec) = self.parse_type_specifier() {
                 // Capture whether the base type (before pointer declarators) was const.
                 // For `const int *p`, parsing_const is true here; the `*` is handled below.
@@ -390,8 +395,11 @@ impl Parser {
                 }
 
                 self.attrs.set_const(saved_const);
+                self.attrs.set_noreturn(saved_noreturn);
                 params.push(ParamDecl { type_spec, name, fptr_params: fptr_param_decls, is_const: param_is_const, vla_size_exprs, fptr_inner_ptr_depth: inner_ptr_depth });
             } else {
+                self.attrs.set_const(saved_const);
+                self.attrs.set_noreturn(saved_noreturn);
                 break;
             }
 
