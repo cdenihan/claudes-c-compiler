@@ -37,6 +37,8 @@ pub struct ElfWriter {
     pending_sym_diffs: Vec<PendingSymDiff>,
     /// Pending raw expressions to resolve after all labels are known
     pending_exprs: Vec<PendingExpr>,
+    /// Pending instructions with symbolic offset expressions (resolved after labels are known)
+    pending_instructions: Vec<PendingInstruction>,
 }
 
 struct PendingReloc {
@@ -71,6 +73,18 @@ struct PendingSymDiff {
     size: usize,
 }
 
+/// A pending instruction whose operands contain symbolic expressions.
+/// A NOP placeholder is emitted at the instruction offset; after all labels
+/// are known, the expression is evaluated, operands are updated, and the
+/// instruction is re-encoded and patched in place.
+struct PendingInstruction {
+    section: String,
+    offset: u64,
+    mnemonic: String,
+    operands: Vec<Operand>,
+    raw_operands: String,
+}
+
 impl ElfWriter {
     pub fn new() -> Self {
         Self {
@@ -78,6 +92,7 @@ impl ElfWriter {
             pending_branch_relocs: Vec::new(),
             pending_sym_diffs: Vec::new(),
             pending_exprs: Vec::new(),
+            pending_instructions: Vec::new(),
         }
     }
 
@@ -211,6 +226,113 @@ impl ElfWriter {
         Ok(())
     }
 
+    /// Resolve pending instructions that contain symbolic offset expressions.
+    /// After all labels are positioned, substitute label names with offsets,
+    /// evaluate the expression, update operands, re-encode, and patch in place.
+    fn resolve_pending_instructions(&mut self) -> Result<(), String> {
+        let pending = std::mem::take(&mut self.pending_instructions);
+        for pinstr in &pending {
+            // Resolve each operand that has a deferred expression
+            let resolved_operands: Vec<Operand> = pinstr.operands.iter().map(|op| {
+                match op {
+                    Operand::MemExpr { base, expr, writeback } => {
+                        if let Some(val) = self.resolve_label_expr(expr) {
+                            if *writeback {
+                                Operand::MemPreIndex { base: base.clone(), offset: val }
+                            } else {
+                                Operand::Mem { base: base.clone(), offset: val }
+                            }
+                        } else {
+                            op.clone()
+                        }
+                    }
+                    Operand::Expr(expr) => {
+                        if let Some(val) = self.resolve_label_expr(expr) {
+                            Operand::Imm(val)
+                        } else {
+                            op.clone()
+                        }
+                    }
+                    _ => op.clone(),
+                }
+            }).collect();
+
+            // Re-encode the instruction with resolved operands
+            match encode_instruction(&pinstr.mnemonic, &resolved_operands, &pinstr.raw_operands) {
+                Ok(EncodeResult::Word(word)) => {
+                    if let Some(section) = self.base.sections.get_mut(&pinstr.section) {
+                        let off = pinstr.offset as usize;
+                        if off + 4 <= section.data.len() {
+                            section.data[off..off + 4].copy_from_slice(&word.to_le_bytes());
+                        }
+                    }
+                }
+                Ok(EncodeResult::WordWithReloc { word, reloc }) => {
+                    if let Some(section) = self.base.sections.get_mut(&pinstr.section) {
+                        let off = pinstr.offset as usize;
+                        if off + 4 <= section.data.len() {
+                            section.data[off..off + 4].copy_from_slice(&word.to_le_bytes());
+                        }
+                        let is_local = reloc.symbol.starts_with(".L") || reloc.symbol.starts_with(".l") || reloc.symbol == ".";
+                        if is_local {
+                            self.pending_branch_relocs.push(PendingReloc {
+                                section: pinstr.section.clone(),
+                                offset: pinstr.offset,
+                                reloc_type: reloc.reloc_type.elf_type(),
+                                symbol: reloc.symbol.clone(),
+                                addend: reloc.addend,
+                            });
+                        } else {
+                            section.relocs.push(ObjReloc {
+                                offset: pinstr.offset,
+                                reloc_type: reloc.reloc_type.elf_type(),
+                                symbol_name: reloc.symbol,
+                                addend: reloc.addend,
+                            });
+                        }
+                    }
+                }
+                Ok(EncodeResult::Words(words)) => {
+                    if let Some(section) = self.base.sections.get_mut(&pinstr.section) {
+                        let off = pinstr.offset as usize;
+                        for (j, word) in words.iter().enumerate() {
+                            let wo = off + j * 4;
+                            if wo + 4 <= section.data.len() {
+                                section.data[wo..wo + 4].copy_from_slice(&word.to_le_bytes());
+                            }
+                        }
+                    }
+                }
+                Ok(EncodeResult::Skip) => {}
+                Err(e) => {
+                    // Log error but don't fail the whole assembly
+                    eprintln!("warning: failed to resolve deferred instruction '{}': {}", pinstr.mnemonic, e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Substitute all known label names in an expression string with their byte
+    /// offsets, then evaluate the resulting numeric expression.
+    fn resolve_label_expr(&self, expr: &str) -> Option<i64> {
+        let mut resolved = expr.to_string();
+
+        // Collect all label names, sorted longest first to avoid partial replacements
+        let mut label_names: Vec<&String> = self.base.labels.keys().collect();
+        label_names.sort_by_key(|name| std::cmp::Reverse(name.len()));
+
+        for label_name in &label_names {
+            if resolved.contains(label_name.as_str()) {
+                if let Some((_section, offset)) = self.base.labels.get(*label_name) {
+                    resolved = resolved.replace(label_name.as_str(), &offset.to_string());
+                }
+            }
+        }
+
+        crate::backend::asm_expr::parse_integer_expr(&resolved).ok()
+    }
+
     /// Process all parsed assembly statements.
     pub fn process_statements(&mut self, statements: &[AsmStatement]) -> Result<(), String> {
         for stmt in statements {
@@ -238,10 +360,17 @@ impl ElfWriter {
                     expr.section = parent.clone();
                 }
             }
+            for instr in &mut self.pending_instructions {
+                if let Some((parent, offset_adj)) = remap.get(&instr.section) {
+                    instr.offset += offset_adj;
+                    instr.section = parent.clone();
+                }
+            }
         }
         // Resolve symbol differences first (needs all labels to be known)
         self.resolve_sym_diffs()?;
         self.resolve_pending_exprs()?;
+        self.resolve_pending_instructions()?;
         self.resolve_local_branches()?;
         Ok(())
     }
@@ -462,8 +591,30 @@ impl ElfWriter {
         self.base.emit_placeholder(size);
     }
 
+    /// Check if any operand contains a deferred symbolic expression.
+    fn has_deferred_expr(operands: &[Operand]) -> bool {
+        operands.iter().any(|op| matches!(op, Operand::MemExpr { .. } | Operand::Expr(_)))
+    }
+
     fn process_instruction(&mut self, mnemonic: &str, operands: &[Operand], raw_operands: &str) -> Result<(), String> {
         self.base.ensure_text_section();
+
+        // If any operand has a symbolic expression that needs deferred resolution,
+        // emit a NOP placeholder and queue for later resolution.
+        if Self::has_deferred_expr(operands) {
+            let section = self.base.current_section.clone();
+            let offset = self.base.current_offset();
+            self.pending_instructions.push(PendingInstruction {
+                section,
+                offset,
+                mnemonic: mnemonic.to_string(),
+                operands: operands.to_vec(),
+                raw_operands: raw_operands.to_string(),
+            });
+            // Emit NOP placeholder (will be patched during resolution)
+            self.base.emit_u32_le(u32::from_le_bytes(AARCH64_NOP));
+            return Ok(());
+        }
 
         match encode_instruction(mnemonic, operands, raw_operands) {
             Ok(EncodeResult::Word(word)) => {

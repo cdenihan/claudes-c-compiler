@@ -6,15 +6,16 @@
 //!
 //! Supported transformations:
 //!
-//! **Unsigned division by constant** (32-bit):
-//!   `x /u C` => `(uint64_t(x) * M) >> 32 >> s` (with optional add-and-shift fixup)
+//! **Unsigned division by constant** (32-bit and 64-bit):
+//!   `x /u C` => `mulhi(x, M) >> s` (with optional add-and-shift fixup)
+//!   32-bit uses 64-bit intermediate; 64-bit uses 128-bit intermediate.
 //!   Uses the "magic number" algorithm from Hacker's Delight by Henry S. Warren Jr.
 //!
 //! **Signed division by power-of-2**:
-//!   `x /s 2^k` => `(x + ((x >> 31) >>> (32 - k))) >> k`
+//!   `x /s 2^k` => `(x + ((x >> (N-1)) >>> (N - k))) >> k`
 //!   Adds a bias for negative numbers to ensure correct rounding toward zero.
 //!
-//! **Signed division by constant** (32-bit):
+//! **Signed division by constant** (32-bit and 64-bit):
 //!   `x /s C` => multiply by magic number + shift + sign correction
 //!   Uses the signed magic number algorithm from Hacker's Delight.
 //!
@@ -22,13 +23,16 @@
 //!   `x % C` => `x - (x / C) * C`  (using the optimized division above)
 //!
 //! All transformations produce correct results for the full range of inputs,
-//! including edge cases (0, 1, -1, INT_MIN, UINT_MAX).
+//! including edge cases (0, 1, -1, INT_MIN, UINT_MAX, INT64_MIN, UINT64_MAX).
 //!
-//! ## Limitations
+//! ## Implementation
 //!
-//! - Only 32-bit divisions are optimized. Genuine 64-bit divisions (e.g.
-//!   `long long / 10`) fall through to the native div/idiv instruction.
-//!   TODO: Implement 64-bit division using 128-bit magic numbers.
+//! 64-bit magic numbers require 128-bit intermediate products. We use the
+//! compiler's existing I128/U128 types: cast both operands to 128-bit,
+//! multiply, shift right by 64, and truncate back to 64-bit. All four backends
+//! (x86, i686, ARM64, RISC-V) have I128 multiply support that maps to efficient
+//! hardware instructions (mulq/imulq on x86, umulh/smulh on ARM64,
+//! mulhu/mulh on RISC-V).
 //!
 //! - Negative divisors are handled via identity: `x / -C == -(x / C)` and
 //!   `x % -C == x % C` (in C, the sign of the remainder follows the dividend).
@@ -179,10 +183,22 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
                         // exceeds u32 range (e.g. (U64)(char)-128 = 0xFFFFFFFFFFFFFF80).
                         let expanded = match op {
                             IrBinOp::UDiv => {
-                                if divisor > 1 && divisor <= u32::MAX as i64 {
+                                // For unsigned division, reinterpret i64 bits as u64.
+                                // Large u64 divisors (> i64::MAX) appear as negative i64.
+                                let udivisor = divisor as u64;
+                                if udivisor >= 2 && udivisor <= u32::MAX as u64 {
+                                    let d32 = udivisor as u32;
                                     match *ty {
-                                        IrType::U32 => expand_udiv32(*dest, lhs, divisor as u32, *ty, &mut next_id),
-                                        IrType::I64 | IrType::U64 if lhs_is_u32(lhs) => expand_udiv32_in_i64(*dest, lhs, divisor as u32, &mut next_id),
+                                        IrType::U32 => expand_udiv32(*dest, lhs, d32, *ty, &mut next_id),
+                                        // Note: widened_op_type() maps U64 to I64, so UDiv on
+                                        // unsigned long long uses I64 type. Match both.
+                                        IrType::I64 | IrType::U64 if lhs_is_u32(lhs) => expand_udiv32_in_i64(*dest, lhs, d32, &mut next_id),
+                                        IrType::I64 | IrType::U64 => expand_udiv64(*dest, lhs, udivisor, *ty, &mut next_id),
+                                        _ => None,
+                                    }
+                                } else if udivisor >= 2 {
+                                    match *ty {
+                                        IrType::I64 | IrType::U64 => expand_udiv64(*dest, lhs, udivisor, *ty, &mut next_id),
                                         _ => None,
                                     }
                                 } else {
@@ -194,22 +210,60 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
                                     match *ty {
                                         IrType::I32 => expand_sdiv32(*dest, lhs, divisor as i32, *ty, &mut next_id),
                                         IrType::I64 if lhs_is_i32(lhs) => expand_sdiv32_in_i64(*dest, lhs, divisor as i32, &mut next_id),
+                                        IrType::I64 => expand_sdiv64(*dest, lhs, divisor, &mut next_id),
                                         _ => None,
                                     }
-                                } else if divisor < -1 && divisor > i32::MIN as i64 {
+                                } else if divisor > i32::MAX as i64 {
+                                    // Divisor > i32::MAX: only 64-bit
+                                    match *ty {
+                                        IrType::I64 => expand_sdiv64(*dest, lhs, divisor, &mut next_id),
+                                        _ => None,
+                                    }
+                                } else if divisor < -1 {
                                     // Negative divisor: x / -C == -(x / C)
-                                    // Exclude i32::MIN because -i32::MIN overflows i32.
-                                    let pos_divisor = (-divisor) as i32;
-                                    expand_sdiv_neg(*dest, lhs, pos_divisor, *ty, &lhs_is_i32, &mut next_id)
+                                    let pos_divisor = -divisor;
+                                    if pos_divisor <= i32::MAX as i64 {
+                                        match *ty {
+                                            IrType::I32 => {
+                                                let pd = pos_divisor as i32;
+                                                expand_sdiv_neg(*dest, lhs, pd, *ty, &lhs_is_i32, &mut next_id)
+                                            }
+                                            IrType::I64 if lhs_is_i32(lhs) => {
+                                                let pd = pos_divisor as i32;
+                                                expand_sdiv_neg(*dest, lhs, pd, *ty, &lhs_is_i32, &mut next_id)
+                                            }
+                                            IrType::I64 => expand_sdiv64_neg(*dest, lhs, pos_divisor, &mut next_id),
+                                            _ => None,
+                                        }
+                                    } else {
+                                        // pos_divisor > i32::MAX: 64-bit only
+                                        // Exclude i64::MIN because -i64::MIN overflows
+                                        if divisor > i64::MIN {
+                                            match *ty {
+                                                IrType::I64 => expand_sdiv64_neg(*dest, lhs, pos_divisor, &mut next_id),
+                                                _ => None,
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    }
                                 } else {
                                     None
                                 }
                             }
                             IrBinOp::URem => {
-                                if divisor > 1 && divisor <= u32::MAX as i64 {
+                                let udivisor = divisor as u64;
+                                if udivisor >= 2 && udivisor <= u32::MAX as u64 {
+                                    let d32 = udivisor as u32;
                                     match *ty {
-                                        IrType::U32 => expand_urem32(*dest, lhs, divisor as u32, *ty, &mut next_id),
-                                        IrType::I64 | IrType::U64 if lhs_is_u32(lhs) => expand_urem32_in_i64(*dest, lhs, divisor as u32, &mut next_id),
+                                        IrType::U32 => expand_urem32(*dest, lhs, d32, *ty, &mut next_id),
+                                        IrType::I64 | IrType::U64 if lhs_is_u32(lhs) => expand_urem32_in_i64(*dest, lhs, d32, &mut next_id),
+                                        IrType::I64 | IrType::U64 => expand_urem64(*dest, lhs, udivisor, *ty, &mut next_id),
+                                        _ => None,
+                                    }
+                                } else if udivisor >= 2 {
+                                    match *ty {
+                                        IrType::I64 | IrType::U64 => expand_urem64(*dest, lhs, udivisor, *ty, &mut next_id),
                                         _ => None,
                                     }
                                 } else {
@@ -221,16 +275,32 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
                                     match *ty {
                                         IrType::I32 => expand_srem32(*dest, lhs, divisor as i32, *ty, &mut next_id),
                                         IrType::I64 if lhs_is_i32(lhs) => expand_srem32_in_i64(*dest, lhs, divisor as i32, &mut next_id),
+                                        IrType::I64 => expand_srem64(*dest, lhs, divisor, &mut next_id),
                                         _ => None,
                                     }
-                                } else if divisor < -1 && divisor > i32::MIN as i64 {
-                                    // Negative divisor: x % -C == x % C (sign follows dividend in C)
-                                    // Exclude i32::MIN because -i32::MIN overflows i32.
-                                    let pos_divisor = (-divisor) as i32;
+                                } else if divisor > i32::MAX as i64 {
                                     match *ty {
-                                        IrType::I32 => expand_srem32(*dest, lhs, pos_divisor, *ty, &mut next_id),
-                                        IrType::I64 if lhs_is_i32(lhs) => expand_srem32_in_i64(*dest, lhs, pos_divisor, &mut next_id),
+                                        IrType::I64 => expand_srem64(*dest, lhs, divisor, &mut next_id),
                                         _ => None,
+                                    }
+                                } else if divisor < -1 {
+                                    // Negative divisor: x % -C == x % C (sign follows dividend in C)
+                                    let pos_divisor = -divisor;
+                                    if pos_divisor <= i32::MAX as i64 {
+                                        let pd = pos_divisor as i32;
+                                        match *ty {
+                                            IrType::I32 => expand_srem32(*dest, lhs, pd, *ty, &mut next_id),
+                                            IrType::I64 if lhs_is_i32(lhs) => expand_srem32_in_i64(*dest, lhs, pd, &mut next_id),
+                                            IrType::I64 => expand_srem64(*dest, lhs, pos_divisor, &mut next_id),
+                                            _ => None,
+                                        }
+                                    } else if divisor > i64::MIN {
+                                        match *ty {
+                                            IrType::I64 => expand_srem64(*dest, lhs, pos_divisor, &mut next_id),
+                                            _ => None,
+                                        }
+                                    } else {
+                                        None
                                     }
                                 } else {
                                     None
@@ -740,6 +810,471 @@ fn expand_srem32(
     Some(insts)
 }
 
+// ─── Unsigned division by constant (64-bit) ────────────────────────────────
+
+/// Compute the magic number for unsigned 64-bit division by `d`.
+/// Returns (magic_number, post_shift, needs_add) where:
+/// - If !needs_add: result = mulhi(x, magic) >> post_shift
+/// - If needs_add: result = ((x - mulhi(x, magic)) >> 1 + mulhi(x, magic)) >> (post_shift - 1)
+///
+/// Uses the same algorithm as the 32-bit version, scaled up to 64-bit
+/// with 128-bit intermediate arithmetic (available via Rust's u128).
+fn compute_unsigned_magic_64(d: u64) -> Option<(u128, u32, bool)> {
+    assert!(d >= 2);
+
+    // Try each shift amount starting from 0
+    for p in 0u32..64 {
+        // magic = ceil(2^(64+p) / d)
+        // Use checked shifts to avoid overflow in the 128-bit computation
+        let two_pow: u128 = 1u128 << (64 + p);
+        let magic = two_pow.div_ceil(d as u128);
+
+        // Check if this magic number works: the error must be <= 2^p
+        let error = magic * d as u128 - two_pow;
+        if error <= (1u128 << p) {
+            if magic <= u64::MAX as u128 {
+                // Fits in 64 bits - simple case
+                return Some((magic, p, false));
+            } else {
+                // Doesn't fit in 64 bits - use add-and-shift fixup
+                // Subtract 2^64 from magic and compensate
+                let m = magic - (1u128 << 64);
+                if m <= u64::MAX as u128 {
+                    return Some((m, p, true));
+                }
+            }
+        }
+    }
+
+    // Fallback for very large divisors near u64::MAX
+    None
+}
+
+/// Expand `dest = x /u C` for native 64-bit unsigned x using 128-bit multiply.
+/// `ty` is the IR type of the original operation (I64 or U64 - on 64-bit targets,
+/// widened_op_type maps both to I64, but the UDiv opcode indicates unsigned semantics).
+fn expand_udiv64(
+    dest: Value,
+    x: &Operand,
+    d: u64,
+    ty: IrType,
+    next_id: &mut u32,
+) -> Option<Vec<Instruction>> {
+    if d < 2 {
+        return None;
+    }
+
+    // Power of 2: simple shift
+    if d.is_power_of_two() {
+        let shift = d.trailing_zeros();
+        return Some(vec![Instruction::BinOp {
+            dest,
+            op: IrBinOp::LShr,
+            lhs: *x,
+            rhs: Operand::Const(IrConst::I64(shift as i64)),
+            ty,
+        }]);
+    }
+
+    let (magic, shift, needs_add) = compute_unsigned_magic_64(d)?;
+
+    let mut insts = Vec::new();
+
+    // Step 1: cast x to U64 if needed (IR may use I64 for unsigned long long),
+    // then zero-extend to 128 bits. We must use U64->U128 to ensure zero-extension.
+    let x_u64 = if ty == IrType::U64 {
+        *x
+    } else {
+        // ty is I64 but operation is unsigned - reinterpret bits as unsigned
+        let v = fresh_value(next_id);
+        insts.push(Instruction::Cast {
+            dest: v,
+            src: *x,
+            from_ty: ty,
+            to_ty: IrType::U64,
+        });
+        Operand::Value(v)
+    };
+
+    let x128 = fresh_value(next_id);
+    insts.push(Instruction::Cast {
+        dest: x128,
+        src: x_u64,
+        from_ty: IrType::U64,
+        to_ty: IrType::U128,
+    });
+
+    // Step 2: multiply by magic number (in 128 bits, unsigned)
+    let product = fresh_value(next_id);
+    insts.push(Instruction::BinOp {
+        dest: product,
+        op: IrBinOp::Mul,
+        lhs: Operand::Value(x128),
+        rhs: Operand::Const(IrConst::I128(magic as i128)),
+        ty: IrType::U128,
+    });
+
+    // Step 3: get high 64 bits (logical shift right by 64)
+    let hi128 = fresh_value(next_id);
+    insts.push(Instruction::BinOp {
+        dest: hi128,
+        op: IrBinOp::LShr,
+        lhs: Operand::Value(product),
+        rhs: Operand::Const(IrConst::I128(64)),
+        ty: IrType::U128,
+    });
+
+    // Step 4: truncate to 64 bits, then cast back to original type
+    let hi_u64 = fresh_value(next_id);
+    insts.push(Instruction::Cast {
+        dest: hi_u64,
+        src: Operand::Value(hi128),
+        from_ty: IrType::U128,
+        to_ty: IrType::U64,
+    });
+
+    // Cast back to the original type (I64 if needed)
+    let hi = if ty == IrType::U64 {
+        hi_u64
+    } else {
+        let v = fresh_value(next_id);
+        insts.push(Instruction::Cast {
+            dest: v,
+            src: Operand::Value(hi_u64),
+            from_ty: IrType::U64,
+            to_ty: ty,
+        });
+        v
+    };
+
+    if !needs_add {
+        // Simple case: result = hi >> shift
+        if shift == 0 {
+            insts.push(Instruction::Copy { dest, src: Operand::Value(hi) });
+        } else {
+            insts.push(Instruction::BinOp {
+                dest,
+                op: IrBinOp::LShr,
+                lhs: Operand::Value(hi),
+                rhs: Operand::Const(IrConst::I64(shift as i64)),
+                ty,
+            });
+        }
+    } else {
+        // Needs add fixup: result = ((x - hi) >> 1 + hi) >> (shift - 1)
+        let diff = fresh_value(next_id);
+        insts.push(Instruction::BinOp {
+            dest: diff,
+            op: IrBinOp::Sub,
+            lhs: *x,
+            rhs: Operand::Value(hi),
+            ty,
+        });
+
+        let half = fresh_value(next_id);
+        insts.push(Instruction::BinOp {
+            dest: half,
+            op: IrBinOp::LShr,
+            lhs: Operand::Value(diff),
+            rhs: Operand::Const(IrConst::I64(1)),
+            ty,
+        });
+
+        let sum = fresh_value(next_id);
+        insts.push(Instruction::BinOp {
+            dest: sum,
+            op: IrBinOp::Add,
+            lhs: Operand::Value(half),
+            rhs: Operand::Value(hi),
+            ty,
+        });
+
+        if shift > 1 {
+            insts.push(Instruction::BinOp {
+                dest,
+                op: IrBinOp::LShr,
+                lhs: Operand::Value(sum),
+                rhs: Operand::Const(IrConst::I64((shift - 1) as i64)),
+                ty,
+            });
+        } else {
+            insts.push(Instruction::Copy { dest, src: Operand::Value(sum) });
+        }
+    }
+
+    Some(insts)
+}
+
+// ─── Signed division by constant (64-bit) ──────────────────────────────────
+
+/// Compute the magic number for signed 64-bit division by `d`.
+/// Returns (magic_number, shift_amount).
+///
+/// Based on Hacker's Delight, 2nd edition, adapted for 64-bit using 128-bit
+/// intermediate arithmetic.
+fn compute_signed_magic_64(d: i64) -> (i128, u32) {
+    assert!(d >= 2);
+    let ad = d as u64; // absolute value (d > 0)
+    let t: u64 = 0x8000000000000000u64; // 2^63
+    let anc = t - 1 - (t % ad); // absolute value of nc
+    let mut p: u32 = 63;
+    let mut q1: u128 = (1u128 << 63) / anc as u128;
+    let mut r1: u128 = (1u128 << 63) - q1 * anc as u128;
+    let mut q2: u128 = (1u128 << 63) / ad as u128;
+    let mut r2: u128 = (1u128 << 63) - q2 * ad as u128;
+
+    loop {
+        p += 1;
+        q1 *= 2;
+        r1 *= 2;
+        if r1 >= anc as u128 {
+            q1 += 1;
+            r1 -= anc as u128;
+        }
+        q2 *= 2;
+        r2 *= 2;
+        if r2 >= ad as u128 {
+            q2 += 1;
+            r2 -= ad as u128;
+        }
+        let delta = ad as u128 - r2;
+        if q1 < delta || (q1 == delta && r1 == 0) {
+            continue;
+        }
+        break;
+    }
+
+    // Magic number (can be negative when interpreted as signed)
+    let magic = (q2 + 1) as i128;
+    let shift = p - 64;
+    (magic, shift)
+}
+
+/// Expand `dest = x /s C` for native 64-bit signed x using 128-bit multiply.
+fn expand_sdiv64(
+    dest: Value,
+    x: &Operand,
+    d: i64,
+    next_id: &mut u32,
+) -> Option<Vec<Instruction>> {
+    if d < 2 {
+        return None;
+    }
+
+    // Power of 2: x / 2^k => (x + (x >> 63 >>> (64 - k))) >> k
+    if d > 0 && (d as u64).is_power_of_two() {
+        let k = d.trailing_zeros();
+        let mut insts = Vec::new();
+
+        let sign = fresh_value(next_id);
+        insts.push(Instruction::BinOp {
+            dest: sign,
+            op: IrBinOp::AShr,
+            lhs: *x,
+            rhs: Operand::Const(IrConst::I64(63)),
+            ty: IrType::I64,
+        });
+
+        let bias = fresh_value(next_id);
+        insts.push(Instruction::BinOp {
+            dest: bias,
+            op: IrBinOp::LShr,
+            lhs: Operand::Value(sign),
+            rhs: Operand::Const(IrConst::I64(64 - k as i64)),
+            ty: IrType::I64,
+        });
+
+        let biased = fresh_value(next_id);
+        insts.push(Instruction::BinOp {
+            dest: biased,
+            op: IrBinOp::Add,
+            lhs: *x,
+            rhs: Operand::Value(bias),
+            ty: IrType::I64,
+        });
+
+        insts.push(Instruction::BinOp {
+            dest,
+            op: IrBinOp::AShr,
+            lhs: Operand::Value(biased),
+            rhs: Operand::Const(IrConst::I64(k as i64)),
+            ty: IrType::I64,
+        });
+
+        return Some(insts);
+    }
+
+    // General case: signed magic number division
+    let (magic, shift) = compute_signed_magic_64(d);
+    let mut insts = Vec::new();
+
+    // Step 1: sign-extend x to 128 bits
+    let x128 = fresh_value(next_id);
+    insts.push(Instruction::Cast {
+        dest: x128,
+        src: *x,
+        from_ty: IrType::I64,
+        to_ty: IrType::I128,
+    });
+
+    // Step 2: multiply by magic number (in 128 bits)
+    let product = fresh_value(next_id);
+    insts.push(Instruction::BinOp {
+        dest: product,
+        op: IrBinOp::Mul,
+        lhs: Operand::Value(x128),
+        rhs: Operand::Const(IrConst::I128(magic)),
+        ty: IrType::I128,
+    });
+
+    // Step 3: get high 64 bits (arithmetic shift right by 64)
+    let hi128 = fresh_value(next_id);
+    insts.push(Instruction::BinOp {
+        dest: hi128,
+        op: IrBinOp::AShr,
+        lhs: Operand::Value(product),
+        rhs: Operand::Const(IrConst::I128(64)),
+        ty: IrType::I128,
+    });
+
+    // Step 4: truncate to 64 bits
+    let hi = fresh_value(next_id);
+    insts.push(Instruction::Cast {
+        dest: hi,
+        src: Operand::Value(hi128),
+        from_ty: IrType::I128,
+        to_ty: IrType::I64,
+    });
+
+    // Step 5: shift right by shift amount
+    let shifted = if shift > 0 {
+        let s = fresh_value(next_id);
+        insts.push(Instruction::BinOp {
+            dest: s,
+            op: IrBinOp::AShr,
+            lhs: Operand::Value(hi),
+            rhs: Operand::Const(IrConst::I64(shift as i64)),
+            ty: IrType::I64,
+        });
+        s
+    } else {
+        hi
+    };
+
+    // Step 6: sign correction: result + (result >>> 63)
+    let sign_bit = fresh_value(next_id);
+    insts.push(Instruction::BinOp {
+        dest: sign_bit,
+        op: IrBinOp::LShr,
+        lhs: Operand::Value(shifted),
+        rhs: Operand::Const(IrConst::I64(63)),
+        ty: IrType::I64,
+    });
+
+    insts.push(Instruction::BinOp {
+        dest,
+        op: IrBinOp::Add,
+        lhs: Operand::Value(shifted),
+        rhs: Operand::Value(sign_bit),
+        ty: IrType::I64,
+    });
+
+    Some(insts)
+}
+
+// ─── 64-bit modulo by constant ─────────────────────────────────────────────
+
+/// Expand `dest = x %u C` for 64-bit unsigned x.
+fn expand_urem64(
+    dest: Value,
+    x: &Operand,
+    d: u64,
+    ty: IrType,
+    next_id: &mut u32,
+) -> Option<Vec<Instruction>> {
+    if d < 2 || d.is_power_of_two() {
+        return None;
+    }
+
+    let quotient = fresh_value(next_id);
+    let mut insts = expand_udiv64(quotient, x, d, ty, next_id)?;
+
+    let prod = fresh_value(next_id);
+    insts.push(Instruction::BinOp {
+        dest: prod,
+        op: IrBinOp::Mul,
+        lhs: Operand::Value(quotient),
+        rhs: Operand::Const(IrConst::I64(d as i64)),
+        ty,
+    });
+
+    insts.push(Instruction::BinOp {
+        dest,
+        op: IrBinOp::Sub,
+        lhs: *x,
+        rhs: Operand::Value(prod),
+        ty,
+    });
+
+    Some(insts)
+}
+
+/// Expand `dest = x %s C` for 64-bit signed x.
+fn expand_srem64(
+    dest: Value,
+    x: &Operand,
+    d: i64,
+    next_id: &mut u32,
+) -> Option<Vec<Instruction>> {
+    if d < 2 {
+        return None;
+    }
+
+    let quotient = fresh_value(next_id);
+    let mut insts = expand_sdiv64(quotient, x, d, next_id)?;
+
+    let prod = fresh_value(next_id);
+    insts.push(Instruction::BinOp {
+        dest: prod,
+        op: IrBinOp::Mul,
+        lhs: Operand::Value(quotient),
+        rhs: Operand::Const(IrConst::I64(d)),
+        ty: IrType::I64,
+    });
+
+    insts.push(Instruction::BinOp {
+        dest,
+        op: IrBinOp::Sub,
+        lhs: *x,
+        rhs: Operand::Value(prod),
+        ty: IrType::I64,
+    });
+
+    Some(insts)
+}
+
+/// Expand `dest = x /s -C` for 64-bit by computing `-(x /s C)`.
+fn expand_sdiv64_neg(
+    dest: Value,
+    x: &Operand,
+    pos_d: i64,
+    next_id: &mut u32,
+) -> Option<Vec<Instruction>> {
+    let quotient = fresh_value(next_id);
+    let mut insts = expand_sdiv64(quotient, x, pos_d, next_id)?;
+
+    // Negate: dest = 0 - quotient
+    insts.push(Instruction::BinOp {
+        dest,
+        op: IrBinOp::Sub,
+        lhs: Operand::Const(IrConst::I64(0)),
+        rhs: Operand::Value(quotient),
+        ty: IrType::I64,
+    });
+
+    Some(insts)
+}
+
 // ─── I64-promoted variants ─────────────────────────────────────────────────
 // These handle the common case where C integer promotion widened 32-bit
 // operations to I64. The magic number trick works in I64 directly since
@@ -1224,6 +1759,169 @@ mod tests {
                 .collect();
             for &x in &test_vals {
                 assert_eq!(x % pos_d, x % neg_d, "x % {} != x % {} for x={}", pos_d, neg_d, x);
+            }
+        }
+    }
+
+    // ─── 64-bit unsigned magic number tests ────────────────────────────────
+
+    #[test]
+    fn test_unsigned_magic_64_div10() {
+        let (magic, shift, needs_add) = compute_unsigned_magic_64(10).unwrap();
+        let test_vals: Vec<u64> = vec![
+            0, 1, 9, 10, 11, 99, 100, 255, 1000,
+            u32::MAX as u64, u32::MAX as u64 + 1,
+            u64::MAX, u64::MAX - 1, u64::MAX / 2,
+            12345678901234567, 0xCCCCCCCCCCCCCCCC,
+        ];
+        for x in test_vals {
+            let result = if !needs_add {
+                let product = (x as u128 * magic) >> 64 >> shift;
+                product as u64
+            } else {
+                let hi = ((x as u128 * magic) >> 64) as u64;
+                let diff = x - hi;
+                ((diff >> 1).wrapping_add(hi) >> (shift - 1)) as u64
+            };
+            assert_eq!(result, x / 10, "Failed for x={}", x);
+        }
+    }
+
+    #[test]
+    fn test_unsigned_magic_64_exhaustive_small_divisors() {
+        for d in 2u64..=20 {
+            let (magic, shift, needs_add) = compute_unsigned_magic_64(d).unwrap();
+            let test_vals: Vec<u64> = (0..1000u64)
+                .chain(u64::MAX - 1000..=u64::MAX)
+                .chain(std::iter::once(u32::MAX as u64))
+                .chain(std::iter::once(u32::MAX as u64 + 1))
+                .collect();
+            for x in test_vals {
+                let result = if !needs_add {
+                    ((x as u128 * magic) >> 64 >> shift) as u64
+                } else {
+                    let hi = ((x as u128 * magic) >> 64) as u64;
+                    let diff = x - hi;
+                    ((diff >> 1).wrapping_add(hi) >> (shift - 1)) as u64
+                };
+                assert_eq!(result, x / d, "Failed for x={} d={}", x, d);
+            }
+        }
+    }
+
+    #[test]
+    fn test_unsigned_magic_64_large_divisors() {
+        // Test with divisors that don't fit in 32 bits
+        let large_divisors: Vec<u64> = vec![
+            u32::MAX as u64 + 1, // 2^32
+            0x100000000, // 2^32
+            0x123456789ABCDEF0,
+            u64::MAX / 2,
+            u64::MAX / 3,
+            1_000_000_000_000, // 10^12
+        ];
+        for d in large_divisors {
+            if let Some((magic, shift, needs_add)) = compute_unsigned_magic_64(d) {
+                for &x in &[0u64, 1, d - 1, d, d + 1, d * 2, u64::MAX, u64::MAX - 1] {
+                    let result = if !needs_add {
+                        ((x as u128 * magic) >> 64 >> shift) as u64
+                    } else {
+                        let hi = ((x as u128 * magic) >> 64) as u64;
+                        let diff = x - hi;
+                        ((diff >> 1).wrapping_add(hi) >> (shift - 1)) as u64
+                    };
+                    assert_eq!(result, x / d, "Failed for x={} d={}", x, d);
+                }
+            }
+        }
+    }
+
+    // ─── 64-bit signed magic number tests ──────────────────────────────────
+
+    #[test]
+    fn test_signed_magic_64_div10() {
+        let (magic, shift) = compute_signed_magic_64(10);
+        let test_vals: Vec<i64> = vec![
+            0, 1, -1, 9, 10, -10, 11, -11, 99, 100, -100,
+            i64::MAX, i64::MIN + 1,
+            1234567890123456789, -1234567890123456789,
+        ];
+        for x in test_vals {
+            let x128 = x as i128;
+            let product = x128 * magic;
+            let hi = product >> 64;
+            let shifted = hi >> shift;
+            let sign_bit = (shifted as u64) >> 63;
+            let result = (shifted + sign_bit as i128) as i64;
+            assert_eq!(result, x / 10, "Failed for x={}", x);
+        }
+    }
+
+    #[test]
+    fn test_signed_magic_64_exhaustive_small_divisors() {
+        for d in 2i64..=20 {
+            let (magic, shift) = compute_signed_magic_64(d);
+            let test_vals: Vec<i64> = (-1000..1000i64)
+                .chain(std::iter::once(i64::MAX))
+                .chain(std::iter::once(i64::MIN + 1))
+                .chain(std::iter::once(i64::MAX / d * d))
+                .chain(std::iter::once(i64::MIN / d * d))
+                .collect();
+            for x in test_vals {
+                let x128 = x as i128;
+                let product = x128 * magic;
+                let hi = product >> 64;
+                let shifted = hi >> shift;
+                let sign_bit = (shifted as u64) >> 63;
+                let result = (shifted + sign_bit as i128) as i64;
+                assert_eq!(result, x / d, "Failed for x={} d={}", x, d);
+            }
+        }
+    }
+
+    #[test]
+    fn test_signed_magic_64_large_divisors() {
+        // Test with divisors that don't fit in 32 bits
+        let large_divisors: Vec<i64> = vec![
+            i32::MAX as i64 + 1,
+            1_000_000_000_000, // 10^12
+            i64::MAX / 3,
+        ];
+        for d in large_divisors {
+            let (magic, shift) = compute_signed_magic_64(d);
+            let test_vals: Vec<i64> = vec![
+                0, 1, -1, d - 1, d, d + 1, -d + 1, -d, -d - 1,
+                i64::MAX, i64::MIN + 1,
+            ];
+            for x in test_vals {
+                let x128 = x as i128;
+                let product = x128 * magic;
+                let hi = product >> 64;
+                let shifted = hi >> shift;
+                let sign_bit = (shifted as u64) >> 63;
+                let result = (shifted + sign_bit as i128) as i64;
+                assert_eq!(result, x / d, "Failed for x={} d={}", x, d);
+            }
+        }
+    }
+
+    #[test]
+    fn test_negative_divisor_sdiv64() {
+        // Negative 64-bit divisor: x / -C == -(x / C)
+        for pos_d in [2i64, 3, 7, 10, 100, 1_000_000_000_000] {
+            let (magic, shift) = compute_signed_magic_64(pos_d);
+            let test_vals: Vec<i64> = vec![
+                0, 1, -1, 100, -100, i64::MAX, i64::MIN + 1,
+            ];
+            for x in test_vals {
+                let x128 = x as i128;
+                let product = x128 * magic;
+                let hi = product >> 64;
+                let shifted = hi >> shift;
+                let sign_bit = (shifted as u64) >> 63;
+                let pos_result = (shifted + sign_bit as i128) as i64;
+                let result = -pos_result;
+                assert_eq!(result, x / (-pos_d), "Failed for x={} d={}", x, -pos_d);
             }
         }
     }

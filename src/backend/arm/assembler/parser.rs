@@ -28,6 +28,9 @@ pub enum Operand {
     SymbolOffset(String, i64),
     /// Memory operand: [base] or [base, #offset]
     Mem { base: String, offset: i64 },
+    /// Memory operand with symbolic offset expression: [base, #(sym_expr)] or [base, #(sym_expr)]!
+    /// Used when the offset is a label/symbol expression that can't be resolved at parse time.
+    MemExpr { base: String, expr: String, writeback: bool },
     /// Memory operand with pre-index writeback: [base, #offset]!
     MemPreIndex { base: String, offset: i64 },
     /// Memory operand with post-index writeback: [base], #offset
@@ -2106,11 +2109,18 @@ fn parse_memory_operand(s: &str) -> Result<Operand, String> {
 
     // [base, #imm] or [base, imm] (bare immediate without # prefix)
     if let Some(imm_str) = second.strip_prefix('#') {
-        let offset = parse_int_literal(imm_str)?;
-        if has_writeback {
-            return Ok(Operand::MemPreIndex { base, offset });
+        match parse_int_literal(imm_str) {
+            Ok(offset) => {
+                if has_writeback {
+                    return Ok(Operand::MemPreIndex { base, offset });
+                }
+                return Ok(Operand::Mem { base, offset });
+            }
+            Err(_) => {
+                // Expression contains symbols/labels — defer resolution
+                return Ok(Operand::MemExpr { base, expr: imm_str.to_string(), writeback: has_writeback });
+            }
         }
-        return Ok(Operand::Mem { base, offset });
     }
 
     // Handle bare immediate without # prefix (e.g., [sp, -16]! or [x0, 8])
@@ -2236,8 +2246,14 @@ fn parse_immediate(s: &str) -> Result<Operand, String> {
         return parse_modifier(s);
     }
 
-    let val = parse_int_literal(s)?;
-    Ok(Operand::Imm(val))
+    match parse_int_literal(s) {
+        Ok(val) => Ok(Operand::Imm(val)),
+        Err(_) => {
+            // Expression contains symbols/labels — store as raw expression for
+            // deferred resolution (e.g., #(1b - .Lvector_start + 4))
+            Ok(Operand::Expr(s.to_string()))
+        }
+    }
 }
 
 fn parse_int_literal(s: &str) -> Result<i64, String> {

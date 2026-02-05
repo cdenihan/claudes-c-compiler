@@ -257,8 +257,70 @@ fn resolve_numeric_operand(
                 op.clone()
             }
         }
+        Operand::MemExpr { base, expr, writeback } => {
+            let resolved_expr = resolve_numeric_refs_in_expr(expr, current_idx, defs);
+            Operand::MemExpr { base: base.clone(), expr: resolved_expr, writeback: *writeback }
+        }
+        Operand::Expr(expr) => {
+            let resolved_expr = resolve_numeric_refs_in_expr(expr, current_idx, defs);
+            Operand::Expr(resolved_expr)
+        }
         _ => op.clone(),
     }
+}
+
+/// Resolve numeric label references (e.g., `1b`, `2f`) within an expression string.
+/// Replaces each occurrence with the resolved unique label name (e.g., `.Lnum_1_3`).
+fn resolve_numeric_refs_in_expr(
+    expr: &str,
+    current_idx: usize,
+    defs: &HashMap<String, Vec<(usize, String)>>,
+) -> String {
+    let bytes = expr.as_bytes();
+    let mut result = String::with_capacity(expr.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            // Skip hex literals (0x..., 0X...) and binary literals (0b..., 0B...)
+            // to avoid misinterpreting hex digits as label refs (e.g., 0x1b)
+            if bytes[i] == b'0' && i + 1 < bytes.len()
+                && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X'
+                    || bytes[i + 1] == b'b' || bytes[i + 1] == b'B')
+            {
+                // Consume the entire hex/binary literal
+                i += 2; // skip 0x or 0b
+                while i < bytes.len() && bytes[i].is_ascii_alphanumeric() {
+                    i += 1;
+                }
+                result.push_str(&expr[start..i]);
+                continue;
+            }
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            // Check if followed by 'b' or 'f' (not part of a longer identifier)
+            if i < bytes.len()
+                && (bytes[i] == b'b' || bytes[i] == b'f' || bytes[i] == b'B' || bytes[i] == b'F')
+                && (i + 1 >= bytes.len() || !bytes[i + 1].is_ascii_alphanumeric())
+            {
+                let label_ref = &expr[start..=i];
+                i += 1;
+                if let Some(resolved) = resolve_numeric_name(label_ref, current_idx, defs) {
+                    result.push_str(&resolved);
+                } else {
+                    result.push_str(label_ref);
+                }
+            } else {
+                // Regular number
+                result.push_str(&expr[start..i]);
+            }
+        } else {
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    result
 }
 
 /// Resolve numeric label references in data directives.
