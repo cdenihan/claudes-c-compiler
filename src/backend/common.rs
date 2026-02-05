@@ -1419,7 +1419,11 @@ fn emit_init_data(out: &mut AsmOutput, init: &GlobalInit, fallback_ty: IrType, t
             while i < values.len() {
                 let val = &values[i];
                 let const_ty = const_natural_type(val, fallback_ty);
-                let elem_ty = if fallback_ty.size() > const_ty.size() {
+                // Only widen integer constants to fallback_ty (e.g., I32(0) in a pointer
+                // array should emit .quad 0). Float constants (F32, F64, LongDouble) must
+                // keep their natural size -- complex arrays store F32 pairs where each zero
+                // imaginary slot is exactly 4 bytes, not pointer-sized.
+                let elem_ty = if fallback_ty.size() > const_ty.size() && const_ty.is_integer() {
                     fallback_ty
                 } else {
                     const_ty

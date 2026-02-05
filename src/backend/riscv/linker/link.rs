@@ -1,36 +1,20 @@
-//! RISC-V 64-bit ELF linker: symbol resolution, relocation, and ELF executable emission.
+//! RISC-V 64-bit ELF linker: orchestration of linking phases.
 //!
-//! Uses shared types and helpers from the `relocations` sibling module for
-//! instruction patching, symbol resolution, section layout, and ELF writing
-//! utilities.
+//! Entry points for executable (`link_builtin`) and shared library (`link_shared`)
+//! linking. Delegates to sibling modules for input loading, section merging,
+//! symbol resolution, and relocation application.
 
 use std::collections::{HashMap, HashSet};
 use super::elf_read::*;
 use super::relocations::{
-    GlobalSym, MergedSection, InputSecRef,
-    // Relocation constants
-    R_RISCV_32, R_RISCV_64, R_RISCV_BRANCH, R_RISCV_JAL, R_RISCV_CALL_PLT,
-    R_RISCV_GOT_HI20, R_RISCV_TLS_GOT_HI20, R_RISCV_TLS_GD_HI20,
-    R_RISCV_PCREL_HI20, R_RISCV_PCREL_LO12_I, R_RISCV_PCREL_LO12_S,
-    R_RISCV_HI20, R_RISCV_LO12_I, R_RISCV_LO12_S,
-    R_RISCV_TPREL_HI20, R_RISCV_TPREL_LO12_I, R_RISCV_TPREL_LO12_S,
-    R_RISCV_TPREL_ADD,
-    R_RISCV_ADD8, R_RISCV_ADD16, R_RISCV_ADD32, R_RISCV_ADD64,
-    R_RISCV_SUB8, R_RISCV_SUB16, R_RISCV_SUB32, R_RISCV_SUB64,
-    R_RISCV_ALIGN, R_RISCV_RVC_BRANCH, R_RISCV_RVC_JUMP, R_RISCV_RELAX,
-    R_RISCV_SET6, R_RISCV_SUB6, R_RISCV_SET8, R_RISCV_SET16, R_RISCV_SET32,
-    R_RISCV_32_PCREL, R_RISCV_SET_ULEB128, R_RISCV_SUB_ULEB128,
-    // Instruction patching
-    patch_u_type, patch_i_type, patch_s_type, patch_b_type, patch_j_type,
-    patch_cb_type, patch_cj_type,
-    // Symbol resolution
-    resolve_symbol_value, got_sym_key, find_hi20_value, find_hi20_value_shared,
+    GlobalSym, MergedSection,
+    R_RISCV_64, R_RISCV_CALL_PLT,
     // ELF writing helpers
     write_shdr, write_phdr, write_phdr_at, align_up, pad_to,
     // Utility functions
-    build_gnu_hash, find_versioned_soname, resolve_archive_members,
-    output_section_name, section_order,
+    build_gnu_hash, section_order,
 };
+use super::{input, sections, symbols, reloc};
 use crate::backend::linker_common;
 
 // Standard ELF constants from the shared module.
@@ -106,240 +90,39 @@ pub fn link_builtin(
     let mut needed_libs: Vec<String> = needed_libs.iter().map(|s| s.to_string()).collect();
     needed_libs.extend(parsed_args.libs_to_load);
 
-    // ── Phase 1: Read all input object files ────────────────────────────
-    // Archives (.a) passed directly as inputs use demand-driven extraction
-    // (same as -l libraries): only members that satisfy undefined symbols are pulled in.
+    // ── Phase 1: Load inputs, discover shared libs, resolve archives ────
 
     let mut input_objs: Vec<(String, ElfObject)> = Vec::new();
     let mut inline_archive_paths: Vec<String> = Vec::new();
+    input::load_input_files(&all_inputs, &mut input_objs, &mut inline_archive_paths)?;
 
-    for path in &all_inputs {
-        if !std::path::Path::new(path).exists() {
-            return Err(format!("linker input file not found: {}", path));
-        }
-        let data = std::fs::read(path)
-            .map_err(|e| format!("Cannot read {}: {}", path, e))?;
-
-        if data.len() >= 8 && &data[0..8] == b"!<arch>\n" {
-            // Archive: save for demand-driven extraction in Phase 1c
-            inline_archive_paths.push(path.clone());
-        } else if is_thin_archive(&data) {
-            // Thin archive: save for demand-driven extraction in Phase 1c
-            inline_archive_paths.push(path.clone());
-        } else if data.len() >= 4 && &data[0..4] == b"\x7fELF" {
-            let obj = parse_object(&data, path)
-                .map_err(|e| format!("{}: {}", path, e))?;
-            input_objs.push((path.clone(), obj));
-        }
-        // Skip non-ELF/non-archive files (e.g. linker scripts) - not an error
-    }
-
-    // ── Phase 1b: Resolve -l libraries ──────────────────────────────────
-
-    // Build a set of defined symbols from input objects
     let mut defined_syms: HashSet<String> = HashSet::new();
     let mut undefined_syms: HashSet<String> = HashSet::new();
-
-    for (_, obj) in &input_objs {
-        for sym in &obj.symbols {
-            if sym.shndx != SHN_UNDEF && sym.binding() != STB_LOCAL && !sym.name.is_empty() {
-                defined_syms.insert(sym.name.clone());
-            }
-        }
-    }
-    for (_, obj) in &input_objs {
-        for sym in &obj.symbols {
-            if sym.shndx == SHN_UNDEF && !sym.name.is_empty() && sym.binding() != STB_LOCAL
-                && !defined_syms.contains(&sym.name) {
-                    undefined_syms.insert(sym.name.clone());
-                }
-        }
-    }
-
-    // ── Phase 1b: Discover shared library symbols ─────────────────────
+    input::collect_initial_symbols(&input_objs, &mut defined_syms, &mut undefined_syms);
 
     let mut shared_lib_syms: HashMap<String, DynSymbol> = HashMap::new();
     let mut actual_needed_libs: Vec<String> = Vec::new();
-
     if !is_static {
-        for libname in &needed_libs {
-            // -l:filename means search for exact filename
-            let so_name = if let Some(exact) = libname.strip_prefix(':') {
-                exact.to_string()
-            } else {
-                format!("lib{}.so", libname)
-            };
-            for dir in &lib_search_paths {
-                let path = format!("{}/{}", dir, so_name);
-                if std::path::Path::new(&path).exists() {
-                    let data = match std::fs::read(&path) {
-                        Ok(d) => d,
-                        Err(_) => continue,
-                    };
-                    if data.starts_with(b"/* GNU ld script") || data.starts_with(b"OUTPUT_FORMAT") || data.starts_with(b"GROUP") || data.starts_with(b"INPUT") {
-                        let text = String::from_utf8_lossy(&data);
-                        for token in text.split_whitespace() {
-                            let token = token.trim_matches(|c: char| c == '(' || c == ')' || c == ',');
-                            // Handle -l library references (e.g. -ltinfo)
-                            if let Some(lib_name) = token.strip_prefix("-l") {
-                                if !lib_name.is_empty() {
-                                    // Search for the shared library
-                                    let so_name = format!("lib{}.so", lib_name);
-                                    for search_dir in &lib_search_paths {
-                                        let candidate = format!("{}/{}", search_dir, so_name);
-                                        if std::path::Path::new(&candidate).exists() {
-                                            if let Ok(syms) = read_shared_lib_symbols(&candidate) {
-                                                for si in syms {
-                                                    shared_lib_syms.insert(si.name.clone(), si);
-                                                }
-                                            }
-                                            break;
-                                        }
-                                    }
-                                }
-                                continue;
-                            }
-                            if token.contains(".so") && (token.starts_with('/') || token.starts_with("lib")) {
-                                let actual_path = if token.starts_with('/') {
-                                    token.to_string()
-                                } else {
-                                    // Search all lib paths for the referenced .so file
-                                    let mut found = format!("{}/{}", dir, token);
-                                    if !std::path::Path::new(&found).exists() {
-                                        for search_dir in &lib_search_paths {
-                                            let candidate = format!("{}/{}", search_dir, token);
-                                            if std::path::Path::new(&candidate).exists() {
-                                                found = candidate;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    found
-                                };
-                                if let Ok(syms) = read_shared_lib_symbols(&actual_path) {
-                                    for si in syms {
-                                        shared_lib_syms.insert(si.name.clone(), si);
-                                    }
-                                }
-                                // Also try to pull in _nonshared.a from linker script
-                                if actual_path.ends_with("_nonshared.a") {
-                                    if let Ok(archive_data) = std::fs::read(&actual_path) {
-                                        if archive_data.len() >= 8 && &archive_data[0..8] == b"!<arch>\n" {
-                                            if let Ok(members) = parse_archive(&archive_data) {
-                                                resolve_archive_members(
-                                                    members, &mut input_objs,
-                                                    &mut defined_syms, &mut undefined_syms,
-                                                );
-                                            }
-                                        } else if is_thin_archive(&archive_data) {
-                                            if let Ok(members) = parse_thin_archive(&archive_data, &actual_path) {
-                                                resolve_archive_members(
-                                                    members, &mut input_objs,
-                                                    &mut defined_syms, &mut undefined_syms,
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else if data.len() >= 4 && &data[0..4] == b"\x7fELF" {
-                        if let Ok(syms) = read_shared_lib_symbols(&path) {
-                            for si in syms {
-                                shared_lib_syms.insert(si.name.clone(), si);
-                            }
-                        }
-                    }
-                    let versioned = find_versioned_soname(dir, libname);
-                    if let Some(soname) = versioned {
-                        if !actual_needed_libs.contains(&soname) {
-                            actual_needed_libs.push(soname);
-                        }
-                    }
-                    break;
-                }
-            }
-        }
+        input::discover_shared_lib_symbols(
+            &needed_libs, &lib_search_paths, &mut input_objs,
+            &mut defined_syms, &mut undefined_syms,
+            &mut shared_lib_syms, &mut actual_needed_libs,
+        );
     }
 
     // Treat symbols available from shared libs as "defined" for archive resolution
-    // This prevents pulling in static versions of functions that the dynamic linker will provide
     let shared_defined: HashSet<String> = shared_lib_syms.keys()
         .filter(|s| undefined_syms.contains(*s))
         .cloned()
         .collect();
-    for s in &shared_defined {
-        undefined_syms.remove(s);
-    }
+    for s in &shared_defined { undefined_syms.remove(s); }
 
-    // ── Phase 1c: Resolve remaining undefined symbols from .a archives ──
-    // Group-loading: iterate all archives until no new symbols are resolved,
-    // handling circular dependencies (e.g., libm -> libgcc -> libc -> libgcc).
-
-    // First, resolve all archive paths: inline archives (passed directly) come first,
-    // then -l library archives.
-    let mut archive_paths: Vec<String> = Vec::new();
-    {
-        let mut seen: HashSet<String> = HashSet::new();
-        // Add inline archives (passed directly as input files) first
-        for path in &inline_archive_paths {
-            if !seen.contains(path) {
-                seen.insert(path.clone());
-                archive_paths.push(path.clone());
-            }
-        }
-        for libname in &needed_libs {
-            let archive_name = if let Some(exact) = libname.strip_prefix(':') {
-                exact.to_string()
-            } else {
-                format!("lib{}.a", libname)
-            };
-            for dir in &lib_search_paths {
-                let path = format!("{}/{}", dir, archive_name);
-                if std::path::Path::new(&path).exists() {
-                    if !seen.contains(&path) {
-                        seen.insert(path.clone());
-                        archive_paths.push(path);
-                    }
-                    break;
-                }
-            }
-        }
-    }
-
-    // Iterate all archives in a group until stable (no new objects added)
-    let mut group_changed = true;
-    while group_changed {
-        group_changed = false;
-        let prev_count = input_objs.len();
-        for path in &archive_paths {
-            let data = match std::fs::read(path) {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-            if data.len() >= 8 && &data[0..8] == b"!<arch>\n" {
-                if let Ok(members) = parse_archive(&data) {
-                    resolve_archive_members(
-                        members, &mut input_objs,
-                        &mut defined_syms, &mut undefined_syms,
-                    );
-                }
-            } else if is_thin_archive(&data) {
-                if let Ok(members) = parse_thin_archive(&data, path) {
-                    resolve_archive_members(
-                        members, &mut input_objs,
-                        &mut defined_syms, &mut undefined_syms,
-                    );
-                }
-            }
-        }
-        if input_objs.len() != prev_count {
-            group_changed = true;
-        }
-    }
+    input::resolve_archives(
+        &inline_archive_paths, &needed_libs, &lib_search_paths,
+        &mut input_objs, &mut defined_syms, &mut undefined_syms,
+    );
 
     // Restore shared-lib-defined symbols back into undefined_syms
-    // (they'll be resolved through PLT/GOT later)
     for s in shared_defined {
         if !defined_syms.contains(&s) {
             undefined_syms.insert(s);
@@ -348,247 +131,25 @@ pub fn link_builtin(
 
     // ── Phase 2: Merge sections ─────────────────────────────────────────
 
-    // Collect all allocatable sections, grouped by output section name.
-    let mut merged_sections: Vec<MergedSection> = Vec::new();
-    let mut merged_map: HashMap<String, usize> = HashMap::new();
-    let mut input_sec_refs: Vec<InputSecRef> = Vec::new();
-
-    for (obj_idx, (_, obj)) in input_objs.iter().enumerate() {
-        for (sec_idx, sec) in obj.sections.iter().enumerate() {
-            if sec.name.is_empty() || sec.sh_type == SHT_SYMTAB || sec.sh_type == SHT_STRTAB
-                || sec.sh_type == SHT_RELA || sec.sh_type == SHT_GROUP
-            {
-                continue;
-            }
-
-            let out_name = match output_section_name(&sec.name, sec.sh_type, sec.flags) {
-                Some(n) => n,
-                None => continue,
-            };
-
-            let sec_data = &obj.section_data[sec_idx];
-
-            // Skip .riscv.attributes and .note.* for merging (handled separately)
-            if out_name == ".riscv.attributes" || out_name.starts_with(".note.") {
-                // We still need to track these for the output
-                if out_name == ".note.GNU-stack" {
-                    continue; // Skip stack notes, we generate our own
-                }
-                // For .riscv.attributes, keep the first one
-                if !merged_map.contains_key(&out_name) {
-                    let idx = merged_sections.len();
-                    merged_map.insert(out_name.clone(), idx);
-                    merged_sections.push(MergedSection {
-                        name: out_name.clone(),
-                        sh_type: sec.sh_type,
-                        sh_flags: sec.flags,
-                        data: sec_data.clone(),
-                        vaddr: 0,
-                        align: sec.addralign.max(1),
-                    });
-                    input_sec_refs.push(InputSecRef {
-                        obj_idx,
-                        sec_idx,
-                        merged_sec_idx: idx,
-                        offset_in_merged: 0,
-                    });
-                }
-                continue;
-            }
-
-            let merged_idx = if let Some(&idx) = merged_map.get(&out_name) {
-                idx
-            } else {
-                let idx = merged_sections.len();
-                let is_bss = sec.sh_type == SHT_NOBITS || out_name == ".bss" || out_name == ".sbss";
-                merged_map.insert(out_name.clone(), idx);
-                merged_sections.push(MergedSection {
-                    name: out_name.clone(),
-                    sh_type: if is_bss { SHT_NOBITS } else { sec.sh_type },
-                    sh_flags: sec.flags,
-                    data: Vec::new(),
-                    vaddr: 0,
-                    align: sec.addralign.max(1),
-                });
-                idx
-            };
-
-            let ms = &mut merged_sections[merged_idx];
-            // Update flags (union of all inputs)
-            ms.sh_flags |= sec.flags & (SHF_WRITE | SHF_ALLOC | SHF_EXECINSTR | SHF_TLS);
-            ms.align = ms.align.max(sec.addralign.max(1));
-
-            // Align data
-            let align = sec.addralign.max(1) as usize;
-            let cur_len = ms.data.len();
-            let aligned = (cur_len + align - 1) & !(align - 1);
-            if aligned > cur_len {
-                ms.data.resize(aligned, 0);
-            }
-            let offset_in_merged = ms.data.len() as u64;
-
-            // Append section data
-            if sec.sh_type == SHT_NOBITS {
-                // For BSS, just extend with zeros (use section size since NOBITS has no data)
-                ms.data.resize(ms.data.len() + sec.size as usize, 0);
-            } else {
-                ms.data.extend_from_slice(sec_data);
-            }
-
-            input_sec_refs.push(InputSecRef {
-                obj_idx,
-                sec_idx,
-                merged_sec_idx: merged_idx,
-                offset_in_merged,
-            });
-        }
-    }
+    let (mut merged_sections, mut merged_map, input_sec_refs) =
+        sections::merge_sections(&input_objs);
 
     // ── Phase 3: Build global symbol table ──────────────────────────────
 
-    // Map: (obj_idx, sec_idx) -> (merged_sec_idx, offset_in_merged)
     let mut sec_mapping: HashMap<(usize, usize), (usize, u64)> = HashMap::new();
     for r in &input_sec_refs {
         sec_mapping.insert((r.obj_idx, r.sec_idx), (r.merged_sec_idx, r.offset_in_merged));
     }
 
-    let mut global_syms: HashMap<String, GlobalSym> = HashMap::new();
+    let mut global_syms = symbols::build_global_symbols(
+        &input_objs, &sec_mapping, &mut merged_sections, &mut merged_map,
+    );
 
-    // First pass: define symbols
-    for (obj_idx, (_, obj)) in input_objs.iter().enumerate() {
-        for sym in &obj.symbols {
-            if sym.name.is_empty() || sym.binding() == STB_LOCAL {
-                continue;
-            }
-            if sym.shndx == SHN_UNDEF {
-                // Just register as undefined if not yet defined
-                global_syms.entry(sym.name.clone()).or_insert_with(|| GlobalSym {
-                    value: 0,
-                    size: 0,
-                    binding: sym.binding(),
-                    sym_type: sym.sym_type(),
-                    visibility: sym.visibility(),
-                    defined: false,
-                    needs_plt: false,
-                    plt_idx: 0,
-                    got_offset: None,
-                    section_idx: None,
-                });
-                continue;
-            }
-
-            let sec_idx = sym.shndx as usize;
-            let (merged_idx, offset) = match sec_mapping.get(&(obj_idx, sec_idx)) {
-                Some(&v) => v,
-                None => {
-                    if sym.shndx == SHN_ABS {
-                        // Absolute symbol
-                        let entry = global_syms.entry(sym.name.clone()).or_insert_with(|| GlobalSym {
-                            value: sym.value,
-                            size: sym.size,
-                            binding: sym.binding(),
-                            sym_type: sym.sym_type(),
-                            visibility: sym.visibility(),
-                            defined: true,
-                            needs_plt: false,
-                            plt_idx: 0,
-                            got_offset: None,
-                            section_idx: None,
-                        });
-                        if !entry.defined || (entry.binding == STB_WEAK && sym.binding() == STB_GLOBAL) {
-                            entry.value = sym.value;
-                            entry.size = sym.size;
-                            entry.binding = sym.binding();
-                            entry.sym_type = sym.sym_type();
-                            entry.defined = true;
-                        }
-                        continue;
-                    }
-                    if sym.shndx == SHN_COMMON {
-                        // COMMON symbol: allocate in .bss
-                        let bss_idx = *merged_map.entry(".bss".into()).or_insert_with(|| {
-                            let idx = merged_sections.len();
-                            merged_sections.push(MergedSection {
-                                name: ".bss".into(),
-                                sh_type: SHT_NOBITS,
-                                sh_flags: SHF_ALLOC | SHF_WRITE,
-                                data: Vec::new(),
-                                vaddr: 0,
-                                align: 8,
-                            });
-                            idx
-                        });
-                        let ms = &mut merged_sections[bss_idx];
-                        let align = sym.value.max(1) as usize; // st_value is alignment for COMMON
-                        let cur = ms.data.len();
-                        let aligned = (cur + align - 1) & !(align - 1);
-                        ms.data.resize(aligned, 0);
-                        let off = ms.data.len() as u64;
-                        ms.data.resize(ms.data.len() + sym.size as usize, 0);
-                        ms.align = ms.align.max(align as u64);
-
-                        let entry = global_syms.entry(sym.name.clone()).or_insert_with(|| GlobalSym {
-                            value: off, size: sym.size, binding: sym.binding(),
-                            sym_type: STT_OBJECT, visibility: sym.visibility(),
-                            defined: true, needs_plt: false, plt_idx: 0,
-                            got_offset: None, section_idx: Some(bss_idx),
-                        });
-                        if !entry.defined || (entry.binding == STB_WEAK && sym.binding() == STB_GLOBAL) {
-                            entry.value = off; // Will be fixed up when vaddr is assigned
-                            entry.size = sym.size.max(entry.size); // Use largest size
-                            entry.binding = sym.binding();
-                            entry.defined = true;
-                            entry.section_idx = Some(bss_idx);
-                        }
-                        continue;
-                    }
-                    continue;
-                }
-            };
-
-            let entry = global_syms.entry(sym.name.clone()).or_insert_with(|| GlobalSym {
-                value: 0, size: sym.size, binding: sym.binding(),
-                sym_type: sym.sym_type(), visibility: sym.visibility(),
-                defined: false, needs_plt: false, plt_idx: 0,
-                got_offset: None, section_idx: None,
-            });
-
-            // Only overwrite if: (a) not yet defined, or (b) replacing weak with strong
-            if entry.defined && !(entry.binding == STB_WEAK && sym.binding() == STB_GLOBAL) {
-                continue;
-            }
-
-            entry.value = offset + sym.value;
-            entry.size = sym.size;
-            entry.binding = sym.binding();
-            entry.sym_type = sym.sym_type();
-            entry.visibility = sym.visibility();
-            entry.defined = true;
-            entry.section_idx = Some(merged_idx);
-        }
-    }
-
-
-
-    // Mark symbols that need PLT/GOT (undefined function symbols found in shared libs)
-    // Data symbols (STT_OBJECT) get COPY relocations instead
-    let mut plt_symbols: Vec<String> = Vec::new();
-    let mut copy_symbols: Vec<(String, u64)> = Vec::new(); // (name, size) for R_RISCV_COPY
-    for (name, sym) in global_syms.iter_mut() {
-        if !sym.defined {
-            if let Some(shlib_sym) = shared_lib_syms.get(name) {
-                if shlib_sym.sym_type() == STT_OBJECT {
-                    // Data symbol: will use COPY relocation
-                    copy_symbols.push((name.clone(), shlib_sym.size));
-                } else {
-                    // Function symbol: use PLT
-                    sym.needs_plt = true;
-                    sym.plt_idx = plt_symbols.len();
-                    plt_symbols.push(name.clone());
-                }
-            }
-        }
-    }
+    let (plt_symbols, copy_symbols) = if !is_static {
+        symbols::mark_plt_and_copy_symbols(&mut global_syms, &shared_lib_syms)
+    } else {
+        (Vec::new(), Vec::new())
+    };
 
     // Apply --defsym definitions: alias one symbol to another
     for (alias, target) in &defsym_defs {
@@ -597,59 +158,14 @@ pub fn link_builtin(
         }
     }
 
-    // Check for truly undefined symbols (not dynamic, not weak, not linker-defined)
-    {
-        let mut truly_undefined: Vec<&String> = global_syms.iter()
-            .filter(|(name, sym)| {
-                !sym.defined && !sym.needs_plt && sym.binding != STB_WEAK
-                    && !linker_common::is_linker_defined_symbol(name)
-                    && !shared_lib_syms.contains_key(name.as_str())
-            })
-            .map(|(name, _)| name)
-            .collect();
-        if !truly_undefined.is_empty() {
-            truly_undefined.sort();
-            truly_undefined.truncate(20);
-            return Err(format!("undefined symbols: {}",
-                truly_undefined.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
-        }
+    if !is_static {
+        symbols::check_undefined_symbols(&global_syms, &shared_lib_syms)?;
+    } else {
+        symbols::check_undefined_symbols(&global_syms, &HashMap::new())?;
     }
 
-    // Also identify symbols that need GOT entries (referenced via GOT_HI20)
-    let mut got_symbols: Vec<String> = Vec::new();
-    let mut tls_got_symbols: HashSet<String> = HashSet::new();
-    // Track local symbol info for GOT entries: got_key -> (obj_idx, sym_idx, addend)
-    // This is needed because local symbols aren't in global_syms
-    let mut local_got_sym_info: HashMap<String, (usize, usize, i64)> = HashMap::new();
-    {
-        let mut got_set: HashSet<String> = HashSet::new();
-        for (obj_idx, (_, obj)) in input_objs.iter().enumerate() {
-            for relocs in &obj.relocations {
-                for reloc in relocs {
-                    if reloc.rela_type == R_RISCV_GOT_HI20
-                        || reloc.rela_type == R_RISCV_TLS_GOT_HI20
-                        || reloc.rela_type == R_RISCV_TLS_GD_HI20
-                    {
-                        let sym = &obj.symbols[reloc.sym_idx as usize];
-                        let (name, is_local) = got_sym_key(obj_idx, sym, reloc.addend);
-                        if !name.is_empty() && !got_set.contains(&name) {
-                            got_set.insert(name.clone());
-                            got_symbols.push(name.clone());
-                            if is_local {
-                                local_got_sym_info.insert(name.clone(), (obj_idx, reloc.sym_idx as usize, reloc.addend));
-                            }
-                        }
-                        // Track TLS GOT symbols so we can fill them with TP offsets
-                        if reloc.rela_type == R_RISCV_TLS_GOT_HI20
-                            || reloc.rela_type == R_RISCV_TLS_GD_HI20
-                        {
-                            tls_got_symbols.insert(name);
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let (got_symbols, tls_got_symbols, local_got_sym_info) =
+        symbols::collect_got_entries(&input_objs);
 
     // Create synthetic .eh_frame_hdr section (placeholder data, filled after relocations)
     let eh_frame_hdr_fde_count = merged_map.get(".eh_frame")
@@ -1272,505 +788,40 @@ pub fn link_builtin(
         }
     }
 
-    // Build local symbol table for relocation resolution
-    // Map: (obj_idx, local_sym_idx) -> (vaddr)
-    let mut local_sym_vaddrs: Vec<Vec<u64>> = Vec::new();
-    for (obj_idx, (_, obj)) in input_objs.iter().enumerate() {
-        let mut sym_vaddrs = vec![0u64; obj.symbols.len()];
-        for (si, sym) in obj.symbols.iter().enumerate() {
-            if sym.shndx == SHN_UNDEF || sym.shndx == SHN_ABS {
-                if sym.shndx == SHN_ABS {
-                    sym_vaddrs[si] = sym.value;
-                }
-                continue;
-            }
-            if sym.shndx == SHN_COMMON {
-                // COMMON symbols were already placed in .bss
-                if let Some(gs) = global_syms.get(&sym.name) {
-                    sym_vaddrs[si] = gs.value;
-                }
-                continue;
-            }
-            let sec_idx = sym.shndx as usize;
-            if let Some(&(merged_idx, offset)) = sec_mapping.get(&(obj_idx, sec_idx)) {
-                sym_vaddrs[si] = section_vaddrs[merged_idx] + offset + sym.value;
-            }
-        }
-        local_sym_vaddrs.push(sym_vaddrs);
-    }
+    let local_sym_vaddrs = symbols::build_local_sym_vaddrs(
+        &input_objs, &sec_mapping, &section_vaddrs, &global_syms,
+    );
 
     // ── Phase 6: Apply relocations ──────────────────────────────────────
 
-    // Pre-pass: collect GD TLS auipc vaddrs for GD->LE relaxation in static binaries.
-    // For each R_RISCV_TLS_GD_HI20 relocation, we record the vaddr of the auipc
-    // instruction so we can:
-    // 1. Rewrite the auipc to lui (tprel_hi)
-    // 2. Have find_hi20_value return tprel_lo instead of GOT offset
-    // 3. Rewrite the __tls_get_addr call to add+nop
-    // This relaxation is only valid for static binaries where all TLS is local.
-    let mut gd_tls_relax_info: HashMap<u64, (u64, i64)> = HashMap::new(); // auipc_vaddr -> (sym_value, addend)
-    let mut gd_tls_call_nop: HashSet<u64> = HashSet::new(); // vaddrs of __tls_get_addr calls to NOP
-
+    let mut gd_tls_relax_info: HashMap<u64, (u64, i64)> = HashMap::new();
+    let mut gd_tls_call_nop: HashSet<u64> = HashSet::new();
     if is_static {
-    for (obj_idx, (_, obj)) in input_objs.iter().enumerate() {
-        for (sec_idx, relocs) in obj.relocations.iter().enumerate() {
-            if relocs.is_empty() { continue; }
-            let (merged_idx, sec_offset) = match sec_mapping.get(&(obj_idx, sec_idx)) {
-                Some(&v) => v,
-                None => continue,
-            };
-            let ms_vaddr = section_vaddrs[merged_idx];
-
-            // Find GD HI20 relocations and associated __tls_get_addr calls
-            for (ri, reloc) in relocs.iter().enumerate() {
-                if reloc.rela_type == R_RISCV_TLS_GD_HI20 {
-                    let offset = sec_offset + reloc.offset;
-                    let auipc_vaddr = ms_vaddr + offset;
-                    let sym = &obj.symbols[reloc.sym_idx as usize];
-                    let sym_val = resolve_symbol_value(
-                        sym, reloc.sym_idx as usize, obj, obj_idx,
-                        &sec_mapping, &section_vaddrs, &local_sym_vaddrs, &global_syms,
-                    );
-                    gd_tls_relax_info.insert(auipc_vaddr, (sym_val, reloc.addend));
-
-                    // Find the __tls_get_addr CALL_PLT that follows
-                    // It's typically 2-3 instructions after the auipc
-                    for j in (ri + 1)..relocs.len().min(ri + 8) {
-                        let call_reloc = &relocs[j];
-                        if call_reloc.rela_type == R_RISCV_CALL_PLT {
-                            let call_sym = &obj.symbols[call_reloc.sym_idx as usize];
-                            if call_sym.name == "__tls_get_addr" {
-                                let call_offset = sec_offset + call_reloc.offset;
-                                let call_vaddr = ms_vaddr + call_offset;
-                                gd_tls_call_nop.insert(call_vaddr);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        reloc::collect_gd_tls_relax_info(
+            &input_objs, &sec_mapping, &section_vaddrs,
+            &local_sym_vaddrs, &global_syms,
+            &mut gd_tls_relax_info, &mut gd_tls_call_nop,
+        );
     }
-    } // if is_static
 
-    // We need to collect all relocations and apply them to the merged section data
-    for (obj_idx, (obj_name, obj)) in input_objs.iter().enumerate() {
-        for (sec_idx, relocs) in obj.relocations.iter().enumerate() {
-            if relocs.is_empty() { continue; }
-            let (merged_idx, sec_offset) = match sec_mapping.get(&(obj_idx, sec_idx)) {
-                Some(&v) => v,
-                None => continue,
-            };
-
-            let ms_vaddr = section_vaddrs[merged_idx];
-
-            for reloc in relocs {
-                let offset = sec_offset + reloc.offset;
-                let p = ms_vaddr + offset; // PC (address of the relocation site)
-
-                // Resolve symbol value
-                let sym_idx = reloc.sym_idx as usize;
-                if sym_idx >= obj.symbols.len() {
-                    continue;
-                }
-                let sym = &obj.symbols[sym_idx];
-
-                let s = if sym.sym_type() == STT_SECTION {
-                    // Section symbol: value is the section's vaddr
-                    if (sym.shndx as usize) < obj.sections.len() {
-                        if let Some(&(mi, mo)) = sec_mapping.get(&(obj_idx, sym.shndx as usize)) {
-                            section_vaddrs[mi] + mo
-                        } else {
-                            0
-                        }
-                    } else {
-                        0
-                    }
-                } else if !sym.name.is_empty() && sym.binding() != STB_LOCAL {
-                    // Global symbol
-                    if let Some(gs) = global_syms.get(&sym.name) {
-                        if gs.needs_plt || gs.defined {
-                            gs.value
-                        } else {
-                            // Undefined symbol - might be weak
-                            0
-                        }
-                    } else {
-                        0
-                    }
-                } else {
-                    // Local symbol
-                    local_sym_vaddrs[obj_idx][sym_idx]
-                };
-
-                let a = reloc.addend;
-                let data = &mut merged_sections[merged_idx].data;
-                let off = offset as usize;
-
-                match reloc.rela_type {
-                    R_RISCV_RELAX | R_RISCV_ALIGN => {
-                        // Linker relaxation hints - skip (no relaxation performed)
-                        continue;
-                    }
-                    R_RISCV_64 => {
-                        let val = (s as i64 + a) as u64;
-                        if off + 8 <= data.len() {
-                            data[off..off + 8].copy_from_slice(&val.to_le_bytes());
-                        }
-                    }
-                    R_RISCV_32 => {
-                        let val = (s as i64 + a) as u32;
-                        if off + 4 <= data.len() {
-                            data[off..off + 4].copy_from_slice(&val.to_le_bytes());
-                        }
-                    }
-                    R_RISCV_PCREL_HI20 => {
-                        let target = s as i64 + a;
-                        let pc = p as i64;
-                        let offset_val = target - pc;
-                        patch_u_type(data, off, offset_val as u32);
-                    }
-                    R_RISCV_PCREL_LO12_I => {
-                        // The symbol points to the AUIPC instruction (or LUI for GD->LE relaxed)
-                        // We need to find the hi20 relocation that it references
-                        // and compute the low 12 bits of that relocation's value
-                        let auipc_addr = s as i64 + a;
-
-                        // Check if the referenced auipc was GD->LE relaxed to a lui
-                        if let Some(&(sym_val, gd_addend)) = gd_tls_relax_info.get(&(auipc_addr as u64)) {
-                            // For GD->LE relaxed: rewrite addi to use tprel_lo
-                            let tprel = (sym_val as i64 + gd_addend - tls_vaddr as i64) as u32;
-                            patch_i_type(data, off, tprel & 0xFFF);
-                        } else {
-                            // Find the hi20 relocation at the auipc address
-                            let hi_val = find_hi20_value(
-                                obj, obj_idx, sec_idx, &sec_mapping, &section_vaddrs,
-                                &local_sym_vaddrs, &global_syms, auipc_addr as u64,
-                                sec_offset, got_vaddr, &got_symbols, got_plt_vaddr,
-                                &gd_tls_relax_info, tls_vaddr,
-                            );
-                            patch_i_type(data, off, hi_val as u32);
-                        }
-                    }
-                    R_RISCV_PCREL_LO12_S => {
-                        let auipc_addr = s as i64 + a;
-                        if let Some(&(sym_val, gd_addend)) = gd_tls_relax_info.get(&(auipc_addr as u64)) {
-                            let tprel = (sym_val as i64 + gd_addend - tls_vaddr as i64) as u32;
-                            patch_s_type(data, off, tprel & 0xFFF);
-                        } else {
-                            let hi_val = find_hi20_value(
-                                obj, obj_idx, sec_idx, &sec_mapping, &section_vaddrs,
-                                &local_sym_vaddrs, &global_syms, auipc_addr as u64,
-                                sec_offset, got_vaddr, &got_symbols, got_plt_vaddr,
-                                &gd_tls_relax_info, tls_vaddr,
-                            );
-                            patch_s_type(data, off, hi_val as u32);
-                        }
-                    }
-                    R_RISCV_GOT_HI20 => {
-                        let (sym_name, _) = got_sym_key(obj_idx, sym, reloc.addend);
-
-                        let got_entry_vaddr = if let Some(gs) = global_syms.get(&sym.name) {
-                            if let Some(got_off) = gs.got_offset {
-                                got_vaddr + got_off
-                            } else {
-                                // PLT symbol: use GOT.PLT
-                                let plt_idx = gs.plt_idx;
-                                got_plt_vaddr + (2 + plt_idx) as u64 * 8
-                            }
-                        } else {
-                            // Find in got_symbols
-                            if let Some(idx) = got_symbols.iter().position(|n| n == &sym_name) {
-                                got_vaddr + idx as u64 * 8
-                            } else {
-                                0
-                            }
-                        };
-
-                        let offset_val = got_entry_vaddr as i64 + a - p as i64;
-                        patch_u_type(data, off, offset_val as u32);
-                    }
-                    R_RISCV_CALL_PLT => {
-                        // Check if this is a __tls_get_addr call that should be relaxed
-                        if gd_tls_call_nop.contains(&p) {
-                            // GD->LE relaxation: replace call with add a0, a0, tp + nop
-                            if off + 8 <= data.len() {
-                                // add a0, a0, tp: opcode=0110011, funct3=000, funct7=0000000
-                                // rd=a0(10), rs1=a0(10), rs2=tp(4)
-                                let add_insn: u32 = 0x00450533; // add a0, a0, tp
-                                data[off..off + 4].copy_from_slice(&add_insn.to_le_bytes());
-                                // nop = addi x0, x0, 0
-                                let nop: u32 = 0x00000013;
-                                data[off + 4..off + 8].copy_from_slice(&nop.to_le_bytes());
-                            }
-                        } else {
-                            // Normal AUIPC + JALR pair (8 bytes)
-                            let target = if !sym.name.is_empty() && sym.binding() != STB_LOCAL {
-                                if let Some(gs) = global_syms.get(&sym.name) {
-                                    gs.value as i64
-                                } else {
-                                    s as i64
-                                }
-                            } else {
-                                s as i64
-                            };
-                            let offset_val = target + a - p as i64;
-                            let hi = ((offset_val + 0x800) >> 12) & 0xFFFFF;
-                            let lo = offset_val & 0xFFF;
-                            // Patch AUIPC (first 4 bytes)
-                            if off + 8 <= data.len() {
-                                let auipc = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
-                                let auipc = (auipc & 0xFFF) | ((hi as u32) << 12);
-                                data[off..off + 4].copy_from_slice(&auipc.to_le_bytes());
-                                // Patch JALR (next 4 bytes)
-                                let jalr = u32::from_le_bytes(data[off + 4..off + 8].try_into().unwrap());
-                                let jalr = (jalr & 0x000FFFFF) | ((lo as u32) << 20);
-                                data[off + 4..off + 8].copy_from_slice(&jalr.to_le_bytes());
-                            }
-                        }
-                    }
-                    R_RISCV_BRANCH => {
-                        let target = s as i64 + a;
-                        let offset_val = target - p as i64;
-                        patch_b_type(data, off, offset_val as u32);
-                    }
-                    R_RISCV_JAL => {
-                        let target = s as i64 + a;
-                        let offset_val = target - p as i64;
-                        patch_j_type(data, off, offset_val as u32);
-                    }
-                    R_RISCV_RVC_BRANCH => {
-                        // CB-type: c.beqz/c.bnez - 8-bit signed offset
-                        let target = s as i64 + a;
-                        let offset_val = (target - p as i64) as u32;
-                        patch_cb_type(data, off, offset_val);
-                    }
-                    R_RISCV_RVC_JUMP => {
-                        // CJ-type: c.j/c.jal - 11-bit signed offset
-                        let target = s as i64 + a;
-                        let offset_val = (target - p as i64) as u32;
-                        patch_cj_type(data, off, offset_val);
-                    }
-                    R_RISCV_HI20 => {
-                        let val = (s as i64 + a) as u32;
-                        let hi = (val.wrapping_add(0x800)) & 0xFFFFF000;
-                        if off + 4 <= data.len() {
-                            let insn = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
-                            let insn = (insn & 0xFFF) | hi;
-                            data[off..off + 4].copy_from_slice(&insn.to_le_bytes());
-                        }
-                    }
-                    R_RISCV_LO12_I => {
-                        let val = (s as i64 + a) as u32;
-                        let lo = val & 0xFFF;
-                        patch_i_type(data, off, lo);
-                    }
-                    R_RISCV_LO12_S => {
-                        let val = (s as i64 + a) as u32;
-                        let lo = val & 0xFFF;
-                        patch_s_type(data, off, lo);
-                    }
-                    R_RISCV_TPREL_HI20 => {
-                        // TLS Local-Exec: compute offset from TP
-                        // TP points to start of TLS block; offset = symbol_vaddr - tls_base_vaddr
-                        let val = (s as i64 + a - tls_vaddr as i64) as u32;
-                        let hi = (val.wrapping_add(0x800)) & 0xFFFFF000;
-                        if off + 4 <= data.len() {
-                            let insn = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
-                            let insn = (insn & 0xFFF) | hi;
-                            data[off..off + 4].copy_from_slice(&insn.to_le_bytes());
-                        }
-                    }
-                    R_RISCV_TPREL_LO12_I => {
-                        let val = (s as i64 + a - tls_vaddr as i64) as u32;
-                        patch_i_type(data, off, val & 0xFFF);
-                    }
-                    R_RISCV_TPREL_LO12_S => {
-                        let val = (s as i64 + a - tls_vaddr as i64) as u32;
-                        patch_s_type(data, off, val & 0xFFF);
-                    }
-                    R_RISCV_TPREL_ADD => {
-                        // Hint for linker relaxation - no patching needed
-                    }
-                    R_RISCV_ADD8 => {
-                        if off < data.len() {
-                            data[off] = data[off].wrapping_add((s as i64 + a) as u8);
-                        }
-                    }
-                    R_RISCV_ADD16 => {
-                        if off + 2 <= data.len() {
-                            let cur = u16::from_le_bytes(data[off..off + 2].try_into().unwrap());
-                            let val = cur.wrapping_add((s as i64 + a) as u16);
-                            data[off..off + 2].copy_from_slice(&val.to_le_bytes());
-                        }
-                    }
-                    R_RISCV_ADD32 => {
-                        if off + 4 <= data.len() {
-                            let cur = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
-                            let val = cur.wrapping_add((s as i64 + a) as u32);
-                            data[off..off + 4].copy_from_slice(&val.to_le_bytes());
-                        }
-                    }
-                    R_RISCV_ADD64 => {
-                        if off + 8 <= data.len() {
-                            let cur = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
-                            let val = cur.wrapping_add((s as i64 + a) as u64);
-                            data[off..off + 8].copy_from_slice(&val.to_le_bytes());
-                        }
-                    }
-                    R_RISCV_SUB8 => {
-                        if off < data.len() {
-                            data[off] = data[off].wrapping_sub((s as i64 + a) as u8);
-                        }
-                    }
-                    R_RISCV_SUB16 => {
-                        if off + 2 <= data.len() {
-                            let cur = u16::from_le_bytes(data[off..off + 2].try_into().unwrap());
-                            let val = cur.wrapping_sub((s as i64 + a) as u16);
-                            data[off..off + 2].copy_from_slice(&val.to_le_bytes());
-                        }
-                    }
-                    R_RISCV_SUB32 => {
-                        if off + 4 <= data.len() {
-                            let cur = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
-                            let val = cur.wrapping_sub((s as i64 + a) as u32);
-                            data[off..off + 4].copy_from_slice(&val.to_le_bytes());
-                        }
-                    }
-                    R_RISCV_SUB64 => {
-                        if off + 8 <= data.len() {
-                            let cur = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
-                            let val = cur.wrapping_sub((s as i64 + a) as u64);
-                            data[off..off + 8].copy_from_slice(&val.to_le_bytes());
-                        }
-                    }
-                    R_RISCV_SET6 => {
-                        if off < data.len() {
-                            data[off] = (data[off] & 0xC0) | (((s as i64 + a) as u8) & 0x3F);
-                        }
-                    }
-                    R_RISCV_SUB6 => {
-                        if off < data.len() {
-                            let cur = data[off] & 0x3F;
-                            let val = cur.wrapping_sub((s as i64 + a) as u8) & 0x3F;
-                            data[off] = (data[off] & 0xC0) | val;
-                        }
-                    }
-                    R_RISCV_SET8 => {
-                        if off < data.len() {
-                            data[off] = (s as i64 + a) as u8;
-                        }
-                    }
-                    R_RISCV_SET16 => {
-                        if off + 2 <= data.len() {
-                            let val = (s as i64 + a) as u16;
-                            data[off..off + 2].copy_from_slice(&val.to_le_bytes());
-                        }
-                    }
-                    R_RISCV_SET32 => {
-                        if off + 4 <= data.len() {
-                            let val = (s as i64 + a) as u32;
-                            data[off..off + 4].copy_from_slice(&val.to_le_bytes());
-                        }
-                    }
-                    R_RISCV_32_PCREL => {
-                        if off + 4 <= data.len() {
-                            let val = ((s as i64 + a) - p as i64) as u32;
-                            data[off..off + 4].copy_from_slice(&val.to_le_bytes());
-                        }
-                    }
-                    R_RISCV_SET_ULEB128 => {
-                        // Set a ULEB128 encoded value
-                        let val = (s as i64 + a) as u64;
-                        let mut v = val;
-                        let mut i = off;
-                        loop {
-                            if i >= data.len() { break; }
-                            let byte = (v & 0x7F) as u8;
-                            v >>= 7;
-                            if v != 0 {
-                                data[i] = byte | 0x80;
-                            } else {
-                                data[i] = byte;
-                                break;
-                            }
-                            i += 1;
-                        }
-                    }
-                    R_RISCV_SUB_ULEB128 => {
-                        // Subtract from a ULEB128 encoded value
-                        // First decode current ULEB128
-                        let mut cur: u64 = 0;
-                        let mut shift = 0;
-                        let mut i = off;
-                        loop {
-                            if i >= data.len() { break; }
-                            let byte = data[i];
-                            cur |= ((byte & 0x7F) as u64) << shift;
-                            if byte & 0x80 == 0 { break; }
-                            shift += 7;
-                            i += 1;
-                        }
-                        // Subtract and re-encode
-                        let val = cur.wrapping_sub((s as i64 + a) as u64);
-                        let mut v = val;
-                        let mut j = off;
-                        loop {
-                            if j >= data.len() { break; }
-                            let byte = (v & 0x7F) as u8;
-                            v >>= 7;
-                            if v != 0 {
-                                data[j] = byte | 0x80;
-                            } else {
-                                data[j] = byte;
-                                break;
-                            }
-                            j += 1;
-                        }
-                    }
-                    R_RISCV_TLS_GD_HI20 => {
-                        // GD->LE relaxation for static linking:
-                        // Rewrite auipc a0, X -> lui a0, %tprel_hi(sym)
-                        let tprel = (s as i64 + a - tls_vaddr as i64) as u32;
-                        let hi = tprel.wrapping_add(0x800) & 0xFFFFF000;
-                        if off + 4 <= data.len() {
-                            // LUI a0, imm: opcode=0110111, rd=01010(a0)
-                            let lui_insn: u32 = 0x00000537 | hi; // lui a0, hi
-                            data[off..off + 4].copy_from_slice(&lui_insn.to_le_bytes());
-                        }
-                    }
-                    R_RISCV_TLS_GOT_HI20 => {
-                        // TLS IE GOT reference: auipc should point to the GOT entry
-                        // that holds the TP offset for this TLS symbol
-                        let (sym_name, _) = got_sym_key(obj_idx, sym, reloc.addend);
-
-                        let got_entry_vaddr = if let Some(gs) = global_syms.get(&sym.name) {
-                            if let Some(got_off) = gs.got_offset {
-                                got_vaddr + got_off
-                            } else if let Some(idx) = got_symbols.iter().position(|n| n == &sym_name) {
-                                got_vaddr + idx as u64 * 8
-                            } else {
-                                0
-                            }
-                        } else if let Some(idx) = got_symbols.iter().position(|n| n == &sym_name) {
-                            got_vaddr + idx as u64 * 8
-                        } else {
-                            0
-                        };
-
-                        let offset_val = got_entry_vaddr as i64 + a - p as i64;
-                        patch_u_type(data, off, offset_val as u32);
-                    }
-                    other => {
-                        return Err(format!(
-                            "unsupported RISC-V relocation type {} for symbol '{}' in '{}'",
-                            other, sym.name, obj_name
-                        ));
-                    }
-                }
-            }
-        }
-    }
+    let empty_got_offsets = HashMap::new();
+    let empty_plt_addrs = HashMap::new();
+    let ctx = reloc::RelocContext {
+        sec_mapping: &sec_mapping,
+        section_vaddrs: &section_vaddrs,
+        local_sym_vaddrs: &local_sym_vaddrs,
+        global_syms: &global_syms,
+        got_vaddr,
+        got_symbols: &got_symbols,
+        got_plt_vaddr,
+        tls_vaddr,
+        gd_tls_relax_info: &gd_tls_relax_info,
+        gd_tls_call_nop: &gd_tls_call_nop,
+        collect_relatives: false,
+        got_sym_offsets: &empty_got_offsets,
+        plt_sym_addrs: &empty_plt_addrs,
+    };
+    reloc::apply_relocations(&input_objs, &mut merged_sections, &ctx)?;
 
     // ── Phase 7: Build GOT data ─────────────────────────────────────────
 
@@ -2473,305 +1524,48 @@ pub fn link_shared(
     }
 
     // ── Phase 1: Load input objects ──────────────────────────────────
+
     let mut input_objs: Vec<(String, ElfObject)> = Vec::new();
     let mut defined_syms: HashSet<String> = HashSet::new();
     let mut undefined_syms: HashSet<String> = HashSet::new();
     let mut needed_sonames: Vec<String> = Vec::new();
 
-    let load_obj_file = |path: &str, input_objs: &mut Vec<(String, ElfObject)>,
-                         defined_syms: &mut HashSet<String>,
-                         undefined_syms: &mut HashSet<String>| -> Result<(), String> {
-        let data = std::fs::read(path)
-            .map_err(|e| format!("failed to read '{}': {}", path, e))?;
-        if data.len() < 4 { return Ok(()); }
-        if data.starts_with(b"!<arch>") {
-            // Archive
-            let members = parse_archive(&data)?;
-            for (name, obj) in members {
-                for sym in &obj.symbols {
-                    if sym.shndx != SHN_UNDEF && sym.binding() != STB_LOCAL && !sym.name.is_empty() {
-                        defined_syms.insert(sym.name.clone());
-                        undefined_syms.remove(&sym.name);
-                    }
-                }
-                for sym in &obj.symbols {
-                    if sym.shndx == SHN_UNDEF && !sym.name.is_empty() && sym.binding() != STB_LOCAL
-                        && !defined_syms.contains(&sym.name) {
-                        undefined_syms.insert(sym.name.clone());
-                    }
-                }
-                input_objs.push((format!("{}({})", path, name), obj));
-            }
-        } else if data.starts_with(&[0x7f, b'E', b'L', b'F']) {
-            let obj = parse_object(&data, path)?;
-            for sym in &obj.symbols {
-                if sym.shndx != SHN_UNDEF && sym.binding() != STB_LOCAL && !sym.name.is_empty() {
-                    defined_syms.insert(sym.name.clone());
-                    undefined_syms.remove(&sym.name);
-                }
-            }
-            for sym in &obj.symbols {
-                if sym.shndx == SHN_UNDEF && !sym.name.is_empty() && sym.binding() != STB_LOCAL
-                    && !defined_syms.contains(&sym.name) {
-                    undefined_syms.insert(sym.name.clone());
-                }
-            }
-            input_objs.push((path.to_string(), obj));
-        }
-        Ok(())
-    };
-
-    // Load user object files
-    for path in object_files {
-        load_obj_file(path, &mut input_objs, &mut defined_syms, &mut undefined_syms)?;
-    }
-    for path in &extra_object_files {
-        load_obj_file(path, &mut input_objs, &mut defined_syms, &mut undefined_syms)?;
-    }
-
-    // Resolve -l libraries
     let mut all_lib_paths: Vec<String> = extra_lib_paths;
     all_lib_paths.extend(lib_path_strings.iter().cloned());
 
-    for lib_name in &libs_to_load {
-        if let Some(lib_path) = linker_common::resolve_lib(lib_name, &all_lib_paths, false) {
-            let data = match std::fs::read(&lib_path) {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-            if data.starts_with(b"!<arch>") {
-                // Static archive - load members that resolve undefined symbols
-                if let Ok(members) = parse_archive(&data) {
-                    resolve_archive_members(members, &mut input_objs, &mut defined_syms, &mut undefined_syms);
-                }
-            } else if data.starts_with(&[0x7f, b'E', b'L', b'F']) {
-                // Check if it's a shared library
-                if data.len() >= 18 {
-                    let e_type = u16::from_le_bytes([data[16], data[17]]);
-                    if e_type == 3 {
-                        // ET_DYN - shared library, record as NEEDED
-                        if let Some(sn) = linker_common::parse_soname(&data) {
-                            if !needed_sonames.contains(&sn) {
-                                needed_sonames.push(sn);
-                            }
-                        } else {
-                            let base = std::path::Path::new(&lib_path)
-                                .file_name()
-                                .map(|f| f.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| lib_name.clone());
-                            if !needed_sonames.contains(&base) {
-                                needed_sonames.push(base);
-                            }
-                        }
-                        continue;
-                    }
-                }
-                // Relocatable object
-                load_obj_file(&lib_path, &mut input_objs, &mut defined_syms, &mut undefined_syms)?;
-            } else if data.starts_with(b"/* GNU ld script") || data.starts_with(b"GROUP") || data.starts_with(b"INPUT") {
-                // Linker script - skip for shared library linking
-                continue;
-            }
-        }
-    }
+    input::load_shared_lib_inputs(
+        object_files, &extra_object_files,
+        &mut input_objs, &mut defined_syms, &mut undefined_syms,
+    )?;
+    input::resolve_shared_lib_deps(
+        &libs_to_load, &all_lib_paths,
+        &mut input_objs, &mut defined_syms, &mut undefined_syms,
+        &mut needed_sonames,
+    )?;
 
     if input_objs.is_empty() {
         return Err("No input files for shared library".to_string());
     }
 
     // ── Phase 2: Merge sections ─────────────────────────────────────
-    let mut merged_sections: Vec<MergedSection> = Vec::new();
-    let mut merged_map: HashMap<String, usize> = HashMap::new();
-    let mut input_sec_refs: Vec<InputSecRef> = Vec::new();
 
-    for (obj_idx, (_, obj)) in input_objs.iter().enumerate() {
-        for (sec_idx, sec) in obj.sections.iter().enumerate() {
-            if sec.name.is_empty() || sec.sh_type == SHT_SYMTAB || sec.sh_type == SHT_STRTAB
-                || sec.sh_type == SHT_RELA || sec.sh_type == SHT_GROUP { continue; }
-
-            let out_name = match output_section_name(&sec.name, sec.sh_type, sec.flags) {
-                Some(n) => n,
-                None => continue,
-            };
-            if out_name == ".note.GNU-stack" { continue; }
-
-            let sec_data = &obj.section_data[sec_idx];
-
-            // Handle .riscv.attributes - keep first one
-            if out_name == ".riscv.attributes" || out_name.starts_with(".note.") {
-                if !merged_map.contains_key(&out_name) {
-                    let idx = merged_sections.len();
-                    merged_map.insert(out_name.clone(), idx);
-                    merged_sections.push(MergedSection {
-                        name: out_name.clone(),
-                        sh_type: sec.sh_type,
-                        sh_flags: sec.flags,
-                        data: sec_data.clone(),
-                        vaddr: 0,
-                        align: sec.addralign.max(1),
-                    });
-                    input_sec_refs.push(InputSecRef {
-                        obj_idx, sec_idx,
-                        merged_sec_idx: idx,
-                        offset_in_merged: 0,
-                    });
-                }
-                continue;
-            }
-
-            let merged_idx = if let Some(&idx) = merged_map.get(&out_name) {
-                idx
-            } else {
-                let idx = merged_sections.len();
-                let is_bss = sec.sh_type == SHT_NOBITS || out_name == ".bss" || out_name == ".sbss";
-                merged_map.insert(out_name.clone(), idx);
-                merged_sections.push(MergedSection {
-                    name: out_name.clone(),
-                    sh_type: if is_bss { SHT_NOBITS } else { sec.sh_type },
-                    sh_flags: sec.flags,
-                    data: Vec::new(),
-                    vaddr: 0,
-                    align: sec.addralign.max(1),
-                });
-                idx
-            };
-
-            let ms = &mut merged_sections[merged_idx];
-            ms.sh_flags |= sec.flags & (SHF_WRITE | SHF_ALLOC | SHF_EXECINSTR | SHF_TLS);
-            ms.align = ms.align.max(sec.addralign.max(1));
-
-            let align = sec.addralign.max(1) as usize;
-            let cur_len = ms.data.len();
-            let aligned = (cur_len + align - 1) & !(align - 1);
-            if aligned > cur_len { ms.data.resize(aligned, 0); }
-            let offset_in_merged = ms.data.len() as u64;
-
-            if sec.sh_type == SHT_NOBITS {
-                ms.data.resize(ms.data.len() + sec.size as usize, 0);
-            } else {
-                ms.data.extend_from_slice(sec_data);
-            }
-
-            input_sec_refs.push(InputSecRef {
-                obj_idx, sec_idx,
-                merged_sec_idx: merged_idx,
-                offset_in_merged,
-            });
-        }
-    }
+    let (mut merged_sections, mut merged_map, input_sec_refs) =
+        sections::merge_sections(&input_objs);
 
     // ── Phase 3: Build global symbol table ───────────────────────────
+
     let mut sec_mapping: HashMap<(usize, usize), (usize, u64)> = HashMap::new();
     for r in &input_sec_refs {
         sec_mapping.insert((r.obj_idx, r.sec_idx), (r.merged_sec_idx, r.offset_in_merged));
     }
 
-    let mut global_syms: HashMap<String, GlobalSym> = HashMap::new();
-    for (obj_idx, (_, obj)) in input_objs.iter().enumerate() {
-        for sym in &obj.symbols {
-            if sym.name.is_empty() || sym.binding() == STB_LOCAL { continue; }
-            if sym.shndx == SHN_UNDEF {
-                global_syms.entry(sym.name.clone()).or_insert_with(|| GlobalSym {
-                    value: 0, size: 0, binding: sym.binding(), sym_type: sym.sym_type(),
-                    visibility: sym.visibility(), defined: false, needs_plt: false,
-                    plt_idx: 0, got_offset: None, section_idx: None,
-                });
-                continue;
-            }
-            if sym.shndx == SHN_ABS {
-                let entry = global_syms.entry(sym.name.clone()).or_insert_with(|| GlobalSym {
-                    value: sym.value, size: sym.size, binding: sym.binding(),
-                    sym_type: sym.sym_type(), visibility: sym.visibility(),
-                    defined: true, needs_plt: false, plt_idx: 0, got_offset: None,
-                    section_idx: None,
-                });
-                if !entry.defined || (entry.binding == STB_WEAK && sym.binding() == STB_GLOBAL) {
-                    entry.value = sym.value; entry.size = sym.size;
-                    entry.binding = sym.binding(); entry.defined = true;
-                }
-                continue;
-            }
-            if sym.shndx == SHN_COMMON {
-                let bss_idx = *merged_map.entry(".bss".into()).or_insert_with(|| {
-                    let idx = merged_sections.len();
-                    merged_sections.push(MergedSection {
-                        name: ".bss".into(), sh_type: SHT_NOBITS,
-                        sh_flags: SHF_ALLOC | SHF_WRITE, data: Vec::new(), vaddr: 0, align: 8,
-                    });
-                    idx
-                });
-                let ms = &mut merged_sections[bss_idx];
-                let a = sym.value.max(1) as usize;
-                let cur = ms.data.len();
-                let aligned_off = (cur + a - 1) & !(a - 1);
-                ms.data.resize(aligned_off, 0);
-                let off = ms.data.len() as u64;
-                ms.data.resize(ms.data.len() + sym.size as usize, 0);
-                ms.align = ms.align.max(a as u64);
+    let mut global_syms = symbols::build_global_symbols(
+        &input_objs, &sec_mapping, &mut merged_sections, &mut merged_map,
+    );
 
-                let entry = global_syms.entry(sym.name.clone()).or_insert_with(|| GlobalSym {
-                    value: off, size: sym.size, binding: sym.binding(),
-                    sym_type: STT_OBJECT, visibility: sym.visibility(),
-                    defined: true, needs_plt: false, plt_idx: 0,
-                    got_offset: None, section_idx: Some(bss_idx),
-                });
-                if !entry.defined || (entry.binding == STB_WEAK && sym.binding() == STB_GLOBAL) {
-                    entry.value = off; entry.size = sym.size.max(entry.size);
-                    entry.binding = sym.binding(); entry.defined = true;
-                    entry.section_idx = Some(bss_idx);
-                }
-                continue;
-            }
-            let sec_idx = sym.shndx as usize;
-            let (merged_idx, offset) = match sec_mapping.get(&(obj_idx, sec_idx)) {
-                Some(&v) => v,
-                None => continue,
-            };
-            let entry = global_syms.entry(sym.name.clone()).or_insert_with(|| GlobalSym {
-                value: 0, size: sym.size, binding: sym.binding(),
-                sym_type: sym.sym_type(), visibility: sym.visibility(),
-                defined: false, needs_plt: false, plt_idx: 0,
-                got_offset: None, section_idx: None,
-            });
-            if !entry.defined || (entry.binding == STB_WEAK && sym.binding() == STB_GLOBAL) {
-                entry.value = sym.value + offset;
-                entry.size = sym.size;
-                entry.binding = sym.binding();
-                entry.sym_type = sym.sym_type();
-                entry.defined = true;
-                entry.section_idx = Some(merged_idx);
-            }
-        }
-    }
-
-    // Compute local symbol vaddrs (will be filled after layout)
-    let mut local_sym_vaddrs: Vec<Vec<u64>> = Vec::with_capacity(input_objs.len());
-    for (_, obj) in &input_objs {
-        local_sym_vaddrs.push(vec![0u64; obj.symbols.len()]);
-    }
-
-    // ── Phase 3b: Identify GOT entries needed ───────────────────────
-    let mut got_symbols: Vec<String> = Vec::new();
-    {
-        let mut got_set: HashSet<String> = HashSet::new();
-        for (obj_idx, (_, obj)) in input_objs.iter().enumerate() {
-            for relocs in &obj.relocations {
-                for reloc in relocs {
-                    if reloc.rela_type == R_RISCV_GOT_HI20
-                        || reloc.rela_type == R_RISCV_TLS_GOT_HI20
-                        || reloc.rela_type == R_RISCV_TLS_GD_HI20
-                    {
-                        let sym = &obj.symbols[reloc.sym_idx as usize];
-                        let (name, _) = got_sym_key(obj_idx, sym, reloc.addend);
-                        if !name.is_empty() && !got_set.contains(&name) {
-                            got_set.insert(name.clone());
-                            got_symbols.push(name.clone());
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // Identify GOT entries needed
+    let (got_symbols, _tls_got_symbols, _local_got_sym_info) =
+        symbols::collect_got_entries(&input_objs);
 
     // ── Phase 3c: Identify PLT entries needed for external function calls ──
     let mut plt_symbols: Vec<String> = Vec::new();
@@ -3147,21 +1941,9 @@ pub fn link_shared(
         }
     }
 
-    // Compute local symbol virtual addresses
-    for (obj_idx, (_, obj)) in input_objs.iter().enumerate() {
-        for (sym_idx, sym) in obj.symbols.iter().enumerate() {
-            if sym.shndx == SHN_UNDEF || sym.shndx == SHN_ABS || sym.shndx == SHN_COMMON {
-                if sym.shndx == SHN_ABS {
-                    local_sym_vaddrs[obj_idx][sym_idx] = sym.value;
-                }
-                continue;
-            }
-            let sec_idx = sym.shndx as usize;
-            if let Some(&(mi, mo)) = sec_mapping.get(&(obj_idx, sec_idx)) {
-                local_sym_vaddrs[obj_idx][sym_idx] = section_vaddrs[mi] + mo + sym.value;
-            }
-        }
-    }
+    let local_sym_vaddrs = symbols::build_local_sym_vaddrs(
+        &input_objs, &sec_mapping, &section_vaddrs, &global_syms,
+    );
 
     // Assign GOT offsets to symbols that need them
     let mut got_sym_offsets: HashMap<String, u64> = HashMap::new();
@@ -3473,306 +2255,26 @@ pub fn link_shared(
         }
     }
 
-    // Process relocations
-    for (obj_idx, (_, obj)) in input_objs.iter().enumerate() {
-        for (sec_idx, relocs) in obj.relocations.iter().enumerate() {
-            if relocs.is_empty() { continue; }
-
-            let (merged_idx, sec_offset) = match sec_mapping.get(&(obj_idx, sec_idx)) {
-                Some(&v) => v,
-                None => continue,
-            };
-
-            let sec_vaddr = section_vaddrs[merged_idx];
-            let data = &mut merged_sections[merged_idx].data;
-
-            for reloc in relocs {
-                let sym_idx = reloc.sym_idx as usize;
-                if sym_idx >= obj.symbols.len() { continue; }
-                let sym = &obj.symbols[sym_idx];
-
-                let p = sec_vaddr + sec_offset + reloc.offset;
-                let off = (sec_offset + reloc.offset) as usize;
-                let a = reloc.addend;
-
-                // Resolve symbol value
-                let s = if sym.sym_type() == STT_SECTION {
-                    if (sym.shndx as usize) < obj.sections.len() {
-                        if let Some(&(mi, mo)) = sec_mapping.get(&(obj_idx, sym.shndx as usize)) {
-                            section_vaddrs[mi] + mo
-                        } else { 0 }
-                    } else { 0 }
-                } else if !sym.name.is_empty() && sym.binding() != STB_LOCAL {
-                    global_syms.get(&sym.name).map(|gs| gs.value).unwrap_or(0)
-                } else {
-                    local_sym_vaddrs.get(obj_idx)
-                        .and_then(|v| v.get(sym_idx))
-                        .copied()
-                        .unwrap_or(0)
-                };
-
-                match reloc.rela_type {
-                    R_RISCV_RELAX | R_RISCV_ALIGN => { continue; }
-                    R_RISCV_64 => {
-                        let val = (s as i64 + a) as u64;
-                        if off + 8 <= data.len() {
-                            data[off..off+8].copy_from_slice(&val.to_le_bytes());
-                            // Emit R_RISCV_RELATIVE
-                            if s != 0 {
-                                rela_dyn_entries.push((p, val));
-                            }
-                        }
-                    }
-                    R_RISCV_32 => {
-                        let val = (s as i64 + a) as u32;
-                        if off + 4 <= data.len() {
-                            data[off..off+4].copy_from_slice(&val.to_le_bytes());
-                        }
-                    }
-                    R_RISCV_PCREL_HI20 => {
-                        let target = s as i64 + a;
-                        let pc = p as i64;
-                        let offset_val = target - pc;
-                        patch_u_type(data, off, offset_val as u32);
-                    }
-                    R_RISCV_PCREL_LO12_I => {
-                        let auipc_addr = s as i64 + a;
-                        let hi_val = find_hi20_value_shared(
-                            obj, obj_idx, sec_idx, &sec_mapping, &section_vaddrs,
-                            &local_sym_vaddrs, &global_syms, auipc_addr as u64,
-                            sec_offset, got_vaddr, &got_symbols,
-                        );
-                        patch_i_type(data, off, hi_val as u32);
-                    }
-                    R_RISCV_PCREL_LO12_S => {
-                        let auipc_addr = s as i64 + a;
-                        let hi_val = find_hi20_value_shared(
-                            obj, obj_idx, sec_idx, &sec_mapping, &section_vaddrs,
-                            &local_sym_vaddrs, &global_syms, auipc_addr as u64,
-                            sec_offset, got_vaddr, &got_symbols,
-                        );
-                        patch_s_type(data, off, hi_val as u32);
-                    }
-                    R_RISCV_GOT_HI20 => {
-                        let (sym_name, _) = got_sym_key(obj_idx, sym, reloc.addend);
-                        let got_entry_vaddr = if let Some(&got_off) = got_sym_offsets.get(&sym_name) {
-                            got_vaddr + got_off
-                        } else if let Some(gsym) = global_syms.get(&sym.name) {
-                            if let Some(got_off) = gsym.got_offset {
-                                got_vaddr + got_off
-                            } else { 0 }
-                        } else { 0 };
-                        let offset_val = got_entry_vaddr as i64 + a - p as i64;
-                        patch_u_type(data, off, offset_val as u32);
-                    }
-                    R_RISCV_CALL_PLT => {
-                        let target = if !sym.name.is_empty() && sym.binding() != STB_LOCAL {
-                            // For undefined symbols, redirect through PLT stub
-                            if let Some(&plt_addr) = plt_sym_addrs.get(&sym.name) {
-                                plt_addr as i64
-                            } else if let Some(gs) = global_syms.get(&sym.name) {
-                                gs.value as i64
-                            } else { s as i64 }
-                        } else { s as i64 };
-                        let offset_val = target + a - p as i64;
-                        let hi = ((offset_val + 0x800) >> 12) & 0xFFFFF;
-                        let lo = offset_val & 0xFFF;
-                        if off + 8 <= data.len() {
-                            let auipc = u32::from_le_bytes(data[off..off+4].try_into().unwrap());
-                            let auipc = (auipc & 0xFFF) | ((hi as u32) << 12);
-                            data[off..off+4].copy_from_slice(&auipc.to_le_bytes());
-                            let jalr = u32::from_le_bytes(data[off+4..off+8].try_into().unwrap());
-                            let jalr = (jalr & 0x000FFFFF) | ((lo as u32) << 20);
-                            data[off+4..off+8].copy_from_slice(&jalr.to_le_bytes());
-                        }
-                    }
-                    R_RISCV_BRANCH => {
-                        let offset_val = (s as i64 + a - p as i64) as u32;
-                        patch_b_type(data, off, offset_val);
-                    }
-                    R_RISCV_JAL => {
-                        let offset_val = (s as i64 + a - p as i64) as u32;
-                        patch_j_type(data, off, offset_val);
-                    }
-                    R_RISCV_RVC_BRANCH => {
-                        let offset_val = (s as i64 + a - p as i64) as u32;
-                        patch_cb_type(data, off, offset_val);
-                    }
-                    R_RISCV_RVC_JUMP => {
-                        let offset_val = (s as i64 + a - p as i64) as u32;
-                        patch_cj_type(data, off, offset_val);
-                    }
-                    R_RISCV_HI20 => {
-                        let val = (s as i64 + a) as u32;
-                        let hi = val.wrapping_add(0x800) & 0xFFFFF000;
-                        if off + 4 <= data.len() {
-                            let insn = u32::from_le_bytes(data[off..off+4].try_into().unwrap());
-                            let insn = (insn & 0xFFF) | hi;
-                            data[off..off+4].copy_from_slice(&insn.to_le_bytes());
-                        }
-                    }
-                    R_RISCV_LO12_I => {
-                        let val = (s as i64 + a) as u32;
-                        patch_i_type(data, off, val & 0xFFF);
-                    }
-                    R_RISCV_LO12_S => {
-                        let val = (s as i64 + a) as u32;
-                        patch_s_type(data, off, val & 0xFFF);
-                    }
-                    R_RISCV_TPREL_HI20 => {
-                        let val = (s as i64 + a - tls_vaddr as i64) as u32;
-                        let hi = val.wrapping_add(0x800) & 0xFFFFF000;
-                        if off + 4 <= data.len() {
-                            let insn = u32::from_le_bytes(data[off..off+4].try_into().unwrap());
-                            let insn = (insn & 0xFFF) | hi;
-                            data[off..off+4].copy_from_slice(&insn.to_le_bytes());
-                        }
-                    }
-                    R_RISCV_TPREL_LO12_I => {
-                        let val = (s as i64 + a - tls_vaddr as i64) as u32;
-                        patch_i_type(data, off, val & 0xFFF);
-                    }
-                    R_RISCV_TPREL_LO12_S => {
-                        let val = (s as i64 + a - tls_vaddr as i64) as u32;
-                        patch_s_type(data, off, val & 0xFFF);
-                    }
-                    R_RISCV_TPREL_ADD => { /* hint */ }
-                    R_RISCV_ADD8 => {
-                        if off < data.len() { data[off] = data[off].wrapping_add((s as i64 + a) as u8); }
-                    }
-                    R_RISCV_ADD16 => {
-                        if off + 2 <= data.len() {
-                            let cur = u16::from_le_bytes(data[off..off+2].try_into().unwrap());
-                            data[off..off+2].copy_from_slice(&cur.wrapping_add((s as i64 + a) as u16).to_le_bytes());
-                        }
-                    }
-                    R_RISCV_ADD32 => {
-                        if off + 4 <= data.len() {
-                            let cur = u32::from_le_bytes(data[off..off+4].try_into().unwrap());
-                            data[off..off+4].copy_from_slice(&cur.wrapping_add((s as i64 + a) as u32).to_le_bytes());
-                        }
-                    }
-                    R_RISCV_ADD64 => {
-                        if off + 8 <= data.len() {
-                            let cur = u64::from_le_bytes(data[off..off+8].try_into().unwrap());
-                            data[off..off+8].copy_from_slice(&cur.wrapping_add((s as i64 + a) as u64).to_le_bytes());
-                        }
-                    }
-                    R_RISCV_SUB8 => {
-                        if off < data.len() { data[off] = data[off].wrapping_sub((s as i64 + a) as u8); }
-                    }
-                    R_RISCV_SUB16 => {
-                        if off + 2 <= data.len() {
-                            let cur = u16::from_le_bytes(data[off..off+2].try_into().unwrap());
-                            data[off..off+2].copy_from_slice(&cur.wrapping_sub((s as i64 + a) as u16).to_le_bytes());
-                        }
-                    }
-                    R_RISCV_SUB32 => {
-                        if off + 4 <= data.len() {
-                            let cur = u32::from_le_bytes(data[off..off+4].try_into().unwrap());
-                            data[off..off+4].copy_from_slice(&cur.wrapping_sub((s as i64 + a) as u32).to_le_bytes());
-                        }
-                    }
-                    R_RISCV_SUB64 => {
-                        if off + 8 <= data.len() {
-                            let cur = u64::from_le_bytes(data[off..off+8].try_into().unwrap());
-                            data[off..off+8].copy_from_slice(&cur.wrapping_sub((s as i64 + a) as u64).to_le_bytes());
-                        }
-                    }
-                    R_RISCV_SET6 => {
-                        if off < data.len() {
-                            data[off] = (data[off] & 0xC0) | (((s as i64 + a) as u8) & 0x3F);
-                        }
-                    }
-                    R_RISCV_SUB6 => {
-                        if off < data.len() {
-                            let cur = data[off] & 0x3F;
-                            data[off] = (data[off] & 0xC0) | (cur.wrapping_sub((s as i64 + a) as u8) & 0x3F);
-                        }
-                    }
-                    R_RISCV_SET8 => {
-                        if off < data.len() { data[off] = (s as i64 + a) as u8; }
-                    }
-                    R_RISCV_SET16 => {
-                        if off + 2 <= data.len() {
-                            data[off..off+2].copy_from_slice(&((s as i64 + a) as u16).to_le_bytes());
-                        }
-                    }
-                    R_RISCV_SET32 => {
-                        if off + 4 <= data.len() {
-                            data[off..off+4].copy_from_slice(&((s as i64 + a) as u32).to_le_bytes());
-                        }
-                    }
-                    R_RISCV_32_PCREL => {
-                        if off + 4 <= data.len() {
-                            let val = ((s as i64 + a) - p as i64) as u32;
-                            data[off..off+4].copy_from_slice(&val.to_le_bytes());
-                        }
-                    }
-                    R_RISCV_TLS_GD_HI20 => {
-                        // TODO: GD-to-LE relaxation is incorrect in shared libs
-                        // (rewriting auipc to lui breaks PIC). Proper fix: emit
-                        // R_RISCV_TLS_DTPMOD64/DTPOFF64 dynamic relocs. Works for
-                        // PostgreSQL because it doesn't use TLS GD in .so modules.
-                        let tprel = (s as i64 + a - tls_vaddr as i64) as u32;
-                        let hi = tprel.wrapping_add(0x800) & 0xFFFFF000;
-                        if off + 4 <= data.len() {
-                            let lui_insn: u32 = 0x00000537 | hi;
-                            data[off..off+4].copy_from_slice(&lui_insn.to_le_bytes());
-                        }
-                    }
-                    R_RISCV_TLS_GOT_HI20 => {
-                        let (sym_name, _) = got_sym_key(obj_idx, sym, reloc.addend);
-                        let got_entry_vaddr = if let Some(&got_off) = got_sym_offsets.get(&sym_name) {
-                            got_vaddr + got_off
-                        } else { 0 };
-                        let offset_val = got_entry_vaddr as i64 + a - p as i64;
-                        patch_u_type(data, off, offset_val as u32);
-                    }
-                    R_RISCV_SET_ULEB128 | R_RISCV_SUB_ULEB128 => {
-                        // Handle same as executable linker
-                        if reloc.rela_type == R_RISCV_SET_ULEB128 {
-                            let val = (s as i64 + a) as u64;
-                            let mut v = val;
-                            let mut idx = off;
-                            loop {
-                                if idx >= data.len() { break; }
-                                let byte = (v & 0x7F) as u8;
-                                v >>= 7;
-                                if v != 0 { data[idx] = byte | 0x80; } else { data[idx] = byte; break; }
-                                idx += 1;
-                            }
-                        } else {
-                            let mut cur: u64 = 0;
-                            let mut shift = 0;
-                            let mut idx = off;
-                            loop {
-                                if idx >= data.len() { break; }
-                                let byte = data[idx];
-                                cur |= ((byte & 0x7F) as u64) << shift;
-                                if byte & 0x80 == 0 { break; }
-                                shift += 7;
-                                idx += 1;
-                            }
-                            let val = cur.wrapping_sub((s as i64 + a) as u64);
-                            let mut v = val;
-                            let mut j = off;
-                            loop {
-                                if j >= data.len() { break; }
-                                let byte = (v & 0x7F) as u8;
-                                v >>= 7;
-                                if v != 0 { data[j] = byte | 0x80; } else { data[j] = byte; break; }
-                                j += 1;
-                            }
-                        }
-                    }
-                    _ => {
-                        // Skip unknown relocations silently
-                    }
-                }
-            }
-        }
-    }
+    // Apply relocations with RELATIVE collection
+    let empty_relax = HashMap::new();
+    let empty_nop = HashSet::new();
+    let ctx = reloc::RelocContext {
+        sec_mapping: &sec_mapping,
+        section_vaddrs: &section_vaddrs,
+        local_sym_vaddrs: &local_sym_vaddrs,
+        global_syms: &global_syms,
+        got_vaddr,
+        got_symbols: &got_symbols,
+        got_plt_vaddr: 0,
+        tls_vaddr,
+        gd_tls_relax_info: &empty_relax,
+        gd_tls_call_nop: &empty_nop,
+        collect_relatives: true,
+        got_sym_offsets: &got_sym_offsets,
+        plt_sym_addrs: &plt_sym_addrs,
+    };
+    let reloc_result = reloc::apply_relocations(&input_objs, &mut merged_sections, &ctx)?;
+    rela_dyn_entries.extend(reloc_result.relative_entries);
 
     // Write updated section data back to elf buffer
     for ms in merged_sections.iter() {

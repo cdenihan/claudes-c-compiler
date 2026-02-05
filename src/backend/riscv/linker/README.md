@@ -141,8 +141,12 @@ A separate 5-phase pipeline (with sub-phases) produces `ET_DYN` shared objects:
 
 | File              | Lines | Role                                                          |
 |-------------------|-------|---------------------------------------------------------------|
-| `mod.rs`          | ~22   | Module declaration; re-exports `link_builtin` and `link_shared` as public API |
-| `link.rs`         | ~3900 | Core linker: `link_builtin` (executable) and `link_shared` (shared library). Imports all shared types and helpers from `relocations.rs`. |
+| `mod.rs`          | ~30   | Module declaration; re-exports `link_builtin` and `link_shared` as public API |
+| `link.rs`         | ~2350 | Orchestration: `link_builtin` (executable) and `link_shared` (shared library). Delegates to phase modules for input, section merging, symbols, and relocations. Layout and ELF emission remain inline. |
+| `input.rs`        | ~395  | Phase 1: Input file loading, archive resolution (with group iteration), shared library symbol discovery. Used by both executable and shared library linking. |
+| `sections.rs`     | ~115  | Phase 2: Section merging - groups input sections by canonical output name with proper alignment. |
+| `symbols.rs`      | ~270  | Phase 3: Global symbol table construction, COMMON symbol allocation, PLT/GOT symbol identification, local symbol vaddr computation. |
+| `reloc.rs`        | ~580  | Phase 6: Relocation application via `RelocContext` struct. Parameterized for executable vs shared library linking (collects R_RISCV_RELATIVE entries for .so output). |
 | `relocations.rs`  | ~620  | Shared building blocks: relocation constants, instruction patching (`patch_*`), symbol resolution (`resolve_symbol_value`, `find_hi20_value`), shared types (`GlobalSym`, `MergedSection`, `InputSecRef`), and utility functions (`build_gnu_hash`, `resolve_archive_members`, `output_section_name`, `section_order`). ELF writing helpers (`write_shdr`, `write_phdr`, `write_phdr_at`, `align_up`, `pad_to`) are re-exported from `linker_common`. |
 | `elf_read.rs`     | ~90   | Re-exports shared linker_common types; delegates ELF parsing to shared infrastructure |
 
@@ -586,16 +590,16 @@ The final phase writes the complete ELF executable:
 
 ## Key Design Decisions and Trade-offs
 
-### 1. Two-function architecture
+### 1. Phase-based modular architecture
 
-The linker has two main entry points: `link_builtin` (for executables, ~2400
-lines) and `link_shared` (for shared libraries, ~1500 lines) in `link.rs`,
-each organized as a linear pipeline with clearly labeled phases. All shared
-types (`GlobalSym`, `MergedSection`, `InputSecRef`), relocation constants
-(`R_RISCV_*`), instruction patching functions (`patch_*`), symbol resolution
-helpers, and ELF writing utilities live in `relocations.rs` and are imported
-by `link.rs`. Each main function reads top-to-bottom as a pipeline with no
-callbacks, trait objects, or complex control flow.
+The linker has two main entry points: `link_builtin` (for executables) and
+`link_shared` (for shared libraries) in `link.rs`, each organized as a
+linear pipeline with clearly labeled phases. Shared phases are extracted
+into dedicated modules (`input.rs`, `sections.rs`, `symbols.rs`, `reloc.rs`)
+to eliminate code duplication between the two entry points. Relocation
+constants, instruction patching, and types live in `relocations.rs`.
+Each main function reads top-to-bottom as a pipeline with no callbacks,
+trait objects, or complex control flow.
 
 ### 2. In-memory linking
 

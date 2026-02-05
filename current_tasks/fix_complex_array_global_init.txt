@@ -1,7 +1,0 @@
-Fix bug in global complex array initialization where zero-coalescing
-in emit_init_data uses fallback_ty (IrType::Ptr, 8 bytes) instead of
-the natural constant type (IrType::F32, 4 bytes), causing .zero 8
-instead of .zero 4 for each imaginary-zero slot of _Complex float arrays.
-
-This causes wrong data layout for const _Complex float result[] = { -1, -2, ... }
-where the array stride becomes 12 bytes instead of 8 bytes per element.
