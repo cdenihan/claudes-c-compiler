@@ -5,9 +5,16 @@ pipeline. The pipeline transforms the compiler's intermediate representation (IR
 to produce better machine code by eliminating redundant computation, simplifying
 control flow, and replacing expensive operations with cheaper equivalents.
 
-All optimization levels (`-O0` through `-O3`, `-Os`, `-Oz`) currently run the
-same full set of passes. This simplifies the compiler while it matures, avoiding
-subtle bugs where code works at one optimization level but breaks at another.
+Optimization levels control which passes run:
+
+- **`-O0`**: Minimal passes only -- constant folding (for `__builtin_constant_p`),
+  `IsConstant` resolution, inline assembly symbol resolution, and dead static
+  elimination. No inlining, no main optimization loop. Fast compile for debugging.
+- **`-O1`**: Core passes (cfg_simplify, copy_prop, simplify, constant_fold, dce)
+  with a single iteration. Skips expensive analyses (GVN, LICM, IVSR, if-convert,
+  narrow, IPCP, div_by_const).
+- **`-O2` and above** (`-O3`, `-Os`, `-Oz`): Full pipeline with all passes and up
+  to 3 iterations, as described in the rest of this document.
 
 ## Table of Contents
 
@@ -761,9 +768,10 @@ terminator. Uses a use-count-based worklist algorithm with O(n) complexity:
 
 **Side-effecting instructions** are never removed regardless of whether their
 result is used: Store, Call, CallIndirect, Alloca, DynAlloca, Memcpy, all atomic
-operations, InlineAsm, StackRestore, VaStart/VaEnd/VaCopy/VaArg, and non-pure
-Intrinsics. Alloca is conservatively kept because the backend uses positional
-indexing for parameter mapping.
+operations (including Fence), InlineAsm, StackRestore, VaStart/VaEnd/VaCopy/
+VaArg/VaArgStruct, multi-return helpers (GetReturn*Second, SetReturn*Second),
+and non-pure Intrinsics. Alloca is conservatively kept because the backend uses
+positional indexing for parameter mapping.
 
 ### dead_statics -- Dead Static Function and Global Elimination
 
