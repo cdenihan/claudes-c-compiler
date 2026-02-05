@@ -50,10 +50,10 @@ linker.
 | File | Lines | Responsibility |
 |------|-------|---------------|
 | `mod.rs` | 7 | Module declarations and public re-exports (`Driver`, `CompileMode`). |
-| `pipeline.rs` | ~1040 | `Driver` struct with all configuration fields, `new()` constructor, `run()` dispatcher, compilation mode handlers (`run_preprocess_only`, `run_assembly_only`, `run_object_only`, `run_full`), and the core `compile_to_assembly` pipeline. |
-| `cli.rs` | ~660 | GCC-compatible CLI argument parsing: `parse_cli_args()`, query flag handling, response file expansion, and the main argument loop. |
+| `pipeline.rs` | ~1120 | `Driver` struct with all configuration fields, `new()` constructor, `run()` dispatcher, compilation mode handlers (`run_preprocess_only`, `run_assembly_only`, `run_object_only`, `run_full`), and the core `compile_to_assembly` pipeline. |
+| `cli.rs` | ~700 | GCC-compatible CLI argument parsing: `parse_cli_args()`, query flag handling, response file expansion, and the main argument loop. |
 | `external_tools.rs` | ~350 | External tool invocation and assembly source file handling: GCC `-m16` delegation, source `.s`/`.S` file assembly (both builtin and GCC-backed), assembler argument construction, linker argument construction, and dependency file generation. |
-| `file_types.rs` | ~115 | Input file classification: object/archive detection by extension and magic bytes, C source detection, assembly source detection, explicit language override, and line marker stripping for `-P`. |
+| `file_types.rs` | ~110 | Input file classification: object/archive detection by extension and magic bytes, C source detection, assembly source detection, explicit language override, and line marker stripping for `-P`. |
 
 ---
 
@@ -224,14 +224,16 @@ The driver reports as GCC 14.2.0 for build system compatibility:
 |-------|----------|
 | `-dumpmachine` | Target triple (e.g., `x86_64-linux-gnu`) |
 | `-dumpversion` | `14` |
-| `--version` | `ccc (Claude's C Compiler, GCC-compatible) 14.2.0` + FSF copyright |
+| `--version` | `ccc (Claude's C Compiler, GCC-compatible) 14.2.0` + FSF copyright + backend mode |
 | `-v` (alone) | Target and version info |
 | `-print-search-dirs` | Standard library directory layout |
 | `-print-file-name=NAME` | Searches standard GCC library paths; returns bundled include dir for `include` |
-| `-Wl,--version` (no inputs) | Delegates to the target's linker driver for Meson linker detection |
+| `-Wl,--version` (no inputs) | With `gcc_linker`: delegates to GCC; otherwise prints `GNU ld (Claude's C Compiler built-in) 2.42` for Meson linker detection |
 
 The `--version` output includes "Free Software Foundation" text because Meson
-detects GCC by grepping for that string.
+detects GCC by grepping for that string. It also prints the backend mode
+("standalone" or a list of enabled GCC fallback features like `gcc_linker`,
+`gcc_assembler`, `gcc_m16`).
 
 ### SIMD Feature Flag Implication Chain
 
@@ -251,8 +253,10 @@ SIMD-optimized code paths.
 The `-std=` flag controls GNU extensions and inline semantics:
 
 - `gnu89`, `gnu99`, `gnu11`, `gnu17`, `gnu23`: GNU extensions enabled
-- `c89`, `c99`, `c11`, `c17`, `c23`: strict ISO C (GNU extensions disabled)
-- `gnu89`, `c89`, `gnu90`, `c90`: GNU89 inline semantics (`__GNUC_GNU_INLINE__`)
+- `c89`, `c99`, `c11`, `c17`, `c23`, `iso9899:*`: strict ISO C (GNU extensions
+  disabled)
+- `gnu89`, `c89`, `gnu90`, `c90`, `iso9899:1990`, `iso9899:199409`: GNU89
+  inline semantics (`__GNUC_GNU_INLINE__`)
 - All others: C99+ inline semantics (`__GNUC_STDC_INLINE__`)
 
 When GNU extensions are disabled, bare keywords like `typeof` and `asm` are
@@ -266,7 +270,7 @@ always work.
 ### Core Pipeline: `compile_to_assembly`
 
 The heart of the driver is `compile_to_assembly()`, which transforms a C source
-file into target-specific assembly text. The pipeline has 10 phases, each
+file into target-specific assembly text. The pipeline has 9 phases, each
 producing output consumed by the next:
 
 ```
@@ -336,8 +340,10 @@ to stderr:
 The diagnostic engine (`DiagnosticEngine`) owns the source manager and is
 threaded through the pipeline:
 
-1. Created after lexing, configured with the warning config and color mode.
-2. Source manager transferred in after lexing (holds file content and line maps).
+1. Created after preprocessing, configured with the warning config and color
+   mode. Preprocessor warnings are immediately routed through it.
+2. Source manager created during lexing; transferred to the diagnostic engine
+   before parsing (holds file content, line maps, and macro expansion info).
 3. Passed to the parser for span-based error reporting.
 4. Retrieved from the parser and passed to sema.
 5. Retrieved from sema; source manager extracted for debug info emission.
@@ -356,6 +362,8 @@ target-specific and user-specified state:
   `set_target("x86_64")` etc.)
 - **RISC-V overrides**: `-mabi=` and `-march=` values override default
   RV64GC/lp64d macros
+- **Strict ANSI**: `__STRICT_ANSI__` defined when `-std=c*` (non-GNU) mode
+  is selected
 - **Inline semantics**: `__GNUC_GNU_INLINE__` vs `__GNUC_STDC_INLINE__`
 - **Optimization macros**: `__OPTIMIZE__` for `-O1+`, `__OPTIMIZE_SIZE__` for
   `-Os`/`-Oz`
@@ -389,10 +397,12 @@ literals or other non-UTF-8 content.
 
 Two sub-modes:
 
-- **Assembly source** (`.S` files or `-x assembler-with-cpp`): Delegates
-  preprocessing to GCC, forwarding all include paths, defines, force-include
-  files, `-nostdinc`, `-U` flags, `-undef`, `-x` language override, and
-  dependency file generation flags.
+- **Assembly source** (`.S` files or `-x assembler-with-cpp`): With the
+  `gcc_assembler` feature, delegates preprocessing to GCC, forwarding all
+  include paths, defines, force-include files, `-nostdinc`, `-U` flags,
+  `-undef`, `-x` language override, and dependency file generation flags.
+  Without `gcc_assembler`, uses the built-in C preprocessor with
+  `__ASSEMBLER__` defined and assembly-mode tokenization enabled.
 
 - **C source**: Runs the built-in preprocessor. Special cases:
   - `-dM` mode: preprocesses the source then dumps all resulting `#define`
@@ -403,8 +413,8 @@ Two sub-modes:
 ### AssemblyOnly (`-S`)
 
 Compiles C source files through `compile_to_assembly()` and writes the
-resulting `.s` file. With `-m16`, delegates to GCC instead (see GCC `-m16`
-Delegation below).
+resulting `.s` file. With the `gcc_m16` feature enabled and `-m16`, delegates
+to GCC instead (see GCC `-m16` Delegation below).
 
 ### ObjectOnly (`-c`)
 
@@ -428,6 +438,11 @@ Temporary `.o` files use RAII-based `TempFile` guards that clean up on all
 exit paths (success, error, or panic). Freshly compiled objects are placed
 first in the link order, followed by passthrough items in their original
 command-line order.
+
+In verbose mode (`-v`), the driver prints a synthetic link line containing
+`/usr/bin/ld` and `-L` flags. This exists for CMake compatibility -- CMake's
+`CMakeParseImplicitLinkInfo.cmake` extracts `-L` paths from it to populate
+`CMAKE_C_IMPLICIT_LINK_DIRECTORIES`.
 
 Linker arguments are constructed by `build_linker_args()`:
 1. Order-independent flags: `-nostdlib` (if `-r`), `-shared`, `-static`,
@@ -577,8 +592,8 @@ require PIC).
 
 ## Post-Lowering Transformations
 
-After IR lowering, the driver applies several transformations before
-optimization:
+After IR lowering and before mem2reg, the driver applies several
+transformations to the alloca-form IR:
 
 1. **`#pragma weak`**: Marks symbols as weak or creates weak aliases.
 2. **`#pragma redefine_extname`**: Creates `.set` aliases to rename external
@@ -589,12 +604,12 @@ optimization:
 
 ---
 
-## Main Entry Point (`main.rs`)
+## Main Entry Point (`lib.rs` / `compiler_main`)
 
-The compiler's `main()` function spawns a worker thread with a 64 MB stack
-(the default ~8 MB is insufficient for deeply recursive descent parsing of
-large generated C files like Bison parsers). The worker thread runs the
-`real_main()` function which:
+The shared entry point `compiler_main()` (in `lib.rs`, called by each
+binary's `main()`) spawns a worker thread with a 64 MB stack (the default
+~8 MB is insufficient for deeply recursive descent parsing of large generated
+C files like Bison parsers). The worker thread:
 
 1. Collects command-line arguments
 2. Creates a `Driver` and calls `parse_cli_args()`
@@ -618,11 +633,11 @@ computations.
 
 ## Environment Variables
 
-| Variable | Purpose |
-|----------|---------|
-| `CCC_TIME_PHASES` | Print per-phase compilation timing to stderr |
-| `CCC_KEEP_ASM` | Preserve intermediate `.s` files next to output (for debugging) |
-| `CCC_ASM_DEBUG` | Dump preprocessed assembly to `/tmp/asm_debug_<name>.s` |
+| Variable | Where | Purpose |
+|----------|-------|---------|
+| `CCC_TIME_PHASES` | `pipeline.rs` | Print per-phase compilation timing to stderr |
+| `CCC_ASM_DEBUG` | `external_tools.rs` | Dump preprocessed assembly to `/tmp/asm_debug_<name>.s` |
+| `CCC_KEEP_ASM` | `common::temp_files`, `backend::common` | Preserve intermediate `.s` files next to output (for debugging) |
 
 Note: Assembler/linker selection is a compile-time decision via Cargo features
 (`gcc_assembler`, `gcc_linker`), not environment variables. See the top-level
