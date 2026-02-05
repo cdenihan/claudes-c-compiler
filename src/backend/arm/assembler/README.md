@@ -314,7 +314,7 @@ relocatable object file.
 | `ElfWriterBase` | Shared state machine from `elf.rs` -- section management, symbols, labels, directive processing, ELF serialization. |
 | `ObjSection` | A section being built: name, type, flags, data bytes, alignment, relocation list (from `elf.rs`). |
 | `ObjReloc` | A relocation entry: offset, type, symbol name, addend (from `elf.rs`). |
-| `PendingReloc` | A relocation for a local branch label (resolved after all labels are known). |
+| `PendingReloc` | A deferred branch/local relocation (resolved after all labels are known). |
 | `PendingSymDiff` | A deferred symbol-difference expression (e.g., `.long .LBB3 - .Ljt_0`). |
 | `PendingExpr` | A deferred complex expression (section, offset, expression string, size). |
 
@@ -323,7 +323,7 @@ relocatable object file.
 ```rust
 pub struct ElfWriter {
     pub base: ElfWriterBase,              // Shared: sections, labels, symbols, directives
-    pending_branch_relocs: Vec<PendingReloc>,  // Local branches to fix up
+    pending_branch_relocs: Vec<PendingReloc>,  // Branch relocs to resolve at asm time
     pending_sym_diffs: Vec<PendingSymDiff>,     // Deferred A-B expressions
     pending_exprs: Vec<PendingExpr>,            // Deferred complex expressions
 }
@@ -362,8 +362,8 @@ process_statements(statements):
                            call encode_instruction(m, ops)
                            Word       -> emit 4 bytes
                            WordWithReloc:
-                             local (.L*) -> store in pending_branch_relocs
-                             external    -> add_reloc() to section
+                             local (.L*) or branch reloc -> store in pending_branch_relocs
+                             other external -> add_reloc() to section
                            Words      -> emit all 4-byte words
                            Skip       -> no-op
 
@@ -371,12 +371,13 @@ process_statements(statements):
     same-section     -> patch data in place
     cross-section    -> emit R_AARCH64_PREL32 or PREL64 relocation (based on data size)
 
-  resolve_local_branches():   resolve all .L* branch targets
+  resolve_local_branches():   resolve all deferred branch targets
     same-section     -> compute PC-relative offset, patch instruction word
       JUMP26/CALL26  -> encode imm26 field
       CONDBR19       -> encode imm19 field
       TSTBR14        -> encode imm14 field
     cross-section    -> emit relocation with section symbol + addend
+    undefined symbol -> emit external relocation (symbol name + addend)
 ```
 
 ### ELF File Layout
@@ -452,12 +453,15 @@ backward resolution passes to fix up local branches and symbol differences.
 This avoids the complexity of a full two-pass assembler while handling forward
 references correctly.
 
-### 2. Local branch resolution at assembly time
+### 2. Intra-section branch resolution at assembly time
 
-Same-section branches to `.L*` labels are resolved by the assembler itself,
-producing fully-linked instruction words.  Only cross-section or external
-symbol references generate relocations in the `.o` file.  This reduces linker
-work and matches GCC's behavior.
+All branch-type relocations (B, BL, B.cond, CBZ/CBNZ, TBZ/TBNZ) are deferred
+and resolved after all labels are known.  Same-section branches -- whether to
+`.L*` local labels or to named labels like `__primary_switch` -- are resolved
+by the assembler itself, producing fully-linked instruction words.  Only
+cross-section or truly external symbol references generate relocations in the
+`.o` file.  This matches GAS behavior and avoids relying on the linker to
+resolve intra-section PC-relative branches.
 
 ### 3. No DWARF emission
 

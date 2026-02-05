@@ -31,7 +31,10 @@ const AARCH64_NOP: [u8; 4] = [0x1f, 0x20, 0x03, 0xd5];
 pub struct ElfWriter {
     /// Shared ELF writer state (sections, symbols, labels, directives)
     pub base: ElfWriterBase,
-    /// Pending relocations that reference local labels (resolved after all labels are known)
+    /// Pending branch/local relocations to resolve after all labels are known.
+    /// Includes all branch-type relocs (B, BL, B.cond, CBZ, TBZ, etc.) plus
+    /// local .L-prefixed label references, so intra-section targets can be
+    /// resolved at assembly time without emitting unnecessary relocations.
     pending_branch_relocs: Vec<PendingReloc>,
     /// Pending symbol differences to resolve after all labels are known
     pending_sym_diffs: Vec<PendingSymDiff>,
@@ -47,6 +50,17 @@ struct PendingReloc {
     reloc_type: u32,
     symbol: String,
     addend: i64,
+}
+
+/// Returns true if the given ELF relocation type is a branch/jump relocation
+/// that should be deferred for intra-section resolution at assembly time.
+fn is_branch_reloc_type(elf_type: u32) -> bool {
+    matches!(elf_type,
+        279 |  // R_AARCH64_TSTBR14
+        280 |  // R_AARCH64_CONDBR19
+        282 |  // R_AARCH64_JUMP26
+        283    // R_AARCH64_CALL26
+    )
 }
 
 /// A pending raw expression to be resolved after all labels are known.
@@ -268,24 +282,25 @@ impl ElfWriter {
                     }
                 }
                 Ok(EncodeResult::WordWithReloc { word, reloc }) => {
+                    let elf_type = reloc.reloc_type.elf_type();
                     if let Some(section) = self.base.sections.get_mut(&pinstr.section) {
                         let off = pinstr.offset as usize;
                         if off + 4 <= section.data.len() {
                             section.data[off..off + 4].copy_from_slice(&word.to_le_bytes());
                         }
                         let is_local = reloc.symbol.starts_with(".L") || reloc.symbol.starts_with(".l") || reloc.symbol == ".";
-                        if is_local {
+                        if is_local || is_branch_reloc_type(elf_type) {
                             self.pending_branch_relocs.push(PendingReloc {
                                 section: pinstr.section.clone(),
                                 offset: pinstr.offset,
-                                reloc_type: reloc.reloc_type.elf_type(),
+                                reloc_type: elf_type,
                                 symbol: reloc.symbol.clone(),
                                 addend: reloc.addend,
                             });
                         } else {
                             section.relocs.push(ObjReloc {
                                 offset: pinstr.offset,
-                                reloc_type: reloc.reloc_type.elf_type(),
+                                reloc_type: elf_type,
                                 symbol_name: reloc.symbol,
                                 addend: reloc.addend,
                             });
@@ -622,20 +637,21 @@ impl ElfWriter {
                 Ok(())
             }
             Ok(EncodeResult::WordWithReloc { word, reloc }) => {
+                let elf_type = reloc.reloc_type.elf_type();
                 let is_local = reloc.symbol.starts_with(".L") || reloc.symbol.starts_with(".l") || reloc.symbol == ".";
 
-                if is_local {
+                if is_local || is_branch_reloc_type(elf_type) {
                     let offset = self.base.current_offset();
                     self.pending_branch_relocs.push(PendingReloc {
                         section: self.base.current_section.clone(),
                         offset,
-                        reloc_type: reloc.reloc_type.elf_type(),
+                        reloc_type: elf_type,
                         symbol: reloc.symbol.clone(),
                         addend: reloc.addend,
                     });
                     self.base.emit_u32_le(word);
                 } else {
-                    self.base.add_reloc(reloc.reloc_type.elf_type(), reloc.symbol, reloc.addend);
+                    self.base.add_reloc(elf_type, reloc.symbol, reloc.addend);
                     self.base.emit_u32_le(word);
                 }
                 Ok(())
@@ -652,15 +668,27 @@ impl ElfWriter {
     }
 
     /// Resolve local branch labels to PC-relative offsets using AArch64 relocation types.
+    /// For symbols defined in the same section, the PC-relative offset is computed and
+    /// patched directly into the instruction (matching GAS behavior). For undefined or
+    /// cross-section symbols, an external relocation is emitted.
     fn resolve_local_branches(&mut self) -> Result<(), String> {
         for reloc in &self.pending_branch_relocs {
             // "." means current address (branch to self)
             let (target_section, target_offset) = if reloc.symbol == "." {
                 (reloc.section.clone(), reloc.offset)
+            } else if let Some(label_info) = self.base.labels.get(&reloc.symbol) {
+                label_info.clone()
             } else {
-                self.base.labels.get(&reloc.symbol)
-                    .ok_or_else(|| format!("undefined local label: {}", reloc.symbol))?
-                    .clone()
+                // Symbol not defined locally - emit as external relocation
+                if let Some(section) = self.base.sections.get_mut(&reloc.section) {
+                    section.relocs.push(ObjReloc {
+                        offset: reloc.offset,
+                        reloc_type: reloc.reloc_type,
+                        symbol_name: reloc.symbol.clone(),
+                        addend: reloc.addend,
+                    });
+                }
+                continue;
             };
 
             if target_section != reloc.section {
