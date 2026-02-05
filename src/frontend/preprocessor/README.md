@@ -370,8 +370,10 @@ When well-known standard headers are included (e.g., `stdarg.h`, `stdbool.h`,
 `complex.h`), the preprocessor injects compiler-builtin macro definitions
 regardless of whether the real system header is found. For example, including
 `stdarg.h` defines `va_start`, `va_end`, `va_copy`, and `va_arg` as macros
-expanding to `__builtin_*` forms, and injects a `typedef __builtin_va_list
-va_list;` declaration.
+expanding to `__builtin_*` forms. The `va_list`, `__builtin_va_list`, and
+`__gnuc_va_list` types are handled natively by the parser/sema/lowerer
+pipeline (not injected as typedef text, which would break when stdarg.h
+is included from nested headers).
 
 ### Fallback Declarations
 

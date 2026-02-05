@@ -312,6 +312,12 @@ impl TypeContext {
             // __int64_t/__uint64_t: must be LongLong on ILP32, Long on LP64
             ("__int64_t", i64_type),
             ("__uint64_t", u64_type),
+            // <stdarg.h> - va_list and related types.
+            // Sema uses a pointer approximation; the IR lowerer (types_seed.rs)
+            // applies the target-specific concrete ABI type.
+            ("va_list", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            ("__builtin_va_list", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            ("__gnuc_va_list", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
         ];
         for (name, ct) in builtins {
             self.typedefs.insert(name.to_string(), ct.clone());

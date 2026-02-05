@@ -563,7 +563,7 @@ struct X87Decomposed {
 impl X87Decomposed {
     fn is_zero(&self) -> bool { self.biased_exp == 0 && self.mantissa == 0 }
     fn is_special(&self) -> bool { self.biased_exp == 0x7FFF }
-    fn is_inf(&self) -> bool { self.is_special() && (self.mantissa & 0x3FFF_FFFF_FFFF_FFFF) == 0 }
+    fn is_inf(&self) -> bool { self.is_special() && self.mantissa == 0x8000_0000_0000_0000 }
     fn unbiased_exp(&self) -> i32 { self.biased_exp as i32 - 16383 }
 }
 

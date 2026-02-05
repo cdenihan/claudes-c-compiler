@@ -282,3 +282,4 @@ Tracking project build/test results with MY_ASM=builtin MY_LD=builtin
 | libmagic_file | PASS | TODO | TODO | TODO | Passes x86 out of the box |
 | hostapd | PASS | TODO | TODO | TODO | Fixed x86: linker group resolution included direct .a archives in iterative re-scanning loop (circular archive deps with -Wl,--start-group) |
 | pngquant | PASS | TODO | TODO | TODO | Passes x86 out of the box (was previously failing, now fixed by other improvements) |
+| libunistring | PASS | TODO | TODO | TODO | Fixed: (1) preprocessor va_list/gnuc_va_list typedef text injection via pending_injections broke when stdarg.h included from nested headers (typedef emitted inside array initializer); moved to sema seed_builtin_typedefs. (2) x87 is_inf() mask 0x3FFF... stripped QNaN bit 62, making NaN look like infinity in constant folding (0.0L/0.0L); fixed with exact mantissa==0x8000... check. |

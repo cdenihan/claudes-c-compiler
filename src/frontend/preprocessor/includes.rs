@@ -723,7 +723,13 @@ impl Preprocessor {
             "stdarg.h" => {
                 // Define va_start/va_arg/va_end/va_copy as macros expanding to builtins.
                 // These are always needed because they expand to __builtin_* forms.
-                self.pending_injections.push("typedef __builtin_va_list va_list;\n".to_string());
+                // Note: va_list / __gnuc_va_list / __builtin_va_list typedefs are NOT
+                // injected as text here. The parser pre-registers them as type names
+                // (parse.rs), sema seeds them in type_context.rs, and the IR lowerer
+                // provides the target-specific ABI types (types_seed.rs). Injecting
+                // typedef text via pending_injections would break if stdarg.h is included
+                // from within a nested header, since the injected text gets emitted at
+                // the include boundary -- potentially in the middle of an initializer.
                 self.macros.define(MacroDef {
                     name: "va_start".to_string(),
                     is_function_like: true,
@@ -759,8 +765,8 @@ impl Preprocessor {
                     has_named_variadic: false,
                     body: "__builtin_va_arg(ap,type)".to_string(),
                 });
-                // Also define __gnuc_va_list as a typedef
-                self.pending_injections.push("typedef __builtin_va_list __gnuc_va_list;\n".to_string());
+                // __gnuc_va_list is also handled natively by the parser/sema/lowerer
+                // (see comment above about not injecting typedef text).
             }
             _ => {}
         }
