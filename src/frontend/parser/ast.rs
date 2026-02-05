@@ -526,6 +526,10 @@ pub enum TypeSpecifier {
     TypeofType(Box<TypeSpecifier>),
     /// __auto_type - GCC extension: type inferred from initializer expression
     AutoType,
+    /// __attribute__((vector_size(N))) applied directly in cast/compound-literal/sizeof.
+    /// Wraps the base element type and total vector size in bytes.
+    /// E.g., `(__attribute__((vector_size(16))) float){...}` becomes Vector(Float, 16).
+    Vector(Box<TypeSpecifier>, usize),
 }
 
 /// A field declaration in a struct/union.

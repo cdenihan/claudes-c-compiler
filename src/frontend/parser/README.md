@@ -617,6 +617,8 @@ A large enum covering all C type forms:
   `FunctionPointer(ret, params, variadic)`, `BareFunction(ret, params, variadic)`
 - **Name-based:** `TypedefName(String)`
 - **Deferred:** `Typeof(Expr)`, `TypeofType(TypeSpecifier)`, `AutoType`
+- **Vector:** `Vector(inner, total_bytes)` — wraps a base element type with
+  `__attribute__((vector_size(N)))` in cast/compound-literal/sizeof contexts
 
 Note: `Signed` and `Unsigned` are standalone variants that exist for
 completeness in type resolution but are not currently emitted by the parser

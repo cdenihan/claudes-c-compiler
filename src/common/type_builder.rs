@@ -129,6 +129,10 @@ pub trait TypeConvertContext {
             }
             TypeSpecifier::Enum(name, variants, is_packed) => self.resolve_enum(name, variants, *is_packed),
             TypeSpecifier::Typeof(expr) => self.resolve_typeof_expr(expr),
+            TypeSpecifier::Vector(inner, total_bytes) => {
+                let elem_ctype = self.resolve_type_spec_to_ctype(inner);
+                CType::Vector(Box::new(elem_ctype), *total_bytes)
+            }
         }
     }
 }

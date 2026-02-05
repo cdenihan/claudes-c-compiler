@@ -226,6 +226,8 @@ impl Lowerer {
             TypeSpecifier::BareFunction(_, _, _) => IrType::Ptr, // bare function type decays to pointer
             // AutoType should be resolved before reaching here (in lower_local_decl)
             TypeSpecifier::AutoType => if is_32bit { IrType::I32 } else { IrType::I64 },
+            // Vector type: return the element IR type (used for per-element operations)
+            TypeSpecifier::Vector(inner, _) => self.type_spec_to_ir(inner),
         }
     }
 
@@ -381,6 +383,10 @@ impl Lowerer {
         if let TypeSpecifier::TypeofType(inner) = ts {
             return self.sizeof_type(inner);
         }
+        // Handle vector types: total_bytes is the vector size
+        if let TypeSpecifier::Vector(_, total_bytes) = ts {
+            return *total_bytes;
+        }
         let ts = self.resolve_type_spec(ts);
         if let Some((size, _)) = Self::scalar_type_size_align(ts) {
             return size;
@@ -420,6 +426,11 @@ impl Lowerer {
         if let TypeSpecifier::TypeofType(inner) = ts {
             return self.alignof_type(inner);
         }
+        // Handle vector types: alignment equals total vector size (power-of-2 aligned)
+        if let TypeSpecifier::Vector(_, total_bytes) = ts {
+            // Vector alignment is typically the total vector size, capped at 16
+            return (*total_bytes).min(16);
+        }
         let ts = self.resolve_type_spec(ts);
         if let Some((_, align)) = Self::scalar_type_size_align(ts) {
             return align;
@@ -458,6 +469,9 @@ impl Lowerer {
         }
         if let TypeSpecifier::TypeofType(inner) = ts {
             return self.preferred_alignof_type(inner);
+        }
+        if let TypeSpecifier::Vector(_, total_bytes) = ts {
+            return (*total_bytes).min(16);
         }
         let ts = self.resolve_type_spec(ts);
         // On i686, check if scalar type has preferred alignment different from ABI

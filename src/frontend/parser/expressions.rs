@@ -33,6 +33,40 @@ enum PrecedenceLevel {
 }
 
 impl Parser {
+    /// Consume any pending `__attribute__((vector_size(N)))` or `__attribute__((ext_vector_type(N)))`
+    /// that was parsed during a type specifier and wrap the given TypeSpecifier in a
+    /// `TypeSpecifier::Vector` node.  This is needed for casts, compound literals, sizeof,
+    /// and _Alignof where the vector_size attribute is not captured in a Declaration.
+    pub(super) fn apply_pending_vector_attr(&mut self, ts: TypeSpecifier) -> TypeSpecifier {
+        if let Some(total_bytes) = self.attrs.parsing_vector_size.take() {
+            return TypeSpecifier::Vector(Box::new(ts), total_bytes);
+        }
+        if let Some(nelem) = self.attrs.parsing_ext_vector_nelem.take() {
+            // Compute total bytes from element count * element size
+            let elem_size = self.estimate_type_size(&ts);
+            return TypeSpecifier::Vector(Box::new(ts), nelem * elem_size);
+        }
+        ts
+    }
+
+    /// Rough size estimate for a scalar type (for ext_vector_type element size computation).
+    /// TODO: Long/UnsignedLong are 4 bytes on i686 and LongDouble is 12 on i686;
+    /// this currently hardcodes 64-bit sizes. Only affects ext_vector_type (not vector_size).
+    fn estimate_type_size(&self, ts: &TypeSpecifier) -> usize {
+        match ts {
+            TypeSpecifier::Char | TypeSpecifier::UnsignedChar | TypeSpecifier::Bool => 1,
+            TypeSpecifier::Short | TypeSpecifier::UnsignedShort => 2,
+            TypeSpecifier::Int | TypeSpecifier::UnsignedInt
+            | TypeSpecifier::Signed | TypeSpecifier::Unsigned => 4,
+            TypeSpecifier::Long | TypeSpecifier::UnsignedLong => 8, // 64-bit default
+            TypeSpecifier::LongLong | TypeSpecifier::UnsignedLongLong => 8,
+            TypeSpecifier::Float => 4,
+            TypeSpecifier::Double => 8,
+            TypeSpecifier::LongDouble => 16,
+            _ => 4, // fallback
+        }
+    }
+
     pub(super) fn parse_expr(&mut self) -> Expr {
         let lhs = self.parse_assignment_expr();
         if matches!(self.peek(), TokenKind::Comma) {
@@ -150,10 +184,14 @@ impl Parser {
             let save = self.pos;
             let save_typedef = self.attrs.parsing_typedef();
             let save_const = self.attrs.parsing_const();
+            let save_vector_size = self.attrs.parsing_vector_size.take();
+            let save_ext_vector = self.attrs.parsing_ext_vector_nelem.take();
             self.advance();
             if self.is_type_specifier() {
                 if let Some(type_spec) = self.parse_type_specifier() {
-                    let result_type = self.parse_abstract_declarator_suffix(type_spec);
+                    let mut result_type = self.parse_abstract_declarator_suffix(type_spec);
+                    // If __attribute__((vector_size(N))) was parsed, wrap the type
+                    result_type = self.apply_pending_vector_attr(result_type);
                     if matches!(self.peek(), TokenKind::RParen) {
                         let span = self.peek_span();
                         self.advance();
@@ -162,10 +200,16 @@ impl Parser {
                             let init = self.parse_initializer();
                             let lit = Expr::CompoundLiteral(result_type, Box::new(init), span);
                             self.attrs.set_const(save_const);
+                            // Restore outer vector attrs so the enclosing declaration can use them
+                            self.attrs.parsing_vector_size = save_vector_size;
+                            self.attrs.parsing_ext_vector_nelem = save_ext_vector;
                             return self.parse_postfix_ops(lit);
                         }
                         let expr = self.parse_cast_expr();
                         self.attrs.set_const(save_const);
+                        // Restore outer vector attrs so the enclosing declaration can use them
+                        self.attrs.parsing_vector_size = save_vector_size;
+                        self.attrs.parsing_ext_vector_nelem = save_ext_vector;
                         return Expr::Cast(result_type, Box::new(expr), span);
                     }
                 }
@@ -173,6 +217,8 @@ impl Parser {
             self.pos = save;
             self.attrs.set_typedef(save_typedef);
             self.attrs.set_const(save_const);
+            self.attrs.parsing_vector_size = save_vector_size;
+            self.attrs.parsing_ext_vector_nelem = save_ext_vector;
         }
         self.parse_unary_expr()
     }
@@ -262,7 +308,8 @@ impl Parser {
                 let open = self.peek_span();
                 self.expect_context(&TokenKind::LParen, "after '_Alignof'");
                 if let Some(ts) = self.parse_type_specifier() {
-                    let result_type = self.parse_abstract_declarator_suffix(ts);
+                    let mut result_type = self.parse_abstract_declarator_suffix(ts);
+                    result_type = self.apply_pending_vector_attr(result_type);
                     self.expect_closing(&TokenKind::RParen, open);
                     Expr::Alignof(result_type, span)
                 } else {
@@ -279,7 +326,8 @@ impl Parser {
                 let open = self.peek_span();
                 self.expect_context(&TokenKind::LParen, "after '__alignof__'");
                 if let Some(ts) = self.parse_type_specifier() {
-                    let result_type = self.parse_abstract_declarator_suffix(ts);
+                    let mut result_type = self.parse_abstract_declarator_suffix(ts);
+                    result_type = self.apply_pending_vector_attr(result_type);
                     self.expect_closing(&TokenKind::RParen, open);
                     Expr::GnuAlignof(result_type, span)
                 } else {
@@ -300,13 +348,20 @@ impl Parser {
             let save = self.pos;
             let save_typedef = self.attrs.parsing_typedef();
             let save_const = self.attrs.parsing_const();
+            let save_vector_size = self.attrs.parsing_vector_size.take();
+            let save_ext_vector = self.attrs.parsing_ext_vector_nelem.take();
             self.advance();
             if self.is_type_specifier() {
                 if let Some(ts) = self.parse_type_specifier() {
-                    let result_type = self.parse_abstract_declarator_suffix(ts);
+                    let mut result_type = self.parse_abstract_declarator_suffix(ts);
+                    // If __attribute__((vector_size(N))) was parsed, wrap the type
+                    result_type = self.apply_pending_vector_attr(result_type);
                     if matches!(self.peek(), TokenKind::RParen) {
                         self.expect(&TokenKind::RParen);
                         self.attrs.set_const(save_const);
+                        // Restore outer vector attrs so the enclosing declaration can use them
+                        self.attrs.parsing_vector_size = save_vector_size;
+                        self.attrs.parsing_ext_vector_nelem = save_ext_vector;
                         return Expr::Sizeof(Box::new(SizeofArg::Type(result_type)), span);
                     }
                 }
@@ -314,6 +369,8 @@ impl Parser {
             self.pos = save;
             self.attrs.set_typedef(save_typedef);
             self.attrs.set_const(save_const);
+            self.attrs.parsing_vector_size = save_vector_size;
+            self.attrs.parsing_ext_vector_nelem = save_ext_vector;
         }
         let expr = self.parse_unary_expr();
         Expr::Sizeof(Box::new(SizeofArg::Expr(expr)), span)

@@ -891,6 +891,7 @@ impl<'a> SemaConstEval<'a> {
                 let ctype = self.infer_expr_ctype(expr)?;
                 Some(ctype.size_ctx(&*self.types.borrow_struct_layouts()))
             }
+            TypeSpecifier::Vector(_, total_bytes) => Some(*total_bytes),
             _ => None,
         }
     }
@@ -1012,6 +1013,7 @@ impl<'a> SemaConstEval<'a> {
                     crate::common::types::target_ptr_size() // fallback
                 }
             }
+            TypeSpecifier::Vector(_, total_bytes) => (*total_bytes).min(16),
             _ => crate::common::types::target_ptr_size(),
         }
     }
@@ -1046,6 +1048,7 @@ impl<'a> SemaConstEval<'a> {
                     target_ptr_size()
                 }
             }
+            TypeSpecifier::Vector(_, total_bytes) => (*total_bytes).min(16),
             _ => self.alignof_type_spec(spec),
         }
     }
@@ -1177,6 +1180,10 @@ fn ctype_from_type_spec(spec: &TypeSpecifier, types: &TypeContext) -> CType {
         TypeSpecifier::TypeofType(inner) => ctype_from_type_spec(inner, types),
         TypeSpecifier::FunctionPointer(_, _, _) => {
             CType::Pointer(Box::new(CType::Void), AddressSpace::Default) // function pointers are pointer-sized
+        }
+        TypeSpecifier::Vector(inner, total_bytes) => {
+            let elem_ctype = ctype_from_type_spec(inner, types);
+            CType::Vector(Box::new(elem_ctype), *total_bytes)
         }
         _ => CType::Int, // fallback
     }
