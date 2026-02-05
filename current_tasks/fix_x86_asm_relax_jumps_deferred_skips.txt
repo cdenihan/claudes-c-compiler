@@ -1,0 +1,10 @@
+Fix x86 assembler: relax_jumps not updating deferred_skips/deferred_byte_diffs offsets
+
+When relax_jumps() shrinks sections by relaxing long jumps to short form,
+it updates label positions, relocations, other jumps, and alignment markers,
+but forgets to update deferred_skips and deferred_byte_diffs offsets.
+This causes a panic (range end index out of bounds) when resolve_deferred_skips()
+tries to splice bytes at the stale (pre-shrink) offset.
+
+Fix: Add offset adjustment for deferred_skips and deferred_byte_diffs in the
+relax_jumps() function alongside the existing offset updates.
