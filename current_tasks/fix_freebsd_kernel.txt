@@ -1,2 +1,0 @@
-Fixing FreeBSD_kernel project (bearssl component) for x86 target.
-The check script builds contrib/bearssl from the FreeBSD kernel repo.
