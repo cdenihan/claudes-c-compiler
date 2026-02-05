@@ -61,14 +61,16 @@ to ELF executable -- is handled internally with no external tools.
     +----------------------------------------------v---------------------+
     |               OPTIMIZATION PASSES (src/passes/)                    |
     |                                                                    |
-    |  Phase 0: Inlining + cleanup                                      |
+    |  Phase 0: Inlining + post-inline cleanup                           |
+    |    (inline -> mem2reg -> constant_fold -> copy_prop -> simplify    |
+    |     -> constant_fold -> copy_prop -> resolve_asm)                  |
     |           |                                                        |
     |  Main Loop (up to 3 iterations, dirty-tracked):                    |
-    |    cfg_simplify -> copy_prop -> narrow -> simplify -> constant_fold |
-    |    -> gvn -> licm -> iv_strength_reduce -> if_convert -> dce       |
-    |    -> ipcp                                                         |
+    |    cfg_simplify -> copy_prop -> div_by_const -> narrow -> simplify |
+    |    -> constant_fold -> gvn -> licm -> iv_strength_reduce           |
+    |    -> if_convert -> copy_prop -> dce -> cfg_simplify -> ipcp       |
     |           |                                                        |
-    |  Phase 11: Dead static elimination                                 |
+    |  Dead static elimination                                           |
     |           |                                                        |
     |  Phi Elimination (SSA -> register copies)                          |
     +----------------------------------+---------------------------------+
@@ -152,6 +154,11 @@ src/
     inline_asm.rs            Shared inline assembly framework
     common.rs                Data sections, external tool fallback invocation
     x86_common.rs            Shared x86/i686 register names, condition codes
+    elf.rs                   ELF constants and shared types
+    elf_writer_common.rs     Common ELF object file writing utilities
+    linker_common.rs         Shared linker types (dynamic symbols, archive reading)
+    asm_preprocess.rs        Assembly text preprocessing (macro expansion, conditionals)
+    asm_expr.rs              Assembly expression evaluation
     x86/
       codegen/               x86-64 code generation (SysV AMD64 ABI) + peephole
       assembler/             Builtin x86-64 assembler (parser, encoder, ELF writer)
@@ -163,7 +170,7 @@ src/
     arm/
       codegen/               AArch64 code generation (AAPCS64) + peephole
       assembler/             Builtin AArch64 assembler (parser, encoder, ELF writer)
-      linker/                Builtin AArch64 linker (static linking, IFUNC/TLS)
+      linker/                Builtin AArch64 linker (static + dynamic linking, IFUNC/TLS)
     riscv/
       codegen/               RISC-V 64 code generation (LP64D) + peephole
       assembler/             Builtin RV64 assembler (parser, encoder, RV64C compress)
@@ -220,7 +227,7 @@ representation. The concrete Rust types flowing between phases are:
     v
   IrModule  (non-SSA: phi nodes lowered to register copies)
     |
-    |  generate_assembly()  (ArchCodegen trait dispatch)
+    |  Target::generate_assembly_with_opts_and_debug()  (ArchCodegen dispatch)
     v
   String  (target-specific assembly text)
     |
@@ -255,7 +262,7 @@ representation. The concrete Rust types flowing between phases are:
 - **Peephole optimization**: Each backend has a post-codegen peephole optimizer
   that eliminates redundant patterns (store/load forwarding, dead stores, copy
   propagation) from the stack-based code generator. The x86 peephole is the most
-  mature with 8+ pass types.
+  mature with 15 distinct pass functions.
 
 - **Builtin assembler and linker**: Each architecture has a native assembler
   (AT&T/ARM/RV syntax parser, instruction encoder, ELF object writer) and a
@@ -285,7 +292,7 @@ representation. The concrete Rust types flowing between phases are:
 - **Trait-based backend abstraction.** The `ArchCodegen` trait (~185 methods)
   captures the interface between the shared code generation framework and
   architecture-specific instruction emission. Default implementations express
-  algorithms once (e.g., the 8-phase call sequence), while backends supply
+  algorithms once (e.g., the 7-phase call sequence in `emit_call`), while backends supply
   only the architecture-specific primitives.
 
 - **Zero external dependencies for compilation.** The entire compilation
@@ -339,8 +346,8 @@ applies relocations, and writes a complete ELF executable:
 |-------------|-----------|-----------------|-----------------|
 | x86-64 | Dynamic | R_X86_64_64, PC32, PLT32, GOTPCREL | PLT/GOT, TLS |
 | i686 | Dynamic | R_386_32, PC32, PLT32, GOTPC, GOTOFF | 32-bit ELF, `.rel` |
-| AArch64 | Static | ADR_PREL_PG_HI21, ADD_ABS_LO12_NC, CALL26 | IFUNC/IPLT, TLS |
-| RISC-V | Dynamic | HI20, LO12_I, LO12_S, CALL, PCREL_HI20 | Relaxation markers |
+| AArch64 | Static + Dynamic | ADR_PREL_PG_HI21, ADD_ABS_LO12_NC, CALL26 | PLT/GOT, IFUNC/IPLT, TLS |
+| RISC-V | Dynamic | HI20, LO12_I, LO12_S, CALL, PCREL_HI20 | TLS GD→LE relaxation |
 
 ### GCC Fallback
 
