@@ -20,12 +20,12 @@ expressions, type conversions, ABI conventions, and global initializers. The
 | `stmt_control_flow.rs` | Control flow lowering (if/while/for/goto/labels) |
 | `stmt_asm.rs` | Inline assembly lowering |
 | `struct_init.rs` | Struct/union initializer list lowering (`emit_struct_init`): field dispatch loop, per-field-type handlers |
-| `expr.rs` | Expression lowering: binary/unary ops, casts, ternary, pointer arithmetic |
+| `expr.rs` | Expression lowering dispatcher, identifier resolution, literal lowering, type inference (`infer_expr_type`, `common_type`), implicit casts |
 | `expr_sizeof.rs` | sizeof/alignof expression lowering |
 | `expr_ops.rs` | Binary/unary operator lowering |
-| `expr_access.rs` | Member access (struct/union field) lowering |
-| `expr_builtins.rs` | `__builtin_*` intrinsics (fpclassify, clz, ctz, bswap, popcount, etc.) |
-| `expr_builtins_intrin.rs` | Builtin intrinsic helpers |
+| `expr_access.rs` | Cast, compound literals, sizeof, generic selection, address-of, dereference, array subscript, member access, statement expressions, va_arg |
+| `expr_builtins.rs` | `__builtin_*` dispatch hub and X86 SSE/CRC intrinsics; delegates to sub-modules for bit manipulation, overflow, and FP classification |
+| `expr_builtins_intrin.rs` | Integer bit-manipulation intrinsics: `__builtin_clz`, `__builtin_ctz`, `__builtin_ffs`, `__builtin_clrsb`, `__builtin_bswap`, `__builtin_popcount`, `__builtin_parity` |
 | `expr_builtins_overflow.rs` | Overflow builtins (`__builtin_add_overflow`, etc.) |
 | `expr_builtins_fpclass.rs` | FP classification builtins |
 | `expr_atomics.rs` | `__atomic_*` and `__sync_*` operations via table-driven dispatch |
@@ -34,7 +34,7 @@ expressions, type conversions, ABI conventions, and global initializers. The
 | `expr_types.rs` | Expression type inference (`get_expr_type`, `get_expr_ctype`) |
 | `lvalue.rs` | L-value resolution and array address computation |
 | `types.rs` | `TypeSpecifier` to `IrType`/`CType`, sizeof/alignof |
-| `types_ctype.rs` | CType utility functions |
+| `types_ctype.rs` | Bidirectional TypeSpecifier/CType conversion, function pointer parameter handling, struct/union-to-CType, `TypeConvertContext` trait |
 | `types_seed.rs` | Builtin typedef and libc math function signature seeding |
 | `structs.rs` | Struct/union layout cache, field offset resolution, `mark_transparent_union` |
 | `complex.rs` | `_Complex` arithmetic, assignment, conversions, and `expr_ctype` helper |
@@ -121,7 +121,7 @@ static and inline functions are actually referenced. The algorithm:
 1. Collects direct references from root (non-skippable) function bodies and global
    initializers.
 2. Builds a per-function reference map for skippable functions.
-3. Uses a BFS workaround to transitively close the reference set.
+3. Uses a worklist to transitively close the reference set.
 
 Unreferenced static/inline functions are skipped in the third pass, providing a
 significant performance win for translation units that include many header-defined
@@ -280,11 +280,21 @@ sub-methods:
    - Phase 3: complex decomposed/packed reconstruction (reconstruct the
      stack-allocated {real, imag} pair from individual register values)
 
-4. **`handle_kr_float_promotion`** -- For K&R (old-style) function definitions,
+4. **`evaluate_vla_param_side_effects`** -- Evaluate VLA parameter size expressions
+   for their side effects (e.g., `void foo(int a, int b[a++])` -- the `a++` must
+   be evaluated so that `a` is incremented before the function body runs).
+
+5. **`handle_kr_float_promotion`** -- For K&R (old-style) function definitions,
    float parameters are promoted to double by the caller. This step emits
    narrowing stores (FPTrunc double to float) for parameters declared as float.
 
-5. **`finalize_function`** -- Emit implicit return (void functions, or unreachable
+6. **`prescan_label_depths`** -- Pre-scans the function body for label definitions
+   and their scope depths, needed so that `goto` can determine how many cleanup
+   scopes to exit for forward references (goto before label definition).
+
+7. **`lower_compound_stmt`** -- Lower the function body.
+
+8. **`finalize_function`** -- Emit implicit return (void functions, or unreachable
    fallthrough), register the completed IR function in the module.
 
 ### Global Initialization Subsystem
@@ -398,10 +408,13 @@ and designator chains. These are extracted into free functions to avoid duplicat
   (`__attribute__((cleanup))`) are emitted in reverse declaration order at scope exit.
 
 - **Complex ABI**: `_Complex double` decomposes to two FP registers (real, imag).
-  `_Complex float` packs into a single I64 on x86-64. `_Complex long double` uses
-  sret on RISC-V and x86-64 (MEMORY class), but decomposes to two F128 registers on
-  AArch64 (HFA). The ABI logic is centralized in `func_lowering.rs` for parameters
-  and `stmt_return.rs` for return values.
+  `_Complex float` packs into a single I64 on x86-64. `_Complex long double`
+  return convention varies by target: x86-64 returns in x87 registers st(0)/st(1)
+  (COMPLEX_X87 class), AArch64 decomposes to two F128 registers (HFA in q0/q1),
+  while RISC-V and i686 use sret hidden pointer. For parameter passing, x86-64
+  passes `_Complex long double` on the stack (MEMORY class), AArch64 decomposes
+  to two F128 values, and RISC-V passes by reference. The ABI logic is centralized
+  in `func_lowering.rs` for parameters and `stmt_return.rs` for return values.
 
 - **Short-circuit evaluation**: `&&` and `||` use conditional branches (jump to
   true/false blocks), not boolean AND/OR instructions. This ensures that the
