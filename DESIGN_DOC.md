@@ -159,6 +159,7 @@ src/
     linker_common.rs         Shared linker types (dynamic symbols, archive reading)
     asm_preprocess.rs        Assembly text preprocessing (macro expansion, conditionals)
     asm_expr.rs              Assembly expression evaluation
+    peephole_common.rs       Shared peephole optimizer utilities (word matching, line store)
     x86/
       codegen/               x86-64 code generation (SysV AMD64 ABI) + peephole
       assembler/             Builtin x86-64 assembler (parser, encoder, ELF writer)
