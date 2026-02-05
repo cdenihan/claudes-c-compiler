@@ -1,0 +1,14 @@
+Fix canfestival build failure caused by C99 inline-only functions being completely
+skipped during lowering.
+
+C99 6.7.4p7: plain `inline` without `extern`/`static` is an "inline definition" that
+does not provide an external definition. Currently, the lowerer skips these functions
+entirely (line 717-721 in lower.rs), which means their bodies are never available for
+the inliner. If the function is called, the caller emits an undefined reference that
+the linker can't resolve.
+
+Fix: Lower C99 inline-only functions as static functions (same as always_inline handling)
+so their bodies are available for inlining. If all calls are inlined, the function is
+dead and gets eliminated. If not, it's emitted as a local symbol.
+
+Started: 2026-02-05
