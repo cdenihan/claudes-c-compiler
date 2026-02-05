@@ -455,6 +455,44 @@ impl ElfWriter {
     /// R_RISCV_RELAX ELF relocation type
     const R_RISCV_RELAX: u32 = 51;
 
+    /// R_RISCV_ALIGN ELF relocation type — marks alignment padding so the
+    /// linker can adjust it after relaxation shrinks preceding instructions.
+    const R_RISCV_ALIGN: u32 = 43;
+
+    /// Align the current section and emit an R_RISCV_ALIGN relocation if
+    /// relaxation is enabled and the section is executable. The relocation
+    /// is placed at the start of the NOP padding with an addend equal to
+    /// the padding size, so the linker can re-pad after relaxation changes
+    /// code size.
+    ///
+    /// R_RISCV_ALIGN is only meaningful in executable sections where linker
+    /// relaxation can change instruction sizes. In data sections, alignment
+    /// is static and emitting these relocations confuses tools like the
+    /// kernel's modpost (which interprets them as symbol references).
+    fn emit_align_with_reloc(&mut self, align_bytes: u64) {
+        if align_bytes <= 1 {
+            return;
+        }
+        let offset_before = self.base.current_offset();
+        self.base.align_to(align_bytes);
+        let offset_after = self.base.current_offset();
+        let padding = offset_after - offset_before;
+        if padding > 0 && !self.no_relax {
+            // Only emit R_RISCV_ALIGN in executable sections where linker
+            // relaxation may change code sizes and require re-alignment.
+            if let Some(s) = self.base.sections.get_mut(&self.base.current_section) {
+                if (s.sh_flags & SHF_EXECINSTR) != 0 {
+                    s.relocs.push(ObjReloc {
+                        offset: offset_before,
+                        reloc_type: Self::R_RISCV_ALIGN,
+                        symbol_name: String::new(),
+                        addend: padding as i64,
+                    });
+                }
+            }
+        }
+    }
+
     /// Process all parsed assembly statements.
     pub fn process_statements(&mut self, statements: &[AsmStatement]) -> Result<(), String> {
         let statements = resolve_numeric_label_refs(statements);
