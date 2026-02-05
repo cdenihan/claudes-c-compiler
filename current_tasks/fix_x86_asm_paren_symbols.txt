@@ -1,1 +1,0 @@
-Fix x86 asm parser: strip parens from symbols in data directives
