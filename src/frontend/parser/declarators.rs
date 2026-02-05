@@ -132,7 +132,7 @@ impl Parser {
         }
         match &self.tokens[self.pos + 1].kind {
             TokenKind::Star | TokenKind::Caret => true,
-            TokenKind::LParen => true,
+            TokenKind::LParen | TokenKind::LBracket => true,
             TokenKind::Attribute | TokenKind::Extension => true,
             TokenKind::Identifier(name) => {
                 // Typedef name -> parameter list; regular name -> declarator
@@ -505,7 +505,24 @@ impl Parser {
         // e.g. void foo(void (__attribute__((ms_abi)) *handler)(int))
         self.skip_gcc_extensions();
 
-        if matches!(self.peek(), TokenKind::Star) {
+        if matches!(self.peek(), TokenKind::LBracket) {
+            // Abstract array declarator in parens: ([4]) or ([])
+            // E.g., `int f(int ([4]))` is equivalent to `int f(int *)`
+            while matches!(self.peek(), TokenKind::LBracket) {
+                self.advance();
+                self.skip_array_qualifiers();
+                if matches!(self.peek(), TokenKind::RBracket) {
+                    array_dims.push(None);
+                    self.advance();
+                } else {
+                    let dim_expr = self.parse_expr();
+                    array_dims.push(Some(Box::new(dim_expr)));
+                    self.expect(&TokenKind::RBracket);
+                }
+            }
+            self.expect(&TokenKind::RParen);
+            return None;
+        } else if matches!(self.peek(), TokenKind::Star) {
             // Function pointer or pointer-to-array: (*name)(params) or (*name)[N]
             let mut inner_ptr_depth = 0u32;
             while self.consume_if(&TokenKind::Star) {
