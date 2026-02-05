@@ -52,7 +52,8 @@ pub use regalloc_helpers::{
     find_param_alloca,
 };
 
-use crate::ir::reexports::IrFunction;
+use crate::ir::reexports::{IrFunction, Instruction};
+use crate::common::types::IrType;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use super::regalloc::PhysReg;
 
@@ -249,6 +250,49 @@ fn build_layout_context(
                 for blk in dest_blocks {
                     if root_blocks.last() != Some(&blk) {
                         root_blocks.push(blk);
+                    }
+                }
+            }
+        }
+    }
+
+    // F128 load pointer promotion: when an F128 Load uses a non-alloca pointer,
+    // the codegen records that pointer as the reload source for the full-precision
+    // 128-bit value. If the loaded F128 dest is used in other blocks, the pointer
+    // must remain accessible during those blocks' codegen. Without this, the
+    // pointer stays block-local (Tier 3) and its slot gets reused by other
+    // blocks' local values, causing the F128 reload to dereference garbage.
+    //
+    // Fix: propagate the F128 dest's use-blocks into the pointer's use-blocks,
+    // forcing the pointer to Tier 2 (multi-block) when the dest crosses blocks.
+    if coalesce {
+        // Collect alloca value IDs to distinguish direct vs. indirect sources.
+        let alloca_set: FxHashSet<u32> = func.blocks.iter()
+            .flat_map(|b| b.instructions.iter())
+            .filter_map(|inst| {
+                if let Instruction::Alloca { dest, .. } = inst { Some(dest.0) } else { None }
+            })
+            .collect();
+
+        // Collect (ptr_id, dest_id) pairs for F128 loads from non-alloca pointers.
+        let f128_loads: Vec<(u32, u32)> = func.blocks.iter()
+            .flat_map(|b| b.instructions.iter())
+            .filter_map(|inst| {
+                if let Instruction::Load { dest, ptr, ty, .. } = inst {
+                    if *ty == IrType::F128 && !alloca_set.contains(&ptr.0) {
+                        return Some((ptr.0, dest.0));
+                    }
+                }
+                None
+            })
+            .collect();
+
+        for (ptr_id, dest_id) in f128_loads {
+            if let Some(dest_blocks) = use_blocks_map.get(&dest_id).cloned() {
+                let ptr_blocks = use_blocks_map.entry(ptr_id).or_insert_with(Vec::new);
+                for blk in dest_blocks {
+                    if !ptr_blocks.contains(&blk) {
+                        ptr_blocks.push(blk);
                     }
                 }
             }
