@@ -1,0 +1,14 @@
+Fix i686 assembler: add .code64/.code32 mode switching support
+
+The i686 assembler does not handle .code64 sections in mixed-mode assembly files
+like arch/x86/realmode/rm/trampoline_64.S. When the kernel build uses -m16 for
+realmode code, the i686 assembler is invoked, but trampoline_64.S has .code64
+sections that contain 64-bit instructions (jmpq, lidt with rip-relative, etc.).
+
+Currently .code64 is silently ignored (falls through to unknown directive handler),
+causing "unhandled i686 instruction" errors for 64-bit instructions.
+
+Fix: Add AsmItem::CodeMode variant, parse .code64/.code32/.code16 directives,
+and have the ELF writer delegate to the x86-64 encoder when in .code64 mode.
+
+Started: 2026-02-05
