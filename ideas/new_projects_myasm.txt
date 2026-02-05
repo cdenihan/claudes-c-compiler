@@ -127,7 +127,7 @@ Tracking project build/test results with MY_ASM=builtin MY_LD=builtin
 | crush   | PASS | PASS | PASS | PASS | All architectures pass out of the box |
 | ini     | PASS | PASS | PASS | PASS | All architectures pass out of the box |
 | check   | PASS | PASS | PASS | PASS | All architectures pass out of the box |
-| tree-sitter | TODO | PASS | TODO | TODO | i686 fixed by COMDAT groups + GOTPC + PIC codegen fixes |
+| tree-sitter | PASS | PASS | TODO | TODO | i686 fixed by COMDAT groups + GOTPC + PIC codegen fixes; x86 now passes |
 | miniaudio | PASS | PASS | FAIL (ARM NEON parse) | PASS | Fixed x86/i686 asm: added rsqrtss/rcpss instructions |
 | civetweb | PASS | TODO | TODO | TODO | Passes x86 |
 | lzw     | PASS | TODO | TODO | TODO | Passes x86 |
