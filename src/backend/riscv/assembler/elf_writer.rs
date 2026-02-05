@@ -605,6 +605,34 @@ impl ElfWriter {
                 for dv in values {
                     match dv {
                         DataValue::Integer(v) => self.base.emit_bytes(&[*v as u8]),
+                        DataValue::Symbol { name, addend } => {
+                            // Try resolving as alias (.set/.equ) — may be a forward ref
+                            let resolved = self.base.resolve_expr_aliases(name);
+                            let deferred_expr = if *addend != 0 {
+                                format!("({}) + ({})", name, addend)
+                            } else {
+                                name.clone()
+                            };
+                            let eval_expr = if *addend != 0 {
+                                format!("({}) + ({})", resolved, addend)
+                            } else {
+                                resolved.clone()
+                            };
+                            if let Ok(v) = crate::backend::asm_expr::parse_integer_expr(&eval_expr) {
+                                self.base.emit_bytes(&[v as u8]);
+                            } else {
+                                // Defer: alias not yet defined (forward reference)
+                                let section = self.base.current_section.clone();
+                                let offset = self.base.current_offset();
+                                self.deferred_exprs.push(DeferredExpr {
+                                    section,
+                                    offset,
+                                    size: 1,
+                                    expr: deferred_expr,
+                                });
+                                self.base.emit_placeholder(1);
+                            }
+                        }
                         _ => self.base.emit_bytes(&[0u8]),
                     }
                 }
@@ -617,9 +645,49 @@ impl ElfWriter {
                         DataValue::Integer(v) => self.base.emit_bytes(&(*v as u16).to_le_bytes()),
                         DataValue::Expression(expr) => {
                             let resolved = self.base.resolve_expr_aliases(expr);
+                            let resolved = self.base.resolve_expr_labels(&resolved);
                             match crate::backend::asm_expr::parse_integer_expr(&resolved) {
                                 Ok(v) => self.base.emit_bytes(&(v as u16).to_le_bytes()),
-                                Err(e) => return Err(format!("failed to evaluate .short expression '{}': {}", expr, e)),
+                                Err(_) => {
+                                    // Defer: expression contains forward references
+                                    let section = self.base.current_section.clone();
+                                    let offset = self.base.current_offset();
+                                    self.deferred_exprs.push(DeferredExpr {
+                                        section,
+                                        offset,
+                                        size: 2,
+                                        expr: expr.clone(),
+                                    });
+                                    self.base.emit_placeholder(2);
+                                }
+                            }
+                        }
+                        DataValue::Symbol { name, addend } => {
+                            // Try resolving as alias (.set/.equ) — may be a forward ref
+                            let resolved = self.base.resolve_expr_aliases(name);
+                            let deferred_expr = if *addend != 0 {
+                                format!("({}) + ({})", name, addend)
+                            } else {
+                                name.clone()
+                            };
+                            let eval_expr = if *addend != 0 {
+                                format!("({}) + ({})", resolved, addend)
+                            } else {
+                                resolved.clone()
+                            };
+                            if let Ok(v) = crate::backend::asm_expr::parse_integer_expr(&eval_expr) {
+                                self.base.emit_bytes(&(v as u16).to_le_bytes());
+                            } else {
+                                // Defer: alias not yet defined (forward reference)
+                                let section = self.base.current_section.clone();
+                                let offset = self.base.current_offset();
+                                self.deferred_exprs.push(DeferredExpr {
+                                    section,
+                                    offset,
+                                    size: 2,
+                                    expr: deferred_expr,
+                                });
+                                self.base.emit_placeholder(2);
                             }
                         }
                         _ => self.base.emit_bytes(&0u16.to_le_bytes()),
@@ -766,12 +834,19 @@ impl ElfWriter {
                 self.base.emit_placeholder(size);
             }
             DataValue::Symbol { name, addend } => {
-                let reloc_type = if size == 4 {
-                    RelocType::Abs32.elf_type()
+                // Try resolving as alias (.set/.equ) first — the "symbol"
+                // may actually be a compile-time constant defined via .set.
+                let resolved = self.base.resolve_expr_aliases(name);
+                if let Ok(v) = crate::backend::asm_expr::parse_integer_expr(&resolved) {
+                    self.base.emit_data_integer(v + addend, size);
                 } else {
-                    RelocType::Abs64.elf_type()
-                };
-                self.base.emit_data_symbol_ref(name, *addend, size, reloc_type);
+                    let reloc_type = if size == 4 {
+                        RelocType::Abs32.elf_type()
+                    } else {
+                        RelocType::Abs64.elf_type()
+                    };
+                    self.base.emit_data_symbol_ref(name, *addend, size, reloc_type);
+                }
             }
             DataValue::Integer(v) => {
                 self.base.emit_data_integer(*v, size);
