@@ -461,7 +461,8 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
 
         // Other ignorable directives
         ".file" | ".loc" | ".ident" | ".addrsig" | ".addrsig_sym"
-        | ".build_attributes" | ".eabi_attribute" | ".end" => Directive::Ignored,
+        | ".build_attributes" | ".eabi_attribute" | ".end"
+        | ".altmacro" | ".noaltmacro" => Directive::Ignored,
 
         _ => Directive::Unknown {
             name: name.to_string(),

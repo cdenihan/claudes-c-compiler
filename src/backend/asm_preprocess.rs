@@ -278,10 +278,63 @@ pub fn expand_rept_blocks(
 
 // ── .macro / .endm expansion ───────────────────────────────────────────
 
-/// Macro definition: name, parameter list, and body lines.
+/// Macro definition: name, parameter list (with optional defaults), and body lines.
 pub(crate) struct MacroDef {
     params: Vec<String>,
+    defaults: Vec<Option<String>>,
     body: Vec<String>,
+}
+
+/// Parse macro parameter list, handling `param = default_value` syntax.
+///
+/// GAS allows parameters like `enable = 1` where `1` is the default value
+/// used when the caller omits that argument. Parameters are separated by
+/// commas or whitespace.
+fn parse_macro_params(params_str: &str) -> (Vec<String>, Vec<Option<String>>) {
+    if params_str.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut params = Vec::new();
+    let mut defaults = Vec::new();
+
+    // Split on commas first (primary separator), then handle whitespace within each part
+    for part in params_str.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        // Check for `param = default_value` syntax
+        if let Some(eq_pos) = part.find('=') {
+            let param_name = part[..eq_pos].trim();
+            let default_val = part[eq_pos + 1..].trim();
+            // The param name might contain spaces (e.g., "enable = 1")
+            // Take the last whitespace-delimited token as the param name
+            // in case there are multiple tokens before the =
+            let tokens: Vec<&str> = param_name.split_whitespace().collect();
+            if tokens.len() > 1 {
+                // Everything before the last token are separate params with no default
+                for t in &tokens[..tokens.len() - 1] {
+                    params.push(t.to_string());
+                    defaults.push(None);
+                }
+            }
+            if let Some(last) = tokens.last() {
+                if !last.is_empty() {
+                    params.push(last.to_string());
+                    defaults.push(Some(default_val.to_string()));
+                }
+            }
+        } else {
+            // No default value - may contain space-separated params
+            for token in part.split_whitespace() {
+                if !token.is_empty() {
+                    params.push(token.to_string());
+                    defaults.push(None);
+                }
+            }
+        }
+    }
+    (params, defaults)
 }
 
 /// Split macro invocation arguments, separating on commas and whitespace.
@@ -382,14 +435,7 @@ pub fn expand_macros(
                 Some(pos) => (rest[..pos].trim(), rest[pos..].trim().trim_start_matches(',')),
                 None => (rest, ""),
             };
-            let params: Vec<String> = if params_str.is_empty() {
-                Vec::new()
-            } else {
-                params_str.split([',', ' ', '\t'])
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            };
+            let (params, defaults) = parse_macro_params(params_str);
             let mut body = Vec::new();
             let mut depth = 1;
             i += 1;
@@ -406,7 +452,7 @@ pub fn expand_macros(
                 body.push(lines[i].to_string());
                 i += 1;
             }
-            macros.insert(name.to_string(), MacroDef { params, body });
+            macros.insert(name.to_string(), MacroDef { params, defaults, body });
         } else if trimmed == ".endm" || trimmed.starts_with(".endm ") || trimmed.starts_with(".endm\t") {
             // stray .endm — skip
         } else if !trimmed.is_empty() && !trimmed.starts_with('.') && !trimmed.starts_with('#') {
@@ -423,7 +469,11 @@ pub fn expand_macros(
                     let mut expanded = body_line.clone();
                     for (pi, param) in mac.params.iter().enumerate() {
                         let pattern = format!("\\{}", param);
-                        let replacement = args.get(pi).map(|s| s.as_str()).unwrap_or("0");
+                        let replacement = args.get(pi).map(|s| s.as_str()).unwrap_or_else(|| {
+                            mac.defaults.get(pi)
+                                .and_then(|d| d.as_deref())
+                                .unwrap_or("0")
+                        });
                         expanded = expanded.replace(&pattern, replacement);
                     }
                     expanded_lines.push(expanded);
@@ -467,7 +517,11 @@ fn expand_macros_with(
                 let mut expanded = body_line.clone();
                 for (pi, param) in mac.params.iter().enumerate() {
                     let pattern = format!("\\{}", param);
-                    let replacement = args.get(pi).map(|s| s.as_str()).unwrap_or("0");
+                    let replacement = args.get(pi).map(|s| s.as_str()).unwrap_or_else(|| {
+                        mac.defaults.get(pi)
+                            .and_then(|d| d.as_deref())
+                            .unwrap_or("0")
+                    });
                     expanded = expanded.replace(&pattern, replacement);
                 }
                 expanded_lines.push(expanded);
@@ -836,5 +890,41 @@ mod tests {
         assert_eq!(split_macro_args("a, b, c"), vec!["a", "b", "c"]);
         assert_eq!(split_macro_args("0(a1), x, y"), vec!["0(a1)", "x", "y"]);
         assert_eq!(split_macro_args(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_parse_macro_params_simple() {
+        let (params, defaults) = parse_macro_params("a, b, c");
+        assert_eq!(params, vec!["a", "b", "c"]);
+        assert_eq!(defaults, vec![None, None, None]);
+    }
+
+    #[test]
+    fn test_parse_macro_params_with_defaults() {
+        let (params, defaults) = parse_macro_params("a, b = 5, c");
+        assert_eq!(params, vec!["a", "b", "c"]);
+        assert_eq!(defaults, vec![None, Some("5".to_string()), None]);
+    }
+
+    #[test]
+    fn test_parse_macro_params_space_separated() {
+        let (params, defaults) = parse_macro_params("a b c");
+        assert_eq!(params, vec!["a", "b", "c"]);
+        assert_eq!(defaults, vec![None, None, None]);
+    }
+
+    #[test]
+    fn test_parse_macro_params_mixed() {
+        // GAS-style: `.macro ALT_NEW_CONTENT vendor_id, patch_id, enable = 1, new_c`
+        let (params, defaults) = parse_macro_params("vendor_id, patch_id, enable = 1, new_c");
+        assert_eq!(params, vec!["vendor_id", "patch_id", "enable", "new_c"]);
+        assert_eq!(defaults, vec![None, None, Some("1".to_string()), None]);
+    }
+
+    #[test]
+    fn test_parse_macro_params_empty() {
+        let (params, defaults) = parse_macro_params("");
+        assert!(params.is_empty());
+        assert!(defaults.is_empty());
     }
 }

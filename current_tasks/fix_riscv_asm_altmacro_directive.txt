@@ -1,4 +1,0 @@
-Fix RISC-V assembler: add .altmacro/.noaltmacro as ignored directives.
-These are used in the Linux kernel (e.g., arch/riscv/kvm/vcpu_switch.S)
-and cause "unsupported RISC-V assembler directive: .altmacro" errors in standalone mode.
-The kernel files don't use actual altmacro features, so ignoring them is correct.
