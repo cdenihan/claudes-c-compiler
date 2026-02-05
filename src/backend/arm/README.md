@@ -39,7 +39,7 @@ arm/
 - **Peephole optimizer**: 3-phase pipeline (iterative local, global copy
   propagation + dead store elimination, local cleanup)
 - **Assembler**: GNU assembly syntax, fixed 32-bit encoding, macro/conditional
-  preprocessor, ~240 base mnemonics
+  preprocessor, ~400 base mnemonics
 - **Linker**: Static and dynamic linking, shared library (`.so`) output,
   IFUNC/IPLT with IRELATIVE relocations, TLS (LE, IE via GOT, TLSDESC and
   GD relaxation to LE)
