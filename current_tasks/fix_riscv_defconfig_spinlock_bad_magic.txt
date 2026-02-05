@@ -1,0 +1,9 @@
+Fix RISC-V standalone defconfig kernel: spinlock bad magic BUG
+
+The standalone RISC-V defconfig kernel builds successfully but crashes during
+boot with "BUG: spinlock bad magic on CPU#0" in the securityfs init path.
+The spinlock's magic field is 0 instead of the expected value, suggesting
+a codegen bug affecting struct initialization or constant propagation.
+
+Will delta-debug by comparing GCC-compiled and CCC-compiled object files
+to identify which source file's codegen is broken.
