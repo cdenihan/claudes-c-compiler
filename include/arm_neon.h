@@ -2415,5 +2415,708 @@ vst1_lane_s16(short *__p, int16x4_t __a, int __lane)
     *__p = __a.__val[__lane];
 }
 
+/* ================================================================== */
+/*              u16 ARITHMETIC / COMPARE / BITWISE                    */
+/* ================================================================== */
+
+/* vaddq_u16: element-wise add uint16x8_t */
+static __inline__ uint16x8_t __attribute__((__always_inline__))
+vaddq_u16(uint16x8_t __a, uint16x8_t __b)
+{
+    uint16x8_t __ret;
+    for (int __i = 0; __i < 8; __i++)
+        __ret.__val[__i] = __a.__val[__i] + __b.__val[__i];
+    return __ret;
+}
+
+/* vaddq_s16: element-wise add int16x8_t */
+static __inline__ int16x8_t __attribute__((__always_inline__))
+vaddq_s16(int16x8_t __a, int16x8_t __b)
+{
+    int16x8_t __ret;
+    for (int __i = 0; __i < 8; __i++)
+        __ret.__val[__i] = __a.__val[__i] + __b.__val[__i];
+    return __ret;
+}
+
+/* vsubq_u16: element-wise subtract uint16x8_t */
+static __inline__ uint16x8_t __attribute__((__always_inline__))
+vsubq_u16(uint16x8_t __a, uint16x8_t __b)
+{
+    uint16x8_t __ret;
+    for (int __i = 0; __i < 8; __i++)
+        __ret.__val[__i] = __a.__val[__i] - __b.__val[__i];
+    return __ret;
+}
+
+/* vsubq_s16: element-wise subtract int16x8_t */
+static __inline__ int16x8_t __attribute__((__always_inline__))
+vsubq_s16(int16x8_t __a, int16x8_t __b)
+{
+    int16x8_t __ret;
+    for (int __i = 0; __i < 8; __i++)
+        __ret.__val[__i] = __a.__val[__i] - __b.__val[__i];
+    return __ret;
+}
+
+/* vsubq_u32: element-wise subtract uint32x4_t */
+static __inline__ uint32x4_t __attribute__((__always_inline__))
+vsubq_u32(uint32x4_t __a, uint32x4_t __b)
+{
+    uint32x4_t __ret;
+    for (int __i = 0; __i < 4; __i++)
+        __ret.__val[__i] = __a.__val[__i] - __b.__val[__i];
+    return __ret;
+}
+
+/* vmaxq_u16: element-wise unsigned max uint16x8_t */
+static __inline__ uint16x8_t __attribute__((__always_inline__))
+vmaxq_u16(uint16x8_t __a, uint16x8_t __b)
+{
+    uint16x8_t __ret;
+    for (int __i = 0; __i < 8; __i++)
+        __ret.__val[__i] = __a.__val[__i] > __b.__val[__i] ? __a.__val[__i] : __b.__val[__i];
+    return __ret;
+}
+
+/* vminq_u16: element-wise unsigned min uint16x8_t */
+static __inline__ uint16x8_t __attribute__((__always_inline__))
+vminq_u16(uint16x8_t __a, uint16x8_t __b)
+{
+    uint16x8_t __ret;
+    for (int __i = 0; __i < 8; __i++)
+        __ret.__val[__i] = __a.__val[__i] < __b.__val[__i] ? __a.__val[__i] : __b.__val[__i];
+    return __ret;
+}
+
+/* vminq_s16: element-wise signed min int16x8_t */
+static __inline__ int16x8_t __attribute__((__always_inline__))
+vminq_s16(int16x8_t __a, int16x8_t __b)
+{
+    int16x8_t __ret;
+    for (int __i = 0; __i < 8; __i++)
+        __ret.__val[__i] = __a.__val[__i] < __b.__val[__i] ? __a.__val[__i] : __b.__val[__i];
+    return __ret;
+}
+
+/* vmulq_u16: element-wise multiply uint16x8_t */
+static __inline__ uint16x8_t __attribute__((__always_inline__))
+vmulq_u16(uint16x8_t __a, uint16x8_t __b)
+{
+    uint16x8_t __ret;
+    for (int __i = 0; __i < 8; __i++)
+        __ret.__val[__i] = __a.__val[__i] * __b.__val[__i];
+    return __ret;
+}
+
+/* ================================================================== */
+/*              u16 COMPARE INTRINSICS                                */
+/* ================================================================== */
+
+/* vcgtzq_s16: compare greater than zero, int16x8_t -> uint16x8_t */
+static __inline__ uint16x8_t __attribute__((__always_inline__))
+vcgtzq_s16(int16x8_t __a)
+{
+    uint16x8_t __ret;
+    for (int __i = 0; __i < 8; __i++)
+        __ret.__val[__i] = (__a.__val[__i] > 0) ? 0xFFFF : 0x0000;
+    return __ret;
+}
+
+/* vcgtzq_s32: compare greater than zero, int32x4_t -> uint32x4_t */
+static __inline__ uint32x4_t __attribute__((__always_inline__))
+vcgtzq_s32(int32x4_t __a)
+{
+    uint32x4_t __ret;
+    for (int __i = 0; __i < 4; __i++)
+        __ret.__val[__i] = (__a.__val[__i] > 0) ? 0xFFFFFFFF : 0x00000000;
+    return __ret;
+}
+
+/* vcltzq_s16: compare less than zero, int16x8_t -> uint16x8_t */
+static __inline__ uint16x8_t __attribute__((__always_inline__))
+vcltzq_s16(int16x8_t __a)
+{
+    uint16x8_t __ret;
+    for (int __i = 0; __i < 8; __i++)
+        __ret.__val[__i] = (__a.__val[__i] < 0) ? 0xFFFF : 0x0000;
+    return __ret;
+}
+
+/* vtstq_u16: test bits, uint16x8_t */
+static __inline__ uint16x8_t __attribute__((__always_inline__))
+vtstq_u16(uint16x8_t __a, uint16x8_t __b)
+{
+    uint16x8_t __ret;
+    for (int __i = 0; __i < 8; __i++)
+        __ret.__val[__i] = (__a.__val[__i] & __b.__val[__i]) ? 0xFFFF : 0x0000;
+    return __ret;
+}
+
+/* vtstq_u32: test bits, uint32x4_t */
+static __inline__ uint32x4_t __attribute__((__always_inline__))
+vtstq_u32(uint32x4_t __a, uint32x4_t __b)
+{
+    uint32x4_t __ret;
+    for (int __i = 0; __i < 4; __i++)
+        __ret.__val[__i] = (__a.__val[__i] & __b.__val[__i]) ? 0xFFFFFFFF : 0x00000000;
+    return __ret;
+}
+
+/* ================================================================== */
+/*              BITWISE SELECT (vbslq)                                */
+/* ================================================================== */
+
+/* vbslq_u8: bitwise select, uint8x16_t */
+static __inline__ uint8x16_t __attribute__((__always_inline__))
+vbslq_u8(uint8x16_t __sel, uint8x16_t __a, uint8x16_t __b)
+{
+    uint8x16_t __ret;
+    for (int __i = 0; __i < 16; __i++)
+        __ret.__val[__i] = (__sel.__val[__i] & __a.__val[__i]) |
+                           (~__sel.__val[__i] & __b.__val[__i]);
+    return __ret;
+}
+
+/* vbslq_u16: bitwise select, uint16x8_t */
+static __inline__ uint16x8_t __attribute__((__always_inline__))
+vbslq_u16(uint16x8_t __sel, uint16x8_t __a, uint16x8_t __b)
+{
+    uint16x8_t __ret;
+    for (int __i = 0; __i < 8; __i++)
+        __ret.__val[__i] = (__sel.__val[__i] & __a.__val[__i]) |
+                           (~__sel.__val[__i] & __b.__val[__i]);
+    return __ret;
+}
+
+/* vbslq_u32: bitwise select, uint32x4_t */
+static __inline__ uint32x4_t __attribute__((__always_inline__))
+vbslq_u32(uint32x4_t __sel, uint32x4_t __a, uint32x4_t __b)
+{
+    uint32x4_t __ret;
+    for (int __i = 0; __i < 4; __i++)
+        __ret.__val[__i] = (__sel.__val[__i] & __a.__val[__i]) |
+                           (~__sel.__val[__i] & __b.__val[__i]);
+    return __ret;
+}
+
+/* vbslq_u64: bitwise select, uint64x2_t */
+static __inline__ uint64x2_t __attribute__((__always_inline__))
+vbslq_u64(uint64x2_t __sel, uint64x2_t __a, uint64x2_t __b)
+{
+    uint64x2_t __ret;
+    for (int __i = 0; __i < 2; __i++)
+        __ret.__val[__i] = (__sel.__val[__i] & __a.__val[__i]) |
+                           (~__sel.__val[__i] & __b.__val[__i]);
+    return __ret;
+}
+
+/* vbslq_s8: bitwise select, int8x16_t (using u8 bitwise ops) */
+static __inline__ int8x16_t __attribute__((__always_inline__))
+vbslq_s8(uint8x16_t __sel, int8x16_t __a, int8x16_t __b)
+{
+    int8x16_t __ret;
+    for (int __i = 0; __i < 16; __i++)
+        __ret.__val[__i] = (__sel.__val[__i] & (unsigned char)__a.__val[__i]) |
+                           (~__sel.__val[__i] & (unsigned char)__b.__val[__i]);
+    return __ret;
+}
+
+/* vbslq_s16: bitwise select, int16x8_t (using u16 bitwise ops) */
+static __inline__ int16x8_t __attribute__((__always_inline__))
+vbslq_s16(uint16x8_t __sel, int16x8_t __a, int16x8_t __b)
+{
+    int16x8_t __ret;
+    for (int __i = 0; __i < 8; __i++)
+        __ret.__val[__i] = (__sel.__val[__i] & (unsigned short)__a.__val[__i]) |
+                           (~__sel.__val[__i] & (unsigned short)__b.__val[__i]);
+    return __ret;
+}
+
+/* vbslq_s32: bitwise select, int32x4_t (using u32 bitwise ops) */
+static __inline__ int32x4_t __attribute__((__always_inline__))
+vbslq_s32(uint32x4_t __sel, int32x4_t __a, int32x4_t __b)
+{
+    int32x4_t __ret;
+    for (int __i = 0; __i < 4; __i++)
+        __ret.__val[__i] = (__sel.__val[__i] & (unsigned int)__a.__val[__i]) |
+                           (~__sel.__val[__i] & (unsigned int)__b.__val[__i]);
+    return __ret;
+}
+
+/* ================================================================== */
+/*              EXTRACT (vextq_u16)                                   */
+/* ================================================================== */
+
+/* vextq_u16: extract from pair of uint16x8_t */
+#define vextq_u16(__a, __b, __n) __extension__ ({ \
+    uint16x8_t __r; \
+    unsigned short __tmp[16]; \
+    __tmp[0] = (__a).__val[0]; __tmp[1] = (__a).__val[1]; \
+    __tmp[2] = (__a).__val[2]; __tmp[3] = (__a).__val[3]; \
+    __tmp[4] = (__a).__val[4]; __tmp[5] = (__a).__val[5]; \
+    __tmp[6] = (__a).__val[6]; __tmp[7] = (__a).__val[7]; \
+    __tmp[8] = (__b).__val[0]; __tmp[9] = (__b).__val[1]; \
+    __tmp[10] = (__b).__val[2]; __tmp[11] = (__b).__val[3]; \
+    __tmp[12] = (__b).__val[4]; __tmp[13] = (__b).__val[5]; \
+    __tmp[14] = (__b).__val[6]; __tmp[15] = (__b).__val[7]; \
+    __r.__val[0] = __tmp[(__n)]; __r.__val[1] = __tmp[(__n) + 1]; \
+    __r.__val[2] = __tmp[(__n) + 2]; __r.__val[3] = __tmp[(__n) + 3]; \
+    __r.__val[4] = __tmp[(__n) + 4]; __r.__val[5] = __tmp[(__n) + 5]; \
+    __r.__val[6] = __tmp[(__n) + 6]; __r.__val[7] = __tmp[(__n) + 7]; \
+    __r; \
+})
+
+/* vextq_s16: extract from pair of int16x8_t */
+#define vextq_s16(__a, __b, __n) __extension__ ({ \
+    int16x8_t __r; \
+    short __tmp[16]; \
+    __tmp[0] = (__a).__val[0]; __tmp[1] = (__a).__val[1]; \
+    __tmp[2] = (__a).__val[2]; __tmp[3] = (__a).__val[3]; \
+    __tmp[4] = (__a).__val[4]; __tmp[5] = (__a).__val[5]; \
+    __tmp[6] = (__a).__val[6]; __tmp[7] = (__a).__val[7]; \
+    __tmp[8] = (__b).__val[0]; __tmp[9] = (__b).__val[1]; \
+    __tmp[10] = (__b).__val[2]; __tmp[11] = (__b).__val[3]; \
+    __tmp[12] = (__b).__val[4]; __tmp[13] = (__b).__val[5]; \
+    __tmp[14] = (__b).__val[6]; __tmp[15] = (__b).__val[7]; \
+    __r.__val[0] = __tmp[(__n)]; __r.__val[1] = __tmp[(__n) + 1]; \
+    __r.__val[2] = __tmp[(__n) + 2]; __r.__val[3] = __tmp[(__n) + 3]; \
+    __r.__val[4] = __tmp[(__n) + 4]; __r.__val[5] = __tmp[(__n) + 5]; \
+    __r.__val[6] = __tmp[(__n) + 6]; __r.__val[7] = __tmp[(__n) + 7]; \
+    __r; \
+})
+
+/* ================================================================== */
+/*              TABLE LOOKUP (vqtbl2q)                                */
+/* ================================================================== */
+
+/* vqtbl2q_u8: table lookup across 2 registers (32 bytes) */
+static __inline__ uint8x16_t __attribute__((__always_inline__))
+vqtbl2q_u8(uint8x16x2_t __a, uint8x16_t __b)
+{
+    uint8x16_t __ret;
+    for (int __i = 0; __i < 16; __i++) {
+        unsigned char __idx = __b.__val[__i];
+        if (__idx < 16)
+            __ret.__val[__i] = __a.val[0].__val[__idx];
+        else if (__idx < 32)
+            __ret.__val[__i] = __a.val[1].__val[__idx - 16];
+        else
+            __ret.__val[__i] = 0;
+    }
+    return __ret;
+}
+
+/* vqtbx2q_u8: table lookup extend across 2 registers */
+static __inline__ uint8x16_t __attribute__((__always_inline__))
+vqtbx2q_u8(uint8x16_t __def, uint8x16x2_t __a, uint8x16_t __b)
+{
+    uint8x16_t __ret;
+    for (int __i = 0; __i < 16; __i++) {
+        unsigned char __idx = __b.__val[__i];
+        if (__idx < 16)
+            __ret.__val[__i] = __a.val[0].__val[__idx];
+        else if (__idx < 32)
+            __ret.__val[__i] = __a.val[1].__val[__idx - 16];
+        else
+            __ret.__val[__i] = __def.__val[__i];
+    }
+    return __ret;
+}
+
+/* vqtbl3q_u8: table lookup across 3 registers (48 bytes) */
+static __inline__ uint8x16_t __attribute__((__always_inline__))
+vqtbl3q_u8(uint8x16x3_t __a, uint8x16_t __b)
+{
+    uint8x16_t __ret;
+    for (int __i = 0; __i < 16; __i++) {
+        unsigned char __idx = __b.__val[__i];
+        if (__idx < 16)
+            __ret.__val[__i] = __a.val[0].__val[__idx];
+        else if (__idx < 32)
+            __ret.__val[__i] = __a.val[1].__val[__idx - 16];
+        else if (__idx < 48)
+            __ret.__val[__i] = __a.val[2].__val[__idx - 32];
+        else
+            __ret.__val[__i] = 0;
+    }
+    return __ret;
+}
+
+/* ================================================================== */
+/*              UNZIP / DE-INTERLEAVE (AArch64 vuzp1/vuzp2)          */
+/* ================================================================== */
+
+/* vuzp1q_u16: unzip even elements from two uint16x8_t
+ * result = {a[0], a[2], a[4], a[6], b[0], b[2], b[4], b[6]} */
+static __inline__ uint16x8_t __attribute__((__always_inline__))
+vuzp1q_u16(uint16x8_t __a, uint16x8_t __b)
+{
+    uint16x8_t __ret;
+    __ret.__val[0] = __a.__val[0];
+    __ret.__val[1] = __a.__val[2];
+    __ret.__val[2] = __a.__val[4];
+    __ret.__val[3] = __a.__val[6];
+    __ret.__val[4] = __b.__val[0];
+    __ret.__val[5] = __b.__val[2];
+    __ret.__val[6] = __b.__val[4];
+    __ret.__val[7] = __b.__val[6];
+    return __ret;
+}
+
+/* vuzp2q_u16: unzip odd elements from two uint16x8_t
+ * result = {a[1], a[3], a[5], a[7], b[1], b[3], b[5], b[7]} */
+static __inline__ uint16x8_t __attribute__((__always_inline__))
+vuzp2q_u16(uint16x8_t __a, uint16x8_t __b)
+{
+    uint16x8_t __ret;
+    __ret.__val[0] = __a.__val[1];
+    __ret.__val[1] = __a.__val[3];
+    __ret.__val[2] = __a.__val[5];
+    __ret.__val[3] = __a.__val[7];
+    __ret.__val[4] = __b.__val[1];
+    __ret.__val[5] = __b.__val[3];
+    __ret.__val[6] = __b.__val[5];
+    __ret.__val[7] = __b.__val[7];
+    return __ret;
+}
+
+/* vuzp1q_u8: unzip even elements from two uint8x16_t */
+static __inline__ uint8x16_t __attribute__((__always_inline__))
+vuzp1q_u8(uint8x16_t __a, uint8x16_t __b)
+{
+    uint8x16_t __ret;
+    for (int __i = 0; __i < 8; __i++) {
+        __ret.__val[__i] = __a.__val[__i * 2];
+        __ret.__val[__i + 8] = __b.__val[__i * 2];
+    }
+    return __ret;
+}
+
+/* vuzp2q_u8: unzip odd elements from two uint8x16_t */
+static __inline__ uint8x16_t __attribute__((__always_inline__))
+vuzp2q_u8(uint8x16_t __a, uint8x16_t __b)
+{
+    uint8x16_t __ret;
+    for (int __i = 0; __i < 8; __i++) {
+        __ret.__val[__i] = __a.__val[__i * 2 + 1];
+        __ret.__val[__i + 8] = __b.__val[__i * 2 + 1];
+    }
+    return __ret;
+}
+
+/* vuzp1q_u32: unzip even elements from two uint32x4_t */
+static __inline__ uint32x4_t __attribute__((__always_inline__))
+vuzp1q_u32(uint32x4_t __a, uint32x4_t __b)
+{
+    uint32x4_t __ret;
+    __ret.__val[0] = __a.__val[0];
+    __ret.__val[1] = __a.__val[2];
+    __ret.__val[2] = __b.__val[0];
+    __ret.__val[3] = __b.__val[2];
+    return __ret;
+}
+
+/* vuzp2q_u32: unzip odd elements from two uint32x4_t */
+static __inline__ uint32x4_t __attribute__((__always_inline__))
+vuzp2q_u32(uint32x4_t __a, uint32x4_t __b)
+{
+    uint32x4_t __ret;
+    __ret.__val[0] = __a.__val[1];
+    __ret.__val[1] = __a.__val[3];
+    __ret.__val[2] = __b.__val[1];
+    __ret.__val[3] = __b.__val[3];
+    return __ret;
+}
+
+/* vzip1q_u16: zip/interleave low halves of two uint16x8_t
+ * result = {a[0], b[0], a[1], b[1], a[2], b[2], a[3], b[3]} */
+static __inline__ uint16x8_t __attribute__((__always_inline__))
+vzip1q_u16(uint16x8_t __a, uint16x8_t __b)
+{
+    uint16x8_t __ret;
+    __ret.__val[0] = __a.__val[0]; __ret.__val[1] = __b.__val[0];
+    __ret.__val[2] = __a.__val[1]; __ret.__val[3] = __b.__val[1];
+    __ret.__val[4] = __a.__val[2]; __ret.__val[5] = __b.__val[2];
+    __ret.__val[6] = __a.__val[3]; __ret.__val[7] = __b.__val[3];
+    return __ret;
+}
+
+/* vzip2q_u16: zip/interleave high halves of two uint16x8_t
+ * result = {a[4], b[4], a[5], b[5], a[6], b[6], a[7], b[7]} */
+static __inline__ uint16x8_t __attribute__((__always_inline__))
+vzip2q_u16(uint16x8_t __a, uint16x8_t __b)
+{
+    uint16x8_t __ret;
+    __ret.__val[0] = __a.__val[4]; __ret.__val[1] = __b.__val[4];
+    __ret.__val[2] = __a.__val[5]; __ret.__val[3] = __b.__val[5];
+    __ret.__val[4] = __a.__val[6]; __ret.__val[5] = __b.__val[6];
+    __ret.__val[6] = __a.__val[7]; __ret.__val[7] = __b.__val[7];
+    return __ret;
+}
+
+/* vzip1q_u32: zip/interleave low halves of two uint32x4_t */
+static __inline__ uint32x4_t __attribute__((__always_inline__))
+vzip1q_u32(uint32x4_t __a, uint32x4_t __b)
+{
+    uint32x4_t __ret;
+    __ret.__val[0] = __a.__val[0]; __ret.__val[1] = __b.__val[0];
+    __ret.__val[2] = __a.__val[1]; __ret.__val[3] = __b.__val[1];
+    return __ret;
+}
+
+/* vzip2q_u32: zip/interleave high halves of two uint32x4_t */
+static __inline__ uint32x4_t __attribute__((__always_inline__))
+vzip2q_u32(uint32x4_t __a, uint32x4_t __b)
+{
+    uint32x4_t __ret;
+    __ret.__val[0] = __a.__val[2]; __ret.__val[1] = __b.__val[2];
+    __ret.__val[2] = __a.__val[3]; __ret.__val[3] = __b.__val[3];
+    return __ret;
+}
+
+/* ================================================================== */
+/*              ADDITIONAL REINTERPRET CASTS                          */
+/* ================================================================== */
+
+/* vreinterpretq_s16_u16: reinterpret uint16x8_t as int16x8_t */
+static __inline__ int16x8_t __attribute__((__always_inline__))
+vreinterpretq_s16_u16(uint16x8_t __a)
+{
+    int16x8_t __ret;
+    __builtin_memcpy(&__ret, &__a, 16);
+    return __ret;
+}
+
+/* vreinterpretq_u16_s16: reinterpret int16x8_t as uint16x8_t */
+static __inline__ uint16x8_t __attribute__((__always_inline__))
+vreinterpretq_u16_s16(int16x8_t __a)
+{
+    uint16x8_t __ret;
+    __builtin_memcpy(&__ret, &__a, 16);
+    return __ret;
+}
+
+/* vreinterpretq_u64_u16: reinterpret uint16x8_t as uint64x2_t */
+static __inline__ uint64x2_t __attribute__((__always_inline__))
+vreinterpretq_u64_u16(uint16x8_t __a)
+{
+    uint64x2_t __ret;
+    __builtin_memcpy(&__ret, &__a, 16);
+    return __ret;
+}
+
+/* vreinterpretq_u16_u64: reinterpret uint64x2_t as uint16x8_t */
+static __inline__ uint16x8_t __attribute__((__always_inline__))
+vreinterpretq_u16_u64(uint64x2_t __a)
+{
+    uint16x8_t __ret;
+    __builtin_memcpy(&__ret, &__a, 16);
+    return __ret;
+}
+
+/* vreinterpretq_s32_s16: reinterpret int16x8_t as int32x4_t */
+static __inline__ int32x4_t __attribute__((__always_inline__))
+vreinterpretq_s32_s16(int16x8_t __a)
+{
+    int32x4_t __ret;
+    __builtin_memcpy(&__ret, &__a, 16);
+    return __ret;
+}
+
+/* vreinterpretq_s16_s32: reinterpret int32x4_t as int16x8_t */
+static __inline__ int16x8_t __attribute__((__always_inline__))
+vreinterpretq_s16_s32(int32x4_t __a)
+{
+    int16x8_t __ret;
+    __builtin_memcpy(&__ret, &__a, 16);
+    return __ret;
+}
+
+/* vreinterpretq_u16_s8: reinterpret int8x16_t as uint16x8_t */
+static __inline__ uint16x8_t __attribute__((__always_inline__))
+vreinterpretq_u16_s8(int8x16_t __a)
+{
+    uint16x8_t __ret;
+    __builtin_memcpy(&__ret, &__a, 16);
+    return __ret;
+}
+
+/* vreinterpretq_s8_s16: reinterpret int16x8_t as int8x16_t */
+static __inline__ int8x16_t __attribute__((__always_inline__))
+vreinterpretq_s8_s16(int16x8_t __a)
+{
+    int8x16_t __ret;
+    __builtin_memcpy(&__ret, &__a, 16);
+    return __ret;
+}
+
+/* vreinterpretq_s64_u64: reinterpret uint64x2_t as int64x2_t */
+static __inline__ int64x2_t __attribute__((__always_inline__))
+vreinterpretq_s64_u64(uint64x2_t __a)
+{
+    int64x2_t __ret;
+    __builtin_memcpy(&__ret, &__a, 16);
+    return __ret;
+}
+
+/* vreinterpretq_u64_s64: reinterpret int64x2_t as uint64x2_t */
+static __inline__ uint64x2_t __attribute__((__always_inline__))
+vreinterpretq_u64_s64(int64x2_t __a)
+{
+    uint64x2_t __ret;
+    __builtin_memcpy(&__ret, &__a, 16);
+    return __ret;
+}
+
+/* vreinterpretq_s8_u16: reinterpret uint16x8_t as int8x16_t */
+static __inline__ int8x16_t __attribute__((__always_inline__))
+vreinterpretq_s8_u16(uint16x8_t __a)
+{
+    int8x16_t __ret;
+    __builtin_memcpy(&__ret, &__a, 16);
+    return __ret;
+}
+
+/* vreinterpretq_f32_u32: reinterpret uint32x4_t as float32x4_t */
+static __inline__ float32x4_t __attribute__((__always_inline__))
+vreinterpretq_f32_u32(uint32x4_t __a)
+{
+    float32x4_t __ret;
+    __builtin_memcpy(&__ret, &__a, 16);
+    return __ret;
+}
+
+/* vreinterpretq_u32_f32: reinterpret float32x4_t as uint32x4_t */
+static __inline__ uint32x4_t __attribute__((__always_inline__))
+vreinterpretq_u32_f32(float32x4_t __a)
+{
+    uint32x4_t __ret;
+    __builtin_memcpy(&__ret, &__a, 16);
+    return __ret;
+}
+
+/* ================================================================== */
+/*              ADDITIONAL SHIFT INTRINSICS                           */
+/* ================================================================== */
+
+/* vshlq_n_u16: shift left by immediate, uint16x8_t */
+#define vshlq_n_u16(__a, __n) __extension__ ({ \
+    uint16x8_t __r; \
+    for (int __i = 0; __i < 8; __i++) \
+        __r.__val[__i] = (__a).__val[__i] << (__n); \
+    __r; \
+})
+
+/* vshrq_n_u16: shift right by immediate, uint16x8_t */
+#define vshrq_n_u16(__a, __n) __extension__ ({ \
+    uint16x8_t __r; \
+    for (int __i = 0; __i < 8; __i++) \
+        __r.__val[__i] = (__a).__val[__i] >> (__n); \
+    __r; \
+})
+
+/* vshlq_n_s16: shift left by immediate, int16x8_t */
+#define vshlq_n_s16(__a, __n) __extension__ ({ \
+    int16x8_t __r; \
+    for (int __i = 0; __i < 8; __i++) \
+        __r.__val[__i] = (__a).__val[__i] << (__n); \
+    __r; \
+})
+
+/* vshrq_n_s16: shift right by immediate, int16x8_t */
+#define vshrq_n_s16(__a, __n) __extension__ ({ \
+    int16x8_t __r; \
+    for (int __i = 0; __i < 8; __i++) \
+        __r.__val[__i] = (__a).__val[__i] >> (__n); \
+    __r; \
+})
+
+/* ================================================================== */
+/*         ADDITIONAL WIDENING / NARROWING INTRINSICS                 */
+/* ================================================================== */
+
+/* vmovl_u16: widen uint16x4_t to uint32x4_t */
+static __inline__ uint32x4_t __attribute__((__always_inline__))
+vmovl_u16(uint16x4_t __a)
+{
+    uint32x4_t __ret;
+    __ret.__val[0] = __a.__val[0];
+    __ret.__val[1] = __a.__val[1];
+    __ret.__val[2] = __a.__val[2];
+    __ret.__val[3] = __a.__val[3];
+    return __ret;
+}
+
+/* vmovl_s16: widen int16x4_t to int32x4_t */
+static __inline__ int32x4_t __attribute__((__always_inline__))
+vmovl_s16(int16x4_t __a)
+{
+    int32x4_t __ret;
+    __ret.__val[0] = __a.__val[0];
+    __ret.__val[1] = __a.__val[1];
+    __ret.__val[2] = __a.__val[2];
+    __ret.__val[3] = __a.__val[3];
+    return __ret;
+}
+
+/* vmovl_high_u16: widen high half of uint16x8_t to uint32x4_t */
+static __inline__ uint32x4_t __attribute__((__always_inline__))
+vmovl_high_u16(uint16x8_t __a)
+{
+    uint32x4_t __ret;
+    __ret.__val[0] = __a.__val[4];
+    __ret.__val[1] = __a.__val[5];
+    __ret.__val[2] = __a.__val[6];
+    __ret.__val[3] = __a.__val[7];
+    return __ret;
+}
+
+/* vmovl_high_u8: widen high half of uint8x16_t to uint16x8_t */
+static __inline__ uint16x8_t __attribute__((__always_inline__))
+vmovl_high_u8(uint8x16_t __a)
+{
+    uint16x8_t __ret;
+    for (int __i = 0; __i < 8; __i++)
+        __ret.__val[__i] = __a.__val[__i + 8];
+    return __ret;
+}
+
+/* ================================================================== */
+/*              LANE / HALF / COMBINE INTRINSICS (s16)                */
+/* ================================================================== */
+
+/* vsetq_lane_s16: set one lane in int16x8_t */
+static __inline__ int16x8_t __attribute__((__always_inline__))
+vsetq_lane_s16(short __val, int16x8_t __a, int __lane)
+{
+    __a.__val[__lane] = __val;
+    return __a;
+}
+
+/* vget_low_u16: get low half of uint16x8_t as uint16x4_t */
+static __inline__ uint16x4_t __attribute__((__always_inline__))
+vget_low_u16(uint16x8_t __a)
+{
+    uint16x4_t __ret;
+    __ret.__val[0] = __a.__val[0];
+    __ret.__val[1] = __a.__val[1];
+    __ret.__val[2] = __a.__val[2];
+    __ret.__val[3] = __a.__val[3];
+    return __ret;
+}
+
+/* vget_high_u16: get high half of uint16x8_t as uint16x4_t */
+static __inline__ uint16x4_t __attribute__((__always_inline__))
+vget_high_u16(uint16x8_t __a)
+{
+    uint16x4_t __ret;
+    __ret.__val[0] = __a.__val[4];
+    __ret.__val[1] = __a.__val[5];
+    __ret.__val[2] = __a.__val[6];
+    __ret.__val[3] = __a.__val[7];
+    return __ret;
+}
+
 
 #endif /* _ARM_NEON_H_INCLUDED */

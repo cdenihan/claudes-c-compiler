@@ -3185,14 +3185,21 @@ impl InstructionEncoder {
 
         // AT&T: outb %al, %dx  (src=al, dst=dx)
         // AT&T: outb %al, $imm8  (src=al, dst=imm)
+        // Also handle parenthesized form: outl %eax, (%dx)
         match (&ops[0], &ops[1]) {
-            (Operand::Register(_src), Operand::Register(_dst)) => {
+            (Operand::Register(_), Operand::Register(_)) => {
                 // outb %al, %dx  =>  0xEE (byte) or 0xEF (word/dword)
                 if size == 2 { self.bytes.push(0x66); }
                 self.bytes.push(if size == 1 { 0xEE } else { 0xEF });
                 Ok(())
             }
-            (Operand::Register(_src), Operand::Immediate(ImmediateValue::Integer(val))) => {
+            (Operand::Register(_), Operand::Memory(_)) => {
+                // outl %eax, (%dx)  =>  same encoding as register form
+                if size == 2 { self.bytes.push(0x66); }
+                self.bytes.push(if size == 1 { 0xEE } else { 0xEF });
+                Ok(())
+            }
+            (Operand::Register(_), Operand::Immediate(ImmediateValue::Integer(val))) => {
                 // outb %al, $imm8  =>  0xE6 ib (byte) or 0xE7 ib (word/dword)
                 if size == 2 { self.bytes.push(0x66); }
                 self.bytes.push(if size == 1 { 0xE6 } else { 0xE7 });
@@ -3226,14 +3233,21 @@ impl InstructionEncoder {
 
         // AT&T: inb %dx, %al  (src=dx, dst=al)
         // AT&T: inb $imm8, %al  (src=imm, dst=al)
+        // Also handle parenthesized form: inl (%dx), %eax
         match (&ops[0], &ops[1]) {
-            (Operand::Register(_src), Operand::Register(_dst)) => {
+            (Operand::Register(_), Operand::Register(_)) => {
                 // inb %dx, %al  =>  0xEC (byte) or 0xED (word/dword)
                 if size == 2 { self.bytes.push(0x66); }
                 self.bytes.push(if size == 1 { 0xEC } else { 0xED });
                 Ok(())
             }
-            (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Register(_dst)) => {
+            (Operand::Memory(_), Operand::Register(_)) => {
+                // inl (%dx), %eax  =>  same encoding as register form
+                if size == 2 { self.bytes.push(0x66); }
+                self.bytes.push(if size == 1 { 0xEC } else { 0xED });
+                Ok(())
+            }
+            (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Register(_)) => {
                 // inb $imm8, %al  =>  0xE4 ib (byte) or 0xE5 ib (word/dword)
                 if size == 2 { self.bytes.push(0x66); }
                 self.bytes.push(if size == 1 { 0xE4 } else { 0xE5 });

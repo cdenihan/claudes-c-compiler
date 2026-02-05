@@ -7,7 +7,7 @@ Tracking project build/test results with MY_ASM=builtin MY_LD=builtin
 | tomlc99 | PASS | PASS | PASS | PASS | i686 fixed by local symbol reloc fix |
 | parson  | PASS | PASS | PASS | PASS | i686 fixed by local symbol reloc fix |
 | jsmn    | PASS | PASS | N/A  | N/A  | Fixed i686: IFUNC support (IPLT/IRELATIVE), TLS, local sym resolution, generic section writes |
-| zstd    | PASS | TODO | TODO | TODO | Fixed __ASSEMBLER__ for .S files, .pushsection/.popsection, BMI2 instrs, bitwise expr parsing |
+| zstd    | PASS | TODO | FAIL (runtime) | FAIL (runtime) | Fixed __ASSEMBLER__ for .S files, .pushsection/.popsection, BMI2 instrs, bitwise expr parsing; ARM now compiles (added missing NEON u16 intrinsics), runtime crash in fullbench; RISC-V compiles, fuzzer crashes at test335 |
 | 8cc     | PASS | PASS | TODO | TODO | Fixed x86 builtin linker copy-reloc st_shndx and .gnu.hash; i686 fixed by COMDAT groups + GOTPC + PIC codegen fixes |
 | bzip2   | PASS | PASS | PASS | PASS | i686 fixed by local symbol reloc fix |
 | miniz   | PASS | PASS | PASS | PASS | i686 fixed by COMDAT groups + GOTPC + PIC codegen fixes |
