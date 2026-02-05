@@ -217,18 +217,28 @@ impl ElfWriter {
             self.process_statement(stmt)?;
         }
         // Merge subsections (e.g., .text.__subsection.1 → .text) before resolving
-        let merge_map = self.base.merge_subsections();
-        // Update pending_branch_relocs that referenced merged subsections
-        for reloc in &mut self.pending_branch_relocs {
-            if let Some((parent, offset_adj)) = merge_map.get(&reloc.section) {
-                reloc.section = parent.clone();
-                reloc.offset += *offset_adj;
+        let remap = self.base.merge_subsections();
+        // Fix up pending references that pointed to now-merged subsection names
+        if !remap.is_empty() {
+            for reloc in &mut self.pending_branch_relocs {
+                if let Some((parent, offset_adj)) = remap.get(&reloc.section) {
+                    reloc.offset += offset_adj;
+                    reloc.section = parent.clone();
+                }
+            }
+            for diff in &mut self.pending_sym_diffs {
+                if let Some((parent, offset_adj)) = remap.get(&diff.section) {
+                    diff.offset += offset_adj;
+                    diff.section = parent.clone();
+                }
+            }
+            for expr in &mut self.pending_exprs {
+                if let Some((parent, offset_adj)) = remap.get(&expr.section) {
+                    expr.offset += offset_adj;
+                    expr.section = parent.clone();
+                }
             }
         }
-        // TODO: pending_sym_diffs and pending_exprs also store section names
-        // at emit time and would need similar updating if they are ever
-        // emitted inside .subsection blocks. Currently this doesn't affect
-        // kernel ALTERNATIVE patterns (sym diffs/exprs are in main code).
         // Resolve symbol differences first (needs all labels to be known)
         self.resolve_sym_diffs()?;
         self.resolve_pending_exprs()?;

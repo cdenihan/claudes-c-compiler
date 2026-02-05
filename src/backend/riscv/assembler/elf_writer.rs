@@ -496,18 +496,23 @@ impl ElfWriter {
         // Merge subsections (e.g., .text.__subsection.1 → .text) before resolving
         // relocations. This is critical for kernel ALTERNATIVE macros which use
         // .subsection 1 to place alternative code within the same section.
-        // TODO: deferred expressions created while inside a subsection store the
-        // subsection name as their section. After merging, that section no longer
-        // exists, so the deferred value won't be patched. This doesn't affect
-        // kernel ALTERNATIVE patterns (deferred exprs are in .alternative, not
-        // in subsections), but would need fixing if forward-ref expressions
-        // appear inside .subsection blocks.
-        let merge_map = self.base.merge_subsections();
-        // Update pending_branch_relocs that referenced merged subsections
-        for reloc in &mut self.pending_branch_relocs {
-            if let Some((parent, offset_adj)) = merge_map.get(&reloc.section) {
-                reloc.section = parent.clone();
-                reloc.offset += *offset_adj;
+        let remap = self.base.merge_subsections();
+        // Fix up pending references that pointed to now-merged subsection names.
+        // Deferred expressions and branch relocs created inside a subsection store the
+        // subsection name as their section; after merging, that section no longer exists.
+        // Remap them to the parent section with the correct offset adjustment.
+        if !remap.is_empty() {
+            for reloc in &mut self.pending_branch_relocs {
+                if let Some((parent, offset_adj)) = remap.get(&reloc.section) {
+                    reloc.offset += offset_adj;
+                    reloc.section = parent.clone();
+                }
+            }
+            for expr in &mut self.deferred_exprs {
+                if let Some((parent, offset_adj)) = remap.get(&expr.section) {
+                    expr.offset += offset_adj;
+                    expr.section = parent.clone();
+                }
             }
         }
         self.resolve_deferred_exprs()?;
