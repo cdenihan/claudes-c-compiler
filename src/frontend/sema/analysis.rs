@@ -199,6 +199,12 @@ impl SemanticAnalyzer {
 
     fn analyze_function_def(&mut self, func: &FunctionDef) {
         let return_type = self.type_spec_to_ctype(&func.return_type);
+
+        // Register enum constants from the return type (e.g., anonymous enums
+        // used as return types: `static enum { A, B } func(void) { ... }`).
+        // Must happen at file scope before pushing the function body scope.
+        self.collect_enum_constants_from_type_spec(&func.return_type);
+
         let params: Vec<(CType, Option<String>)> = func.params.iter().map(|p| {
             let ty = self.type_spec_to_ctype(&p.type_spec);
             (ty, p.name.clone())

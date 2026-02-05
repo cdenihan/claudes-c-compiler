@@ -1,4 +1,0 @@
-Fixing mksh shell: ccc-x86 compiled binary produces incorrect output.
-172 test failures with ccc-x86 vs 0 with GCC.
-Shell appears to enter wrong code path - dumps env vars instead of executing commands.
-Investigating codegen/runtime bug.

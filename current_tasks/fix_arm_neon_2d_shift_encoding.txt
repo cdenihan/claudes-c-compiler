@@ -1,9 +1,0 @@
-Fix ARM NEON vector shift .2d encoding bug.
-USHR.2d, SHL.2d, SSHR.2d only operate on lane 0 (scalar encoding)
-instead of both lanes (vector encoding).
-
-The Q bit is likely not being set correctly for .2d arrangement.
-
-Also adding missing vgetq_lane_u8 NEON intrinsic.
-
-Started 2026-02-04.

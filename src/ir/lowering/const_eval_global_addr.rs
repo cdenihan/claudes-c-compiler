@@ -633,6 +633,29 @@ impl Lowerer {
                     _ => None,
                 }
             }
+            // arr[i] where arr is a global array of structs: return the element's struct layout.
+            // This handles patterns like `arr[0].text` where we need the layout of the
+            // struct element to resolve the `.text` field access.
+            Expr::ArraySubscript(base, _index, _) => {
+                let mut cur = base.as_ref();
+                // Walk through nested subscripts to find the base identifier
+                while let Expr::ArraySubscript(inner, _, _) = cur {
+                    cur = inner.as_ref();
+                }
+                match cur {
+                    Expr::Identifier(name, _) => {
+                        let global_name = self.resolve_to_global_name(name)?;
+                        let ginfo = self.globals.get(&global_name)?;
+                        if ginfo.is_array {
+                            // Return the struct layout of the array element type
+                            ginfo.struct_layout.as_ref().map(|rc| (**rc).clone())
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            }
             // (&struct_expr)->field: dereference is a no-op for &expr, resolve field type
             Expr::PointerMemberAccess(base, field, _) => {
                 // The base should be &something; get the pointee's struct layout

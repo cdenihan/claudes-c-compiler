@@ -654,11 +654,160 @@ vget_lane_u8(uint8x8_t __a, int __lane)
     return __a.__val[__lane];
 }
 
+static __inline__ unsigned short __attribute__((__always_inline__))
+vget_lane_u16(uint16x4_t __a, int __lane)
+{
+    return __a.__val[__lane];
+}
+
+static __inline__ short __attribute__((__always_inline__))
+vget_lane_s16(int16x4_t __a, int __lane)
+{
+    return __a.__val[__lane];
+}
+
+static __inline__ unsigned int __attribute__((__always_inline__))
+vget_lane_u32(uint32x2_t __a, int __lane)
+{
+    return __a.__val[__lane];
+}
+
+static __inline__ int __attribute__((__always_inline__))
+vget_lane_s32(int32x2_t __a, int __lane)
+{
+    return __a.__val[__lane];
+}
+
+static __inline__ float __attribute__((__always_inline__))
+vget_lane_f32(float32x2_t __a, int __lane)
+{
+    return __a.__val[__lane];
+}
+
+static __inline__ unsigned char __attribute__((__always_inline__))
+vgetq_lane_u8(uint8x16_t __a, int __lane)
+{
+    return __a.__val[__lane];
+}
+
+static __inline__ signed char __attribute__((__always_inline__))
+vgetq_lane_s8(int8x16_t __a, int __lane)
+{
+    return __a.__val[__lane];
+}
+
+static __inline__ unsigned short __attribute__((__always_inline__))
+vgetq_lane_u16(uint16x8_t __a, int __lane)
+{
+    return __a.__val[__lane];
+}
+
+static __inline__ short __attribute__((__always_inline__))
+vgetq_lane_s16(int16x8_t __a, int __lane)
+{
+    return __a.__val[__lane];
+}
+
+static __inline__ int __attribute__((__always_inline__))
+vgetq_lane_s32(int32x4_t __a, int __lane)
+{
+    return __a.__val[__lane];
+}
+
 static __inline__ unsigned int __attribute__((__always_inline__))
 vgetq_lane_u32(uint32x4_t __a, int __lane)
 {
     return __a.__val[__lane];
 }
+
+static __inline__ float __attribute__((__always_inline__))
+vgetq_lane_f32(float32x4_t __a, int __lane)
+{
+    return __a.__val[__lane];
+}
+
+static __inline__ double __attribute__((__always_inline__))
+vgetq_lane_f64(float64x2_t __a, int __lane)
+{
+    return __a.__val[__lane];
+}
+
+/* vset_lane: set a single lane in a vector */
+static __inline__ uint8x8_t __attribute__((__always_inline__))
+vset_lane_u8(unsigned char __val, uint8x8_t __a, int __lane)
+{
+    __a.__val[__lane] = __val;
+    return __a;
+}
+
+static __inline__ uint8x16_t __attribute__((__always_inline__))
+vsetq_lane_u8(unsigned char __val, uint8x16_t __a, int __lane)
+{
+    __a.__val[__lane] = __val;
+    return __a;
+}
+
+static __inline__ uint16x4_t __attribute__((__always_inline__))
+vset_lane_u16(unsigned short __val, uint16x4_t __a, int __lane)
+{
+    __a.__val[__lane] = __val;
+    return __a;
+}
+
+static __inline__ uint16x8_t __attribute__((__always_inline__))
+vsetq_lane_u16(unsigned short __val, uint16x8_t __a, int __lane)
+{
+    __a.__val[__lane] = __val;
+    return __a;
+}
+
+static __inline__ uint32x2_t __attribute__((__always_inline__))
+vset_lane_u32(unsigned int __val, uint32x2_t __a, int __lane)
+{
+    __a.__val[__lane] = __val;
+    return __a;
+}
+
+static __inline__ uint32x4_t __attribute__((__always_inline__))
+vsetq_lane_u32(unsigned int __val, uint32x4_t __a, int __lane)
+{
+    __a.__val[__lane] = __val;
+    return __a;
+}
+
+static __inline__ int32x2_t __attribute__((__always_inline__))
+vset_lane_s32(int __val, int32x2_t __a, int __lane)
+{
+    __a.__val[__lane] = __val;
+    return __a;
+}
+
+static __inline__ int32x4_t __attribute__((__always_inline__))
+vsetq_lane_s32(int __val, int32x4_t __a, int __lane)
+{
+    __a.__val[__lane] = __val;
+    return __a;
+}
+
+static __inline__ float32x2_t __attribute__((__always_inline__))
+vset_lane_f32(float __val, float32x2_t __a, int __lane)
+{
+    __a.__val[__lane] = __val;
+    return __a;
+}
+
+static __inline__ float32x4_t __attribute__((__always_inline__))
+vsetq_lane_f32(float __val, float32x4_t __a, int __lane)
+{
+    __a.__val[__lane] = __val;
+    return __a;
+}
+
+#define vset_lane_u64(__val, __a, __lane) ({ uint64x1_t __r = (__a); __r.__val[(__lane)] = (__val); __r; })
+#define vsetq_lane_u64(__val, __a, __lane) ({ uint64x2_t __r = (__a); __r.__val[(__lane)] = (__val); __r; })
+#define vset_lane_s64(__val, __a, __lane) ({ int64x1_t __r = (__a); __r.__val[(__lane)] = (__val); __r; })
+#define vsetq_lane_s64(__val, __a, __lane) ({ int64x2_t __r = (__a); __r.__val[(__lane)] = (__val); __r; })
+#define vsetq_lane_f64(__val, __a, __lane) ({ float64x2_t __r = (__a); __r.__val[(__lane)] = (__val); __r; })
 
 /* ================================================================== */
 /*                    ARITHMETIC OPERATIONS                            */

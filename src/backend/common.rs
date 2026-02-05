@@ -21,6 +21,7 @@ use crate::ir::reexports::{
     IrModule,
 };
 use crate::common::types::IrType;
+use crate::backend::elf::{EM_386, EM_X86_64, EM_AARCH64, EM_RISCV};
 
 /// Print a one-time warning when using a GCC-backed assembler.
 ///
@@ -57,7 +58,6 @@ pub struct AssemblerConfig {
 }
 
 /// Configuration for an external linker.
-#[allow(dead_code)]
 pub struct LinkerConfig {
     /// The linker command (e.g., "gcc", "aarch64-linux-gnu-gcc")
     pub command: &'static str,
@@ -117,11 +117,11 @@ pub fn assemble_with_extra(config: &AssemblerConfig, asm_text: &str, output_path
 /// Map an ELF e_machine value to a human-readable architecture name.
 fn elf_machine_name(em: u16) -> &'static str {
     match em {
-        3 => "i386",
-        40 => "ARM",
-        62 => "x86-64",
-        183 => "aarch64",
-        243 => "RISC-V",
+        EM_386     => "i386",
+        40         => "ARM",
+        EM_X86_64  => "x86-64",
+        EM_AARCH64 => "aarch64",
+        EM_RISCV   => "RISC-V",
         _ => "unknown",
     }
 }
@@ -182,12 +182,6 @@ fn validate_object_architectures(
     Err(msg)
 }
 
-/// Link object files into an executable using an external toolchain.
-#[allow(dead_code)]
-pub fn link(config: &LinkerConfig, object_files: &[&str], output_path: &str) -> Result<(), String> {
-    link_with_args(config, object_files, output_path, &[])
-}
-
 /// Link object files into an executable (or shared library), with additional user-provided linker args.
 ///
 /// When the `gcc_linker` Cargo feature is enabled, uses GCC as the linker
@@ -217,56 +211,27 @@ pub fn link_with_args(config: &LinkerConfig, object_files: &[&str], output_path:
     // Default (gcc_linker disabled): use the built-in native linker
     #[cfg(not(feature = "gcc_linker"))]
     {
-        if !is_relocatable {
-            if config.expected_elf_machine == 62 {
-                return link_builtin_x86(
-                    object_files, output_path, user_args,
-                    is_nostdlib, is_static, is_shared,
-                );
-            }
-            if config.expected_elf_machine == 243 {
-                if is_shared {
-                    return link_builtin_riscv_shared(
-                        object_files, output_path, user_args,
-                    );
-                } else {
-                    return link_builtin_riscv(
-                        object_files, output_path, user_args,
-                        is_nostdlib, is_static,
-                    );
-                }
-            }
-            if config.expected_elf_machine == 183 {
-                return link_builtin_aarch64(
-                    object_files, output_path, user_args,
-                    is_nostdlib, is_static, is_shared,
-                );
-            }
-            if !is_shared && config.expected_elf_machine == 3 {
-                return link_builtin_i686(
-                    object_files, output_path, user_args,
-                    is_nostdlib, is_static,
-                );
-            }
-        }
-
-        if is_shared {
-            return Err(format!(
-                "Shared library linking (-shared) is only supported for x86-64, AArch64, and RISC-V. \
-                 Target '{}' requires the gcc_linker feature. \
-                 Rebuild with: cargo build --features gcc_linker",
-                config.arch_name
-            ));
-        }
         if is_relocatable {
             return Err("Relocatable linking (-r) requires the gcc_linker feature. \
                        Rebuild with: cargo build --features gcc_linker".to_string());
         }
-        Err(format!(
-            "No built-in linker for ELF machine {} ({}). \
-             Rebuild with: cargo build --features gcc_linker",
-            config.expected_elf_machine, config.arch_name
-        ))
+
+        // Look up the architecture config by ELF machine number
+        let arch = match config.expected_elf_machine {
+            EM_X86_64  => &DIRECT_LD_X86_64,
+            EM_AARCH64 => &DIRECT_LD_AARCH64,
+            EM_RISCV   => &DIRECT_LD_RISCV64,
+            EM_386     => &DIRECT_LD_I686,
+            _ => {
+                return Err(format!(
+                    "No built-in linker for ELF machine {} ({}). \
+                     Rebuild with: cargo build --features gcc_linker",
+                    config.expected_elf_machine, config.arch_name
+                ));
+            }
+        };
+
+        link_builtin_native(arch, object_files, output_path, user_args, is_nostdlib, is_static, is_shared)
     }
 }
 
@@ -334,10 +299,14 @@ fn link_with_gcc(
 /// Each architecture has different CRT/GCC library paths, emulation mode,
 /// dynamic linker path, etc. This struct captures all those differences
 /// so a single generic function can handle all backends.
-#[allow(dead_code)]
+#[cfg(not(feature = "gcc_linker"))]
+#[allow(dead_code)] // Some fields (emulation, dynamic_linker, etc.) are stored for documentation/future use
 struct DirectLdArchConfig {
     /// Human-readable architecture name for error messages (e.g., "x86-64", "RISC-V")
     arch_name: &'static str,
+    /// ELF e_machine value (e.g., EM_X86_64=62, EM_RISCV=243).
+    /// Used to dispatch to the correct backend linker.
+    elf_machine: u16,
     /// ld emulation mode (e.g., "elf_x86_64", "elf64lriscv", "elf_i386", "aarch64linux")
     emulation: &'static str,
     /// Dynamic linker path (e.g., "/lib64/ld-linux-x86-64.so.2")
@@ -364,15 +333,16 @@ struct DirectLdArchConfig {
 }
 
 /// Standard GCC versions to probe (newest to oldest), shared across most architectures.
-#[allow(dead_code)]
+#[cfg(not(feature = "gcc_linker"))]
 const GCC_VERSIONS_FULL: &[&str] = &["14", "13", "12", "11", "10", "9", "8", "7", "6", "5", "4.9"];
 /// Shorter version list for architectures that don't have very old GCC support.
-#[allow(dead_code)]
+#[cfg(not(feature = "gcc_linker"))]
 const GCC_VERSIONS_SHORT: &[&str] = &["14", "13", "12", "11", "10", "9", "8", "7"];
 
-#[allow(dead_code)]
+#[cfg(not(feature = "gcc_linker"))]
 const DIRECT_LD_X86_64: DirectLdArchConfig = DirectLdArchConfig {
     arch_name: "x86-64",
+    elf_machine: EM_X86_64,
     emulation: "elf_x86_64",
     dynamic_linker: "/lib64/ld-linux-x86-64.so.2",
     gcc_lib_base_paths: &[
@@ -402,9 +372,10 @@ const DIRECT_LD_X86_64: DirectLdArchConfig = DirectLdArchConfig {
     gcc_package_hint: "Is the GCC development package installed?",
 };
 
-#[allow(dead_code)]
+#[cfg(not(feature = "gcc_linker"))]
 const DIRECT_LD_RISCV64: DirectLdArchConfig = DirectLdArchConfig {
     arch_name: "RISC-V",
+    elf_machine: EM_RISCV,
     emulation: "elf64lriscv",
     dynamic_linker: "/lib/ld-linux-riscv64-lp64d.so.1",
     gcc_lib_base_paths: &[
@@ -432,9 +403,10 @@ const DIRECT_LD_RISCV64: DirectLdArchConfig = DirectLdArchConfig {
         (e.g., gcc-riscv64-linux-gnu)",
 };
 
-#[allow(dead_code)]
+#[cfg(not(feature = "gcc_linker"))]
 const DIRECT_LD_I686: DirectLdArchConfig = DirectLdArchConfig {
     arch_name: "i686",
+    elf_machine: EM_386,
     emulation: "elf_i386",
     dynamic_linker: "/lib/ld-linux.so.2",
     gcc_lib_base_paths: &[
@@ -467,9 +439,10 @@ const DIRECT_LD_I686: DirectLdArchConfig = DirectLdArchConfig {
     gcc_package_hint: "Is the gcc-i686-linux-gnu package installed?",
 };
 
-#[allow(dead_code)]
+#[cfg(not(feature = "gcc_linker"))]
 const DIRECT_LD_AARCH64: DirectLdArchConfig = DirectLdArchConfig {
     arch_name: "AArch64",
+    elf_machine: EM_AARCH64,
     emulation: "aarch64linux",
     dynamic_linker: "/lib/ld-linux-aarch64.so.1",
     gcc_lib_base_paths: &[
@@ -504,7 +477,7 @@ const DIRECT_LD_AARCH64: DirectLdArchConfig = DirectLdArchConfig {
 
 /// Discover GCC's library directory by probing well-known paths.
 /// Returns the path containing crtbegin.o (e.g., "/usr/lib/gcc/x86_64-linux-gnu/13").
-#[allow(dead_code)]
+#[cfg(not(feature = "gcc_linker"))]
 fn find_gcc_lib_dir(arch: &DirectLdArchConfig) -> Option<String> {
     for base in arch.gcc_lib_base_paths {
         for ver in arch.gcc_versions {
@@ -520,7 +493,7 @@ fn find_gcc_lib_dir(arch: &DirectLdArchConfig) -> Option<String> {
 
 /// Discover the system CRT directory containing crt1.o.
 /// Returns the path (e.g., "/usr/lib/x86_64-linux-gnu").
-#[allow(dead_code)]
+#[cfg(not(feature = "gcc_linker"))]
 fn find_crt_dir(arch: &DirectLdArchConfig) -> Option<String> {
     for dir in arch.crt_dir_candidates {
         let crt1 = format!("{}/crt1.o", dir);
@@ -540,7 +513,7 @@ fn find_crt_dir(arch: &DirectLdArchConfig) -> Option<String> {
 /// - `crt_after`: CRT objects to link after user objects
 /// - `lib_paths`: Combined library search paths (user -L first, then system paths)
 /// - `needed_libs`: Default libraries to link
-#[allow(dead_code)]
+#[cfg(not(feature = "gcc_linker"))]
 struct BuiltinLinkSetup {
     crt_before: Vec<String>,
     crt_after: Vec<String>,
@@ -548,7 +521,7 @@ struct BuiltinLinkSetup {
     needed_libs: Vec<String>,
 }
 
-#[allow(dead_code)]
+#[cfg(not(feature = "gcc_linker"))]
 fn resolve_builtin_link_setup(
     arch: &DirectLdArchConfig,
     user_args: &[String],
@@ -653,14 +626,63 @@ fn resolve_builtin_link_setup(
     BuiltinLinkSetup { crt_before, crt_after, lib_paths, needed_libs }
 }
 
-/// Link using the built-in native x86-64 ELF linker.
+/// Add architecture-specific extra libraries after "gcc" in the needed libs list.
+///
+/// Most architectures need libgcc_eh.a (static) or libgcc_s.so (dynamic) for
+/// exception handling / stack unwinding, but the exact policy varies:
+/// - x86-64: no extra libs needed (libgcc alone suffices)
+/// - i686: always adds gcc_eh (needed for __divmoddi4, etc.)
+/// - AArch64/RISC-V: gcc_eh for static, gcc_s for dynamic
+#[cfg(not(feature = "gcc_linker"))]
+fn add_arch_extra_libs(setup: &mut BuiltinLinkSetup, elf_machine: u16, is_static: bool) {
+    // x86-64 doesn't need extra gcc libs
+    if elf_machine == EM_X86_64 {
+        return;
+    }
+    // Find the "gcc" entry and insert the extra lib after it
+    if let Some(pos) = setup.needed_libs.iter().position(|l| l == "gcc") {
+        // i686 always needs gcc_eh; others use gcc_eh for static, gcc_s for dynamic
+        let extra = if elf_machine == EM_386 || is_static { "gcc_eh" } else { "gcc_s" };
+        setup.needed_libs.insert(pos + 1, extra.to_string());
+    }
+}
+
+/// Convert a `BuiltinLinkSetup` into borrowed slices for passing to backend linkers.
+///
+/// Avoids repeating the same 4-line `.iter().map(|s| s.as_str()).collect()` pattern.
+#[cfg(not(feature = "gcc_linker"))]
+struct LinkSetupRefs<'a> {
+    lib_paths: Vec<&'a str>,
+    needed_libs: Vec<&'a str>,
+    crt_before: Vec<&'a str>,
+    crt_after: Vec<&'a str>,
+}
+
+#[cfg(not(feature = "gcc_linker"))]
+impl BuiltinLinkSetup {
+    fn as_refs(&self) -> LinkSetupRefs<'_> {
+        LinkSetupRefs {
+            lib_paths: self.lib_paths.iter().map(|s| s.as_str()).collect(),
+            needed_libs: self.needed_libs.iter().map(|s| s.as_str()).collect(),
+            crt_before: self.crt_before.iter().map(|s| s.as_str()).collect(),
+            crt_after: self.crt_after.iter().map(|s| s.as_str()).collect(),
+        }
+    }
+}
+
+/// Link using the built-in native ELF linker for any supported architecture.
 ///
 /// This is the fully native path: no external ld binary is needed. The linker
 /// reads ELF .o files and .a archives, resolves symbols against system shared
 /// libraries (libc.so.6), handles relocations, and produces a dynamically-linked
-/// ELF executable.
-#[allow(dead_code)]
-pub(crate) fn link_builtin_x86(
+/// ELF executable. Dispatches to the correct per-architecture backend based on
+/// the `arch.elf_machine` value.
+///
+/// For shared library output (-shared), delegates to the per-arch `link_shared`
+/// entry point with library paths only (no CRT objects).
+#[cfg(not(feature = "gcc_linker"))]
+fn link_builtin_native(
+    arch: &DirectLdArchConfig,
     object_files: &[&str],
     output_path: &str,
     user_args: &[String],
@@ -668,207 +690,48 @@ pub(crate) fn link_builtin_x86(
     is_static: bool,
     is_shared: bool,
 ) -> Result<(), String> {
-    use crate::backend::x86::linker;
+    use crate::backend::{x86, i686, arm, riscv};
 
     if is_shared {
-        // Shared libraries: no CRT objects, but we do need libgcc for compiler
-        // runtime functions like __udivti3, __divti3, etc.
-        let setup = resolve_builtin_link_setup(&DIRECT_LD_X86_64, user_args, true, false);
-        let lib_path_refs: Vec<&str> = setup.lib_paths.iter().map(|s| s.as_str()).collect();
-        let implicit_libs: Vec<&str> = if is_nostdlib { vec![] } else { vec!["gcc"] };
-        return linker::link_shared(
-            object_files,
-            output_path,
-            user_args,
-            &lib_path_refs,
-            &implicit_libs,
-        );
-    }
-
-    let setup = resolve_builtin_link_setup(&DIRECT_LD_X86_64, user_args, is_nostdlib, is_static);
-
-    let lib_path_refs: Vec<&str> = setup.lib_paths.iter().map(|s| s.as_str()).collect();
-    let needed_lib_refs: Vec<&str> = setup.needed_libs.iter().map(|s| s.as_str()).collect();
-    let crt_before_refs: Vec<&str> = setup.crt_before.iter().map(|s| s.as_str()).collect();
-    let crt_after_refs: Vec<&str> = setup.crt_after.iter().map(|s| s.as_str()).collect();
-
-    linker::link_builtin(
-        object_files,
-        output_path,
-        user_args,
-        &lib_path_refs,
-        &needed_lib_refs,
-        &crt_before_refs,
-        &crt_after_refs,
-    )
-}
-
-/// Link using the built-in native i686 ELF linker.
-///
-/// Parallel to `link_builtin_x86`: uses `DIRECT_LD_I686` for CRT/library
-/// discovery, then delegates to the i686 native linker.
-#[allow(dead_code)]
-pub(crate) fn link_builtin_i686(
-    object_files: &[&str],
-    output_path: &str,
-    user_args: &[String],
-    is_nostdlib: bool,
-    is_static: bool,
-) -> Result<(), String> {
-    use crate::backend::i686::linker;
-
-    let mut setup = resolve_builtin_link_setup(&DIRECT_LD_I686, user_args, is_nostdlib, is_static);
-
-    // i686 static linking needs libgcc.a for compiler helper functions
-    // (__divmoddi4, __udivmoddi4, etc.) referenced by libc, plus libgcc_eh.a
-    // for exception handling / stack unwinding.
-    if !is_nostdlib {
-        if let Some(pos) = setup.needed_libs.iter().position(|l| l == "gcc") {
-            setup.needed_libs.insert(pos + 1, "gcc_eh".to_string());
-        }
-    }
-
-    let lib_path_refs: Vec<&str> = setup.lib_paths.iter().map(|s| s.as_str()).collect();
-    let needed_lib_refs: Vec<&str> = setup.needed_libs.iter().map(|s| s.as_str()).collect();
-    let crt_before_refs: Vec<&str> = setup.crt_before.iter().map(|s| s.as_str()).collect();
-    let crt_after_refs: Vec<&str> = setup.crt_after.iter().map(|s| s.as_str()).collect();
-
-    linker::link_builtin(
-        object_files,
-        output_path,
-        user_args,
-        &lib_path_refs,
-        &needed_lib_refs,
-        &crt_before_refs,
-        &crt_after_refs,
-    )
-}
-
-/// Link using the built-in native AArch64 ELF linker.
-///
-/// Parallel to `link_builtin_x86`: uses `DIRECT_LD_AARCH64` for CRT/library
-/// discovery, then delegates to the AArch64 native linker.
-/// Supports static linking, dynamic linking, and shared library output (-shared).
-#[allow(dead_code)]
-pub(crate) fn link_builtin_aarch64(
-    object_files: &[&str],
-    output_path: &str,
-    user_args: &[String],
-    is_nostdlib: bool,
-    is_static: bool,
-    is_shared: bool,
-) -> Result<(), String> {
-    use crate::backend::arm::linker;
-
-    if is_shared {
-        // Shared libraries: no CRT objects, no default libs (like -nostdlib).
-        let setup = resolve_builtin_link_setup(&DIRECT_LD_AARCH64, user_args, true, false);
-        let lib_path_refs: Vec<&str> = setup.lib_paths.iter().map(|s| s.as_str()).collect();
-        return linker::link_shared(
-            object_files,
-            output_path,
-            user_args,
-            &lib_path_refs,
-        );
-    }
-
-    let mut setup = resolve_builtin_link_setup(&DIRECT_LD_AARCH64, user_args, is_nostdlib, is_static);
-
-    // AArch64 linking needs gcc_eh for exception handling (unwinding) when static,
-    // or gcc_s when dynamic
-    if !is_nostdlib {
-        if is_static {
-            if let Some(pos) = setup.needed_libs.iter().position(|l| l == "gcc") {
-                setup.needed_libs.insert(pos + 1, "gcc_eh".to_string());
+        // Shared libraries: no CRT objects, lib paths only
+        let setup = resolve_builtin_link_setup(arch, user_args, true, false);
+        let refs = setup.as_refs();
+        return match arch.elf_machine {
+            EM_X86_64 => {
+                // x86-64 shared linker also takes implicit libs (gcc for runtime helpers)
+                let implicit_libs: Vec<&str> = if is_nostdlib { vec![] } else { vec!["gcc"] };
+                x86::linker::link_shared(object_files, output_path, user_args, &refs.lib_paths, &implicit_libs)
             }
-        } else if let Some(pos) = setup.needed_libs.iter().position(|l| l == "gcc") {
-            setup.needed_libs.insert(pos + 1, "gcc_s".to_string());
-        }
+            EM_AARCH64 => arm::linker::link_shared(object_files, output_path, user_args, &refs.lib_paths),
+            EM_RISCV => riscv::linker::link_shared(object_files, output_path, user_args, &refs.lib_paths),
+            _ => Err(format!("No shared library linker for {} (elf_machine={})", arch.arch_name, arch.elf_machine)),
+        };
     }
 
-    let lib_path_refs: Vec<&str> = setup.lib_paths.iter().map(|s| s.as_str()).collect();
-    let needed_lib_refs: Vec<&str> = setup.needed_libs.iter().map(|s| s.as_str()).collect();
-    let crt_before_refs: Vec<&str> = setup.crt_before.iter().map(|s| s.as_str()).collect();
-    let crt_after_refs: Vec<&str> = setup.crt_after.iter().map(|s| s.as_str()).collect();
+    let mut setup = resolve_builtin_link_setup(arch, user_args, is_nostdlib, is_static);
+    add_arch_extra_libs(&mut setup, arch.elf_machine, is_static);
+    let refs = setup.as_refs();
 
-    linker::link_builtin(
-        object_files,
-        output_path,
-        user_args,
-        &lib_path_refs,
-        &needed_lib_refs,
-        &crt_before_refs,
-        &crt_after_refs,
-        is_static,
-    )
-}
-
-/// Link using the built-in native RISC-V ELF linker.
-///
-/// Parallel to `link_builtin_x86`: uses `DIRECT_LD_RISCV64` for CRT/library
-/// discovery, then delegates to the RISC-V native linker.
-#[allow(dead_code)]
-pub(crate) fn link_builtin_riscv(
-    object_files: &[&str],
-    output_path: &str,
-    user_args: &[String],
-    is_nostdlib: bool,
-    is_static: bool,
-) -> Result<(), String> {
-    use crate::backend::riscv::linker;
-
-    let mut setup = resolve_builtin_link_setup(&DIRECT_LD_RISCV64, user_args, is_nostdlib, is_static);
-
-    if !is_nostdlib {
-        if is_static {
-            // RISC-V static linking needs gcc_eh for exception handling/unwinding
-            if let Some(pos) = setup.needed_libs.iter().position(|l| l == "gcc") {
-                setup.needed_libs.insert(pos + 1, "gcc_eh".to_string());
-            }
-        } else {
-            // RISC-V dynamic linking needs gcc_s
-            if let Some(pos) = setup.needed_libs.iter().position(|l| l == "gcc") {
-                setup.needed_libs.insert(pos + 1, "gcc_s".to_string());
-            }
-        }
+    match arch.elf_machine {
+        EM_X86_64 => x86::linker::link_builtin(
+            object_files, output_path, user_args,
+            &refs.lib_paths, &refs.needed_libs, &refs.crt_before, &refs.crt_after,
+        ),
+        EM_386 => i686::linker::link_builtin(
+            object_files, output_path, user_args,
+            &refs.lib_paths, &refs.needed_libs, &refs.crt_before, &refs.crt_after,
+        ),
+        EM_AARCH64 => arm::linker::link_builtin(
+            object_files, output_path, user_args,
+            &refs.lib_paths, &refs.needed_libs, &refs.crt_before, &refs.crt_after,
+            is_static,
+        ),
+        EM_RISCV => riscv::linker::link_builtin(
+            object_files, output_path, user_args,
+            &refs.lib_paths, &refs.needed_libs, &refs.crt_before, &refs.crt_after,
+        ),
+        _ => Err(format!("No built-in linker for {} (elf_machine={})", arch.arch_name, arch.elf_machine)),
     }
-
-    let lib_path_refs: Vec<&str> = setup.lib_paths.iter().map(|s| s.as_str()).collect();
-    let needed_lib_refs: Vec<&str> = setup.needed_libs.iter().map(|s| s.as_str()).collect();
-    let crt_before_refs: Vec<&str> = setup.crt_before.iter().map(|s| s.as_str()).collect();
-    let crt_after_refs: Vec<&str> = setup.crt_after.iter().map(|s| s.as_str()).collect();
-
-    linker::link_builtin(
-        object_files,
-        output_path,
-        user_args,
-        &lib_path_refs,
-        &needed_lib_refs,
-        &crt_before_refs,
-        &crt_after_refs,
-    )
-}
-
-/// Link a RISC-V shared library (.so) using the built-in linker.
-///
-/// Similar to `link_builtin_x86`'s shared path: no CRT objects, no default libs.
-/// Library paths are still resolved for -l flags.
-#[allow(dead_code)]
-pub(crate) fn link_builtin_riscv_shared(
-    object_files: &[&str],
-    output_path: &str,
-    user_args: &[String],
-) -> Result<(), String> {
-    use crate::backend::riscv::linker;
-
-    let setup = resolve_builtin_link_setup(&DIRECT_LD_RISCV64, user_args, true, false);
-    let lib_path_refs: Vec<&str> = setup.lib_paths.iter().map(|s| s.as_str()).collect();
-    linker::link_shared(
-        object_files,
-        output_path,
-        user_args,
-        &lib_path_refs,
-    )
 }
 
 /// Assembly output buffer with helpers for emitting text.

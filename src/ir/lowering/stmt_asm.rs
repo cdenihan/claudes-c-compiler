@@ -63,7 +63,7 @@ impl Lowerer {
                     }
                 }
             }
-            let out_ty = IrType::from_ctype(&self.expr_ctype(&out.expr));
+            let out_ty = self.asm_operand_ir_type(&self.expr_ctype(&out.expr));
             // Detect address space for memory operands (e.g., __seg_gs pointer dereferences)
             let out_seg = self.get_asm_operand_addr_space(&out.expr);
             let ptr = if let Some(lv) = self.lower_lvalue(&out.expr) {
@@ -188,7 +188,7 @@ impl Lowerer {
                     }
                 }
             }
-            let inp_ty = IrType::from_ctype(&self.expr_ctype(&inp.expr));
+            let inp_ty = self.asm_operand_ir_type(&self.expr_ctype(&inp.expr));
             let inp_seg = self.get_asm_operand_addr_space(&inp.expr);
             let mut sym_name: Option<String> = None;
             let val = if constraint_has_immediate_alt(&constraint) {
@@ -614,6 +614,38 @@ impl Lowerer {
         match expr {
             Expr::Deref(inner, _) => self.get_addr_space_of_ptr_expr(inner),
             _ => AddressSpace::Default,
+        }
+    }
+
+    /// Map a CType to an IrType for inline asm operand sizing.
+    ///
+    /// Unlike `IrType::from_ctype()` which maps aggregate types (vectors, structs)
+    /// to `Ptr` (8 bytes on 64-bit), this preserves the actual size so the backend's
+    /// inline asm emitter can choose the correct load/store width.
+    ///
+    /// For 128-bit types (GCC vectors with `__attribute__((vector_size(16)))` or
+    /// struct-based NEON types like `uint8x16_t` that are 16 bytes), we return
+    /// `IrType::I128` (size 16) so the ARM backend uses `ldr qN`/`str qN` instead
+    /// of `fmov dN, xN` which only transfers 64 bits and zeroes the upper lane.
+    fn asm_operand_ir_type(&self, ctype: &crate::common::types::CType) -> IrType {
+        use crate::common::types::CType;
+        match ctype {
+            CType::Vector(_, total_size) if *total_size == 16 => IrType::I128,
+            CType::Vector(_, total_size) if *total_size == 8 => IrType::I64,
+            CType::Struct(_) | CType::Union(_) => {
+                // For struct/union types used with NEON "w" constraints (e.g.,
+                // uint8x16_t which is `struct { unsigned char __val[16]; }`),
+                // preserve the actual size so the backend uses 128-bit loads/stores.
+                let layouts = self.types.borrow_struct_layouts();
+                let size = ctype.size_ctx(&*layouts);
+                match size {
+                    16 => IrType::I128,
+                    8 => IrType::I64,
+                    4 => IrType::I32,
+                    _ => IrType::Ptr,
+                }
+            }
+            _ => IrType::from_ctype(ctype),
         }
     }
 }

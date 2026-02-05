@@ -532,13 +532,14 @@ fn load_shared_library(
     let soname = linker_common::parse_soname(&data).unwrap_or_else(|| {
         Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string())
     });
-    if !needed_sonames.contains(&soname) { needed_sonames.push(soname.clone()); }
 
     let dyn_syms = linker_common::parse_shared_library_symbols(&data, path)?;
+    let mut lib_needed = false;
     let mut matched_weak_objects: Vec<(u64, u64)> = Vec::new();
     for dsym in &dyn_syms {
         if let Some(existing) = globals.get(&dsym.name) {
             if existing.defined_in.is_none() && !existing.is_dynamic {
+                lib_needed = true;
                 globals.insert(dsym.name.clone(), GlobalSymbol {
                     value: 0, size: dsym.size, info: dsym.info,
                     defined_in: None, from_lib: Some(soname.clone()),
@@ -572,6 +573,10 @@ fn load_shared_library(
                 });
             }
         }
+    }
+    // Only add DT_NEEDED for this library if it resolved at least one symbol
+    if lib_needed && !needed_sonames.contains(&soname) {
+        needed_sonames.push(soname);
     }
     Ok(())
 }

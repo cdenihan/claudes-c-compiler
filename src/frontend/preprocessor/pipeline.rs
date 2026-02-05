@@ -288,6 +288,27 @@ impl Preprocessor {
                 continue;
             }
 
+            // Similarly, when accumulating a multi-line macro invocation in an
+            // included file, #define/#undef directives must be processed (to
+            // register/remove macros) without interrupting the accumulation.
+            // Without this, #define directives inside #ifdef blocks in included
+            // files would leak into the output as literal text. This mirrors the
+            // conditional directive handling above.
+            let is_define_undef_directive = if is_directive && !is_conditional_directive {
+                let after_hash = trimmed[1..].trim_start();
+                after_hash.starts_with("define") || after_hash.starts_with("undef")
+            } else {
+                false
+            };
+            if is_define_undef_directive && is_include && !pending_line.is_empty() {
+                if self.conditionals.is_active() {
+                    let hash_col = line.find('#').map(|i| i + 2).unwrap_or(1);
+                    self.process_directive(trimmed, source_line_num + 1, hash_col);
+                }
+                pending_newlines += 1;
+                continue;
+            }
+
             let process_directive = is_directive
                 && (!is_include || pending_line.is_empty());
 
