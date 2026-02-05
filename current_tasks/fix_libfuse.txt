@@ -1,0 +1,2 @@
+Investigating and fixing libfuse project compilation with ccc compilers.
+Testing with GCC first, then diagnosing any compiler issues.
